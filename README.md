@@ -157,21 +157,6 @@ cargo test
 
 Copy `.env.example` to `.env` to keep a separate development session (for example `TG_DATA_DIR=./.tdlib`).
 
-### Releases
-
-Pushing a version tag builds the app for every platform in GitHub Actions ([`release.yml`](.github/workflows/release.yml)) and attaches the files to a GitHub release. Publish to crates.io only once that release is up: `cargo binstall` looks for the files of the version it finds on crates.io, under the tag `v<version>`.
-
-```sh
-git tag v0.4.0 && git push origin v0.4.0   # wait for the Release workflow
-cargo publish
-```
-
-The build bakes in the API key from the repository secrets `TUIGRAM_API_ID` and `TUIGRAM_API_HASH` (**Settings → Secrets and variables → Actions**), masked so it isn't plain text in the binary. The key never goes into the repository or the crate on crates.io. To build a binary with your own key baked in, set the same variables when building:
-
-```sh
-TUIGRAM_API_ID=1234567 TUIGRAM_API_HASH=0123456789abcdef0123456789abcdef cargo build --release
-```
-
 ## Built with
 
 - [TDLib](https://github.com/tdlib/td) through [tdlib-rs](https://github.com/FedericoBruzzone/tdlib-rs)

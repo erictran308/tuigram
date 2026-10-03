@@ -25,6 +25,17 @@ The first build downloads a prebuilt TDLib and links it statically (`download-td
 
 Config (`config.rs`): API credentials may never be committed or end up in the published crate (both are public). Release binaries get tuigram's own key at compile time instead: `.github/workflows/release.yml` (run by pushing a `v*` tag) passes the `TUIGRAM_API_ID` / `TUIGRAM_API_HASH` repository secrets, and `build.rs` writes them XORed with a per-build random mask to `$OUT_DIR/built_in_keys.rs` (so the hash is never plain text in the binary), which `config::built_in_keys` unmasks; `cargo install` builds have none. `cargo binstall tuigram-cli` installs the release binary instead (`[package.metadata.binstall]` in `Cargo.toml`, with its from-source and QuickInstall fallbacks off, since those would have no key), so release asset names and the `v<version>` tag must stay as `pkg-url` expects, and a release must be up before `cargo publish`. At runtime the key comes from `TG_API_ID` / `TG_API_HASH`, else `settings.toml`, else the built-in one, else the login screen asks for one (`LoginStep::ApiId` / `ApiHash`) before TDLib gets its parameters. If Telegram rejects the key in use, the login screen asks for another and a new TDLib client starts with it (`App::reject_api_keys`). `TG_DATA_DIR` overrides the data directory, which holds the TDLib database, downloaded files, `tdlib.log` and `settings.toml`; it's set to 0700 on every start. `TG_*` settings can also come from `.env` in the working directory, for development (see `.env.example`): `config::load_dotenv` reads only that directory and only `TG_*` keys, into a map `config::var` falls back to, and never sets process environment variables (so a `.env` in an untrusted folder can't set `LD_PRELOAD` for the programs tuigram starts).
 
+## Releasing
+
+Release binaries carry tuigram's API key, so they're built only by `.github/workflows/release.yml`, from the `TUIGRAM_API_ID` / `TUIGRAM_API_HASH` repository secrets (Settings → Secrets and variables → Actions). Order matters: `cargo binstall` looks for the GitHub release of the version it finds on crates.io, so the release must exist before `cargo publish`.
+
+1. Bump `version` in `Cargo.toml`, run `cargo build` (updates `Cargo.lock`), then tests, clippy, `cargo fmt --check` and `actionlint`.
+2. Commit and push `main`.
+3. `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. The workflow builds six targets (Linux/macOS/Windows × x86_64/ARM64) and, only if all succeed, creates the GitHub release with the archives, `SHA256SUMS` and a provenance attestation. About 15–20 minutes.
+4. Once `releases/download/vX.Y.Z/SHA256SUMS` exists: `cargo publish`.
+
+When `tdlib-rs` changes in `Cargo.lock`, update `TDLIB_RS_VERSION`, `TDLIB_VERSION` and every target's `tdlib_sha256` in the workflow (the zips are at `github.com/FedericoBruzzone/tdlib-rs/releases`); the build stops until they match. To build a binary with a key baked in locally, set the same variables: `TUIGRAM_API_ID=… TUIGRAM_API_HASH=… cargo build --release` (both or neither, or build.rs fails).
+
 ## Security
 
 Everything another Telegram user sends is untrusted: text, names, chat titles, file names, links, files, images.
