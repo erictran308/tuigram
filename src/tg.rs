@@ -90,6 +90,8 @@ pub struct Deletable {
 
 /// TDLib download priority, 1 (lowest) to 32. Photos on screen matter.
 const DOWNLOAD_PRIORITY: i32 = 16;
+/// Chat photos in the list come after photos in messages.
+const QUIET_DOWNLOAD_PRIORITY: i32 = 8;
 
 unsafe extern "C" {
     /// TDLib's synchronous entry point, for the few requests that need no
@@ -448,17 +450,28 @@ impl Tg {
     /// Downloads a file into TDLib's files directory, or returns at once if it's
     /// already there.
     pub fn download(&self, file_id: i32) {
+        self.fetch_file(file_id, DOWNLOAD_PRIORITY, true);
+    }
+
+    /// Like [`download`](Self::download), for files nobody asked for (chat
+    /// photos): they wait behind other downloads, and a failure isn't reported.
+    pub fn download_quiet(&self, file_id: i32) {
+        self.fetch_file(file_id, QUIET_DOWNLOAD_PRIORITY, false);
+    }
+
+    fn fetch_file(&self, file_id: i32, priority: i32, report_errors: bool) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
         tokio::spawn(async move {
             // synchronous = true: answer only once the whole file is on disk.
-            let result =
-                functions::download_file(file_id, DOWNLOAD_PRIORITY, 0, 0, true, client_id).await;
+            let result = functions::download_file(file_id, priority, 0, 0, true, client_id).await;
             let path = match result {
                 Ok(enums::File::File(f)) if f.local.is_downloading_completed => Some(f.local.path),
                 Ok(_) => None,
                 Err(e) => {
-                    let _ = tx.send(TgEvent::Error(e.message));
+                    if report_errors {
+                        let _ = tx.send(TgEvent::Error(e.message));
+                    }
                     None
                 }
             };

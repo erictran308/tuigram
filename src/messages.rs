@@ -124,7 +124,7 @@ fn largest(photo: &types::Photo) -> Option<&types::PhotoSize> {
 }
 
 /// TDLib's JSON sends bytes as base64.
-fn decode_minithumbnail(mini: Option<&types::Minithumbnail>) -> Option<Thumbnail> {
+pub fn decode_minithumbnail(mini: Option<&types::Minithumbnail>) -> Option<Thumbnail> {
     let data = &mini?.data;
     base64::engine::general_purpose::STANDARD
         .decode(data)

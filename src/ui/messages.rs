@@ -846,6 +846,7 @@ mod tests {
             cols,
             rows: rows_,
             thumbnail: false,
+            avatar: false,
         };
         images.insert_ready(key, red.into());
         let buf = render_buffer(&mut open, false, &mut images);
@@ -886,6 +887,7 @@ mod tests {
             cols,
             rows,
             thumbnail: false,
+            avatar: false,
         };
         images.insert_ready(key, red.into());
 

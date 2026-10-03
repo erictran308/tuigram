@@ -623,6 +623,9 @@ impl App {
                     .set_last_message(u.chat_id, u.last_message.as_ref(), &u.positions)
             }
             Update::ChatTitle(u) => self.chats.set_title(u.chat_id, u.title),
+            Update::ChatPhoto(u) => self.chats.set_photo(u.chat_id, u.photo.as_ref()),
+            Update::ChatAccentColors(u) => self.chats.set_accent(u.chat_id, u.accent_color_id),
+            Update::AccentColors(u) => self.chats.set_accent_colors(&u.colors),
             Update::ChatReadInbox(u) => self.chats.set_unread(u.chat_id, u.unread_count),
             Update::Option(u) if u.name == "my_id" => {
                 if let OptionValue::Integer(v) = u.value {

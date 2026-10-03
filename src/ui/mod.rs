@@ -21,6 +21,7 @@ const MAX_COMPOSER_ROWS: usize = 6;
 /// The "Reply to …" bar at the top of the composer: who, then what they said.
 const REPLY_BAR_ROWS: u16 = 2;
 
+mod chat_list;
 mod help;
 mod messages;
 mod qr;
@@ -253,7 +254,20 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     let [list_area, chat_area] =
         Layout::horizontal([Constraint::Percentage(35), Constraint::Fill(1)]).areas(body);
 
-    draw_chat_list(frame, app, list_area, colors);
+    let list = chat_list::ChatList {
+        chats: &app.chats,
+        selected: app.selected,
+        loading: app.chats_loading,
+        focused: app.focus == Focus::Chats,
+        // The settings popup, the command list and toasts can reach over it.
+        covered: app.settings_menu.is_some()
+            || app.toast.is_some()
+            || app
+                .prompt
+                .as_ref()
+                .is_some_and(|p| p.kind == PromptKind::Command),
+    };
+    chat_list::draw(frame, list_area, &list, &mut app.images, colors);
     match app.open.as_mut() {
         Some(open) => {
             let names = messages::Names {
@@ -565,86 +579,6 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
         list,
         popup,
         &mut ListState::default().with_selected(Some(menu.selected)),
-    );
-}
-
-fn draw_chat_list(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
-    let filter = app.chats.filter();
-    let mut title = if filter.is_empty() {
-        format!(" Chats ({}) ", app.chats.ids().len())
-    } else {
-        format!(
-            " Chats ({} of {}) /{filter} ",
-            app.chats.ids().len(),
-            app.chats.total()
-        )
-    };
-    if app.chats_loading {
-        title.push_str("loading… ");
-    }
-    let block = Block::bordered()
-        .title(title)
-        .border_style(border(app.focus == Focus::Chats, colors));
-    // Inner width minus the 1-column cursor bar.
-    let width = block.inner(area).width.saturating_sub(1) as usize;
-    let selected = app
-        .selected
-        .and_then(|id| app.chats.ids().iter().position(|&x| x == id));
-
-    let items: Vec<ListItem> = app
-        .chats
-        .ids()
-        .iter()
-        .filter_map(|&id| app.chats.get(id).map(|chat| (id, chat)))
-        .enumerate()
-        .map(|(i, (id, chat))| {
-            let is_selected = selected == Some(i);
-            // Drawn by hand: List's highlight symbol only marks an item's first row.
-            let bar = if is_selected {
-                Span::from("▌").fg(colors.accent)
-            } else {
-                Span::from(" ")
-            };
-            let badge = if chat.unread > 0 {
-                format!(" {} ", chat.unread)
-            } else {
-                String::new()
-            };
-            let title = app.chats.title(id).unwrap_or_default();
-            let title = truncate(title, width.saturating_sub(badge.width() + 1));
-            let pad = width.saturating_sub(title.width() + badge.width());
-            let style = title_style(&app.chats, id, colors).bold();
-            let mut first = vec![bar.clone()];
-            first.extend(highlight(&title, filter, style, colors));
-            first.push(Span::from(" ".repeat(pad)));
-            first.push(Span::from(badge).fg(colors.bg).bg(colors.primary));
-            ListItem::new(vec![
-                Line::from(first),
-                Line::from(vec![
-                    bar,
-                    Span::from(truncate(&chat.preview, width)).fg(colors.subtle),
-                ]),
-            ])
-        })
-        .collect();
-
-    if items.is_empty() && !filter.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No chats match")
-                .fg(colors.muted)
-                .centered()
-                .block(block),
-            area,
-        );
-        return;
-    }
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::new().bg(colors.selection));
-    frame.render_stateful_widget(
-        list,
-        area,
-        &mut ListState::default().with_selected(selected),
     );
 }
 

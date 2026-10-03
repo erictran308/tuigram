@@ -108,7 +108,8 @@ pub struct Colors {
     pub own_meta: Color,
     pub other_bubble: Color,
     pub other_meta: Color,
-    /// Sender names in groups, picked by sender id.
+    /// Sender names in groups, picked by sender id, and the squares standing
+    /// in for missing chat photos, by Telegram's accent color id (0 red … 6 pink).
     pub names: [Color; 7],
     /// The QR code on the login screen.
     pub qr_dark: Color,

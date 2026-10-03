@@ -8,8 +8,10 @@
 use std::collections::{HashMap, HashSet};
 
 use tdlib_rs::enums::{ChatList, ChatType, MessageContent};
-use tdlib_rs::types::{self, ChatPosition, Message};
+use tdlib_rs::types::{self, AccentColor, ChatPhotoInfo, ChatPosition, Message};
 
+use crate::images::Thumbnail;
+use crate::messages::decode_minithumbnail;
 use crate::search;
 use crate::text;
 
@@ -22,6 +24,32 @@ pub struct Chat {
     pub preview: String,
     /// Position in the main list; 0 means the chat isn't in it (e.g. archived).
     order: i64,
+    pub photo: Option<ChatPhoto>,
+    /// Telegram's accent color id, which colors the chat's badge when it has
+    /// no photo.
+    accent: i32,
+}
+
+/// A chat's photo, for its avatar in the list.
+#[derive(Clone)]
+pub struct ChatPhoto {
+    /// The small (160 px) version.
+    pub file_id: i32,
+    /// Where TDLib already has it on disk, if it does.
+    pub path: Option<String>,
+    /// The blurry version embedded in the chat, shown until the photo is ready.
+    pub thumbnail: Option<Thumbnail>,
+}
+
+impl ChatPhoto {
+    fn new(info: &ChatPhotoInfo) -> Self {
+        let local = &info.small.local;
+        Self {
+            file_id: info.small.id,
+            path: local.is_downloading_completed.then(|| local.path.clone()),
+            thumbnail: decode_minithumbnail(info.minithumbnail.as_ref()),
+        }
+    }
 }
 
 /// What Telegram calls your chat with yourself.
@@ -44,6 +72,9 @@ pub struct Chats {
     filter: String,
     /// Chats in the main list, before the filter.
     total: usize,
+    /// Accent color ids past the seven built-in ones, mapped to the built-in
+    /// one they look like.
+    accent_colors: HashMap<i32, i32>,
 }
 
 impl Chats {
@@ -55,6 +86,8 @@ impl Chats {
             unread: chat.unread_count,
             preview: chat.last_message.as_ref().map(preview).unwrap_or_default(),
             order: main_order(&chat.positions).unwrap_or(0),
+            photo: chat.photo.as_ref().map(ChatPhoto::new),
+            accent: chat.accent_color_id,
         };
         self.by_id.insert(chat.id, entry);
         self.dirty = true;
@@ -97,6 +130,37 @@ impl Chats {
             chat.unread = unread;
             self.dirty = true;
         }
+    }
+
+    pub fn set_photo(&mut self, chat_id: i64, photo: Option<&ChatPhotoInfo>) {
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            chat.photo = photo.map(ChatPhoto::new);
+        }
+    }
+
+    pub fn set_accent(&mut self, chat_id: i64, accent_color_id: i32) {
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            chat.accent = accent_color_id;
+        }
+    }
+
+    /// Takes TDLib's list of the accent colors past the built-in ones.
+    pub fn set_accent_colors(&mut self, colors: &[AccentColor]) {
+        self.accent_colors = colors
+            .iter()
+            .map(|c| (c.id, c.built_in_accent_color_id))
+            .collect();
+    }
+
+    /// Which of Telegram's seven colors (red, orange, violet, green, cyan,
+    /// blue, pink) the chat's badge has.
+    pub fn accent(&self, chat_id: i64) -> usize {
+        let id = self.by_id.get(&chat_id).map_or(0, |c| c.accent);
+        let built_in = match id {
+            0..7 => id,
+            _ => self.accent_colors.get(&id).copied().unwrap_or(id),
+        };
+        built_in.rem_euclid(7) as usize
     }
 
     /// Call when a chat is opened, before it's marked as read.
@@ -196,6 +260,28 @@ impl Chats {
     }
 }
 
+#[cfg(test)]
+impl Chats {
+    /// Adds a chat below the others, for tests elsewhere: TDLib's `Chat` is
+    /// too big to build by hand.
+    pub fn add_for_test(&mut self, id: i64, title: &str, photo: Option<ChatPhoto>) {
+        let order = 1000 - self.by_id.len() as i64;
+        self.by_id.insert(
+            id,
+            Chat {
+                title: title.into(),
+                is_channel: false,
+                unread: 0,
+                preview: String::new(),
+                order,
+                photo,
+                accent: 0,
+            },
+        );
+        self.dirty = true;
+    }
+}
+
 fn main_order(positions: &[ChatPosition]) -> Option<i64> {
     positions
         .iter()
@@ -256,6 +342,8 @@ mod tests {
                     unread,
                     preview: String::new(),
                     order,
+                    photo: None,
+                    accent: 0,
                 },
             );
         }
@@ -303,6 +391,8 @@ mod tests {
                 unread: 0,
                 preview: String::new(),
                 order: 10,
+                photo: None,
+                accent: 0,
             },
         );
 
@@ -318,6 +408,24 @@ mod tests {
         list.set_filter("");
         list.refresh();
         assert_eq!(list.ids(), [2, 1, 3, 4]);
+    }
+
+    #[test]
+    fn accent_colors_past_the_built_in_seven_map_to_one_of_them() {
+        let mut list = chats(&[(1, 50, 0), (2, 40, 0), (3, 30, 0)]);
+        list.set_accent(1, 3);
+        list.set_accent(2, 9);
+        list.set_accent(3, 12);
+        list.set_accent_colors(&[AccentColor {
+            id: 9,
+            built_in_accent_color_id: 5,
+            light_theme_colors: Vec::new(),
+            dark_theme_colors: Vec::new(),
+            min_channel_chat_boost_level: 0,
+        }]);
+        assert_eq!(list.accent(1), 3);
+        assert_eq!(list.accent(2), 5);
+        assert_eq!(list.accent(3), 5, "an unknown id still gets a color");
     }
 
     #[test]
