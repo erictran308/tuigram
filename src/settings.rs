@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::ApiKeys;
 use crate::theme::Theme;
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -14,6 +15,9 @@ pub struct Settings {
     pub theme: Theme,
     /// Chats highlighted with `H`, by id.
     pub highlighted_chats: Vec<i64>,
+    /// Telegram API credentials entered on the login screen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_keys: Option<ApiKeys>,
 }
 
 impl Settings {
@@ -49,15 +53,23 @@ mod tests {
         let _ = std::fs::remove_file(&file);
 
         assert_eq!(Settings::load(&file).unwrap().theme, Theme::Mocha);
-        let settings = Settings {
+        let mut settings = Settings {
             theme: Theme::Latte,
             highlighted_chats: vec![-1001234567890, 42],
+            api_keys: None,
         };
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
             "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]"
         );
+        assert_eq!(Settings::load(&file).unwrap(), settings);
+
+        settings.api_keys = Some(ApiKeys {
+            id: 1234567,
+            hash: "0123456789abcdef0123456789abcdef".into(),
+        });
+        settings.save(&file).unwrap();
         assert_eq!(Settings::load(&file).unwrap(), settings);
 
         std::fs::write(&file, r#"theme = "dracula""#).unwrap();

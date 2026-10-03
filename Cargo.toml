@@ -1,13 +1,25 @@
 [package]
-name = "tuigram"
+name = "tuigram-cli"
 version = "0.1.0"
 edition = "2024"
+description = "Telegram in your terminal: a fast, vim-style Telegram client built on TDLib"
+license = "MIT"
+readme = "README.md"
+keywords = ["telegram", "tui", "terminal", "tdlib", "vim"]
+categories = ["command-line-utilities"]
+exclude = ["CLAUDE.md", ".env.example"]
+
+# The command is `tuigram`; the crate name `tuigram` was taken on crates.io.
+[[bin]]
+name = "tuigram"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22"
 chrono = "0.4.45"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
+dirs = "6.0.0"
 dotenvy = "0.15.7"
 futures = "0.3.34"
 image = "0.25"

@@ -15,6 +15,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Instant, sleep_until};
 
 use crate::chats::Chats;
+use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
 use crate::messages::{MediaFile, OpenChat};
 use crate::search::MessageSearch;
@@ -46,6 +47,11 @@ pub enum Screen {
 
 pub enum LoginStep {
     Connecting,
+    /// First run without API credentials: ask for them, ID then hash.
+    ApiId,
+    ApiHash {
+        id: i32,
+    },
     Phone,
     Code {
         sent_via: &'static str,
@@ -71,7 +77,7 @@ pub struct Login {
 }
 
 impl Login {
-    fn new(step: LoginStep) -> Self {
+    pub fn new(step: LoginStep) -> Self {
         let mut input = TextArea::default();
         input.set_block(Block::bordered());
         input.set_cursor_line_style(Style::default());
@@ -172,6 +178,8 @@ pub struct App {
     pub menu: Option<OpenMenu>,
     pub settings: Settings,
     settings_path: PathBuf,
+    /// API credentials from the environment, which win over saved ones.
+    env_keys: Option<ApiKeys>,
     pub settings_menu: Option<SettingsMenu>,
     /// Shown in the status bar while typing a `/` search.
     pub prompt: Option<SearchPrompt>,
@@ -187,12 +195,18 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(tg: Tg, images: Images, settings: Settings, settings_path: PathBuf) -> Self {
+    pub fn new(
+        tg: Tg,
+        images: Images,
+        settings: Settings,
+        settings_path: PathBuf,
+        env_keys: Option<ApiKeys>,
+    ) -> Self {
         let mut chats = Chats::default();
         chats.set_highlighted(&settings.highlighted_chats);
         Self {
             tg,
-            screen: Screen::Login(Box::new(Login::new(LoginStep::Connecting))),
+            screen: login_screen(LoginStep::Connecting),
             focus: Focus::Chats,
             chats,
             users: HashMap::new(),
@@ -204,6 +218,7 @@ impl App {
             menu: None,
             settings,
             settings_path,
+            env_keys,
             settings_menu: None,
             prompt: None,
             chats_loading: false,
@@ -267,6 +282,7 @@ impl App {
     fn on_tg(&mut self, event: TgEvent) {
         match event {
             TgEvent::Update(update) => self.on_update(*update),
+            TgEvent::Error(message) if message.contains("API_ID") => self.reject_api_keys(),
             TgEvent::Error(message) => match &mut self.screen {
                 Screen::Login(login) => {
                     login.busy = false;
@@ -442,8 +458,13 @@ impl App {
     fn on_auth_state(&mut self, state: AuthorizationState) {
         let step = match state {
             AuthorizationState::WaitTdlibParameters => {
-                self.tg.set_tdlib_parameters();
-                return;
+                match self.env_keys.clone().or(self.settings.api_keys.clone()) {
+                    Some(keys) => {
+                        self.tg.set_tdlib_parameters(keys);
+                        return;
+                    }
+                    None => LoginStep::ApiId,
+                }
             }
             AuthorizationState::WaitPhoneNumber => LoginStep::Phone,
             AuthorizationState::WaitCode(s) => LoginStep::Code {
@@ -474,7 +495,7 @@ impl App {
                 return;
             }
         };
-        self.screen = Screen::Login(Box::new(Login::new(step)));
+        self.screen = login_screen(step);
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -516,6 +537,32 @@ impl App {
         if value.is_empty() || login.busy {
             return;
         }
+        // API credentials are checked here; TDLib only gets them once both are in.
+        match login.step {
+            LoginStep::ApiId => {
+                match config::parse_api_id(&value) {
+                    Some(id) => self.screen = login_screen(LoginStep::ApiHash { id }),
+                    None => login.error = Some("The API ID is a number, like 1234567".into()),
+                }
+                return;
+            }
+            LoginStep::ApiHash { id } => {
+                if !config::is_api_hash(&value) {
+                    login.error = Some("The API hash is 32 letters and digits".into());
+                    return;
+                }
+                let keys = ApiKeys { id, hash: value };
+                self.settings.api_keys = Some(keys.clone());
+                if let Err(e) = self.settings.save(&self.settings_path) {
+                    login.error = Some(format!("Couldn't save them: {e:#}"));
+                    return;
+                }
+                self.tg.set_tdlib_parameters(keys);
+                self.screen = login_screen(LoginStep::Connecting);
+                return;
+            }
+            _ => {}
+        }
         login.busy = true;
         login.error = None;
         match login.step {
@@ -524,7 +571,38 @@ impl App {
             LoginStep::Password { .. } => self.tg.send_password(value),
             LoginStep::Email => self.tg.send_email(value),
             LoginStep::EmailCode => self.tg.send_email_code(value),
-            LoginStep::Connecting | LoginStep::OtherDevice { .. } | LoginStep::Unsupported(_) => {}
+            LoginStep::Connecting
+            | LoginStep::ApiId
+            | LoginStep::ApiHash { .. }
+            | LoginStep::OtherDevice { .. }
+            | LoginStep::Unsupported(_) => {}
+        }
+    }
+
+    /// Telegram refused the API credentials (`API_ID_INVALID` and the like).
+    /// TDLib can't take new ones without a restart, so saved ones are forgotten
+    /// and the next run asks again.
+    fn reject_api_keys(&mut self) {
+        let message = if self.env_keys.is_some() {
+            "Telegram rejected TG_API_ID / TG_API_HASH. Check them on my.telegram.org.".into()
+        } else {
+            self.settings.api_keys = None;
+            match self.settings.save(&self.settings_path) {
+                Ok(()) => {
+                    "Telegram rejected the API ID and hash. Restart tuigram to enter them again."
+                        .into()
+                }
+                Err(e) => format!(
+                    "Telegram rejected the API ID and hash, and they couldn't be cleared: {e:#}"
+                ),
+            }
+        };
+        match &mut self.screen {
+            Screen::Login(login) => {
+                login.busy = false;
+                login.error = Some(message);
+            }
+            Screen::Main => self.status = Some(message),
         }
     }
 
@@ -1017,6 +1095,10 @@ fn open_externally(target: &str) -> std::io::Result<()> {
         .spawn()?;
     std::thread::spawn(move || child.wait());
     Ok(())
+}
+
+fn login_screen(step: LoginStep) -> Screen {
+    Screen::Login(Box::new(Login::new(step)))
 }
 
 fn new_composer() -> TextArea<'static> {

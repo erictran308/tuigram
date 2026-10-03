@@ -3,3 +3,4 @@
 # Secrets: API credentials and the TDLib database (holds your login session)
 .env
 .tdlib/
+src/credentials.rs

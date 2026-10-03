@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow};
 use tdlib_rs::{enums, functions, types};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::Config;
+use crate::config::{ApiKeys, Config};
 
 pub enum TgEvent {
     Update(Box<enums::Update>),
@@ -117,7 +117,7 @@ impl Tg {
         })
     }
 
-    pub fn set_tdlib_parameters(&self) {
+    pub fn set_tdlib_parameters(&self, keys: ApiKeys) {
         let config = Arc::clone(&self.config);
         let client_id = self.client_id;
         self.spawn(async move {
@@ -131,8 +131,8 @@ impl Tg {
                 true,          // use_chat_info_database
                 true,          // use_message_database: keeps history cached locally
                 false,         // use_secret_chats
-                config.api_id,
-                config.api_hash.clone(),
+                keys.id,
+                keys.hash,
                 "en".into(),
                 "Terminal".into(), // device_model: what Settings → Devices shows
                 std::env::consts::OS.into(),

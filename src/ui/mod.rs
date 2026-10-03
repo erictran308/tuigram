@@ -96,6 +96,16 @@ fn draw_login(frame: &mut Frame, login: &Login, colors: &Colors) {
 
     let (title, text) = match &login.step {
         LoginStep::Connecting => ("Connecting…".to_string(), String::new()),
+        LoginStep::ApiId => (
+            "Telegram API ID".into(),
+            "Telegram gives every app its own API ID and hash. Get yours once at \
+             my.telegram.org → API development tools (any app name), then paste api_id."
+                .into(),
+        ),
+        LoginStep::ApiHash { .. } => (
+            "Telegram API hash".into(),
+            "Now paste api_hash from the same page. Both stay on this computer.".into(),
+        ),
         LoginStep::Phone => (
             "Phone number".into(),
             "Include the country code, e.g. +1 415 555 0123".into(),
@@ -544,6 +554,23 @@ mod tests {
             .unwrap();
         assert!(selected.contains("▌"), "cursor on the selected item");
         assert!(rows.iter().any(|r| r.contains("3 https://docs.rs")));
+    }
+
+    #[test]
+    fn first_run_asks_for_api_credentials_and_says_where_to_get_them() {
+        let colors = Theme::Mocha.colors();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|f| draw_login(f, &Login::new(LoginStep::ApiId), &colors))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol())
+            .collect();
+        assert!(text.contains("Telegram API ID"));
+        assert!(text.contains("my.telegram.org"), "says where to get it");
+        assert!(text.contains("paste api_id"), "help text isn't cut off");
     }
 
     #[test]

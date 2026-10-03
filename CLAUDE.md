@@ -2,11 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-tuigram: a Telegram *user* client (not a bot) for the terminal, built on TDLib (`tdlib-rs`) and ratatui, with vim-style modes.
+tuigram: a Telegram *user* client (not a bot) for the terminal, built on TDLib (`tdlib-rs`) and ratatui, with vim-style modes. Published on crates.io as `tuigram-cli` (the name `tuigram` was taken); the binary is `tuigram`.
 
 ## Never run the app against the real session
 
-`.tdlib/` holds the user's logged-in Telegram session. Running the binary reads their chats and sends read receipts (`view_messages`) to real people. Do not `cargo run` to check a change; verify with tests that render into ratatui's `TestBackend` (see existing tests in `src/ui/`). Ask the user to run the app when a change needs to be seen live.
+The data directory holds the user's logged-in Telegram session: the platform app-data dir (`tuigram --help` prints it), or `TG_DATA_DIR` if set (e.g. `./.tdlib`). Running the binary reads their chats and sends read receipts (`view_messages`) to real people. Do not `cargo run` to check a change; verify with tests that render into ratatui's `TestBackend` (see existing tests in `src/ui/`). Ask the user to run the app when a change needs to be seen live.
 
 ## Commands
 
@@ -16,11 +16,14 @@ cargo test                       # all tests
 cargo test search_matches        # tests whose name contains the string
 cargo clippy --all-targets       # keep it warning-free
 cargo fmt
+cargo install --path .           # puts `tuigram` on PATH (~/.cargo/bin)
+cargo package --list             # check what would be published
+cargo publish --dry-run
 ```
 
 The first build downloads a prebuilt TDLib and links it statically (`download-tdlib` + `static` features, `build.rs`). Static linking is deliberate: dynamic linking crashed the build script under clippy/rust-analyzer.
 
-Setup: copy `.env.example` to `.env` with `TG_API_ID` / `TG_API_HASH` from my.telegram.org. `TG_DATA_DIR` (default `./.tdlib`) holds the TDLib database, downloaded files, `tdlib.log`, and the app's `settings.toml`.
+Config (`config.rs`): no API credentials ship with the app, and none may ever be committed (the repo is public, and anything in the published crate is public). They come from `TG_API_ID` / `TG_API_HASH`, else from `settings.toml`, else the login screen asks for them on first run (`LoginStep::ApiId` / `ApiHash`) before TDLib gets its parameters. `TG_DATA_DIR` overrides the data directory, which holds the TDLib database, downloaded files, `tdlib.log` and `settings.toml`. `main` loads `.env` from the working directory first, so dev overrides can live there (see `.env.example`).
 
 ## Architecture
 
