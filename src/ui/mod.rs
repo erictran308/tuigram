@@ -13,6 +13,7 @@ use crate::app::{
 };
 use crate::config;
 use crate::messages::{OpenChat, Replied};
+use crate::notify::Notifications;
 use crate::search;
 use crate::theme::{Colors, Theme};
 
@@ -326,7 +327,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         draw_confirm(frame, chat_area, confirm, colors);
     }
     if let Some(menu) = &mut app.settings_menu {
-        draw_settings(frame, menu, colors);
+        draw_settings(frame, menu, app.settings.notifications, colors);
     }
     if let Some(toast) = &app.toast {
         draw_toast(frame, toast, colors);
@@ -419,7 +420,12 @@ fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors
 
 /// The `?` popup, centered on the screen: a tab with every shortcut, and one
 /// with the settings (only the theme for now).
-fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, colors: &Colors) {
+fn draw_settings(
+    frame: &mut Frame,
+    menu: &mut SettingsMenu,
+    notifications: Notifications,
+    colors: &Colors,
+) {
     let area = frame.area();
     // Both tabs get the same size, so the tabs don't move when switching.
     let width = 72.min(area.width.saturating_sub(2));
@@ -441,6 +447,9 @@ fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, colors: &Colors) {
     ]);
     let keys = match menu.tab {
         HelpTab::Shortcuts => " j/k scroll · Tab settings · Esc close ",
+        HelpTab::Settings if menu.selected == SettingsMenu::NOTIFICATIONS => {
+            " Space on/off · Enter save · Tab shortcuts · Esc cancel "
+        }
         HelpTab::Settings => " j/k preview · Enter save · Tab shortcuts · Esc cancel ",
     };
     let block = popup_block(tabs, keys, colors);
@@ -452,36 +461,53 @@ fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, colors: &Colors) {
         return;
     }
 
-    let [heading, list] =
-        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
-    frame.render_widget(Line::from(" Theme").fg(colors.muted).bold(), heading);
-    let items: Vec<ListItem> = Theme::ALL
-        .iter()
-        .enumerate()
-        .map(|(i, &theme)| {
-            let bar = if i == menu.selected {
-                Span::from("▌").fg(colors.accent)
-            } else {
-                Span::from(" ")
-            };
-            // The dot marks the saved theme, which Esc goes back to.
-            let mark = if theme == menu.saved {
-                " ● "
-            } else {
-                " ○ "
-            };
-            ListItem::new(Line::from(vec![
-                bar,
-                Span::from(mark).fg(colors.accent),
-                Span::from(theme.label()),
-            ]))
-        })
-        .collect();
-    frame.render_stateful_widget(
-        List::new(items).highlight_style(Style::new().bg(colors.selection)),
-        list,
-        &mut ListState::default().with_selected(Some(menu.selected)),
-    );
+    let row = |i: usize, mark: &'static str, label: &'static str| {
+        let selected = i == menu.selected;
+        let bar = if selected {
+            Span::from("▌").fg(colors.accent)
+        } else {
+            Span::from(" ")
+        };
+        let line = Line::from(vec![bar, Span::from(mark).fg(colors.accent), label.into()]);
+        if selected {
+            line.style(Style::new().bg(colors.selection))
+        } else {
+            line
+        }
+    };
+    let heading = |text: &'static str| Line::from(text).fg(colors.muted).bold();
+    let mut lines = vec![heading(" Theme")];
+    for (i, &theme) in Theme::ALL.iter().enumerate() {
+        // The dot marks the saved theme, which Esc goes back to.
+        let mark = if theme == menu.saved {
+            " ● "
+        } else {
+            " ○ "
+        };
+        lines.push(row(i, mark, theme.label()));
+    }
+    lines.push(Line::default());
+    lines.push(heading(" Notifications"));
+    let check = if notifications == Notifications::Off {
+        " [ ] "
+    } else {
+        " [✓] "
+    };
+    lines.push(row(
+        SettingsMenu::NOTIFICATIONS,
+        check,
+        "New messages, while tuigram is in the background",
+    ));
+    for (line, y) in lines.into_iter().zip(inner.y..inner.bottom()) {
+        frame.render_widget(
+            line,
+            Rect {
+                y,
+                height: 1,
+                ..inner
+            },
+        );
+    }
 }
 
 /// A popup's frame: accent border and its own background, so it stands out
@@ -890,11 +916,14 @@ mod tests {
             scroll: 0,
             selected: 3,
             saved: Theme::Mocha,
+            saved_notifications: Notifications::Auto,
         };
         // Too short for the whole list.
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         let mut draw = |menu: &mut SettingsMenu| {
-            terminal.draw(|f| draw_settings(f, menu, &colors)).unwrap();
+            terminal
+                .draw(|f| draw_settings(f, menu, Notifications::Auto, &colors))
+                .unwrap();
             buffer_rows(terminal.backend().buffer())
         };
         let has = |rows: &[String], needle: &str| rows.iter().any(|r| r.contains(needle));
@@ -1341,11 +1370,12 @@ mod tests {
             scroll: 0,
             selected: 0,
             saved: Theme::Mocha,
+            saved_notifications: Notifications::Auto,
         };
         let colors = Theme::Latte.colors();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         terminal
-            .draw(|f| draw_settings(f, &mut menu, &colors))
+            .draw(|f| draw_settings(f, &mut menu, Notifications::Auto, &colors))
             .unwrap();
         let buf = terminal.backend().buffer();
         let rows: Vec<String> = (0..buf.area.height)
@@ -1366,5 +1396,38 @@ mod tests {
             .find(|&x| buf[(x, y)].symbol() == "C")
             .unwrap();
         assert_eq!(buf[(x, y)].bg, colors.popup_bg);
+    }
+
+    #[test]
+    fn notifications_show_as_a_checkbox_under_the_themes() {
+        let colors = Theme::Mocha.colors();
+        let mut menu = SettingsMenu {
+            tab: HelpTab::Settings,
+            scroll: 0,
+            selected: SettingsMenu::NOTIFICATIONS,
+            saved: Theme::Mocha,
+            saved_notifications: Notifications::Auto,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
+        let mut draw = |notifications| {
+            terminal
+                .draw(|f| draw_settings(f, &mut menu, notifications, &colors))
+                .unwrap();
+            buffer_rows(terminal.backend().buffer())
+        };
+        let row = |rows: &[String], needle: &str| {
+            rows.iter().find(|r| r.contains(needle)).unwrap().clone()
+        };
+
+        let rows = draw(Notifications::Auto);
+        assert!(row(&rows, "Notifications").contains("Notifications"));
+        assert!(row(&rows, "New messages").contains("▌ [✓] New messages"));
+        assert!(
+            row(&rows, "Space on/off").contains("Esc cancel"),
+            "key hints"
+        );
+
+        let rows = draw(Notifications::Off);
+        assert!(row(&rows, "New messages").contains("▌ [ ] New messages"));
     }
 }

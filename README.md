@@ -28,6 +28,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Search everything.** `/` in the chat list filters chats as you type. `/` inside a chat searches its entire history, and `n`/`N` jump between matches, highlighted where they appear.
 - **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, date separators, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app.
+- **Notifications.** New messages pop up as system notifications while you're in another window, and the window title counts your unread chats. Telegram's mute settings apply.
 - **Make it yours.** Four Catppuccin themes with live preview, and highlights that make your important chats stand out.
 - **Private by design.** tuigram talks only to Telegram. No telemetry, no accounts and no servers in between. Your session stays on your machine, and read receipts go out only for messages you've actually had in front of you.
 - **Careful with what others send.** A file that could run a program, or a link whose text hides where it really goes, asks before opening.
@@ -127,6 +128,16 @@ The status bar always shows the keys for where you are. The essentials:
 | `:` | Run a command, typed in full: `:logout` logs out of Telegram on this computer |
 | `?` | Every shortcut, plus settings and themes |
 | `q` | Quit |
+
+## Notifications
+
+While tuigram's window is in the background, new messages show as notifications from your terminal: messages that arrive together become one, and a busy chat stays quiet for half a minute after each. Chats you muted in Telegram stay silent.
+
+They work in Ghostty, kitty, WezTerm, iTerm2, foot and Konsole, also over SSH. In Windows Terminal, turn on `compatibility.allowOSC777` in its settings. Other terminals ring the bell instead. In tmux, add `set -g allow-passthrough on` and `set -g focus-events on` to `~/.tmux.conf`.
+
+To turn them off or on, press `?`, go to **Settings**, and press `Space` on **Notifications**, then `Enter` to save. To pick how they're sent, set `notifications` in `settings.toml` (in [your data folder](#your-data)) to `"bell"`, `"osc9"`, `"osc777"` or `"osc99"`; the default `"auto"` picks for your terminal.
+
+Like Telegram Desktop, tuigram shows you as online while its window is focused and you've pressed a key in the last minute, so notifications arrive right away instead of waiting to see if you read them on your phone.
 
 ## Your data
 

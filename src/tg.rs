@@ -92,6 +92,9 @@ pub struct Deletable {
 const DOWNLOAD_PRIORITY: i32 = 16;
 /// Chat photos in the list come after photos in messages.
 const QUIET_DOWNLOAD_PRIORITY: i32 = 8;
+/// Chats with notifications at once. Only new ones are announced, so a few
+/// is plenty; TDLib allows up to 25.
+const NOTIFICATION_GROUPS: i64 = 5;
 
 unsafe extern "C" {
     /// TDLib's synchronous entry point, for the few requests that need no
@@ -479,6 +482,31 @@ impl Tg {
         });
     }
 
+    /// Shows the user as online to others, or not. While online, TDLib also
+    /// sends notifications without waiting to see if the phone reads the
+    /// message first.
+    pub fn set_online(&self, online: bool) {
+        let value = enums::OptionValue::Boolean(types::OptionValueBoolean { value: online });
+        self.set_option("online", value);
+    }
+
+    /// Turns on TDLib's notifications (`updateNotificationGroup`), which are
+    /// off until a client says how many chats it shows at once.
+    pub fn enable_notifications(&self) {
+        let value = enums::OptionValue::Integer(types::OptionValueInteger {
+            value: NOTIFICATION_GROUPS,
+        });
+        self.set_option("notification_group_count_max", value);
+    }
+
+    fn set_option(&self, name: &str, value: enums::OptionValue) {
+        self.spawn(functions::set_option(
+            name.into(),
+            Some(value),
+            self.client_id,
+        ));
+    }
+
     /// Marks messages as read, which also sends read receipts.
     pub fn view_messages(&self, chat_id: i64, message_ids: Vec<i64>) {
         self.spawn(functions::view_messages(
@@ -492,7 +520,14 @@ impl Tg {
 
     /// Flushes TDLib's database and ends with `authorizationStateClosed`.
     pub fn close(&self) {
-        self.spawn(functions::close(self.client_id));
+        let client_id = self.client_id;
+        self.spawn(async move {
+            // Others see you go offline now, not minutes later. Before login
+            // this fails, which is fine.
+            let offline = enums::OptionValue::Boolean(types::OptionValueBoolean { value: false });
+            let _ = functions::set_option("online".into(), Some(offline), client_id).await;
+            functions::close(client_id).await
+        });
     }
 
     /// Ends the session and deletes TDLib's database, ending with

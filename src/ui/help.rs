@@ -73,6 +73,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("j / k", "Move"),
             ("Enter", "Choose"),
             ("1-9", "Choose by number"),
+            ("Space", "Turn a setting on or off"),
             ("Esc / q", "Close"),
             ("Tab / h / l", "Switch tabs in this popup"),
             ("y / n", "Open or not, when asked about a file or link"),

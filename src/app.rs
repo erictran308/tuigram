@@ -10,7 +10,11 @@ use ratatui::DefaultTerminal;
 use ratatui::style::Style;
 use ratatui::widgets::Block;
 use ratatui_textarea::TextArea;
-use tdlib_rs::enums::{AuthenticationCodeType, AuthorizationState, OptionValue, Update};
+use tdlib_rs::enums::{
+    AuthenticationCodeType, AuthorizationState, ChatList, MessageSender, NotificationType,
+    OptionValue, Update,
+};
+use tdlib_rs::types::{Message, UpdateNotificationGroup};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Instant, sleep_until};
 
@@ -19,6 +23,7 @@ use crate::clipboard::{Clipboard, Copied, Decoded};
 use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
 use crate::messages::{Link, MediaFile, OpenChat, Replied, SendState};
+use crate::notify::{self, Note, Notifications, Notifier};
 use crate::search::MessageSearch;
 use crate::settings::Settings;
 use crate::text;
@@ -43,6 +48,8 @@ const HALF_PAGE: isize = 10;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a toast stays up.
 const TOAST_TIME: Duration = Duration::from_secs(2);
+/// Without a key press for this long, you're no longer shown as online.
+const IDLE_AFTER: Duration = Duration::from_secs(60);
 
 /// Where the API key TDLib was given came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -245,13 +252,21 @@ pub enum HelpTab {
 }
 
 /// The `?` popup: every keyboard shortcut, and the settings. On the settings
-/// tab, moving the cursor previews a theme; Esc puts the saved one back.
+/// tab, moving the cursor previews a theme and Space turns notifications on
+/// or off; Enter saves, Esc puts the saved settings back.
 pub struct SettingsMenu {
     pub tab: HelpTab,
     /// First row shown on the shortcuts tab. Drawing keeps it in range.
     pub scroll: usize,
+    /// Row on the settings tab: a theme, or [`SettingsMenu::NOTIFICATIONS`].
     pub selected: usize,
     pub saved: Theme,
+    pub saved_notifications: Notifications,
+}
+
+impl SettingsMenu {
+    /// The notifications row, after the themes.
+    pub const NOTIFICATIONS: usize = Theme::ALL.len();
 }
 
 /// What the status bar prompt is for: a `/` search through chat titles or the
@@ -359,6 +374,26 @@ pub struct App {
     /// The terminal window has focus. Terminals that don't report focus
     /// changes leave this on.
     terminal_focused: bool,
+    /// The terminal has reported a focus change, so `terminal_focused` can
+    /// be trusted.
+    focus_reported: bool,
+    /// The last key press or paste, or the window getting focus.
+    last_input: Instant,
+    /// What TDLib was last told: shown as online to others.
+    online: bool,
+    /// Tells the user about new messages while they're away from tuigram.
+    notifier: Notifier,
+    /// How notifications reach this terminal (never `Auto`).
+    notify_with: Notifications,
+    /// Inside tmux, which passes codes on only when they're wrapped.
+    in_tmux: bool,
+    /// Counts notifications sent, to tell them apart.
+    notifications_sent: u64,
+    /// Messages from before this (unix time) aren't announced: they came in
+    /// while tuigram wasn't running.
+    notify_since: i32,
+    /// Unmuted chats with unread messages, shown in the window title.
+    unread_chats: i32,
     /// TDLib is logging out (`:logout`, the session ended elsewhere, or
     /// leaving a QR login), and a new client takes over once it has closed.
     relogin: bool,
@@ -376,6 +411,9 @@ impl App {
     ) -> Self {
         let mut chats = Chats::default();
         chats.set_highlighted(&settings.highlighted_chats);
+        let notify_with = settings
+            .notifications
+            .resolve(|name| std::env::var(name).ok());
         Self {
             tg,
             screen: login_screen(LoginStep::Connecting),
@@ -406,6 +444,15 @@ impl App {
             pending_g: false,
             quit_deadline: None,
             terminal_focused: true,
+            focus_reported: false,
+            last_input: Instant::now(),
+            online: false,
+            notifier: Notifier::default(),
+            notify_with,
+            in_tmux: std::env::var_os("TMUX").is_some(),
+            notifications_sent: 0,
+            notify_since: i32::MAX,
+            unread_chats: 0,
             relogin: false,
             exit: false,
         }
@@ -435,6 +482,8 @@ impl App {
                 self.selected = self.chats.ids().first().copied();
             }
             self.mark_seen();
+            self.update_online();
+            self.send_notification();
             terminal.draw(|frame| ui::draw(frame, &mut self))?;
             // Start downloads/encodes for photos the frame showed but didn't have.
             self.images.fetch(&self.tg);
@@ -445,7 +494,16 @@ impl App {
             }
 
             let deadline = self.quit_deadline;
-            let toast_until = self.toast.as_ref().map(|t| t.until);
+            // Wakes up to take the toast down, to go offline when idle, and
+            // to send notifications that had to wait.
+            let wake = [
+                self.toast.as_ref().map(|t| t.until),
+                self.online.then_some(self.last_input + IDLE_AFTER),
+                self.notifier.next_at(),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             tokio::select! {
                 Some(event) = events.recv() => {
                     self.on_tagged(event);
@@ -456,35 +514,49 @@ impl App {
                 }
                 Some(event) = image_events.recv() => self.images.on_built(event),
                 Some(decoded) = decoded.recv() => self.on_decoded(decoded),
-                Some(event) = keys.next() => match event? {
-                    Event::Key(key) => self.on_key(key),
-                    Event::FocusGained => self.terminal_focused = true,
-                    Event::FocusLost => self.terminal_focused = false,
-                    Event::Paste(text) if matches!(self.screen, Screen::Login(_)) => {
-                        if let Screen::Login(login) = &mut self.screen
-                            && login.takes_input()
-                        {
-                            login.input.insert_str(text.trim());
-                        }
-                    }
-                    Event::Paste(text) if self.prompt.is_some() => {
-                        if let Some(prompt) = self.prompt.as_mut() {
-                            prompt.input.insert_str(text.replace(['\r', '\n'], " "));
-                        }
-                        self.on_prompt_edit();
-                    }
-                    Event::Paste(text) if self.focus == Focus::Input => {
-                        self.composer.insert_str(text.replace('\r', ""));
-                    }
-                    _ => {}
-                },
+                Some(event) = keys.next() => self.on_terminal_event(event?),
                 _ = sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => break,
-                // Wakes up to take the toast down.
-                _ = sleep_until(toast_until.unwrap_or_else(Instant::now)), if toast_until.is_some() => {}
+                _ = sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {}
                 else => break,
             }
         }
         Ok(())
+    }
+
+    fn on_terminal_event(&mut self, event: Event) {
+        if matches!(event, Event::Key(_) | Event::Paste(_) | Event::FocusGained) {
+            self.last_input = Instant::now();
+        }
+        match event {
+            Event::Key(key) => self.on_key(key),
+            Event::FocusGained => {
+                self.terminal_focused = true;
+                self.focus_reported = true;
+                // Back at tuigram: what was waiting is on screen.
+                self.notifier.clear();
+            }
+            Event::FocusLost => {
+                self.terminal_focused = false;
+                self.focus_reported = true;
+            }
+            Event::Paste(text) if matches!(self.screen, Screen::Login(_)) => {
+                if let Screen::Login(login) = &mut self.screen
+                    && login.takes_input()
+                {
+                    login.input.insert_str(text.trim());
+                }
+            }
+            Event::Paste(text) if self.prompt.is_some() => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.input.insert_str(text.replace(['\r', '\n'], " "));
+                }
+                self.on_prompt_edit();
+            }
+            Event::Paste(text) if self.focus == Focus::Input => {
+                self.composer.insert_str(text.replace('\r', ""));
+            }
+            _ => {}
+        }
     }
 
     /// Late events from a client replaced after logging out are dropped: a
@@ -623,6 +695,10 @@ impl App {
                     .set_last_message(u.chat_id, u.last_message.as_ref(), &u.positions)
             }
             Update::ChatTitle(u) => self.chats.set_title(u.chat_id, u.title),
+            Update::NotificationGroup(u) => self.on_notifications(u),
+            Update::UnreadChatCount(u) if matches!(u.chat_list, ChatList::Main) => {
+                self.set_unread_chats(u.unread_unmuted_count)
+            }
             Update::ChatPhoto(u) => self.chats.set_photo(u.chat_id, u.photo.as_ref()),
             Update::ChatAccentColors(u) => self.chats.set_accent(u.chat_id, u.accent_color_id),
             Update::AccentColors(u) => self.chats.set_accent_colors(&u.colors),
@@ -710,6 +786,9 @@ impl App {
             AuthorizationState::Ready => {
                 self.screen = Screen::Main;
                 self.load_more_chats();
+                // Even when they're off: they can be turned on any time.
+                self.tg.enable_notifications();
+                self.notify_since = unix_now();
                 return;
             }
             // Also when the session was ended from another device: back to
@@ -924,6 +1003,7 @@ impl App {
                     scroll: 0,
                     selected: Theme::ALL.iter().position(|&t| t == saved).unwrap_or(0),
                     saved,
+                    saved_notifications: self.settings.notifications,
                 });
             }
             (_, KeyCode::Char(':')) => self.open_prompt(PromptKind::Command),
@@ -1081,22 +1161,121 @@ impl App {
     /// see it: the chat pane and the terminal window have focus, and the view
     /// is on the newest message. Viewing it marks the whole chat as read.
     fn mark_seen(&mut self) {
-        let looking = matches!(self.screen, Screen::Main)
-            && self.terminal_focused
-            && matches!(self.focus, Focus::Messages | Focus::Input)
-            && self.settings_menu.is_none();
-        let Some(open) = self.open.as_mut().filter(|o| looking && o.at_newest) else {
-            return;
-        };
-        if open.selected.is_some() {
+        let watched = self.open.as_ref().map(|o| o.chat_id);
+        if !watched.is_some_and(|id| self.watching(id)) {
             return;
         }
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
         let newest = open.messages.iter().rev().find(|(_, m)| !m.outgoing);
         if let Some((&id, _)) = newest
             && id > open.seen
         {
             open.seen = id;
             self.tg.view_messages(open.chat_id, vec![id]);
+        }
+    }
+
+    /// The chat is open in front of the user, on its newest message, so new
+    /// ones are seen as they arrive.
+    fn watching(&self, chat_id: i64) -> bool {
+        matches!(self.screen, Screen::Main)
+            && self.terminal_focused
+            && matches!(self.focus, Focus::Messages | Focus::Input)
+            && self.settings_menu.is_none()
+            && self
+                .open
+                .as_ref()
+                .is_some_and(|o| o.chat_id == chat_id && o.at_newest && o.selected.is_none())
+    }
+
+    /// The user would see a new message in this chat without being told:
+    /// tuigram's window has focus. Where the terminal never reports focus,
+    /// only the chat being read counts.
+    fn sees(&self, chat_id: i64) -> bool {
+        if self.focus_reported {
+            self.terminal_focused
+        } else {
+            self.watching(chat_id)
+        }
+    }
+
+    /// Online on Telegram while the user is at tuigram: logged in, its window
+    /// focused, and a key pressed in the last [`IDLE_AFTER`].
+    fn update_online(&mut self) {
+        let online = matches!(self.screen, Screen::Main)
+            && self.quit_deadline.is_none()
+            && self.terminal_focused
+            && self.last_input.elapsed() < IDLE_AFTER;
+        if online != self.online {
+            self.online = online;
+            self.tg.set_online(online);
+        }
+    }
+
+    /// New messages from TDLib, which already left out muted chats and
+    /// messages read elsewhere. Those the user sees anyway, or that came in
+    /// before tuigram started, are dropped.
+    fn on_notifications(&mut self, update: UpdateNotificationGroup) {
+        self.notifier.remove(&update.removed_notification_ids);
+        if self.notify_with == Notifications::Off {
+            return;
+        }
+        let chat_id = update.chat_id;
+        for notification in update.added_notifications {
+            let NotificationType::NewMessage(new) = notification.r#type else {
+                continue;
+            };
+            if notification.date < self.notify_since || self.sees(chat_id) {
+                continue;
+            }
+            let text = if new.show_preview {
+                self.notification_text(&new.message)
+            } else {
+                "New message".into()
+            };
+            let note = Note {
+                id: notification.id,
+                chat_id,
+                chat: self.chats.title(chat_id).unwrap_or("Telegram").into(),
+                text,
+                silent: notification.is_silent,
+            };
+            self.notifier.add(note, Instant::now());
+        }
+    }
+
+    /// "Alice: see you at 5" in groups; just the text in private chats,
+    /// where the chat's name says who, and in channels.
+    fn notification_text(&self, message: &Message) -> String {
+        let text = crate::chats::content_text(&message.content);
+        match &message.sender_id {
+            MessageSender::User(sender) if sender.user_id != message.chat_id => {
+                match self.users.get(&sender.user_id) {
+                    Some(name) => format!("{name}: {text}"),
+                    None => text,
+                }
+            }
+            _ => text,
+        }
+    }
+
+    fn send_notification(&mut self) {
+        let Some(alert) = self.notifier.due(Instant::now()) else {
+            return;
+        };
+        self.notifications_sent += 1;
+        let id = self.notifications_sent;
+        if let Some(code) = notify::escape(self.notify_with, &alert, id, self.in_tmux) {
+            notify::send(&code);
+        }
+    }
+
+    fn set_unread_chats(&mut self, count: i32) {
+        if count != self.unread_chats {
+            self.unread_chats = count;
+            notify::send(&notify::title(count));
         }
     }
 
@@ -1133,6 +1312,11 @@ impl App {
         self.chats_loading = false;
         self.all_chats_loaded = false;
         self.pending_g = false;
+        // The client that knew about being online is gone.
+        self.online = false;
+        self.notifier.clear();
+        self.notify_since = i32::MAX;
+        self.set_unread_chats(0);
     }
 
     /// `n` (`step` 1) goes to the next older match, `N` (-1) to the next newer.
@@ -1598,7 +1782,24 @@ impl App {
             }
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
                 self.settings.theme = menu.saved;
+                let saved = menu.saved_notifications;
                 self.settings_menu = None;
+                self.set_notifications(saved);
+                return;
+            }
+            KeyCode::Char(' ')
+                if menu.tab == HelpTab::Settings
+                    && menu.selected == SettingsMenu::NOTIFICATIONS =>
+            {
+                // Back on, they go out the way they did before, e.g. "bell".
+                let on = match menu.saved_notifications {
+                    Notifications::Off => Notifications::Auto,
+                    saved => saved,
+                };
+                self.set_notifications(match self.settings.notifications {
+                    Notifications::Off => on,
+                    _ => Notifications::Off,
+                });
                 return;
             }
             _ => {}
@@ -1616,11 +1817,22 @@ impl App {
             // Drawing stops it at the end of the list.
             HelpTab::Shortcuts => menu.scroll = menu.scroll.saturating_add_signed(delta),
             HelpTab::Settings => {
-                let last = Theme::ALL.len() - 1;
+                let last = SettingsMenu::NOTIFICATIONS;
                 menu.selected = menu.selected.saturating_add_signed(delta).min(last);
                 // Preview: the whole app redraws in the theme under the cursor.
-                self.settings.theme = Theme::ALL[menu.selected];
+                if let Some(&theme) = Theme::ALL.get(menu.selected) {
+                    self.settings.theme = theme;
+                }
             }
+        }
+    }
+
+    /// Takes effect at once; the settings popup saves it.
+    fn set_notifications(&mut self, notifications: Notifications) {
+        self.settings.notifications = notifications;
+        self.notify_with = notifications.resolve(|name| std::env::var(name).ok());
+        if notifications == Notifications::Off {
+            self.notifier.clear();
         }
     }
 
@@ -1795,6 +2007,13 @@ fn code_destination(kind: &AuthenticationCodeType) -> &'static str {
         AuthenticationCodeType::Fragment(_) => "to fragment.com",
         _ => "to one of your devices",
     }
+}
+
+/// Seconds since 1970, like the dates TDLib gives.
+fn unix_now() -> i32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i32)
 }
 
 #[cfg(test)]

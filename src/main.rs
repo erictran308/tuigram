@@ -4,6 +4,7 @@ mod clipboard;
 mod config;
 mod images;
 mod messages;
+mod notify;
 mod search;
 mod settings;
 mod text;
@@ -44,6 +45,9 @@ async fn main() -> Result<()> {
     let tg = tg::Tg::start(config, tx).await?;
 
     let mut terminal = ratatui::init();
+    // The title shows unread chats while tuigram runs, then goes back.
+    notify::send(notify::SAVE_TITLE);
+    notify::send(&notify::title(0));
     // A panic, on any thread, ends the app: the terminal is put back, then
     // the message is printed without control characters, since it can quote
     // text from a message. Carrying on after a background thread died would
@@ -55,6 +59,7 @@ async fn main() -> Result<()> {
             DisableBracketedPaste,
             DisableFocusChange
         );
+        notify::send(notify::RESTORE_TITLE);
         ratatui::restore();
         eprintln!("tuigram crashed: {}", text::clean(&info.to_string()));
         std::process::exit(101);
@@ -90,6 +95,7 @@ async fn main() -> Result<()> {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
     let _ = execute!(stdout(), DisableBracketedPaste, DisableFocusChange);
+    notify::send(notify::RESTORE_TITLE);
     ratatui::restore();
     result
 }

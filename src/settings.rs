@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ApiKeys;
+use crate::notify::Notifications;
 use crate::theme::Theme;
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -15,6 +16,9 @@ pub struct Settings {
     pub theme: Theme,
     /// Chats highlighted with `H`, by id.
     pub highlighted_chats: Vec<i64>,
+    /// How new messages are announced: "auto" picks what the terminal
+    /// supports; also "off", "bell", "osc9", "osc777" or "osc99".
+    pub notifications: Notifications,
     /// Telegram API credentials entered on the login screen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<ApiKeys>,
@@ -56,12 +60,13 @@ mod tests {
         let mut settings = Settings {
             theme: Theme::Latte,
             highlighted_chats: vec![-1001234567890, 42],
+            notifications: Notifications::Off,
             api_keys: None,
         };
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]"
+            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\""
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
 
