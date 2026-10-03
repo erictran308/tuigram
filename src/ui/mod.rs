@@ -7,12 +7,17 @@ use unicode_width::UnicodeWidthStr;
 
 use ratatui_textarea::TextArea;
 
-use crate::app::{App, Focus, Login, LoginStep, OpenMenu, Screen, SearchTarget, SettingsMenu};
+use crate::app::{
+    App, DeleteMenu, Focus, Login, LoginStep, OpenMenu, Screen, SearchTarget, SettingsMenu,
+};
+use crate::messages::{OpenChat, Replied};
 use crate::search;
 use crate::theme::{Colors, Theme};
 
 /// The composer grows with its text up to this many rows, then scrolls.
 const MAX_COMPOSER_ROWS: usize = 6;
+/// The "Reply to …" bar at the top of the composer: who, then what they said.
+const REPLY_BAR_ROWS: u16 = 2;
 
 mod messages;
 
@@ -173,7 +178,10 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 users: &app.users,
                 chats: &app.chats,
             };
-            let rows = app.composer.lines().len().clamp(1, MAX_COMPOSER_ROWS) as u16;
+            let mut rows = app.composer.lines().len().clamp(1, MAX_COMPOSER_ROWS) as u16;
+            if open.reply.is_some() {
+                rows += REPLY_BAR_ROWS;
+            }
             let [history, composer] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(rows + 2)])
                     .areas(chat_area);
@@ -189,6 +197,8 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             draw_composer(
                 frame,
                 &mut app.composer,
+                open.reply.as_ref(),
+                &names,
                 composer,
                 app.focus == Focus::Input,
                 colors,
@@ -206,9 +216,65 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     if let Some(menu) = &app.menu {
         draw_menu(frame, chat_area, menu, colors);
     }
+    if let Some(menu) = &app.delete_menu {
+        draw_delete(frame, chat_area, menu, colors);
+    }
     if let Some(menu) = &app.settings_menu {
         draw_settings(frame, menu, colors);
     }
+}
+
+/// The `d` popup over the message pane: the message, then how to delete it.
+fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors) {
+    let rows = menu.choices.len().max(1) as u16;
+    let width = ((menu.snippet.width() + 6).clamp(40, 60) as u16).min(area.width);
+    // Borders, the message and a gap, then the choices.
+    let popup = center(area, width, rows + 4);
+    let block = popup_block(" Delete message ", " Enter delete · Esc cancel ", colors);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let [message, _, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    let text_width = (inner.width as usize).saturating_sub(3);
+    frame.render_widget(
+        Line::from(vec![
+            Span::from(" ▎ ").fg(colors.error),
+            Span::from(truncate(&menu.snippet, text_width)),
+        ]),
+        message,
+    );
+    if menu.choices.is_empty() {
+        frame.render_widget(Line::from(" Checking…").fg(colors.muted), list);
+        return;
+    }
+    let items: Vec<ListItem> = menu
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(i, choice)| {
+            let bar = if i == menu.selected {
+                Span::from("▌").fg(colors.accent)
+            } else {
+                Span::from(" ")
+            };
+            ListItem::new(Line::from(vec![
+                bar,
+                Span::from(format!("{} ", i + 1)).fg(colors.muted),
+                Span::from(choice.label()).fg(colors.error),
+            ]))
+        })
+        .collect();
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(Style::new().bg(colors.selection)),
+        list,
+        &mut ListState::default().with_selected(Some(menu.selected)),
+    );
 }
 
 /// The settings popup (`?`), centered on the screen. Only the theme for now.
@@ -392,27 +458,69 @@ fn draw_chat_list(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     );
 }
 
+/// The box messages are written in. While replying, a bar at its top says
+/// which message the reply answers.
 fn draw_composer(
     frame: &mut Frame,
     composer: &mut TextArea<'static>,
+    reply: Option<&Replied>,
+    names: &messages::Names,
     area: Rect,
     insert: bool,
     colors: &Colors,
 ) {
-    composer.set_block(Block::bordered().border_style(border(insert, colors)));
+    let block = Block::bordered().border_style(border(insert, colors));
+    let mut text = block.inner(area);
+    frame.render_widget(block, area);
+    if let Some(reply) = reply {
+        let [bar, rest] =
+            Layout::vertical([Constraint::Length(REPLY_BAR_ROWS), Constraint::Fill(1)]).areas(text);
+        draw_reply_bar(frame, reply, names, bar, colors);
+        text = rest;
+    }
     // The cursor only shows in Insert mode, so it's obvious where keys go.
     composer.set_cursor_style(if insert {
         Style::new().reversed()
     } else {
         Style::new()
     });
-    composer.set_placeholder_text(if insert {
-        "Write a message…"
-    } else {
-        "Press i to write a message"
+    composer.set_placeholder_text(match (insert, reply.is_some()) {
+        (true, true) => "Write a reply…",
+        (true, false) => "Write a message…",
+        (false, true) => "Press i to write your reply",
+        (false, false) => "Press i to write a message",
     });
     composer.set_placeholder_style(Style::new().fg(colors.muted));
-    frame.render_widget(&*composer, area);
+    frame.render_widget(&*composer, text);
+}
+
+/// "Reply to Alice" over a line of the message, with a bar down the side
+/// like a quote.
+fn draw_reply_bar(
+    frame: &mut Frame,
+    reply: &Replied,
+    names: &messages::Names,
+    area: Rect,
+    colors: &Colors,
+) {
+    let name = names.author(reply.sender, reply.outgoing);
+    let width = (area.width as usize).saturating_sub(2);
+    let label = "↩ Reply to ";
+    let bar = || Span::from("▎ ").fg(colors.reply);
+    let lines = vec![
+        Line::from(vec![
+            bar(),
+            Span::from(label).fg(colors.reply),
+            Span::from(truncate(&name, width.saturating_sub(label.width())))
+                .fg(colors.reply)
+                .bold(),
+        ]),
+        Line::from(vec![
+            bar(),
+            Span::from(truncate(&reply.snippet, width)).fg(colors.subtle),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// The `/` prompt, vim style: `/query` at the bottom of the screen.
@@ -443,6 +551,23 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     frame.render_widget(Line::from(hints).fg(colors.muted).right_aligned(), keys);
 }
 
+/// Hints for keys that depend on the cursor: `gd` on a reply, and Ctrl-o
+/// after a `gd`.
+fn jump_hints(open: &OpenChat) -> Vec<&'static str> {
+    let mut hints = Vec::new();
+    let on_reply = open
+        .cursor_id()
+        .and_then(|id| open.messages.get(&id))
+        .is_some_and(|m| m.reply_to.is_some());
+    if on_reply {
+        hints.push("gd go to replied");
+    }
+    if !open.jumps.is_empty() {
+        hints.push("Ctrl-o back to reply");
+    }
+    hints
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     if app.prompt.is_some() {
         draw_prompt(frame, app, area, colors);
@@ -450,10 +575,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     }
     let normal = Span::from(" NORMAL ").fg(colors.bg).bg(colors.primary);
     let searching = app.open.as_ref().is_some_and(|o| o.search.is_some());
+    let replying = app.open.as_ref().is_some_and(|o| o.reply.is_some());
+    let insert = Span::from(" INSERT ").fg(colors.bg).bg(colors.insert);
     let (mode, hints) = match app.focus {
         _ if app.settings_menu.is_some() => {
             (normal, "  j/k preview theme · Enter save · Esc cancel")
         }
+        _ if app.delete_menu.is_some() => (normal, "  j/k choose · Enter delete · Esc cancel"),
         Focus::Chats if !app.chats.filter().is_empty() => (
             normal,
             "  j/k move · Enter open · Esc clear search · / search again · i write · q quit",
@@ -464,18 +592,43 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages if searching => (
             normal,
-            "  n/N older/newer match · Esc end search · / search again · j/k newer/older · Enter open media · i write · h back",
+            "  n/N older/newer match · Esc end search · / search again · j/k newer/older · Enter open media · r reply · i write · h back",
+        ),
+        Focus::Messages if replying => (
+            normal,
+            "  i write reply · Esc cancel reply · r reply to selected instead · j/k newer/older · Enter open media · h back",
         ),
         Focus::Messages => (
             normal,
-            "  j/k newer/older · Enter open media · i write · / search · gg/G oldest/newest · Ctrl-d/u half page · h back · ? settings · q quit",
+            "  j/k newer/older · r reply · d delete · Enter open media · i write · / search · gg/G oldest/newest · Ctrl-d/u half page · h back · ? settings · q quit",
+        ),
+        Focus::Input if replying => (
+            insert,
+            "  Enter send reply · Alt-Enter or Ctrl-j new line · Esc normal mode · Esc Esc cancel reply",
         ),
         Focus::Input => (
-            Span::from(" INSERT ").fg(colors.bg).bg(colors.insert),
+            insert,
             "  Enter send · Alt-Enter or Ctrl-j new line · Esc normal mode",
         ),
     };
-    let mut spans = vec![mode.bold(), Span::from(hints).fg(colors.muted)];
+    let context = match &app.open {
+        Some(open)
+            if app.focus == Focus::Messages
+                && app.settings_menu.is_none()
+                && app.delete_menu.is_none() =>
+        {
+            jump_hints(open)
+        }
+        _ => Vec::new(),
+    };
+    let mut spans = vec![mode.bold()];
+    if context.is_empty() {
+        spans.push(Span::from(hints).fg(colors.muted));
+    } else {
+        // Keys that only work right here go first, a bit brighter.
+        spans.push(Span::from(format!("  {} · ", context.join(" · "))).fg(colors.fg));
+        spans.push(Span::from(hints.trim_start()).fg(colors.muted));
+    }
     if app.quit_deadline.is_some() {
         spans.push(Span::from("  Closing… (q again to force)").fg(colors.warning));
     } else if !app.opening.is_empty() {
@@ -554,6 +707,121 @@ mod tests {
             .unwrap();
         assert!(selected.contains("▌"), "cursor on the selected item");
         assert!(rows.iter().any(|r| r.contains("3 https://docs.rs")));
+    }
+
+    #[test]
+    fn the_composer_says_which_message_a_reply_answers() {
+        let colors = Theme::Mocha.colors();
+        let users = std::collections::HashMap::from([(2, "Chardy".to_string())]);
+        let chats = crate::chats::Chats::default();
+        let names = messages::Names {
+            users: &users,
+            chats: &chats,
+        };
+        let reply = Replied {
+            id: 7,
+            sender: crate::messages::Sender::User(2),
+            outgoing: false,
+            snippet: "are we still on for a very long dinner tonight at the usual place".into(),
+        };
+        let mut composer = TextArea::default();
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_composer(f, &mut composer, Some(&reply), &names, area, true, &colors);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+
+        assert!(rows[1].contains("▎ ↩ Reply to Chardy"), "{}", rows[1]);
+        assert!(rows[2].contains("▎ are we still on"), "{}", rows[2]);
+        assert!(rows[2].contains('…'), "a long message is cut to fit");
+        assert!(rows[3].contains("Write a reply…"), "typing goes below it");
+        let bar = (0..buf.area.width)
+            .find(|&x| buf[(x, 1)].symbol() == "▎")
+            .unwrap();
+        assert_eq!(buf[(bar, 1)].fg, colors.reply);
+    }
+
+    #[test]
+    fn deleting_shows_the_message_and_only_the_choices_telegram_allows() {
+        use crate::tg::Deletable;
+        let colors = Theme::Mocha.colors();
+        let mut menu = DeleteMenu {
+            message_id: 5,
+            snippet: "see you at 7".into(),
+            choices: Vec::new(),
+            selected: 0,
+        };
+        let render = |menu: &DeleteMenu| -> Vec<String> {
+            let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+            terminal
+                .draw(|f| draw_delete(f, f.area(), menu, &colors))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+                .collect()
+        };
+        let has = |rows: &[String], needle: &str| rows.iter().any(|r| r.contains(needle));
+
+        let rows = render(&menu);
+        assert!(has(&rows, "Delete message"));
+        assert!(has(&rows, "▎ see you at 7"), "says which message");
+        assert!(has(&rows, "Checking…"), "until TDLib answers");
+
+        menu.set_allowed(Deletable {
+            for_everyone: true,
+            for_me: true,
+        });
+        let rows = render(&menu);
+        assert!(
+            has(&rows, "▌1 Delete for everyone"),
+            "first, under the cursor"
+        );
+        assert!(has(&rows, " 2 Delete for me"));
+
+        // Channels and groups only delete for everyone.
+        menu.set_allowed(Deletable {
+            for_everyone: true,
+            for_me: false,
+        });
+        assert_eq!(menu.choices, [crate::app::DeleteChoice::Everyone]);
+        assert!(!has(&render(&menu), "Delete for me"));
+    }
+
+    #[test]
+    fn jump_keys_are_hinted_only_where_they_work() {
+        use crate::messages::{Msg, ReplyTo, SendState, Sender};
+        let msg = |reply_to| Msg {
+            sender: Sender::User(2),
+            outgoing: false,
+            date: 0,
+            text: "text".into(),
+            preview: None,
+            file: None,
+            links: Vec::new(),
+            link_ranges: Vec::new(),
+            state: SendState::Sent,
+            reply_to,
+        };
+        let mut open = OpenChat::new(1);
+        open.messages.insert(1, msg(None));
+        let to_first = ReplyTo {
+            message_id: Some(1),
+            quote: None,
+        };
+        open.messages.insert(2, msg(Some(to_first)));
+
+        assert_eq!(jump_hints(&open), ["gd go to replied"], "newest is a reply");
+        open.selected = Some(1);
+        assert!(jump_hints(&open).is_empty());
+        open.jumps.push(2);
+        assert_eq!(jump_hints(&open), ["Ctrl-o back to reply"]);
     }
 
     #[test]

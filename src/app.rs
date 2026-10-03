@@ -17,10 +17,10 @@ use tokio::time::{Instant, sleep_until};
 use crate::chats::Chats;
 use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
-use crate::messages::{MediaFile, OpenChat};
+use crate::messages::{MediaFile, OpenChat, Replied, SendState};
 use crate::search::MessageSearch;
 use crate::settings::Settings;
-use crate::tg::{Found, Page, Tg, TgEvent};
+use crate::tg::{Deletable, Found, Page, Tg, TgEvent};
 use crate::theme::Theme;
 use crate::ui;
 
@@ -121,6 +121,46 @@ pub struct OpenMenu {
     pub selected: usize,
 }
 
+/// One way to delete a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteChoice {
+    Everyone,
+    OnlyMe,
+}
+
+impl DeleteChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            DeleteChoice::Everyone => "Delete for everyone",
+            DeleteChoice::OnlyMe => "Delete for me",
+        }
+    }
+}
+
+/// The `d` popup, confirming which message goes and for whom.
+pub struct DeleteMenu {
+    pub message_id: i64,
+    /// The message on one line, so it's clear which one is deleted.
+    pub snippet: String,
+    /// What TDLib allows, for everyone first as Telegram lists it. Empty
+    /// until TDLib answers.
+    pub choices: Vec<DeleteChoice>,
+    pub selected: usize,
+}
+
+impl DeleteMenu {
+    pub fn set_allowed(&mut self, deletable: Deletable) {
+        self.choices = [
+            (deletable.for_everyone, DeleteChoice::Everyone),
+            (deletable.for_me, DeleteChoice::OnlyMe),
+        ]
+        .into_iter()
+        .filter_map(|(allowed, choice)| allowed.then_some(choice))
+        .collect();
+        self.selected = 0;
+    }
+}
+
 /// The settings popup (`?`). Moving the cursor previews a theme; Esc puts the
 /// saved one back.
 pub struct SettingsMenu {
@@ -176,6 +216,7 @@ pub struct App {
     pub opening: HashSet<i32>,
     /// Shown over everything when Enter finds several things to open.
     pub menu: Option<OpenMenu>,
+    pub delete_menu: Option<DeleteMenu>,
     pub settings: Settings,
     settings_path: PathBuf,
     /// API credentials from the environment, which win over saved ones.
@@ -216,6 +257,7 @@ impl App {
             images,
             opening: HashSet::new(),
             menu: None,
+            delete_menu: None,
             settings,
             settings_path,
             env_keys,
@@ -248,6 +290,11 @@ impl App {
             terminal.draw(|frame| ui::draw(frame, &mut self))?;
             // Start downloads/encodes for photos the frame showed but didn't have.
             self.images.fetch(&self.tg);
+            if let Some(open) = self.open.as_mut() {
+                for id in open.missing_replied() {
+                    self.tg.get_replied_message(open.chat_id, id);
+                }
+            }
 
             let deadline = self.quit_deadline;
             tokio::select! {
@@ -310,6 +357,20 @@ impl App {
                 query,
                 found,
             } => self.on_found(chat_id, &query, found),
+            TgEvent::Replied {
+                chat_id,
+                message_id,
+                replied,
+            } => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == chat_id) {
+                    open.set_replied(message_id, replied.map(|m| *m));
+                }
+            }
+            TgEvent::Deletable {
+                chat_id,
+                message_id,
+                deletable,
+            } => self.on_deletable(chat_id, message_id, deletable),
             TgEvent::Downloaded { file_id, path } => {
                 if self.opening.remove(&file_id) {
                     match &path {
@@ -515,6 +576,7 @@ impl App {
         match self.screen {
             Screen::Login(_) => self.on_login_key(key),
             Screen::Main if self.settings_menu.is_some() => self.on_settings_key(key),
+            Screen::Main if self.delete_menu.is_some() => self.on_delete_key(key),
             Screen::Main if self.menu.is_some() => self.on_menu_key(key),
             Screen::Main if self.prompt.is_some() => self.on_prompt_key(key, ctrl),
             Screen::Main if self.focus == Focus::Input => self.on_insert_key(key, ctrl),
@@ -643,7 +705,7 @@ impl App {
             (Focus::Messages, KeyCode::Char('/')) => self.open_prompt(SearchTarget::Messages),
             (Focus::Messages, KeyCode::Char('n')) => self.next_match(1),
             (Focus::Messages, KeyCode::Char('N')) => self.next_match(-1),
-            // Esc ends a search before it leaves the pane.
+            // Esc ends a search, then a reply, before it leaves the pane.
             (Focus::Chats, KeyCode::Esc) => self.chats.set_filter(""),
             (Focus::Messages, KeyCode::Esc)
                 if self.open.as_ref().is_some_and(|o| o.search.is_some()) =>
@@ -652,6 +714,17 @@ impl App {
                     open.search = None;
                 }
             }
+            (Focus::Messages, KeyCode::Esc)
+                if self.open.as_ref().is_some_and(|o| o.reply.is_some()) =>
+            {
+                if let Some(open) = self.open.as_mut() {
+                    open.reply = None;
+                }
+            }
+            (Focus::Messages, KeyCode::Char('r')) => self.reply_to_selected(),
+            (Focus::Messages, KeyCode::Char('d')) if pending_g => self.go_to_replied(),
+            (Focus::Messages, KeyCode::Char('d')) => self.open_delete_menu(),
+            (Focus::Messages, KeyCode::Char('o')) if ctrl => self.jump_back(),
             (Focus::Chats, KeyCode::Enter | KeyCode::Char('l')) => self.open_selected_chat(),
             (Focus::Chats, KeyCode::Char('i')) => {
                 self.open_selected_chat();
@@ -694,7 +767,8 @@ impl App {
         if text.is_empty() {
             return;
         }
-        self.tg.send_text(open.chat_id, text.to_string());
+        let reply_to = open.reply.take().map(|r| r.id);
+        self.tg.send_text(open.chat_id, text.to_string(), reply_to);
         self.composer = new_composer();
         // Jump to the bottom to watch it arrive.
         self.jump_to_newest();
@@ -877,11 +951,7 @@ impl App {
         let Some(open) = &self.open else {
             return;
         };
-        let Some(msg) = open
-            .selected
-            .or_else(|| open.newest_id())
-            .and_then(|id| open.messages.get(&id))
-        else {
+        let Some(msg) = open.cursor_id().and_then(|id| open.messages.get(&id)) else {
             return;
         };
         let mut targets: Vec<Target> = msg.file.clone().map(Target::File).into_iter().collect();
@@ -895,6 +965,132 @@ impl App {
                     selected: 0,
                 })
             }
+        }
+    }
+
+    /// `r`: answer the message under the cursor. Goes straight to Insert mode,
+    /// keeping whatever was already typed.
+    fn reply_to_selected(&mut self) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let Some((&id, msg)) = open
+            .cursor_id()
+            .and_then(|id| open.messages.get_key_value(&id))
+        else {
+            return;
+        };
+        if msg.state == SendState::Failed {
+            self.status = Some("Can't reply to a message that wasn't sent".into());
+            return;
+        }
+        open.reply = Some(Replied::new(id, msg));
+        self.focus = Focus::Input;
+    }
+
+    /// `d`: asks how to delete the message under the cursor. The popup opens
+    /// at once and fills in when TDLib says what's allowed.
+    fn open_delete_menu(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let Some((&message_id, msg)) = open
+            .cursor_id()
+            .and_then(|id| open.messages.get_key_value(&id))
+        else {
+            return;
+        };
+        self.delete_menu = Some(DeleteMenu {
+            message_id,
+            snippet: msg.snippet(),
+            choices: Vec::new(),
+            selected: 0,
+        });
+        self.tg.check_deletable(open.chat_id, message_id);
+    }
+
+    fn on_deletable(&mut self, chat_id: i64, message_id: i64, deletable: Option<Deletable>) {
+        // Drop answers for a popup that closed, or a chat that changed.
+        if self.open.as_ref().is_none_or(|o| o.chat_id != chat_id) {
+            return;
+        }
+        let Some(menu) = self
+            .delete_menu
+            .as_mut()
+            .filter(|m| m.message_id == message_id)
+        else {
+            return;
+        };
+        // On an error, TDLib's message is already in the status bar.
+        let Some(deletable) = deletable else {
+            self.delete_menu = None;
+            return;
+        };
+        menu.set_allowed(deletable);
+        if menu.choices.is_empty() {
+            self.delete_menu = None;
+            self.status = Some("You can't delete this message".into());
+        }
+    }
+
+    /// The delete popup takes all keys while it's up.
+    fn on_delete_key(&mut self, key: KeyEvent) {
+        let Some(menu) = self.delete_menu.as_mut() else {
+            return;
+        };
+        let last = menu.choices.len().saturating_sub(1);
+        let pick = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                menu.selected = (menu.selected + 1).min(last);
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                menu.selected = menu.selected.saturating_sub(1);
+                None
+            }
+            KeyCode::Enter | KeyCode::Char('l') => Some(menu.selected),
+            KeyCode::Char(c @ '1'..='9') => Some(c as usize - '1' as usize),
+            KeyCode::Esc | KeyCode::Char('q' | 'h') => {
+                self.delete_menu = None;
+                return;
+            }
+            _ => None,
+        };
+        // Nothing to pick while TDLib hasn't answered.
+        let Some(choice) = pick.and_then(|i| menu.choices.get(i).copied()) else {
+            return;
+        };
+        let message_id = menu.message_id;
+        self.delete_menu = None;
+        if let Some(open) = &self.open {
+            let revoke = choice == DeleteChoice::Everyone;
+            self.tg.delete_message(open.chat_id, message_id, revoke);
+        }
+    }
+
+    /// `gd`: from a reply to the message it answers, loading the history
+    /// around it if needed. Ctrl-o comes back.
+    fn go_to_replied(&mut self) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        match open.replied_jump() {
+            Ok((from, to)) => {
+                open.jumps.push(from);
+                self.jump_to_message(to);
+            }
+            Err(why) => self.status = Some(why.into()),
+        }
+    }
+
+    /// Ctrl-o: back to the reply the last `gd` left.
+    fn jump_back(&mut self) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        match open.jumps.pop() {
+            Some(id) => self.jump_to_message(id),
+            None => self.status = Some("Nothing to go back to".into()),
         }
     }
 

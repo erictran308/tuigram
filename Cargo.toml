@@ -1,6 +1,6 @@
 [package]
 name = "tuigram-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Telegram in your terminal: a fast, vim-style Telegram client built on TDLib"
 license = "MIT"
@@ -28,6 +28,7 @@ ratatui = "0.30.2"
 ratatui-image = { version = "11.1", default-features = false, features = ["image-defaults", "crossterm"] }
 ratatui-textarea = "0.9.2"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 tdlib-rs = { version = "1.4.0", features = ["download-tdlib", "static"] }
 textwrap = "0.16.4"
 tokio = { version = "1.53.1", features = ["full"] }

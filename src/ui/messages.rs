@@ -16,7 +16,9 @@ use unicode_width::UnicodeWidthStr;
 use super::truncate;
 use crate::chats::Chats;
 use crate::images::Images;
-use crate::messages::{Msg, OpenChat, Preview, ScrollAnchor, SendState, Sender};
+use crate::messages::{
+    Fetched, Msg, OpenChat, Preview, Replied, ReplyTo, ScrollAnchor, SendState, Sender,
+};
 use crate::search;
 use crate::theme::Colors;
 
@@ -42,6 +44,40 @@ impl Names<'_> {
             Sender::Chat(id) => self.chats.get(id).map(|c| c.title.clone()),
         };
         name.unwrap_or_else(|| "Unknown".into())
+    }
+
+    /// Who sent a message, with "(me)" on your own.
+    pub(super) fn author(&self, sender: Sender, outgoing: bool) -> String {
+        let mut name = self.get(sender);
+        if outgoing {
+            name.push_str(" (me)");
+        }
+        name
+    }
+}
+
+/// The lines at the top of a reply: who it answers, then what they said.
+struct Quote {
+    name: String,
+    /// For the bar and the name. `None` while the answered message loads or
+    /// if it's gone, which draws them faded.
+    color: Option<Color>,
+    text: Option<String>,
+}
+
+/// What sits above a message's photo and text.
+struct Header {
+    name: Option<(String, Color)>,
+    quote: Option<Quote>,
+}
+
+impl Header {
+    fn rows(&self) -> usize {
+        let quote = self
+            .quote
+            .as_ref()
+            .map_or(0, |q| 1 + usize::from(q.text.is_some()));
+        usize::from(self.name.is_some()) + quote
     }
 }
 
@@ -138,23 +174,36 @@ pub fn draw(
     frame.render_widget(Paragraph::new(visible), shift(body));
     draw_photos(frame, shift(body), &photos, top, images, colors);
 
+    let gutters = [shift(left), shift(right)];
+    // The message being answered stays marked while the reply is written.
+    if let Some(reply) = &open.reply
+        && let Some(target) = placed.iter().find(|p| p.id == reply.id)
+    {
+        mark(frame, gutters, target, top, colors.reply);
+    }
     if focused && let Some(sel) = selected {
-        let rows = (sel.bubble_start.max(top)..sel.end.min(top + height)).map(|_| "▌");
-        let marker = |rows: Vec<&'static str>| {
-            Paragraph::new(rows.into_iter().map(Line::from).collect::<Vec<_>>()).fg(colors.accent)
+        mark(frame, gutters, sel, top, colors.accent);
+    }
+}
+
+/// Bars in both gutters beside a message's bubble, for its visible rows.
+fn mark(frame: &mut Frame, gutters: [Rect; 2], msg: &Placed, top: usize, color: Color) {
+    let height = usize::from(gutters[0].height);
+    let rows = msg.bubble_start.max(top)..msg.end.min(top + height);
+    if rows.is_empty() {
+        return;
+    }
+    let offset = (rows.start - top) as u16;
+    for (gutter, bar) in gutters.into_iter().zip(["▌", "▐"]) {
+        let area = Rect {
+            y: gutter.y + offset,
+            height: rows.len() as u16,
+            ..gutter
         };
-        let rows: Vec<_> = rows.collect();
-        let offset = sel.bubble_start.saturating_sub(top) as u16;
-        let place = |r: Rect| {
-            let r = shift(r);
-            Rect {
-                y: r.y + offset,
-                height: (rows.len() as u16).min(r.height.saturating_sub(offset)),
-                ..r
-            }
-        };
-        frame.render_widget(marker(rows.clone()), place(left));
-        frame.render_widget(marker(rows.iter().map(|_| "▐").collect()), place(right));
+        frame.render_widget(
+            Paragraph::new(vec![Line::from(bar); rows.len()]).fg(color),
+            area,
+        );
     }
 }
 
@@ -294,14 +343,18 @@ fn layout(
 
         // Like Telegram: name only on the first of several messages in a row.
         let name = (show_names && prev_sender != Some(msg.sender)).then(|| {
-            let count = colors.names.len() as i64;
-            let color = colors.names[sender_key(msg.sender).rem_euclid(count) as usize];
-            let mut name = names.get(msg.sender);
-            if msg.outgoing {
-                name.push_str(" (me)");
-            }
-            (name, color)
+            (
+                names.author(msg.sender, msg.outgoing),
+                name_color(msg.sender, colors),
+            )
         });
+        let header = Header {
+            name,
+            quote: msg
+                .reply_to
+                .as_ref()
+                .map(|reply| quote(open, id, reply, names, colors)),
+        };
         let meta = match msg.state {
             SendState::Sent => time.map_or(String::new(), |t| t.format("%H:%M").to_string()),
             SendState::Pending => "sending…".into(),
@@ -309,14 +362,14 @@ fn layout(
         };
         let bubble_start = lines.len();
         let photo_size = msg.preview.as_ref().map(|p| photo_cells(p, max_text, font));
-        let has_name = name.is_some();
+        let header_rows = header.rows();
         let matches = search::find(&msg.text, query);
-        let (rows, inner) = bubble(msg, name, photo_size, &meta, &matches, max_text, colors);
+        let (rows, inner) = bubble(msg, header, photo_size, &meta, &matches, max_text, colors);
         if let (Some(photo), Some((cols, photo_rows))) = (&msg.preview, photo_size) {
             // Rows are right-aligned for own messages, so measure from the right.
             let bubble_x = if msg.outgoing { width - (inner + 2) } else { 0 };
             photos.push(PhotoSlot {
-                line: bubble_start + usize::from(has_name),
+                line: bubble_start + header_rows,
                 x: (bubble_x + 1) as u16,
                 cols,
                 rows: photo_rows,
@@ -336,9 +389,40 @@ fn layout(
     (lines, placed, photos)
 }
 
-fn sender_key(sender: Sender) -> i64 {
-    match sender {
+/// Each sender keeps one of the theme's name colors.
+fn name_color(sender: Sender, colors: &Colors) -> Color {
+    let id = match sender {
         Sender::User(id) | Sender::Chat(id) => id,
+    };
+    colors.names[id.rem_euclid(colors.names.len() as i64) as usize]
+}
+
+/// What reply `id` answers: the loaded message if it's there, else what
+/// TDLib sent for it. A quote the sender picked replaces the message's text.
+fn quote(open: &OpenChat, id: i64, reply: &ReplyTo, names: &Names, colors: &Colors) -> Quote {
+    let fetched = open.replied.get(&id);
+    let replied = reply
+        .message_id
+        .and_then(|answered| open.messages.get_key_value(&answered))
+        .map(|(&answered, msg)| Replied::new(answered, msg))
+        .or_else(|| match fetched {
+            Some(Fetched::Found(replied)) => Some(replied.clone()),
+            _ => None,
+        });
+    match replied {
+        Some(replied) => Quote {
+            name: names.author(replied.sender, replied.outgoing),
+            color: Some(name_color(replied.sender, colors)),
+            text: Some(reply.quote.clone().unwrap_or(replied.snippet)),
+        },
+        None => Quote {
+            name: match fetched {
+                Some(Fetched::Missing) => "Deleted message".into(),
+                _ => "Loading…".into(),
+            },
+            color: None,
+            text: reply.quote.clone(),
+        },
     }
 }
 
@@ -346,10 +430,10 @@ fn sender_key(sender: Sender) -> i64 {
 /// sits at the bottom right, on the last text line if it fits. `matches` are
 /// byte ranges of the text to highlight for a search.
 /// Returns the rows and the bubble's inner width. A photo gets `rows` blank
-/// rows of `cols` width right under the name, for [`draw_photos`] to fill.
+/// rows of `cols` width right under the header, for [`draw_photos`] to fill.
 fn bubble(
     msg: &Msg,
-    name: Option<(String, Color)>,
+    header: Header,
     photo: Option<(u16, u16)>,
     meta: &str,
     matches: &[Range<usize>],
@@ -368,10 +452,11 @@ fn bubble(
     } else {
         Style::new().fg(colors.fg).bg(bg)
     };
-    let meta_color = match (msg.state, sticker) {
-        (SendState::Failed, _) => colors.error,
-        (_, true) => colors.muted,
-        (_, false) => meta_fg,
+    // Secondary text that still reads on the bubble.
+    let faded = if sticker { colors.muted } else { meta_fg };
+    let meta_color = match msg.state {
+        SendState::Failed => colors.error,
+        _ => faded,
     };
     let meta_style = style.fg(meta_color);
     let text = wrap(&msg.text, max_text);
@@ -391,9 +476,21 @@ fn bubble(
     if meta_inline {
         inner = inner.max(last_w + 1 + meta_w);
     }
-    let name = name.map(|(n, color)| (truncate(&n, max_text), color));
+    let name = header
+        .name
+        .map(|(n, color)| (truncate(&n, max_text), color));
     if let Some((n, _)) = &name {
         inner = inner.max(n.width());
+    }
+    // The quote's bar takes two columns.
+    let quote = header.quote.map(|q| Quote {
+        name: truncate(&q.name, max_text.saturating_sub(2)),
+        text: q.text.map(|t| truncate(&t, max_text.saturating_sub(2))),
+        ..q
+    });
+    if let Some(q) = &quote {
+        let text_w = q.text.as_ref().map_or(0, |t| t.width());
+        inner = inner.max(2 + q.name.width().max(text_w));
     }
     if let Some((cols, _)) = photo {
         inner = inner.max(usize::from(cols));
@@ -416,6 +513,16 @@ fn bubble(
     if let Some((n, color)) = name {
         let w = n.width();
         out.push(row(vec![Span::styled(n, style.fg(color).bold())], w));
+    }
+    if let Some(q) = quote {
+        let accent = style.fg(q.color.unwrap_or(faded));
+        let bar = || Span::styled("▎ ", accent);
+        let w = q.name.width();
+        out.push(row(vec![bar(), Span::styled(q.name, accent.bold())], 2 + w));
+        if let Some(text) = q.text {
+            let w = text.width();
+            out.push(row(vec![bar(), Span::styled(text, style.fg(faded))], 2 + w));
+        }
     }
     if let Some((cols, rows)) = photo {
         for _ in 0..rows {
@@ -544,6 +651,7 @@ mod tests {
             links: Vec::new(),
             link_ranges: Vec::new(),
             state: SendState::Sent,
+            reply_to: None,
         }
     }
 
@@ -903,6 +1011,112 @@ mod tests {
             buf.content().iter().all(|c| c.bg != own),
             "no bubble color anywhere"
         );
+    }
+
+    #[test]
+    fn replies_show_who_and_what_they_answer() {
+        let users = HashMap::from([(1, "Eric".to_string()), (2, "Chardy".to_string())]);
+        let chats = Chats::default();
+        let names = Names {
+            users: &users,
+            chats: &chats,
+        };
+        let font = FontSize {
+            width: 10,
+            height: 20,
+        };
+        let colors = Theme::default().colors();
+        let reply = |message_id, quote: Option<&str>| {
+            Some(ReplyTo {
+                message_id,
+                quote: quote.map(Into::into),
+            })
+        };
+        let at = 1_790_086_500;
+        let mut open = sample();
+        // Answers "hi there", which is loaded.
+        open.messages.insert(
+            5,
+            Msg {
+                reply_to: reply(Some(1), None),
+                ..msg(true, at, "yes!")
+            },
+        );
+        // Quotes part of a message TDLib says is gone.
+        open.messages.insert(
+            6,
+            Msg {
+                reply_to: reply(Some(0), Some("the plan")),
+                ..msg(false, at, "and you?")
+            },
+        );
+        open.replied.insert(6, Fetched::Missing);
+        // A photo answering a message in another chat, not fetched yet.
+        open.messages.insert(
+            7,
+            Msg {
+                reply_to: reply(None, None),
+                preview: Some(Preview {
+                    file_id: 7,
+                    width: 800,
+                    height: 600,
+                    thumbnail: None,
+                    sticker: false,
+                }),
+                ..msg(false, at, "")
+            },
+        );
+
+        let (lines, _, photos) = layout(&open, &names, true, 58, font, &colors);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let at = |needle: &str| text.iter().position(|l| l.contains(needle)).unwrap();
+
+        let yes = at("yes!");
+        assert!(text[yes - 2].contains("▎ Chardy"), "{}", text[yes - 2]);
+        assert!(text[yes - 1].contains("▎ hi there"), "{}", text[yes - 1]);
+        let bar = &lines[yes - 2].spans[1];
+        assert_eq!(bar.content, "▎ ");
+        assert_eq!(bar.style.fg, Some(name_color(Sender::User(2), &colors)));
+
+        let and_you = at("and you?");
+        assert!(text[and_you - 2].contains("▎ Deleted message"));
+        assert!(
+            text[and_you - 1].contains("▎ the plan"),
+            "the quote, not the text"
+        );
+        let faded = &lines[and_you - 2].spans[1];
+        assert_eq!(faded.style.fg, Some(colors.other_meta));
+
+        assert_eq!(
+            photos[0].line,
+            at("▎ Loading…") + 1,
+            "the photo goes under the quote"
+        );
+    }
+
+    #[test]
+    fn the_message_being_replied_to_stays_marked_while_typing() {
+        let mut open = sample();
+        open.reply = Some(crate::messages::Replied::new(1, &open.messages[&1]));
+        // Typing the reply: the message pane isn't focused.
+        let buf = render_buffer(&mut open, false, &mut images());
+        let colors = Theme::default().colors();
+        let y = (0..buf.area.height)
+            .find(|&y| {
+                let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                row.contains("hi there")
+            })
+            .unwrap();
+        let (left, right) = (buf[(1, y)].clone(), buf[(buf.area.width - 2, y)].clone());
+        assert_eq!((left.symbol(), left.fg), ("▌", colors.reply));
+        assert_eq!((right.symbol(), right.fg), ("▐", colors.reply));
+
+        open.reply = None;
+        let buf = render_buffer(&mut open, false, &mut images());
+        assert_eq!(buf[(1, y)].symbol(), " ", "no marker without a reply");
     }
 
     #[test]

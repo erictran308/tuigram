@@ -4,10 +4,13 @@
 //! the app as [`TgEvent`]s, and responses complete the pending request futures.
 //! Each request runs as its own tokio task so the UI never waits on the network.
 
+use std::ffi::{CStr, CString, c_char};
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
+use serde_json::json;
 use tdlib_rs::{enums, functions, types};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -34,6 +37,18 @@ pub enum TgEvent {
         chat_id: i64,
         query: String,
         found: Option<Found>,
+    },
+    /// The message that `message_id` replies to; `None` if TDLib couldn't find it.
+    Replied {
+        chat_id: i64,
+        message_id: i64,
+        replied: Option<Box<types::Message>>,
+    },
+    /// Who a message can be deleted for; `None` if TDLib couldn't say.
+    Deletable {
+        chat_id: i64,
+        message_id: i64,
+        deletable: Option<Deletable>,
     },
     /// A download finished; `path` is `None` if it failed.
     Downloaded {
@@ -64,8 +79,58 @@ pub struct Found {
     pub next_from: i64,
 }
 
+/// Who a message can be deleted for. Depends on the chat type, your rights
+/// in it, and Telegram's time limits, so TDLib works it out.
+#[derive(Clone, Copy)]
+pub struct Deletable {
+    pub for_everyone: bool,
+    pub for_me: bool,
+}
+
 /// TDLib download priority, 1 (lowest) to 32. Photos on screen matter.
 const DOWNLOAD_PRIORITY: i32 = 16;
+
+unsafe extern "C" {
+    /// TDLib's synchronous entry point, for the few requests that need no
+    /// client. It's linked in with tdlib-rs, which doesn't wrap it.
+    fn td_execute(request: *const c_char) -> *const c_char;
+}
+
+/// Sends TDLib's logs (warnings and worse) to `path`. Must run before the
+/// first client is created: TDLib logs to stderr until told otherwise, which
+/// would print in the terminal around the TUI.
+fn log_to_file(path: &Path) -> Result<()> {
+    let requests = [
+        json!({
+            "@type": "setLogStream",
+            "log_stream": {
+                "@type": "logStreamFile",
+                "path": path.to_string_lossy(),
+                "max_file_size": 10 * 1024 * 1024,
+                "redirect_stderr": false,
+            },
+        }),
+        json!({ "@type": "setLogVerbosityLevel", "new_verbosity_level": 2 }),
+    ];
+    for request in requests {
+        let request = CString::new(request.to_string())?;
+        // SAFETY: `request` is a NUL-terminated string that outlives the call.
+        // TDLib returns a NUL-terminated answer (or null) that stays valid
+        // until the next `td_execute` call, and it's copied out before then.
+        let response = unsafe {
+            let response = td_execute(request.as_ptr());
+            if response.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(response).to_string_lossy().into_owned()
+            }
+        };
+        if !response.contains(r#""@type":"ok""#) {
+            bail!("TDLib log setup failed: {response}");
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct Tg {
@@ -76,6 +141,7 @@ pub struct Tg {
 
 impl Tg {
     pub async fn start(config: Config, tx: UnboundedSender<TgEvent>) -> Result<Self> {
+        log_to_file(&config.data_dir.join("tdlib.log"))?;
         let client_id = tdlib_rs::create_client();
 
         // `receive` blocks for up to 2s at a time, so it gets a plain thread.
@@ -93,22 +159,10 @@ impl Tg {
             }
         });
 
-        // TDLib logs to stderr by default, which would draw over the TUI. This
-        // first request also wakes the client up: it sends no updates before one.
-        let log_path = config.data_dir.join("tdlib.log");
-        functions::set_log_stream(
-            enums::LogStream::File(types::LogStreamFile {
-                path: log_path.to_string_lossy().into_owned(),
-                max_file_size: 10 * 1024 * 1024,
-                redirect_stderr: false,
-            }),
-            client_id,
-        )
-        .await
-        .map_err(|e| anyhow!("TDLib log setup failed: {}", e.message))?;
-        functions::set_log_verbosity_level(2, client_id)
+        // A new client sends no updates until it gets its first request.
+        functions::get_option("version".into(), client_id)
             .await
-            .map_err(|e| anyhow!("TDLib log setup failed: {}", e.message))?;
+            .map_err(|e| anyhow!("TDLib didn't start: {}", e.message))?;
 
         Ok(Self {
             client_id,
@@ -273,9 +327,64 @@ impl Tg {
         });
     }
 
-    /// Sends a plain-text message. TDLib first reports it with a temporary id
-    /// (`updateNewMessage`), then `updateMessageSendSucceeded` or `…Failed`.
-    pub fn send_text(&self, chat_id: i64, text: String) {
+    /// Fetches the message that message `message_id` replies to, even from
+    /// another chat. Failures aren't errors to show: the message was usually
+    /// just deleted.
+    pub fn get_replied_message(&self, chat_id: i64, message_id: i64) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let replied = functions::get_replied_message(chat_id, message_id, client_id)
+                .await
+                .ok()
+                .map(|enums::Message::Message(m)| Box::new(m));
+            let _ = tx.send(TgEvent::Replied {
+                chat_id,
+                message_id,
+                replied,
+            });
+        });
+    }
+
+    /// Asks TDLib who a message can be deleted for. Answers from local data.
+    pub fn check_deletable(&self, chat_id: i64, message_id: i64) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let result = functions::get_message_properties(chat_id, message_id, client_id).await;
+            let deletable = match result {
+                Ok(enums::MessageProperties::MessageProperties(p)) => Some(Deletable {
+                    for_everyone: p.can_be_deleted_for_all_users,
+                    for_me: p.can_be_deleted_only_for_self,
+                }),
+                Err(e) => {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    None
+                }
+            };
+            let _ = tx.send(TgEvent::Deletable {
+                chat_id,
+                message_id,
+                deletable,
+            });
+        });
+    }
+
+    /// Deletes a message for everyone in the chat (`revoke`), or only for
+    /// you. TDLib confirms with `updateDeleteMessages`.
+    pub fn delete_message(&self, chat_id: i64, message_id: i64, revoke: bool) {
+        self.spawn(functions::delete_messages(
+            chat_id,
+            vec![message_id],
+            revoke,
+            self.client_id,
+        ));
+    }
+
+    /// Sends a plain-text message, as a reply to message `reply_to` if given.
+    /// TDLib first reports it with a temporary id (`updateNewMessage`), then
+    /// `updateMessageSendSucceeded` or `…Failed`.
+    pub fn send_text(&self, chat_id: i64, text: String, reply_to: Option<i64>) {
         let content = enums::InputMessageContent::InputMessageText(types::InputMessageText {
             text: types::FormattedText {
                 text,
@@ -284,10 +393,17 @@ impl Tg {
             link_preview_options: None,
             clear_draft: true,
         });
+        let reply_to = reply_to.map(|message_id| {
+            enums::InputMessageReplyTo::Message(types::InputMessageReplyToMessage {
+                message_id,
+                quote: None,
+                checklist_task_id: 0,
+            })
+        });
         self.spawn(functions::send_message(
             chat_id,
             None,
-            None,
+            reply_to,
             None,
             content,
             self.client_id,

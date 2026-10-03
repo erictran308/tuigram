@@ -54,6 +54,7 @@ impl Theme {
             error: p.red,
             warning: p.yellow,
             search: p.yellow,
+            reply: p.teal,
             own_bubble: mix(p.base, p.blue, tint),
             own_meta: mix(p.text, p.blue, 0.5),
             other_bubble: p.surface0,
@@ -90,6 +91,8 @@ pub struct Colors {
     pub warning: Color,
     /// Behind text matching a `/` search, and the SEARCH label.
     pub search: Color,
+    /// The reply bar over the composer, and the marker on the message it answers.
+    pub reply: Color,
     pub own_bubble: Color,
     /// Time and send status on own bubbles.
     pub own_meta: Color,

@@ -1,12 +1,12 @@
 //! History of the open chat, sorted by message id (which is chronological).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
 use base64::Engine;
 use tdlib_rs::enums::{
-    MessageContent, MessageSender, MessageSendingState, StickerFormat, TextEntityType,
-    ThumbnailFormat,
+    MessageContent, MessageReplyTo, MessageSender, MessageSendingState, StickerFormat,
+    TextEntityType, ThumbnailFormat,
 };
 use tdlib_rs::types::{self, Message};
 
@@ -143,6 +143,56 @@ pub struct Msg {
     /// Byte ranges of `text` that are links, to underline.
     pub link_ranges: Vec<Range<usize>>,
     pub state: SendState,
+    /// Set when this message is a reply.
+    pub reply_to: Option<ReplyTo>,
+}
+
+impl Msg {
+    /// The message on one line: its text, or else what it holds ("Photo").
+    pub fn snippet(&self) -> String {
+        let text = one_line(&self.text);
+        match &self.file {
+            _ if !text.is_empty() => text,
+            Some(file) => file.label.clone(),
+            None => "Message".into(),
+        }
+    }
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What a reply answers.
+pub struct ReplyTo {
+    /// The answered message, if it's in this chat. Replies to another chat's
+    /// messages only get them from TDLib, since ids are per chat.
+    pub message_id: Option<i64>,
+    /// The part of the answered message the reply quotes, on one line, if
+    /// the sender picked one.
+    pub quote: Option<String>,
+}
+
+/// A message being replied to: who sent it and a line of what it said. For
+/// the composer, it's copied when `r` is pressed, so the reply bar still
+/// shows it after another part of the history loads.
+#[derive(Clone)]
+pub struct Replied {
+    pub id: i64,
+    pub sender: Sender,
+    pub outgoing: bool,
+    pub snippet: String,
+}
+
+impl Replied {
+    pub fn new(id: i64, msg: &Msg) -> Self {
+        Self {
+            id,
+            sender: msg.sender,
+            outgoing: msg.outgoing,
+            snippet: msg.snippet(),
+        }
+    }
 }
 
 /// A message's downloadable file, with what to call it in the open menu.
@@ -339,6 +389,14 @@ impl From<Message> for Msg {
             Some(MessageSendingState::Pending(_)) => SendState::Pending,
             Some(MessageSendingState::Failed(_)) => SendState::Failed,
         };
+        // Replies to stories aren't shown.
+        let reply_to = match message.reply_to {
+            Some(MessageReplyTo::Message(r)) => Some(ReplyTo {
+                message_id: (r.chat_id == message.chat_id).then_some(r.message_id),
+                quote: r.quote.map(|q| one_line(&q.text.text)),
+            }),
+            _ => None,
+        };
         let body = body(&message.content);
         Self {
             sender,
@@ -350,8 +408,17 @@ impl From<Message> for Msg {
             links: body.links,
             link_ranges: body.link_ranges,
             state,
+            reply_to,
         }
     }
+}
+
+/// A replied message that isn't loaded, asked of TDLib.
+pub enum Fetched {
+    Loading,
+    Found(Replied),
+    /// TDLib couldn't find it: it was deleted, or is in a chat we can't see.
+    Missing,
 }
 
 /// The top of the message view: `offset` lines into the block of `msg_id`.
@@ -380,6 +447,13 @@ pub struct OpenChat {
     /// The loaded messages reach the newest one, so new arrivals join them.
     pub at_newest: bool,
     pub search: Option<MessageSearch>,
+    /// Set with `r`; the next message sent answers this one.
+    pub reply: Option<Replied>,
+    /// What replies answer when it isn't among the loaded messages, by the
+    /// id of the reply.
+    pub replied: HashMap<i64, Fetched>,
+    /// Replies `gd` jumped away from, latest last, for Ctrl-o to go back to.
+    pub jumps: Vec<i64>,
 }
 
 impl OpenChat {
@@ -393,7 +467,67 @@ impl OpenChat {
             all_loaded: false,
             at_newest: true,
             search: None,
+            reply: None,
+            replied: HashMap::new(),
+            jumps: Vec::new(),
         }
+    }
+
+    /// The message under the cursor: the selected one, else the newest.
+    pub fn cursor_id(&self) -> Option<i64> {
+        self.selected.or_else(|| self.newest_id())
+    }
+
+    /// Where `gd` goes from the message under the cursor: (the reply, the
+    /// message it answers), or why it can't go anywhere.
+    pub fn replied_jump(&self) -> Result<(i64, i64), &'static str> {
+        let from = self.cursor_id().ok_or("No message selected")?;
+        let reply = self
+            .messages
+            .get(&from)
+            .and_then(|m| m.reply_to.as_ref())
+            .ok_or("Not a reply")?;
+        let to = reply
+            .message_id
+            .ok_or("It answers a message in another chat")?;
+        if !self.messages.contains_key(&to)
+            && matches!(self.replied.get(&from), Some(Fetched::Missing))
+        {
+            return Err("The message it answers was deleted");
+        }
+        Ok((from, to))
+    }
+
+    /// Loaded replies whose answered message isn't loaded and hasn't been
+    /// asked for yet. They're marked as loading; the caller asks TDLib.
+    pub fn missing_replied(&mut self) -> Vec<i64> {
+        let missing: Vec<i64> = self
+            .messages
+            .iter()
+            .filter(|(id, msg)| {
+                // A message still sending has a temporary id TDLib can't look up.
+                msg.state == SendState::Sent
+                    && !self.replied.contains_key(id)
+                    && msg.reply_to.as_ref().is_some_and(|r| {
+                        r.message_id
+                            .is_none_or(|answered| !self.messages.contains_key(&answered))
+                    })
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for &id in &missing {
+            self.replied.insert(id, Fetched::Loading);
+        }
+        missing
+    }
+
+    /// TDLib's answer for what reply `reply_id` answers.
+    pub fn set_replied(&mut self, reply_id: i64, replied: Option<Message>) {
+        let fetched = match replied {
+            Some(message) => Fetched::Found(Replied::new(message.id, &message.into())),
+            None => Fetched::Missing,
+        };
+        self.replied.insert(reply_id, fetched);
     }
 
     pub fn insert(&mut self, message: Message) {
@@ -453,6 +587,10 @@ impl OpenChat {
         if self.selected == Some(old_id) {
             self.selected = Some(message.id);
         }
+        // A reply to a message that was still sending goes to its real id.
+        if let Some(reply) = self.reply.as_mut().filter(|r| r.id == old_id) {
+            reply.id = message.id;
+        }
         self.insert(message);
     }
 
@@ -461,6 +599,9 @@ impl OpenChat {
             let body = body(content);
             (msg.text, msg.preview, msg.file) = (body.text, body.preview, body.file);
             (msg.links, msg.link_ranges) = (body.links, body.link_ranges);
+            if let Some(reply) = self.reply.as_mut().filter(|r| r.id == message_id) {
+                reply.snippet = msg.snippet();
+            }
         }
     }
 
@@ -469,6 +610,9 @@ impl OpenChat {
             self.messages.remove(id);
             if self.selected == Some(*id) {
                 self.selected = None;
+            }
+            if self.reply.as_ref().is_some_and(|r| r.id == *id) {
+                self.reply = None;
             }
         }
     }
@@ -709,6 +853,7 @@ mod tests {
                     links: Vec::new(),
                     link_ranges: Vec::new(),
                     state: SendState::Sent,
+                    reply_to: None,
                 };
                 (id, msg)
             })
@@ -773,6 +918,96 @@ mod tests {
         open.messages.extend(page([3, 4, 101]));
         open.add_page(Page::Latest, page(90..100));
         assert_eq!(ids(&open), (90..100).chain([101]).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn snippets_put_a_message_on_one_line_or_name_what_it_holds() {
+        let mut msgs = page([1]);
+        let msg = &mut msgs[0].1;
+        msg.text = "first line\n\nsecond\tline ".into();
+        assert_eq!(msg.snippet(), "first line second line");
+
+        msg.text = String::new();
+        msg.file = Some(MediaFile {
+            id: 3,
+            label: "Photo".into(),
+        });
+        assert_eq!(msg.snippet(), "Photo", "a photo without a caption");
+    }
+
+    #[test]
+    fn deleting_the_message_being_replied_to_ends_the_reply() {
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page(1..5));
+        open.reply = Some(Replied::new(3, &open.messages[&3]));
+        assert_eq!(open.reply.as_ref().unwrap().snippet, "message 3");
+
+        open.remove(&[2]);
+        assert!(open.reply.is_some(), "another message went");
+        open.remove(&[3]);
+        assert!(open.reply.is_none());
+    }
+
+    #[test]
+    fn replied_messages_that_arent_loaded_are_asked_for_once() {
+        let mut open = OpenChat::new(1);
+        let mut messages = page(10..15);
+        let mut reply = |at: usize, message_id| {
+            messages[at].1.reply_to = Some(ReplyTo {
+                message_id,
+                quote: None,
+            })
+        };
+        reply(1, Some(10)); // 11 answers 10, which is loaded
+        reply(2, Some(3)); // 12 answers an older message
+        reply(3, None); // 13 answers a message in another chat
+        open.add_page(Page::Latest, messages);
+
+        assert_eq!(open.missing_replied(), [12, 13]);
+        assert!(open.missing_replied().is_empty(), "already asked");
+
+        open.set_replied(12, None);
+        assert!(matches!(open.replied[&12], Fetched::Missing));
+
+        // Once it's gone from the loaded messages, it has to be asked for.
+        open.remove(&[10]);
+        assert_eq!(open.missing_replied(), [11]);
+    }
+
+    #[test]
+    fn gd_goes_from_a_reply_to_the_message_it_answers() {
+        let mut open = OpenChat::new(1);
+        let mut messages = page(10..15);
+        let mut reply = |at: usize, message_id| {
+            messages[at].1.reply_to = Some(ReplyTo {
+                message_id,
+                quote: None,
+            })
+        };
+        reply(1, Some(10));
+        reply(2, Some(3)); // not loaded
+        reply(3, None); // in another chat
+        reply(4, Some(4)); // the newest, answering a deleted message
+        open.add_page(Page::Latest, messages);
+        open.replied.insert(14, Fetched::Missing);
+
+        let from = |open: &mut OpenChat, id| {
+            open.selected = Some(id);
+            open.replied_jump()
+        };
+        assert_eq!(from(&mut open, 11), Ok((11, 10)));
+        assert_eq!(from(&mut open, 12), Ok((12, 3)), "loads around it");
+        assert_eq!(
+            from(&mut open, 13),
+            Err("It answers a message in another chat")
+        );
+        assert_eq!(from(&mut open, 10), Err("Not a reply"));
+        open.selected = None;
+        assert_eq!(
+            open.replied_jump(),
+            Err("The message it answers was deleted"),
+            "no selection means the newest"
+        );
     }
 
     #[test]
