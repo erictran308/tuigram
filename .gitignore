@@ -1,0 +1,5 @@
+/target
+
+# Secrets: API credentials and the TDLib database (holds your login session)
+.env
+.tdlib/
