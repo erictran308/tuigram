@@ -93,7 +93,7 @@ Environment variables (also read from a `.env` file in the current directory):
 ## Development
 
 ```sh
-git clone <this repo> && cd tuigram
+git clone https://github.com/erictran308/tuigram && cd tuigram
 cargo run       # uses the same data folder as the installed app, or TG_DATA_DIR
 cargo test
 ```

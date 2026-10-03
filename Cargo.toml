@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Telegram in your terminal: a fast, vim-style Telegram client built on TDLib"
 license = "MIT"
+repository = "https://github.com/erictran308/tuigram"
 readme = "README.md"
 keywords = ["telegram", "tui", "terminal", "tdlib", "vim"]
 categories = ["command-line-utilities"]
