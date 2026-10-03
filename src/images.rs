@@ -33,6 +33,31 @@ pub struct Key {
     pub thumbnail: bool,
 }
 
+/// Caps for decoding images from other people. Telegram's photos are at most
+/// 2560px a side and stickers 512px, so a bigger one is only a way to run
+/// memory out.
+fn limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits
+}
+
+/// Like `image::open` (the format comes from the extension), within [`limits`].
+pub fn open_image(path: &str) -> image::ImageResult<image::DynamicImage> {
+    let mut reader = image::ImageReader::open(path)?;
+    reader.limits(limits());
+    reader.decode()
+}
+
+/// Like `image::load_from_memory`, within [`limits`].
+fn decode_bytes(data: &[u8]) -> image::ImageResult<image::DynamicImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format()?;
+    reader.limits(limits());
+    reader.decode()
+}
+
 /// An image finished encoding (or failed) on a background thread.
 pub struct ImageEvent {
     key: Key,
@@ -113,7 +138,7 @@ impl Images {
             match self.files.get(&photo.file_id) {
                 Some(FileState::Ready(path)) => {
                     let path = path.clone();
-                    self.build(full, move || Ok(image::open(path)?));
+                    self.build(full, move || Ok(open_image(&path)?));
                 }
                 Some(FileState::Downloading | FileState::Failed) => {}
                 None => {
@@ -126,7 +151,7 @@ impl Images {
                     thumbnail: true,
                     ..full
                 };
-                self.build(key, move || Ok(image::load_from_memory(&data)?));
+                self.build(key, move || Ok(decode_bytes(&data)?));
             }
         }
     }
@@ -201,3 +226,23 @@ impl Images {
 
 /// Shared thumbnail bytes, so cloning a [`Preview`] each frame is cheap.
 pub type Thumbnail = Arc<[u8]>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut data = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(width, height)
+            .write_to(&mut data, image::ImageFormat::Png)
+            .unwrap();
+        data.into_inner()
+    }
+
+    #[test]
+    fn images_bigger_than_telegram_sends_are_refused() {
+        assert!(decode_bytes(&png(512, 512)).is_ok());
+        let error = decode_bytes(&png(5000, 1)).unwrap_err();
+        assert!(matches!(error, image::ImageError::Limits(_)), "{error}");
+    }
+}

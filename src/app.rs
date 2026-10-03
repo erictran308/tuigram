@@ -18,10 +18,11 @@ use crate::chats::Chats;
 use crate::clipboard::{Clipboard, Copied, Decoded};
 use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
-use crate::messages::{MediaFile, OpenChat, Replied, SendState};
+use crate::messages::{Link, MediaFile, OpenChat, Replied, SendState};
 use crate::search::MessageSearch;
 use crate::settings::Settings;
-use crate::tg::{Deletable, Found, Page, Tg, TgEvent};
+use crate::text;
+use crate::tg::{Deletable, Found, Page, Tagged, Tg, TgEvent};
 use crate::theme::Theme;
 use crate::ui;
 
@@ -42,6 +43,14 @@ const HALF_PAGE: isize = 10;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a toast stays up.
 const TOAST_TIME: Duration = Duration::from_secs(2);
+
+/// Where the API key TDLib was given came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeySource {
+    Env,
+    Saved,
+    BuiltIn,
+}
 
 pub enum Screen {
     Login(Box<Login>),
@@ -110,7 +119,7 @@ impl Login {
 /// Something in a message that Enter opens or `y` copies.
 pub enum Target {
     File(MediaFile),
-    Link(String),
+    Link(Link),
     /// The whole text or caption; only copied.
     Text(String),
 }
@@ -119,10 +128,44 @@ impl Target {
     pub fn label(&self) -> &str {
         match self {
             Target::File(file) => &file.label,
-            Target::Link(url) => url,
+            Target::Link(link) => &link.url,
             Target::Text(_) => "Whole message",
         }
     }
+}
+
+/// Asks before opening something that could hurt: a file that may run code,
+/// or a link whose words say something other than where it goes.
+pub struct Confirm {
+    pub title: String,
+    /// Why it asks, and what exactly would open.
+    pub lines: Vec<String>,
+    pub action: Confirmed,
+}
+
+/// What `y` does in a [`Confirm`].
+pub enum Confirmed {
+    OpenFile(String),
+    OpenLink(String),
+}
+
+/// File types that open in a viewer or player, never as a program. Anything
+/// else asks first: `.exe`, `.bat`, `.command`, `.jar`, `.terminal`, `.html`
+/// and many more can run code when opened.
+const SAFE_TO_OPEN: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "avif", "bmp", "tif", "tiff", "mp4",
+    "m4v", "mov", "mkv", "webm", "avi", "3gp", "mpg", "mpeg", "mp3", "m4a", "aac", "ogg", "oga",
+    "opus", "wav", "flac", "pdf", "txt", "md", "epub", "docx", "xlsx", "pptx", "odt", "ods", "odp",
+    "zip", "rar", "7z", "tar", "gz", "tgz",
+];
+
+/// Whether a file opens in a viewer or player, never as a program; see
+/// [`SAFE_TO_OPEN`].
+fn safe_to_open(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| SAFE_TO_OPEN.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// What picking from a [`PickMenu`] does.
@@ -183,7 +226,14 @@ impl DeleteMenu {
         .into_iter()
         .filter_map(|(allowed, choice)| allowed.then_some(choice))
         .collect();
-        self.selected = 0;
+        // The cursor starts on the choice that's easy to live with, as in
+        // Telegram, and also lands there if keys typed while TDLib was still
+        // answering went nowhere.
+        self.selected = self
+            .choices
+            .iter()
+            .position(|&c| c == DeleteChoice::OnlyMe)
+            .unwrap_or(0);
     }
 }
 
@@ -286,10 +336,15 @@ pub struct App {
     /// Shown over everything when Enter or `y` finds several things.
     pub menu: Option<PickMenu>,
     pub delete_menu: Option<DeleteMenu>,
+    pub confirm: Option<Confirm>,
     pub settings: Settings,
     settings_path: PathBuf,
     /// API credentials from the environment, which win over saved ones.
     env_keys: Option<ApiKeys>,
+    /// The key TDLib has; `None` until it gets one.
+    keys_source: Option<KeySource>,
+    /// Telegram refused the built-in key, so it isn't offered to TDLib again.
+    built_in_rejected: bool,
     pub settings_menu: Option<SettingsMenu>,
     /// Shown in the status bar while typing a `/` search.
     pub prompt: Option<Prompt>,
@@ -301,6 +356,9 @@ pub struct App {
     pending_g: bool,
     /// Set once quitting started; we exit at this time even if TDLib never answers.
     pub quit_deadline: Option<Instant>,
+    /// The terminal window has focus. Terminals that don't report focus
+    /// changes leave this on.
+    terminal_focused: bool,
     /// TDLib is logging out (`:logout`, the session ended elsewhere, or
     /// leaving a QR login), and a new client takes over once it has closed.
     relogin: bool,
@@ -334,9 +392,12 @@ impl App {
             toast: None,
             menu: None,
             delete_menu: None,
+            confirm: None,
             settings,
             settings_path,
             env_keys,
+            keys_source: None,
+            built_in_rejected: false,
             settings_menu: None,
             prompt: None,
             chats_loading: false,
@@ -344,6 +405,7 @@ impl App {
             status: None,
             pending_g: false,
             quit_deadline: None,
+            terminal_focused: true,
             relogin: false,
             exit: false,
         }
@@ -352,7 +414,7 @@ impl App {
     pub async fn run(
         mut self,
         terminal: &mut DefaultTerminal,
-        mut events: UnboundedReceiver<TgEvent>,
+        mut events: UnboundedReceiver<Tagged>,
         mut image_events: UnboundedReceiver<ImageEvent>,
         mut decoded: UnboundedReceiver<Decoded>,
     ) -> Result<()> {
@@ -372,6 +434,7 @@ impl App {
             {
                 self.selected = self.chats.ids().first().copied();
             }
+            self.mark_seen();
             terminal.draw(|frame| ui::draw(frame, &mut self))?;
             // Start downloads/encodes for photos the frame showed but didn't have.
             self.images.fetch(&self.tg);
@@ -385,16 +448,25 @@ impl App {
             let toast_until = self.toast.as_ref().map(|t| t.until);
             tokio::select! {
                 Some(event) = events.recv() => {
-                    self.on_tg(event);
+                    self.on_tagged(event);
                     // Drain the backlog so a burst of updates costs one redraw.
                     while let Ok(event) = events.try_recv() {
-                        self.on_tg(event);
+                        self.on_tagged(event);
                     }
                 }
                 Some(event) = image_events.recv() => self.images.on_built(event),
                 Some(decoded) = decoded.recv() => self.on_decoded(decoded),
                 Some(event) = keys.next() => match event? {
                     Event::Key(key) => self.on_key(key),
+                    Event::FocusGained => self.terminal_focused = true,
+                    Event::FocusLost => self.terminal_focused = false,
+                    Event::Paste(text) if matches!(self.screen, Screen::Login(_)) => {
+                        if let Screen::Login(login) = &mut self.screen
+                            && login.takes_input()
+                        {
+                            login.input.insert_str(text.trim());
+                        }
+                    }
                     Event::Paste(text) if self.prompt.is_some() => {
                         if let Some(prompt) = self.prompt.as_mut() {
                             prompt.input.insert_str(text.replace(['\r', '\n'], " "));
@@ -413,6 +485,14 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Late events from a client replaced after logging out are dropped: a
+    /// download or error from the old session would land in the new one.
+    fn on_tagged(&mut self, (client_id, event): Tagged) {
+        if client_id == self.tg.client_id() {
+            self.on_tg(event);
+        }
     }
 
     fn on_tg(&mut self, event: TgEvent) {
@@ -463,11 +543,7 @@ impl App {
             TgEvent::Downloaded { file_id, path } => {
                 if self.opening.remove(&file_id) {
                     match &path {
-                        Some(path) => {
-                            if let Err(e) = open_externally(path) {
-                                self.status = Some(format!("Couldn't open file: {e}"));
-                            }
-                        }
+                        Some(path) => self.open_downloaded(path.clone()),
                         None => self.status = Some("Download failed".into()),
                     }
                 }
@@ -505,13 +581,6 @@ impl App {
             page,
             messages.into_iter().map(|m| (m.id, m.into())).collect(),
         );
-        if matches!(page, Page::Latest | Page::Newer(_))
-            && open.at_newest
-            && let Some(newest) = open.newest_id()
-        {
-            // Viewing the newest message marks the whole chat as read.
-            self.tg.view_messages(chat_id, vec![newest]);
-        }
         if open.messages.len() < MIN_LOADED {
             self.load_older_messages();
         }
@@ -562,7 +631,7 @@ impl App {
             }
             Update::User(u) => {
                 let name = format!("{} {}", u.user.first_name, u.user.last_name);
-                self.users.insert(u.user.id, name.trim().to_string());
+                self.users.insert(u.user.id, text::clean(name.trim()));
             }
             Update::NewMessage(u) => {
                 // While older messages are shown, new ones load with the rest.
@@ -571,11 +640,7 @@ impl App {
                     .as_mut()
                     .filter(|o| o.chat_id == u.message.chat_id && o.at_newest)
                 {
-                    let (id, incoming) = (u.message.id, !u.message.is_outgoing);
                     open.insert(u.message);
-                    if incoming {
-                        self.tg.view_messages(open.chat_id, vec![id]);
-                    }
                 }
             }
             Update::MessageSendSucceeded(u) => {
@@ -613,15 +678,14 @@ impl App {
 
     fn on_auth_state(&mut self, state: AuthorizationState) {
         let step = match state {
-            AuthorizationState::WaitTdlibParameters => {
-                match self.env_keys.clone().or(self.settings.api_keys.clone()) {
-                    Some(keys) => {
-                        self.tg.set_tdlib_parameters(keys);
-                        return;
-                    }
-                    None => LoginStep::ApiId,
+            AuthorizationState::WaitTdlibParameters => match self.api_keys() {
+                Some((source, keys)) => {
+                    self.keys_source = Some(source);
+                    self.tg.set_tdlib_parameters(keys);
+                    return;
                 }
-            }
+                None => LoginStep::ApiId,
+            },
             AuthorizationState::WaitPhoneNumber => LoginStep::Phone,
             AuthorizationState::WaitCode(s) => LoginStep::Code {
                 sent_via: code_destination(&s.code_info.r#type),
@@ -657,6 +721,7 @@ impl App {
             AuthorizationState::Closing => return,
             AuthorizationState::Closed if self.relogin && self.quit_deadline.is_none() => {
                 self.relogin = false;
+                self.keys_source = None;
                 self.forget_session();
                 self.tg.reopen();
                 self.screen = login_screen(LoginStep::Connecting);
@@ -686,6 +751,7 @@ impl App {
         self.status = None;
         match self.screen {
             Screen::Login(_) => self.on_login_key(key),
+            Screen::Main if self.confirm.is_some() => self.on_confirm_key(key),
             Screen::Main if self.settings_menu.is_some() => self.on_settings_key(key, ctrl),
             Screen::Main if self.delete_menu.is_some() => self.on_delete_key(key),
             Screen::Main if self.menu.is_some() => self.on_menu_key(key),
@@ -745,7 +811,15 @@ impl App {
                     login.error = Some(format!("Couldn't save them: {e:#}"));
                     return;
                 }
-                self.tg.set_tdlib_parameters(keys);
+                if self.keys_source.is_some() {
+                    // TDLib only takes a key at startup, so a new client
+                    // starts with the saved one.
+                    self.relogin = true;
+                    self.tg.close();
+                } else {
+                    self.keys_source = Some(KeySource::Saved);
+                    self.tg.set_tdlib_parameters(keys);
+                }
                 self.screen = login_screen(LoginStep::Connecting);
                 return;
             }
@@ -768,25 +842,44 @@ impl App {
         }
     }
 
-    /// Telegram refused the API credentials (`API_ID_INVALID` and the like).
-    /// TDLib can't take new ones without a restart, so saved ones are forgotten
-    /// and the next run asks again.
+    /// The API key to start TDLib with: from the environment, else saved,
+    /// else the one release binaries come with.
+    fn api_keys(&self) -> Option<(KeySource, ApiKeys)> {
+        let built_in = config::built_in_keys().filter(|_| !self.built_in_rejected);
+        let env = self.env_keys.clone().map(|k| (KeySource::Env, k));
+        env.or_else(|| {
+            self.settings
+                .api_keys
+                .clone()
+                .map(|k| (KeySource::Saved, k))
+        })
+        .or_else(|| built_in.map(|k| (KeySource::BuiltIn, k)))
+    }
+
+    /// Telegram refused the API credentials (`API_ID_INVALID`, or
+    /// `API_ID_PUBLISHED_FLOOD` for a key it blocked). On the login screen,
+    /// it asks for another key, which a new client then starts with.
     fn reject_api_keys(&mut self) {
-        let message = if self.env_keys.is_some() {
-            "Telegram rejected TG_API_ID / TG_API_HASH. Check them on my.telegram.org.".into()
-        } else {
-            self.settings.api_keys = None;
-            match self.settings.save(&self.settings_path) {
-                Ok(()) => {
-                    "Telegram rejected the API ID and hash. Restart tuigram to enter them again."
-                        .into()
+        let message = match self.keys_source {
+            Some(KeySource::Env) => "Telegram rejected TG_API_ID / TG_API_HASH.".to_string(),
+            Some(KeySource::BuiltIn) => {
+                self.built_in_rejected = true;
+                "Telegram rejected tuigram's built-in key. Use your own.".into()
+            }
+            Some(KeySource::Saved) | None => {
+                self.settings.api_keys = None;
+                match self.settings.save(&self.settings_path) {
+                    Ok(()) => "Telegram rejected that API ID and hash.".into(),
+                    Err(e) => format!("Telegram rejected the API key; can't forget it: {e:#}"),
                 }
-                Err(e) => format!(
-                    "Telegram rejected the API ID and hash, and they couldn't be cleared: {e:#}"
-                ),
             }
         };
         match &mut self.screen {
+            Screen::Login(_) if self.keys_source != Some(KeySource::Env) => {
+                let mut login = Login::new(LoginStep::ApiId);
+                login.error = Some(message);
+                self.screen = Screen::Login(Box::new(login));
+            }
             Screen::Login(login) => {
                 login.busy = false;
                 login.error = Some(message);
@@ -981,6 +1074,29 @@ impl App {
         }
     }
 
+    /// Sends a read receipt for the newest incoming message once you can
+    /// see it: the chat pane and the terminal window have focus, and the view
+    /// is on the newest message. Viewing it marks the whole chat as read.
+    fn mark_seen(&mut self) {
+        let looking = matches!(self.screen, Screen::Main)
+            && self.terminal_focused
+            && matches!(self.focus, Focus::Messages | Focus::Input)
+            && self.settings_menu.is_none();
+        let Some(open) = self.open.as_mut().filter(|o| looking && o.at_newest) else {
+            return;
+        };
+        if open.selected.is_some() {
+            return;
+        }
+        let newest = open.messages.iter().rev().find(|(_, m)| !m.outgoing);
+        if let Some((&id, _)) = newest
+            && id > open.seen
+        {
+            open.seen = id;
+            self.tg.view_messages(open.chat_id, vec![id]);
+        }
+    }
+
     /// `:logout`: ends the session on Telegram's side and deletes what TDLib
     /// keeps on this computer. The login screen comes back once TDLib closes.
     fn log_out(&mut self) {
@@ -992,8 +1108,12 @@ impl App {
     /// Drops everything from the old session before a new client starts, so
     /// nothing from it shows up after logging in again, maybe as someone else.
     fn forget_session(&mut self) {
+        // Highlights are chat ids of the old account.
+        self.settings.highlighted_chats.clear();
+        if let Err(e) = self.settings.save(&self.settings_path) {
+            self.status = Some(format!("Couldn't save settings: {e:#}"));
+        }
         self.chats = Chats::default();
-        self.chats.set_highlighted(&self.settings.highlighted_chats);
         self.users.clear();
         self.selected = None;
         self.open = None;
@@ -1004,6 +1124,7 @@ impl App {
         self.copying.clear();
         self.menu = None;
         self.delete_menu = None;
+        self.confirm = None;
         self.settings_menu = None;
         self.prompt = None;
         self.chats_loading = false;
@@ -1270,12 +1391,67 @@ impl App {
                     self.tg.download(file.id);
                 }
             }
-            Target::Link(url) => {
-                if let Err(e) = open_externally(&url) {
-                    self.status = Some(format!("Couldn't open link: {e}"));
+            Target::Link(Link {
+                url,
+                disguise: Some(shown),
+            }) => {
+                self.confirm = Some(Confirm {
+                    title: "Open this link?".into(),
+                    lines: vec![
+                        format!("The text says: {shown}"),
+                        format!("It goes to:    {url}"),
+                    ],
+                    action: Confirmed::OpenLink(url),
+                })
+            }
+            Target::Link(link) => self.open_externally(&link.url),
+            Target::Text(_) => {}
+        }
+    }
+
+    /// A file finished downloading for Enter: opened at once if it's a
+    /// type that can't run code, else only after a `y`.
+    fn open_downloaded(&mut self, path: String) {
+        mark_downloaded(&path);
+        if safe_to_open(&path) {
+            self.open_externally(&path);
+            return;
+        }
+        let name = Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.confirm = Some(Confirm {
+            title: format!("Open {name}?"),
+            lines: vec![
+                "Files like this can run programs on your computer.".into(),
+                "Only open it if you trust whoever sent it.".into(),
+            ],
+            action: Confirmed::OpenFile(path),
+        });
+    }
+
+    fn open_externally(&mut self, target: &str) {
+        if let Err(e) = open_externally(target) {
+            self.status = Some(format!("Couldn't open it: {e}"));
+        }
+    }
+
+    /// The confirmation takes all keys while it's up. Only `y` goes ahead, so
+    /// an Enter pressed out of habit can't.
+    fn on_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') => {
+                if let Some(confirm) = self.confirm.take() {
+                    match confirm.action {
+                        Confirmed::OpenFile(target) | Confirmed::OpenLink(target) => {
+                            self.open_externally(&target)
+                        }
+                    }
                 }
             }
-            Target::Text(_) => {}
+            KeyCode::Char('n' | 'q') | KeyCode::Esc => self.confirm = None,
+            _ => {}
         }
     }
 
@@ -1312,7 +1488,7 @@ impl App {
     fn copy_target(&mut self, target: Target) {
         let text = match target {
             Target::Text(text) => text,
-            Target::Link(url) => url,
+            Target::Link(link) => link.url,
             Target::File(file) => {
                 let id = file.id;
                 if self.copying.insert(id, file).is_none() {
@@ -1547,29 +1723,50 @@ impl App {
 
 /// Hands a file path or web link to the system: the default app for a file
 /// (Preview for images on macOS, QuickTime for video…), the browser for a link.
-/// Callers only pass TDLib file paths and http(s) links, so nothing starting
-/// with `-` can be mistaken for an option.
+/// No shell is involved, so a `&` or `|` in a link stays part of it: Windows
+/// uses ShellExecute rather than `cmd /C start`, which would run what follows.
 fn open_externally(target: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = process::Command::new("open");
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut c = process::Command::new("cmd");
-        c.args(["/C", "start", ""]);
-        c
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = process::Command::new("xdg-open");
+    // `open` on macOS waits for LaunchServices, which can take a moment, and
+    // reports nothing useful, so it gets a thread of its own.
+    if cfg!(target_os = "macos") {
+        let target = target.to_string();
+        std::thread::spawn(move || open::that_detached(target));
+        Ok(())
+    } else {
+        open::that_detached(target)
+    }
+}
 
-    // Keep the opener's output off the TUI, and reap it when it exits.
-    let mut child = command
-        .arg(target)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    std::thread::spawn(move || child.wait());
-    Ok(())
+/// Marks a downloaded file as coming from the internet, as browsers do, so
+/// the system's own checks apply when it's opened: Gatekeeper on macOS,
+/// SmartScreen and Office's Protected View on Windows. Best effort.
+fn mark_downloaded(path: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let _ = process::Command::new("/usr/bin/xattr")
+            .args([
+                "-w",
+                "com.apple.quarantine",
+                &format!("0081;{now:x};tuigram;"),
+                path,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::fs::write(
+            format!("{path}:Zone.Identifier"),
+            "[ZoneTransfer]\r\nZoneId=3\r\n",
+        );
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = path;
 }
 
 fn login_screen(step: LoginStep) -> Screen {
@@ -1594,5 +1791,35 @@ fn code_destination(kind: &AuthenticationCodeType) -> &'static str {
         }
         AuthenticationCodeType::Fragment(_) => "to fragment.com",
         _ => "to one of your devices",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_files_that_cant_run_code_open_without_asking() {
+        for path in [
+            "/d/photo.JPG",
+            "/d/clip.mp4",
+            "/d/report.pdf",
+            "/d/notes.txt",
+        ] {
+            assert!(safe_to_open(path), "{path}");
+        }
+        for path in [
+            "/d/setup.exe",
+            "/d/run.bat",
+            "/d/x.command",
+            "/d/x.terminal",
+            "/d/app.jar",
+            "/d/page.html",
+            "/d/invoice.pdf.exe",
+            "/d/no-extension",
+            "/d/data.csv",
+        ] {
+            assert!(!safe_to_open(path), "{path}");
+        }
     }
 }

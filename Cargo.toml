@@ -1,6 +1,6 @@
 [package]
 name = "tuigram-cli"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Telegram in your terminal: a fast, vim-style Telegram client built on TDLib"
 license = "MIT"
@@ -8,12 +8,31 @@ repository = "https://github.com/erictran308/tuigram"
 readme = "README.md"
 keywords = ["telegram", "tui", "terminal", "tdlib", "vim"]
 categories = ["command-line-utilities"]
-exclude = ["CLAUDE.md", ".env.example"]
+exclude = ["CLAUDE.md", ".env.example", ".github"]
 
 # The command is `tuigram`; the crate name `tuigram` was taken on crates.io.
 [[bin]]
 name = "tuigram"
 path = "src/main.rs"
+
+# `cargo binstall tuigram-cli` installs the binary from the GitHub release,
+# which has tuigram's API key built in (see .github/workflows/release.yml).
+# Its fallbacks are off: QuickInstall's binaries and building from source
+# would have no key. Without a release binary, binstall says so instead, and
+# `cargo install` remains for building from source.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/tuigram-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "tuigram{ binary-ext }"
+disabled-strategies = ["quick-install", "compile"]
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/tuigram-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/tuigram-{ target }.zip"
+pkg-fmt = "zip"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -25,6 +44,7 @@ dirs = "6.0.0"
 dotenvy = "0.15.7"
 futures = "0.3.34"
 image = "0.25"
+open = { version = "5.4.4", features = ["shellexecute-on-windows"] }
 qrcode = { version = "0.14.1", default-features = false }
 ratatui = "0.30.2"
 ratatui-image = { version = "11.1", default-features = false, features = ["image-defaults", "crossterm"] }

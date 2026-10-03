@@ -68,7 +68,7 @@ impl Clipboard {
     pub fn decode_image(&self, path: String, label: String) {
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
-            let image = image::open(&path)
+            let image = crate::images::open_image(&path)
                 .map(|i| i.to_rgba8())
                 .map_err(|e| e.to_string());
             let _ = tx.send(Decoded { label, image });

@@ -1,0 +1,216 @@
+# Builds tuigram for every platform with tuigram's own Telegram API key built
+# in, from the TUIGRAM_API_ID and TUIGRAM_API_HASH repository secrets, so
+# people who download a binary don't need to register an app. Pushing a
+# version tag (v0.4.0) attaches the binaries to a GitHub release; running it
+# by hand only builds them, as artifacts of the run.
+#
+# The key never goes into the repository or the crate on crates.io, which are
+# public: `cargo install` builds have none and ask for the user's own. build.rs
+# masks it so it isn't plain text in the binary. Nothing is cached between runs:
+# the build output holds the masked key next to its mask.
+#
+# Actions are pinned to commits, since they run next to the secrets and make
+# the release files. Only the release job can write to the repository.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # tdlib-rs downloads a prebuilt TDLib in its build script without checking
+  # it. These say which zip that is, and the matrix pins each one's SHA-256.
+  # Update all three together when tdlib-rs changes in Cargo.lock.
+  TDLIB_RS_VERSION: "1.4.0"
+  TDLIB_VERSION: "1.8.61"
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 24.04, like tdlib-rs's own CI: its TDLib builds need
+          # libc++ from there.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            run: true
+            tdlib: linux-x86_64
+            tdlib_sha256: 997069633f54306ada33776d2c4a530017d2e7325a22e0f12701d52438c37383
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            run: true
+            tdlib: linux-aarch64
+            tdlib_sha256: 1c9ef54dd34ca5a4053e22853aad763eda80b4188e5a2b22beaa1fa715efbc0a
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            run: true
+            tdlib: macos-aarch64
+            tdlib_sha256: 6600d1fbc6ebf7a3df669b9ae84d48265a28f3c7456a2b64cfd0327aceb88620
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            run: false
+            tdlib: macos-x86_64
+            tdlib_sha256: 2e96b32a8b92d86629b1f116f1e40fd2eed9e7373584cfd947304b90a07013a6
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            run: true
+            tdlib: windows-x86_64
+            tdlib_sha256: 20f226518578b040028556bb862668f6802d16d3a5726df3dccb867dca4e9de1
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            run: false
+            tdlib: windows-aarch64
+            tdlib_sha256: ff37a0edc69c738d5b91bafea53a88983f97be4844b107f8b938f8fd4ff57559
+    env:
+      EXE: ${{ startsWith(matrix.os, 'windows') && '.exe' || '' }}
+    steps:
+      # A release without the key would make everyone register an app.
+      - name: Check the API key secrets
+        shell: bash
+        env:
+          TUIGRAM_API_ID: ${{ secrets.TUIGRAM_API_ID }}
+          TUIGRAM_API_HASH: ${{ secrets.TUIGRAM_API_HASH }}
+        run: |
+          if ! [[ "$TUIGRAM_API_ID" =~ ^[0-9]+$ && "$TUIGRAM_API_HASH" =~ ^[0-9a-fA-F]{32}$ ]]; then
+            echo "::error::Set the TUIGRAM_API_ID and TUIGRAM_API_HASH repository secrets (from my.telegram.org)"
+            exit 1
+          fi
+
+      # Without the token left in .git/config, build scripts can't push.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install libc++
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libc++-dev libc++abi-dev
+
+      # Fetches the same zip tdlib-rs will, and stops if it isn't the pinned
+      # one. After the build, its files are compared with what tdlib-rs
+      # actually linked, which also catches a different zip being served to
+      # tdlib-rs's own download.
+      - name: Download and check TDLib
+        shell: bash
+        env:
+          TDLIB: ${{ matrix.tdlib }}
+          TDLIB_SHA256: ${{ matrix.tdlib_sha256 }}
+        run: |
+          if ! grep -A1 '^name = "tdlib-rs"$' Cargo.lock | grep -qx "version = \"$TDLIB_RS_VERSION\""; then
+            echo "::error::Cargo.lock has another tdlib-rs: update TDLIB_RS_VERSION, TDLIB_VERSION and the TDLib hashes"
+            exit 1
+          fi
+          url="https://github.com/FedericoBruzzone/tdlib-rs/releases/download/v$TDLIB_RS_VERSION/tdlib-$TDLIB_VERSION-$TDLIB.zip"
+          curl -fsSL -o verified-tdlib.zip "$url"
+          sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi; }
+          actual=$(sha256 verified-tdlib.zip | cut -d' ' -f1)
+          if [ "$actual" != "$TDLIB_SHA256" ]; then
+            echo "::error::TDLib zip has SHA-256 $actual, expected $TDLIB_SHA256"
+            exit 1
+          fi
+          if [ "${{ runner.os }}" = Windows ]; then
+            7z x -overified-tdlib verified-tdlib.zip > /dev/null
+          else
+            unzip -q verified-tdlib.zip -d verified-tdlib
+          fi
+
+      - name: Build
+        env:
+          TUIGRAM_API_ID: ${{ secrets.TUIGRAM_API_ID }}
+          TUIGRAM_API_HASH: ${{ secrets.TUIGRAM_API_HASH }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # tdlib-rs and tuigram's build.rs each extract a TDLib into their build
+      # output; both must match the checked zip file for file.
+      - name: Check the linked TDLib is the checked one
+        shell: bash
+        run: |
+          shopt -s nullglob
+          dirs=(target/${{ matrix.target }}/release/build/*/out/tdlib)
+          if [ ${#dirs[@]} -eq 0 ]; then
+            echo "::error::Found no TDLib downloaded by tdlib-rs"
+            exit 1
+          fi
+          for dir in "${dirs[@]}"; do
+            if ! diff -rq verified-tdlib/tdlib "$dir"; then
+              echo "::error::$dir differs from the checked TDLib"
+              exit 1
+            fi
+          done
+
+      # Binaries built for another architecture can't run here; the native
+      # ones show the same build worked.
+      - name: Check the key is built in
+        if: matrix.run
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release/tuigram$EXE
+          "$bin" --version
+          "$bin" --help | grep -q "comes with tuigram's own API key"
+
+      # Asset names have no version, so the README can link to
+      # releases/latest/download/<name>.
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/tuigram$EXE" README.md LICENSE dist/
+          cd dist
+          if [ "${{ runner.os }}" = Windows ]; then
+            7z a ../tuigram-${{ matrix.target }}.zip tuigram.exe README.md LICENSE
+          else
+            tar czf ../tuigram-${{ matrix.target }}.tar.gz tuigram README.md LICENSE
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tuigram-${{ matrix.target }}
+          path: tuigram-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # For the signed provenance attestation.
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Lets anyone check a download was built here, from this commit:
+      # gh attestation verify <file> --repo erictran308/tuigram
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: dist/tuigram-*
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum tuigram-* > SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "$GITHUB_REF_NAME"
+          --generate-notes

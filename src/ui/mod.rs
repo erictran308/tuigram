@@ -8,9 +8,10 @@ use unicode_width::UnicodeWidthStr;
 use ratatui_textarea::TextArea;
 
 use crate::app::{
-    App, Command, DeleteMenu, Focus, HelpTab, Login, LoginStep, MenuAction, PickMenu, PromptKind,
-    Screen, SettingsMenu, Target, Toast,
+    App, Command, Confirm, DeleteMenu, Focus, HelpTab, Login, LoginStep, MenuAction, PickMenu,
+    PromptKind, Screen, SettingsMenu, Target, Toast,
 };
+use crate::config;
 use crate::messages::{OpenChat, Replied};
 use crate::search;
 use crate::theme::{Colors, Theme};
@@ -91,7 +92,14 @@ fn draw_login(frame: &mut Frame, login: &Login, colors: &Colors) {
         draw_qr_login(frame, login, code, colors);
         return;
     }
-    let area = center(frame.area(), 64, 12);
+    // A build from source points to the ready-made app, which needs no key.
+    let source_build = config::built_in_keys().is_none();
+    let help_rows = if matches!(login.step, LoginStep::ApiId) && source_build {
+        4
+    } else {
+        3
+    };
+    let area = center(frame.area(), 64, 9 + help_rows);
     let block = Block::bordered()
         .title(" Log in ")
         .title_alignment(Alignment::Center)
@@ -101,7 +109,7 @@ fn draw_login(frame: &mut Frame, login: &Login, colors: &Colors) {
 
     let [prompt, help, input, error, footer] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Length(help_rows),
         Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -114,10 +122,17 @@ fn draw_login(frame: &mut Frame, login: &Login, colors: &Colors) {
             "Logging out…".to_string(),
             "Then you can log in again, as yourself or someone else.".into(),
         ),
+        LoginStep::ApiId if source_build => (
+            "Telegram API ID".into(),
+            "Builds from source have no API key. Get yours once at my.telegram.org → \
+             API development tools (any app name), then paste api_id.\n\
+             Or skip it all: cargo binstall tuigram-cli"
+                .into(),
+        ),
         LoginStep::ApiId => (
             "Telegram API ID".into(),
-            "Telegram gives every app its own API ID and hash. Get yours once at \
-             my.telegram.org → API development tools (any app name), then paste api_id."
+            "Get your own API ID and hash once at my.telegram.org → API development \
+             tools (any app name), then paste api_id."
                 .into(),
         ),
         LoginStep::ApiHash { .. } => (
@@ -293,6 +308,9 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     if let Some(menu) = &app.delete_menu {
         draw_delete(frame, chat_area, menu, colors);
     }
+    if let Some(confirm) = &app.confirm {
+        draw_confirm(frame, chat_area, confirm, colors);
+    }
     if let Some(menu) = &mut app.settings_menu {
         draw_settings(frame, menu, colors);
     }
@@ -454,6 +472,28 @@ fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, colors: &Colors) {
 
 /// A popup's frame: accent border and its own background, so it stands out
 /// from what's underneath. Callers draw `Clear` first.
+/// The "are you sure" popup over the message pane, for a file that could
+/// run code or a link that hides where it goes.
+fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Colors) {
+    let title = format!(" {} ", confirm.title);
+    let longest = confirm.lines.iter().map(|l| l.width()).max().unwrap_or(0);
+    let width = (longest.max(title.width()) as u16 + 4)
+        .min(area.width)
+        .max(40.min(area.width));
+    let popup = center(area, width, confirm.lines.len() as u16 + 2);
+    let block = popup_block(title, " y open · Esc cancel ", colors)
+        .border_style(Style::new().fg(colors.warning));
+    // Long URLs keep their start, where the site's name is.
+    let room = (block.inner(popup).width as usize).saturating_sub(2);
+    let lines: Vec<Line> = confirm
+        .lines
+        .iter()
+        .map(|line| Line::from(format!(" {}", truncate(line, room))))
+        .collect();
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
 fn popup_block<'a>(title: impl Into<Line<'a>>, keys: &'a str, colors: &Colors) -> Block<'a> {
     Block::bordered()
         .title(title)
@@ -789,6 +829,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     let replying = app.open.as_ref().is_some_and(|o| o.reply.is_some());
     let insert = Span::from(" INSERT ").fg(colors.bg).bg(colors.insert);
     let (mode, hints) = match app.focus {
+        _ if app.confirm.is_some() => (normal, "  y open · n or Esc cancel"),
         _ if app.settings_menu.as_ref().map(|m| m.tab) == Some(HelpTab::Shortcuts) => {
             (normal, "  j/k scroll · Tab settings · Esc close")
         }
@@ -885,6 +926,9 @@ pub(crate) fn truncate(text: &str, max: usize) -> String {
         out.push(c);
         used += w;
     }
+    // Some sequences are wider than their characters add up to ("❤️" is a
+    // 1-wide heart and a 0-wide selector, shown 2 wide), so check the result.
+    while out.width() + 1 > max && out.pop().is_some() {}
     out.push('…');
     out
 }
@@ -1100,11 +1144,11 @@ mod tests {
             for_me: true,
         });
         let rows = render(&menu);
+        assert!(has(&rows, " 1 Delete for everyone"), "first");
         assert!(
-            has(&rows, "▌1 Delete for everyone"),
-            "first, under the cursor"
+            has(&rows, "▌2 Delete for me"),
+            "under the cursor, the safer choice"
         );
-        assert!(has(&rows, " 2 Delete for me"));
 
         // Channels and groups only delete for everyone.
         menu.set_allowed(Deletable {
@@ -1160,7 +1204,13 @@ mod tests {
             .collect();
         assert!(text.contains("Telegram API ID"));
         assert!(text.contains("my.telegram.org"), "says where to get it");
-        assert!(text.contains("paste api_id"), "help text isn't cut off");
+        assert!(text.contains("paste api_id"));
+        assert!(
+            buffer_rows(buf)
+                .iter()
+                .any(|r| r.contains("Or skip it all: cargo binstall tuigram-cli")),
+            "offers the app with a key, on one line; help text isn't cut off"
+        );
     }
 
     fn draw_login_rows(step: LoginStep, width: u16, height: u16) -> Vec<String> {
@@ -1275,6 +1325,47 @@ mod tests {
         let y = rows.iter().position(|r| r.contains("logout")).unwrap() as u16;
         let x = column(&rows[y as usize], "logout");
         assert_eq!(buf[(x, y)].fg, colors.muted, "still listed, dimmed");
+    }
+
+    #[test]
+    fn truncate_never_goes_over_with_emoji_sequences() {
+        let hearts = "❤️".repeat(100);
+        for max in [1, 2, 3, 10, 51] {
+            let cut = truncate(&hearts, max);
+            assert!(cut.width() <= max, "{max}: {cut:?} is {}", cut.width());
+        }
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn a_disguised_link_asks_first_and_shows_where_it_goes() {
+        let colors = Theme::Mocha.colors();
+        let confirm = Confirm {
+            title: "Open this link?".into(),
+            lines: vec![
+                "The text says: bank.com".into(),
+                "It goes to:    https://evil.example/login".into(),
+            ],
+            action: crate::app::Confirmed::OpenLink("https://evil.example/login".into()),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|f| draw_confirm(f, f.area(), &confirm, &colors))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows = buffer_rows(buf);
+        let row = |needle: &str| rows.iter().position(|r| r.contains(needle));
+        assert!(row("Open this link?").is_some());
+        assert!(row("The text says: bank.com").is_some());
+        assert!(row("It goes to:    https://evil.example/login").is_some());
+        let keys = row("y open · Esc cancel").expect("says how to answer");
+        let x = column(&rows[keys], "y open");
+        assert_eq!(
+            buf[(x - 2, keys as u16)].fg,
+            colors.warning,
+            "warning border"
+        );
     }
 
     #[test]

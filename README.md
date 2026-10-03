@@ -7,12 +7,12 @@
 A Telegram client for the terminal with vim keys, inline photos and search across your whole history.<br>
 Written in Rust on [TDLib](https://github.com/tdlib/td), the library behind Telegram's own apps.
 
+[![Release](https://img.shields.io/github/v/release/erictran308/tuigram)](https://github.com/erictran308/tuigram/releases/latest)
 [![crates.io](https://img.shields.io/crates/v/tuigram-cli.svg)](https://crates.io/crates/tuigram-cli)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-```sh
-cargo install tuigram-cli
-```
+**[Download for macOS, Linux or Windows](#get-started)** and log in. Nothing to set up.<br>
+With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 
 <!-- TODO: add a screenshot or GIF here, e.g. ![tuigram](docs/screenshot.png) -->
 
@@ -29,11 +29,59 @@ cargo install tuigram-cli
 - **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, date separators, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app.
 - **Make it yours.** Four Catppuccin themes with live preview, and highlights that make your important chats stand out.
-- **Private by design.** tuigram talks only to Telegram. No telemetry, no accounts and no servers in between. Your session stays on your machine.
+- **Private by design.** tuigram talks only to Telegram. No telemetry, no accounts and no servers in between. Your session stays on your machine, and read receipts go out only for messages you've actually had in front of you.
+- **Careful with what others send.** A file that could run a program, or a link whose text hides where it really goes, asks before opening.
 
 ## Get started
 
-**1. Install.** You need [Rust](https://rustup.rs). The first build downloads TDLib and takes a few minutes.
+There are two ways to install tuigram:
+
+- **Download it** (or `cargo binstall tuigram-cli`). Ready-made apps come with tuigram's own Telegram API key, so you just log in.
+- **Build it from source** with `cargo install`. You bring your own API key, which takes two minutes on Telegram's site.
+
+### Download (recommended)
+
+**1. Install.** If you have Rust and [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), that's one command, on any system:
+
+```sh
+cargo binstall tuigram-cli
+```
+
+Otherwise, on macOS or Linux, paste this into a terminal. It puts `tuigram` in `~/.local/bin`:
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/erictran308/tuigram/releases/latest/download/tuigram-aarch64-apple-darwin.tar.gz | tar xz -C ~/.local/bin tuigram
+```
+
+Swap the file name for your computer's:
+
+| Computer | File |
+| --- | --- |
+| Mac with Apple silicon (M1 or later) | [`tuigram-aarch64-apple-darwin.tar.gz`](https://github.com/erictran308/tuigram/releases/latest/download/tuigram-aarch64-apple-darwin.tar.gz) |
+| Mac with Intel | [`tuigram-x86_64-apple-darwin.tar.gz`](https://github.com/erictran308/tuigram/releases/latest/download/tuigram-x86_64-apple-darwin.tar.gz) |
+| Linux, x86_64 | [`tuigram-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/erictran308/tuigram/releases/latest/download/tuigram-x86_64-unknown-linux-gnu.tar.gz) |
+| Linux, ARM64 | [`tuigram-aarch64-unknown-linux-gnu.tar.gz`](https://github.com/erictran308/tuigram/releases/latest/download/tuigram-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows, x86_64 | [`tuigram-x86_64-pc-windows-msvc.zip`](https://github.com/erictran308/tuigram/releases/latest/download/tuigram-x86_64-pc-windows-msvc.zip) |
+| Windows, ARM64 | [`tuigram-aarch64-pc-windows-msvc.zip`](https://github.com/erictran308/tuigram/releases/latest/download/tuigram-aarch64-pc-windows-msvc.zip) |
+
+- **Windows:** download the `.zip`, unzip it, and run `tuigram.exe` from Windows Terminal.
+- **Linux:** needs Ubuntu 24.04, Debian 13, Fedora 40 or newer, plus libc++: `sudo apt install libc++1` (Fedora: `sudo dnf install libcxx`).
+- **macOS:** if you downloaded the file in a browser instead, macOS blocks the app. Run `xattr -d com.apple.quarantine tuigram` once to allow it.
+
+If `tuigram` isn't found afterwards, add `~/.local/bin` to your `PATH`. Each file comes with a signed record of the commit it was built from; to check one, run `gh attestation verify <file> --repo erictran308/tuigram`.
+
+**2. Run it.**
+
+```sh
+tuigram
+```
+
+**3. Log in.** Type your phone number, or press Tab and scan the QR code with Telegram on your phone. That's it: next time, `tuigram` takes you straight to your chats.
+
+### Build from source
+
+**1. Install.** You need [Rust](https://rustup.rs). `cargo install` always builds from source (unlike `cargo binstall` above). The first build downloads TDLib and takes a few minutes. On Linux, install libc++ first (`sudo apt install libc++-dev libc++abi-dev`).
 
 ```sh
 cargo install tuigram-cli
@@ -41,17 +89,21 @@ cargo install tuigram-cli
 
 Works on Linux, macOS and Windows, on x86_64 and ARM64.
 
-**2. Get your API keys (once).** Telegram requires every client app to have its own API ID and hash. Sign in at [my.telegram.org](https://my.telegram.org), open **API development tools**, and create an app with any name.
+**2. Get your API key (once).** Builds from source have no API key: their code is public, and a key published there would get blocked by Telegram for everyone. Sign in at [my.telegram.org](https://my.telegram.org), open **API development tools**, and create an app with any name.
 
-**3. Run it from anywhere.**
+**3. Run it.** Type `tuigram`, paste your `api_id` and `api_hash` when asked, then log in with your phone number or a QR code. tuigram saves the key, so you only do this once.
 
-```sh
-tuigram
+### Using your own API key
+
+The downloaded app can use your own key too, so your access never depends on tuigram's. Set `TG_API_ID` and `TG_API_HASH` in your environment, or add the key to `settings.toml` in [your data folder](#your-data):
+
+```toml
+[api_keys]
+id = 1234567
+hash = "0123456789abcdef0123456789abcdef"
 ```
 
-Paste your `api_id` and `api_hash` when asked, then log in: type your phone number, or press Tab to scan a QR code instead. That's it: next time, `tuigram` takes you straight to your chats.
-
-> **Why your own keys?** tuigram doesn't ship shared credentials. A key published in public source code can be abused and then blocked by Telegram for everyone who uses it. Your own key means your access never depends on anyone else's.
+tuigram uses the first key it finds, in this order: the environment, `settings.toml`, then the built-in key. If Telegram ever stops accepting the built-in key, tuigram asks for your own instead.
 
 ## Keys
 
@@ -62,7 +114,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `j` / `k` | Move down / up |
 | `gg` / `G` | Jump to top / bottom |
 | `Ctrl-d` / `Ctrl-u` | Half a page down / up |
-| `Enter` / `l` | Open a chat, or the file or link in a message |
+| `Enter` / `l` | Open a chat, or the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens) |
 | `h` / `Esc` | Back to the chat list |
 | `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line |
 | `y` | Copy the selected message: its text, a link, or the photo or file |
@@ -72,6 +124,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `/` | Search chat names, or messages in the open chat |
 | `n` / `N` | Next older / newer match |
 | `H` | Highlight a chat |
+| `:` | Run a command, typed in full: `:logout` logs out of Telegram on this computer |
 | `?` | Every shortcut, plus settings and themes |
 | `q` | Quit |
 
@@ -87,12 +140,12 @@ Everything lives in one folder on your machine (`tuigram --help` prints its path
 
 It holds your login session, API keys, downloaded files and settings. Deleting it removes your session from this computer. To end the session completely, go to **Settings → Devices** in another Telegram app.
 
-Environment variables (also read from a `.env` file in the current directory):
+Environment variables (they can also go in a `.env` file in the current directory):
 
 | Variable | Use |
 | --- | --- |
 | `TG_DATA_DIR` | Keep the data folder somewhere else |
-| `TG_API_ID`, `TG_API_HASH` | Use these API keys instead of the saved ones |
+| `TG_API_ID`, `TG_API_HASH` | Use your own API key instead of the saved or built-in one |
 
 ## Development
 
@@ -103,6 +156,21 @@ cargo test
 ```
 
 Copy `.env.example` to `.env` to keep a separate development session (for example `TG_DATA_DIR=./.tdlib`).
+
+### Releases
+
+Pushing a version tag builds the app for every platform in GitHub Actions ([`release.yml`](.github/workflows/release.yml)) and attaches the files to a GitHub release. Publish to crates.io only once that release is up: `cargo binstall` looks for the files of the version it finds on crates.io, under the tag `v<version>`.
+
+```sh
+git tag v0.4.0 && git push origin v0.4.0   # wait for the Release workflow
+cargo publish
+```
+
+The build bakes in the API key from the repository secrets `TUIGRAM_API_ID` and `TUIGRAM_API_HASH` (**Settings → Secrets and variables → Actions**), masked so it isn't plain text in the binary. The key never goes into the repository or the crate on crates.io. To build a binary with your own key baked in, set the same variables when building:
+
+```sh
+TUIGRAM_API_ID=1234567 TUIGRAM_API_HASH=0123456789abcdef0123456789abcdef cargo build --release
+```
 
 ## Built with
 

@@ -11,6 +11,7 @@ use tdlib_rs::enums::{ChatList, ChatType, MessageContent};
 use tdlib_rs::types::{self, ChatPosition, Message};
 
 use crate::search;
+use crate::text;
 
 pub struct Chat {
     pub title: String,
@@ -49,7 +50,7 @@ impl Chats {
     pub fn insert(&mut self, chat: types::Chat) {
         let is_channel = matches!(&chat.r#type, ChatType::Supergroup(s) if s.is_channel);
         let entry = Chat {
-            title: chat.title,
+            title: text::clean(&chat.title),
             is_channel,
             unread: chat.unread_count,
             preview: chat.last_message.as_ref().map(preview).unwrap_or_default(),
@@ -85,7 +86,7 @@ impl Chats {
 
     pub fn set_title(&mut self, chat_id: i64, title: String) {
         if let Some(chat) = self.by_id.get_mut(&chat_id) {
-            chat.title = title;
+            chat.title = text::clean(&title);
             // It may match the filter now, or no longer.
             self.dirty = true;
         }
@@ -203,8 +204,7 @@ fn main_order(positions: &[ChatPosition]) -> Option<i64> {
 }
 
 fn preview(message: &Message) -> String {
-    let text = content_text(&message.content);
-    let text = text.replace('\n', " ");
+    let text = text::clean(&content_text(&message.content)).replace(['\n', '\t'], " ");
     if message.is_outgoing {
         format!("You: {text}")
     } else {

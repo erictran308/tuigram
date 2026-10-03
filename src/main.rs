@@ -6,6 +6,7 @@ mod images;
 mod messages;
 mod search;
 mod settings;
+mod text;
 mod tg;
 mod theme;
 mod ui;
@@ -14,8 +15,8 @@ use std::io::stdout;
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use ratatui_image::picker::Picker;
@@ -23,7 +24,7 @@ use ratatui_image::picker::Picker;
 #[tokio::main]
 async fn main() -> Result<()> {
     // A missing .env is fine: the variables can also come from the shell.
-    let _ = dotenvy::dotenv();
+    config::load_dotenv();
     match std::env::args().nth(1).as_deref() {
         None => {}
         Some("-h" | "--help") => {
@@ -47,12 +48,30 @@ async fn main() -> Result<()> {
     let tg = tg::Tg::start(config, tx).await?;
 
     let mut terminal = ratatui::init();
+    // A panic, on any thread, ends the app: the terminal is put back, then
+    // the message is printed without control characters, since it can quote
+    // text from a message. Carrying on after a background thread died would
+    // leave the screen restored under a running app.
+    std::panic::set_hook(Box::new(|info| {
+        let _ = execute!(
+            stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableBracketedPaste,
+            DisableFocusChange
+        );
+        ratatui::restore();
+        eprintln!("tuigram crashed: {}", text::clean(&info.to_string()));
+        std::process::exit(101);
+    }));
     // Ask the terminal which image protocol it speaks (Kitty on Ghostty) and its
     // cell size in pixels. Must happen before key reading starts.
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     // Pasted text arrives as one event instead of keystrokes, so a pasted line
     // break can't send a half-written message.
     execute!(stdout(), EnableBracketedPaste)?;
+    // Read receipts wait while the terminal window is in the background, on
+    // terminals that report focus changes.
+    execute!(stdout(), EnableFocusChange)?;
     // Terminals with the kitty keyboard protocol (kitty, Ghostty, WezTerm…)
     // can then report Shift-Enter separately from Enter.
     let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -74,12 +93,22 @@ async fn main() -> Result<()> {
     if enhanced {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(stdout(), DisableBracketedPaste);
+    let _ = execute!(stdout(), DisableBracketedPaste, DisableFocusChange);
     ratatui::restore();
     result
 }
 
 fn print_help() -> Result<()> {
+    // CI checks for this wording to make sure release binaries have the key.
+    let keys = if config::built_in_keys().is_some() {
+        "This build comes with tuigram's own API key, so you only need to log in.
+To use your own key instead, set TG_API_ID and TG_API_HASH."
+    } else {
+        "This build has no API key: on first run, tuigram asks for your Telegram
+API ID and hash, which you get once at https://my.telegram.org (API
+development tools). Or install the ready-made app, which has one:
+  cargo binstall tuigram-cli"
+    };
     println!(
         "tuigram {version}
 Telegram in your terminal, with vim-style keys.
@@ -89,8 +118,7 @@ Usage: tuigram [-h | --help] [-V | --version]
 Inside the app, the status bar lists the keys for wherever you are;
 press ? for settings and q to quit.
 
-On first run, tuigram asks for your Telegram API ID and hash, which you
-get once at https://my.telegram.org (API development tools).
+{keys}
 
 Your login session, API credentials, downloaded files and settings are
 kept in:
@@ -98,7 +126,7 @@ kept in:
 
 Environment:
   TG_DATA_DIR    keep them somewhere else
-  TG_API_ID      API credentials to use instead of the saved ones
+  TG_API_ID      your own API key, used before saved or built-in ones
   TG_API_HASH",
         version = env!("CARGO_PKG_VERSION"),
         data = config::data_dir()?.display(),

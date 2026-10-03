@@ -13,11 +13,15 @@ use tdlib_rs::types::{self, Message};
 use crate::chats::content_text;
 use crate::images::Thumbnail;
 use crate::search::MessageSearch;
+use crate::text;
 use crate::tg::Page;
 
 /// Download the smallest size at least this big (TDLib's "x", ~800px), sharp
 /// enough for a bubble on a high-DPI screen without fetching the original.
 const PHOTO_MIN_SIDE: i32 = 640;
+
+/// Messages kept loaded while following new ones; see [`OpenChat::add_new`].
+const MAX_FOLLOWED: usize = 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Sender {
@@ -141,7 +145,7 @@ pub struct Msg {
     /// The file Enter opens: the full photo, the video, the document…
     pub file: Option<MediaFile>,
     /// Web links in the text or caption, in order, without duplicates.
-    pub links: Vec<String>,
+    pub links: Vec<Link>,
     /// Byte ranges of `text` that are links, to underline.
     pub link_ranges: Vec<Range<usize>>,
     pub state: SendState,
@@ -162,7 +166,29 @@ impl Msg {
 }
 
 fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    text::clean(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A web link in a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub url: String,
+    /// The words the link hides behind, when they aren't the URL itself.
+    /// Opening it asks first and shows where it really goes, since
+    /// `https://bank.com` can lead anywhere.
+    pub disguise: Option<String>,
+}
+
+impl From<&str> for Link {
+    fn from(url: &str) -> Self {
+        Link {
+            url: url.into(),
+            disguise: None,
+        }
+    }
 }
 
 /// What a reply answers.
@@ -211,7 +237,7 @@ struct Body {
     source_text: String,
     preview: Option<Preview>,
     file: Option<MediaFile>,
-    links: Vec<String>,
+    links: Vec<Link>,
     link_ranges: Vec<Range<usize>>,
 }
 
@@ -265,7 +291,7 @@ fn body(content: &MessageContent) -> Body {
             source = Some(&m.caption);
         }
         C::MessageDocument(m) => {
-            let label = format!("File: {}", m.document.file_name);
+            let label = format!("File: {}", text::clean(&m.document.file_name));
             body.file = file(m.document.document.id, label);
             source = Some(&m.caption);
         }
@@ -276,7 +302,7 @@ fn body(content: &MessageContent) -> Body {
             } else {
                 &a.title
             };
-            body.file = file(a.audio.id, format!("Audio: {name}"));
+            body.file = file(a.audio.id, format!("Audio: {}", text::clean(name)));
             source = Some(&m.caption);
         }
         C::MessageVoiceNote(m) => {
@@ -294,7 +320,7 @@ fn body(content: &MessageContent) -> Body {
         _ => {}
     }
     if let Some(source) = source {
-        body.source_text = source.text.clone();
+        body.source_text = text::clean(&source.text);
         let found = links(source);
         // The caption ends the shown text (after e.g. "[File] " or a video's
         // length), so its link ranges shift by whatever comes before it.
@@ -305,9 +331,9 @@ fn body(content: &MessageContent) -> Body {
                 .map(|(_, r)| r.start + shift..r.end + shift)
                 .collect();
         }
-        for (url, _) in found {
-            if !body.links.contains(&url) {
-                body.links.push(url);
+        for (link, _) in found {
+            if !body.links.iter().any(|l| l.url == link.url) {
+                body.links.push(link);
             }
         }
     }
@@ -315,10 +341,11 @@ fn body(content: &MessageContent) -> Body {
     body
 }
 
-/// Tabs become spaces and `\r` goes, so terminal widths add up. Link ranges
-/// move along with the text.
+/// Tabs become spaces and hidden characters ([`text::is_hidden`], `\r`
+/// among them) go, so terminal widths add up. Link ranges move along with
+/// the text.
 fn normalize(text: &str, ranges: &mut [Range<usize>]) -> String {
-    if !text.contains(['\t', '\r']) {
+    if !text.contains(|c| c == '\t' || text::is_hidden(c)) {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
@@ -328,7 +355,7 @@ fn normalize(text: &str, ranges: &mut [Range<usize>]) -> String {
         map[i..i + c.len_utf8()].fill(out.len());
         match c {
             '\t' => out.push_str("    "),
-            '\r' => {}
+            c if text::is_hidden(c) => {}
             c => out.push(c),
         }
     }
@@ -342,22 +369,42 @@ fn normalize(text: &str, ranges: &mut [Range<usize>]) -> String {
 /// Web links Telegram marked in a text, with the byte range they cover:
 /// plain URLs, and links hidden behind words. Only http(s), so a crafted link
 /// can't get the OS to open a local file or app.
-fn links(text: &types::FormattedText) -> Vec<(String, Range<usize>)> {
+fn links(text: &types::FormattedText) -> Vec<(Link, Range<usize>)> {
     let mut out = Vec::new();
     for entity in &text.entities {
         // Entity offsets count UTF-16 code units, not bytes or chars.
         let start = byte_offset(&text.text, entity.offset);
         let end = byte_offset(&text.text, entity.offset.saturating_add(entity.length));
-        let url = match &entity.r#type {
-            TextEntityType::Url => text.text[start..end].to_string(),
-            TextEntityType::TextUrl(t) => t.url.clone(),
+        // TDLib checks entities, but a bad one mustn't crash the app.
+        let Some(shown) = text.text.get(start..end).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let (url, hidden) = match &entity.r#type {
+            TextEntityType::Url => (shown, false),
+            TextEntityType::TextUrl(t) => (t.url.as_str(), true),
             _ => continue,
         };
-        if let Some(url) = web_url(&url) {
-            out.push((url, start..end));
+        if let Some(url) = web_url(url) {
+            let disguise = (hidden && !same_place(shown, &url)).then(|| one_line(shown));
+            out.push((Link { url, disguise }, start..end));
         }
     }
     out
+}
+
+/// Whether link text spells out the URL it leads to, give or take the
+/// scheme, `www.`, a trailing slash and case.
+fn same_place(shown: &str, url: &str) -> bool {
+    let bare = |s: &str| {
+        let s = s.trim().to_lowercase();
+        let s = s
+            .strip_prefix("https://")
+            .or(s.strip_prefix("http://"))
+            .unwrap_or(&s);
+        let s = s.strip_prefix("www.").unwrap_or(s);
+        s.trim_end_matches('/').to_string()
+    };
+    bare(shown) == bare(url)
 }
 
 /// Byte offset of a UTF-16 offset, clamped to the text.
@@ -374,6 +421,7 @@ fn byte_offset(text: &str, utf16: i32) -> usize {
 
 /// `example.com/x` becomes `https://example.com/x`; other schemes are dropped.
 fn web_url(url: &str) -> Option<String> {
+    let url = text::clean(url);
     let url = url.trim();
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("https://") || lower.starts_with("http://") {
@@ -452,6 +500,8 @@ pub struct ScrollAnchor {
 /// new stretch around it, and scrolling down then loads the newer ones.
 pub struct OpenChat {
     pub chat_id: i64,
+    /// The newest message a read receipt was sent for.
+    pub seen: i64,
     pub messages: BTreeMap<i64, Msg>,
     /// Message under the cursor. `None` means "the newest one, and follow new arrivals".
     pub selected: Option<i64>,
@@ -478,6 +528,7 @@ impl OpenChat {
     pub fn new(chat_id: i64) -> Self {
         Self {
             chat_id,
+            seen: 0,
             messages: BTreeMap::new(),
             selected: None,
             scroll: None,
@@ -549,7 +600,22 @@ impl OpenChat {
     }
 
     pub fn insert(&mut self, message: Message) {
-        self.messages.insert(message.id, message.into());
+        self.add_new(message.id, message.into());
+    }
+
+    /// Adds a message that just arrived. While following new messages,
+    /// only the newest [`MAX_FOLLOWED`] stay loaded (older ones load again on
+    /// scrolling up), so a busy or spammed group can't grow memory and the
+    /// layout done every frame without end.
+    fn add_new(&mut self, id: i64, msg: Msg) {
+        self.messages.insert(id, msg);
+        // Not mid-request: a page of older messages must still join up.
+        if self.selected.is_none() && self.loading.is_none() {
+            while self.messages.len() > MAX_FOLLOWED {
+                self.messages.pop_first();
+                self.all_loaded = false;
+            }
+        }
     }
 
     /// Adds a page of history, as (message id, message) pairs. A `Latest` or
@@ -771,7 +837,7 @@ mod tests {
             ],
         };
         let found = links(&text);
-        let urls: Vec<&str> = found.iter().map(|(u, _)| u.as_str()).collect();
+        let urls: Vec<&str> = found.iter().map(|(l, _)| l.url.as_str()).collect();
         assert_eq!(
             urls,
             [
@@ -786,6 +852,41 @@ mod tests {
         assert_eq!(
             shown,
             ["example.com/a", "docs", "https://x.dev", "https://x.dev"]
+        );
+    }
+
+    #[test]
+    fn links_hidden_behind_other_words_are_marked_and_bad_entities_skipped() {
+        let text_url = |offset, length, url: &str| types::TextEntity {
+            offset,
+            length,
+            r#type: TextEntityType::TextUrl(types::TextEntityTypeTextUrl { url: url.into() }),
+        };
+        let text = types::FormattedText {
+            text: "bank.com Example.com/ here".into(),
+            entities: vec![
+                text_url(0, 8, "https://evil.example"),
+                text_url(9, 12, "https://www.example.com"),
+                text_url(22, 4, "https://elsewhere.dev"),
+                // Broken: negative or past-the-end lengths.
+                text_url(5, -3, "https://a.b"),
+                text_url(30, 4, "https://c.d"),
+            ],
+        };
+        let found: Vec<Link> = links(&text).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(
+            found,
+            [
+                Link {
+                    url: "https://evil.example".into(),
+                    disguise: Some("bank.com".into()),
+                },
+                Link::from("https://www.example.com"),
+                Link {
+                    url: "https://elsewhere.dev".into(),
+                    disguise: Some("here".into()),
+                },
+            ]
         );
     }
 
@@ -883,6 +984,28 @@ mod tests {
 
     fn ids(open: &OpenChat) -> Vec<i64> {
         open.messages.keys().copied().collect()
+    }
+
+    #[test]
+    fn a_busy_chat_keeps_only_the_newest_messages_while_following_them() {
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page(0..10));
+        for (id, msg) in page(10..MAX_FOLLOWED as i64 + 50) {
+            open.add_new(id, msg);
+        }
+        assert_eq!(open.messages.len(), MAX_FOLLOWED);
+        assert_eq!(open.newest_id(), Some(MAX_FOLLOWED as i64 + 49));
+        assert!(
+            !open.all_loaded,
+            "the dropped ones load again on scrolling up"
+        );
+
+        // Reading further up, nothing goes.
+        open.selected = open.oldest_id();
+        for (id, msg) in page(5000..5010) {
+            open.add_new(id, msg);
+        }
+        assert_eq!(open.messages.len(), MAX_FOLLOWED + 10);
     }
 
     #[test]

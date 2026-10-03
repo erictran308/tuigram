@@ -367,7 +367,11 @@ fn layout(
         let (rows, inner) = bubble(msg, header, photo_size, &meta, &matches, max_text, colors);
         if let (Some(photo), Some((cols, photo_rows))) = (&msg.preview, photo_size) {
             // Rows are right-aligned for own messages, so measure from the right.
-            let bubble_x = if msg.outgoing { width - (inner + 2) } else { 0 };
+            let bubble_x = if msg.outgoing {
+                width.saturating_sub(inner + 2)
+            } else {
+                0
+            };
             photos.push(PhotoSlot {
                 line: bubble_start + header_rows,
                 x: (bubble_x + 1) as u16,

@@ -13,6 +13,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::json;
 use tdlib_rs::{enums, functions, types};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::SendError;
 
 use crate::config::{ApiKeys, Config};
 
@@ -132,15 +133,32 @@ fn log_to_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Events go to the app tagged with the client they came from, so it can
+/// drop late ones from a client it replaced after logging out.
+pub type Tagged = (i32, TgEvent);
+
+/// Sends events from one client's requests, tagged with its id.
+#[derive(Clone)]
+struct Events {
+    client_id: i32,
+    tx: UnboundedSender<Tagged>,
+}
+
+impl Events {
+    fn send(&self, event: TgEvent) -> Result<(), SendError<Tagged>> {
+        self.tx.send((self.client_id, event))
+    }
+}
+
 #[derive(Clone)]
 pub struct Tg {
     client_id: i32,
-    tx: UnboundedSender<TgEvent>,
+    tx: Events,
     config: Arc<Config>,
 }
 
 impl Tg {
-    pub async fn start(config: Config, tx: UnboundedSender<TgEvent>) -> Result<Self> {
+    pub async fn start(config: Config, tx: UnboundedSender<Tagged>) -> Result<Self> {
         log_to_file(&config.data_dir.join("tdlib.log"))?;
         let client_id = tdlib_rs::create_client();
 
@@ -150,8 +168,10 @@ impl Tg {
             let tx = tx.clone();
             move || {
                 loop {
-                    if let Some((update, _)) = tdlib_rs::receive()
-                        && tx.send(TgEvent::Update(Box::new(update))).is_err()
+                    if let Some((update, client_id)) = tdlib_rs::receive()
+                        && tx
+                            .send((client_id, TgEvent::Update(Box::new(update))))
+                            .is_err()
                     {
                         break;
                     }
@@ -166,9 +186,14 @@ impl Tg {
 
         Ok(Self {
             client_id,
-            tx,
+            tx: Events { client_id, tx },
             config: Arc::new(config),
         })
+    }
+
+    /// The client events must come from to count; see [`Tagged`].
+    pub fn client_id(&self) -> i32 {
+        self.client_id
     }
 
     pub fn set_tdlib_parameters(&self, keys: ApiKeys) {
@@ -469,6 +494,7 @@ impl Tg {
     /// `authorizationStateWaitTdlibParameters`.
     pub fn reopen(&mut self) {
         self.client_id = tdlib_rs::create_client();
+        self.tx.client_id = self.client_id;
         // A new client sends no updates until it gets its first request.
         self.spawn(functions::get_option("version".into(), self.client_id));
     }
