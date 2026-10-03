@@ -158,7 +158,10 @@ jobs:
         run: |
           bin=target/${{ matrix.target }}/release/tuigram$EXE
           "$bin" --version
-          "$bin" --help | grep -q "comes with tuigram's own API key"
+          # Captured first: with pipefail, grep -q closing the pipe early
+          # would count as a failure of the binary.
+          help=$("$bin" --help)
+          grep -q "comes with tuigram's own API key" <<< "$help"
 
       # Asset names have no version, so the README can link to
       # releases/latest/download/<name>.

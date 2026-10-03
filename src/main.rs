@@ -11,7 +11,7 @@ mod tg;
 mod theme;
 mod ui;
 
-use std::io::stdout;
+use std::io::{Write, stdout};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -27,13 +27,9 @@ async fn main() -> Result<()> {
     config::load_dotenv();
     match std::env::args().nth(1).as_deref() {
         None => {}
-        Some("-h" | "--help") => {
-            print_help()?;
-            return Ok(());
-        }
+        Some("-h" | "--help") => return print(&help()?),
         Some("-V" | "--version") => {
-            println!("tuigram {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
+            return print(&format!("tuigram {}\n", env!("CARGO_PKG_VERSION")));
         }
         Some(other) => anyhow::bail!("unknown argument {other:?}; see tuigram --help"),
     }
@@ -98,7 +94,16 @@ async fn main() -> Result<()> {
     result
 }
 
-fn print_help() -> Result<()> {
+/// Writes to stdout. A reader that stops early (`tuigram --help | head -1`,
+/// `grep -q`) is fine, where `println!` would panic on the closed pipe.
+fn print(text: &str) -> Result<()> {
+    match stdout().lock().write_all(text.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => Ok(result?),
+    }
+}
+
+fn help() -> Result<String> {
     // CI checks for this wording to make sure release binaries have the key.
     let keys = if config::built_in_keys().is_some() {
         "This build comes with tuigram's own API key, so you only need to log in.
@@ -109,7 +114,7 @@ API ID and hash, which you get once at https://my.telegram.org (API
 development tools). Or install the ready-made app, which has one:
   cargo binstall tuigram-cli"
     };
-    println!(
+    Ok(format!(
         "tuigram {version}
 Telegram in your terminal, with vim-style keys.
 
@@ -127,9 +132,9 @@ kept in:
 Environment:
   TG_DATA_DIR    keep them somewhere else
   TG_API_ID      your own API key, used before saved or built-in ones
-  TG_API_HASH",
+  TG_API_HASH
+",
         version = env!("CARGO_PKG_VERSION"),
         data = config::data_dir()?.display(),
-    );
-    Ok(())
+    ))
 }
