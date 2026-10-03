@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{self, Stdio};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -50,6 +50,7 @@ pub enum Screen {
 
 pub enum LoginStep {
     Connecting,
+    LoggingOut,
     /// First run without API credentials: ask for them, ID then hash.
     ApiId,
     ApiHash {
@@ -98,7 +99,10 @@ impl Login {
     pub fn takes_input(&self) -> bool {
         !matches!(
             self.step,
-            LoginStep::Connecting | LoginStep::OtherDevice { .. } | LoginStep::Unsupported(_)
+            LoginStep::Connecting
+                | LoginStep::LoggingOut
+                | LoginStep::OtherDevice { .. }
+                | LoginStep::Unsupported(_)
         )
     }
 }
@@ -200,26 +204,55 @@ pub struct SettingsMenu {
     pub saved: Theme,
 }
 
-/// What a `/` search looks through: chat titles or the open chat's messages.
+/// What the status bar prompt is for: a `/` search through chat titles or the
+/// open chat's messages, or a `:` command.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SearchTarget {
+pub enum PromptKind {
     Chats,
     Messages,
+    Command,
 }
 
-/// The `/` prompt in the status bar. Searching chats filters the list as you
-/// type; searching messages asks TDLib on Enter.
-pub struct SearchPrompt {
-    pub target: SearchTarget,
+/// The prompt in the status bar. Searching chats filters the list as you
+/// type; searching messages asks TDLib on Enter, and so does a command.
+pub struct Prompt {
+    pub kind: PromptKind,
     pub input: TextArea<'static>,
     /// The chat filter and cursor from before, which Esc puts back.
     previous_filter: String,
     previous_selected: Option<i64>,
 }
 
-impl SearchPrompt {
+impl Prompt {
     pub fn query(&self) -> String {
         self.input.lines().concat()
+    }
+}
+
+/// What `:` runs. There are no abbreviations: only the full name runs, so a
+/// typo can't log you out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    Logout,
+}
+
+impl Command {
+    pub const ALL: [Command; 1] = [Command::Logout];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Command::Logout => "logout",
+        }
+    }
+
+    pub fn about(self) -> &'static str {
+        match self {
+            Command::Logout => "Log out of Telegram on this computer",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Command> {
+        Command::ALL.into_iter().find(|c| c.name() == text)
     }
 }
 
@@ -259,7 +292,7 @@ pub struct App {
     env_keys: Option<ApiKeys>,
     pub settings_menu: Option<SettingsMenu>,
     /// Shown in the status bar while typing a `/` search.
-    pub prompt: Option<SearchPrompt>,
+    pub prompt: Option<Prompt>,
     pub chats_loading: bool,
     all_chats_loaded: bool,
     /// Last error, shown in the status bar until the next key press.
@@ -268,6 +301,9 @@ pub struct App {
     pending_g: bool,
     /// Set once quitting started; we exit at this time even if TDLib never answers.
     pub quit_deadline: Option<Instant>,
+    /// TDLib is logging out (`:logout`, the session ended elsewhere, or
+    /// leaving a QR login), and a new client takes over once it has closed.
+    relogin: bool,
     exit: bool,
 }
 
@@ -308,6 +344,7 @@ impl App {
             status: None,
             pending_g: false,
             quit_deadline: None,
+            relogin: false,
             exit: false,
         }
     }
@@ -608,7 +645,23 @@ impl App {
                 self.load_more_chats();
                 return;
             }
-            AuthorizationState::LoggingOut | AuthorizationState::Closing => return,
+            // Also when the session was ended from another device: back to
+            // the login screen instead of quitting.
+            AuthorizationState::LoggingOut => {
+                self.relogin = true;
+                if let Screen::Login(_) = self.screen {
+                    return;
+                }
+                LoginStep::LoggingOut
+            }
+            AuthorizationState::Closing => return,
+            AuthorizationState::Closed if self.relogin && self.quit_deadline.is_none() => {
+                self.relogin = false;
+                self.forget_session();
+                self.tg.reopen();
+                self.screen = login_screen(LoginStep::Connecting);
+                return;
+            }
             AuthorizationState::Closed => {
                 self.exit = true;
                 return;
@@ -646,6 +699,21 @@ impl App {
         let Screen::Login(login) = &mut self.screen else {
             return;
         };
+        match (&login.step, key.code) {
+            (LoginStep::Phone, KeyCode::Tab) if !login.busy => {
+                login.busy = true;
+                login.error = None;
+                self.tg.request_qr_code();
+                return;
+            }
+            (LoginStep::OtherDevice { .. }, KeyCode::Esc) => {
+                self.tg.log_out();
+                self.relogin = true;
+                self.screen = login_screen(LoginStep::Connecting);
+                return;
+            }
+            _ => {}
+        }
         if !login.takes_input() {
             return;
         }
@@ -692,6 +760,7 @@ impl App {
             LoginStep::Email => self.tg.send_email(value),
             LoginStep::EmailCode => self.tg.send_email_code(value),
             LoginStep::Connecting
+            | LoginStep::LoggingOut
             | LoginStep::ApiId
             | LoginStep::ApiHash { .. }
             | LoginStep::OtherDevice { .. }
@@ -761,8 +830,9 @@ impl App {
                     saved,
                 });
             }
-            (Focus::Chats, KeyCode::Char('/')) => self.open_prompt(SearchTarget::Chats),
-            (Focus::Messages, KeyCode::Char('/')) => self.open_prompt(SearchTarget::Messages),
+            (_, KeyCode::Char(':')) => self.open_prompt(PromptKind::Command),
+            (Focus::Chats, KeyCode::Char('/')) => self.open_prompt(PromptKind::Chats),
+            (Focus::Messages, KeyCode::Char('/')) => self.open_prompt(PromptKind::Messages),
             (Focus::Messages, KeyCode::Char('n')) => self.next_match(1),
             (Focus::Messages, KeyCode::Char('N')) => self.next_match(-1),
             // Esc ends a search, then a reply, before it leaves the pane.
@@ -835,19 +905,19 @@ impl App {
         self.jump_to_newest();
     }
 
-    fn open_prompt(&mut self, target: SearchTarget) {
+    fn open_prompt(&mut self, kind: PromptKind) {
         let mut input = TextArea::default();
         input.set_cursor_line_style(Style::default());
         input.set_cursor_style(Style::default().reversed());
-        self.prompt = Some(SearchPrompt {
-            target,
+        self.prompt = Some(Prompt {
+            kind,
             input,
             previous_filter: self.chats.filter().to_string(),
             previous_selected: self.selected,
         });
     }
 
-    /// The `/` prompt takes all keys while it's up.
+    /// The prompt takes all keys while it's up.
     fn on_prompt_key(&mut self, key: KeyEvent, ctrl: bool) {
         let Some(prompt) = self.prompt.as_mut() else {
             return;
@@ -872,7 +942,7 @@ impl App {
         let Some(prompt) = self.prompt.as_ref() else {
             return;
         };
-        if prompt.target == SearchTarget::Chats {
+        if prompt.kind == PromptKind::Chats {
             self.chats.set_filter(prompt.query().trim());
             self.chats.refresh();
             self.selected = self.chats.ids().first().copied();
@@ -885,8 +955,8 @@ impl App {
             return;
         };
         let query = prompt.query().trim().to_string();
-        match prompt.target {
-            SearchTarget::Chats => {
+        match prompt.kind {
+            PromptKind::Chats => {
                 if submit && (query.is_empty() || !self.chats.ids().is_empty()) {
                     return;
                 }
@@ -896,14 +966,49 @@ impl App {
                 self.chats.set_filter(&prompt.previous_filter);
                 self.selected = prompt.previous_selected;
             }
-            SearchTarget::Messages => {
+            PromptKind::Messages => {
                 let Some(open) = self.open.as_mut().filter(|_| submit && !query.is_empty()) else {
                     return;
                 };
                 open.search = Some(MessageSearch::new(query));
                 self.go_to_match(0);
             }
+            PromptKind::Command if !submit || query.is_empty() => {}
+            PromptKind::Command => match Command::parse(&query) {
+                Some(Command::Logout) => self.log_out(),
+                None => self.status = Some(format!("Not a command: {query}")),
+            },
         }
+    }
+
+    /// `:logout`: ends the session on Telegram's side and deletes what TDLib
+    /// keeps on this computer. The login screen comes back once TDLib closes.
+    fn log_out(&mut self) {
+        self.tg.log_out();
+        self.relogin = true;
+        self.screen = login_screen(LoginStep::LoggingOut);
+    }
+
+    /// Drops everything from the old session before a new client starts, so
+    /// nothing from it shows up after logging in again, maybe as someone else.
+    fn forget_session(&mut self) {
+        self.chats = Chats::default();
+        self.chats.set_highlighted(&self.settings.highlighted_chats);
+        self.users.clear();
+        self.selected = None;
+        self.open = None;
+        self.focus = Focus::Chats;
+        self.composer = new_composer();
+        self.images.forget_files();
+        self.opening.clear();
+        self.copying.clear();
+        self.menu = None;
+        self.delete_menu = None;
+        self.settings_menu = None;
+        self.prompt = None;
+        self.chats_loading = false;
+        self.all_chats_loaded = false;
+        self.pending_g = false;
     }
 
     /// `n` (`step` 1) goes to the next older match, `N` (-1) to the next newer.
@@ -1446,15 +1551,15 @@ impl App {
 /// with `-` can be mistaken for an option.
 fn open_externally(target: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
-    let mut command = Command::new("open");
+    let mut command = process::Command::new("open");
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut c = Command::new("cmd");
+        let mut c = process::Command::new("cmd");
         c.args(["/C", "start", ""]);
         c
     };
     #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = Command::new("xdg-open");
+    let mut command = process::Command::new("xdg-open");
 
     // Keep the opener's output off the TUI, and reap it when it exits.
     let mut child = command

@@ -54,6 +54,7 @@ impl Theme {
             error: p.red,
             warning: p.yellow,
             search: p.yellow,
+            command: p.mauve,
             reply: p.teal,
             success: p.green,
             own_bubble: mix(p.base, p.blue, tint),
@@ -62,6 +63,10 @@ impl Theme {
             other_meta: p.subtext0,
             // Telegram's seven name colors, in Catppuccin's shades.
             names: [p.red, p.peach, p.mauve, p.green, p.teal, p.blue, p.pink],
+            // Dark on light in every flavor: not every scanner reads an
+            // inverted code.
+            qr_dark: MOCHA.mantle,
+            qr_light: LATTE.base,
         }
     }
 }
@@ -92,6 +97,8 @@ pub struct Colors {
     pub warning: Color,
     /// Behind text matching a `/` search, and the SEARCH label.
     pub search: Color,
+    /// The COMMAND label.
+    pub command: Color,
     /// The reply bar over the composer, and the marker on the message it answers.
     pub reply: Color,
     /// Toasts saying something worked.
@@ -103,6 +110,9 @@ pub struct Colors {
     pub other_meta: Color,
     /// Sender names in groups, picked by sender id.
     pub names: [Color; 7],
+    /// The QR code on the login screen.
+    pub qr_dark: Color,
+    pub qr_light: Color,
 }
 
 /// The part of a Catppuccin palette the UI uses.

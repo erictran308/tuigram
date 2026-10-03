@@ -22,7 +22,7 @@ cargo install tuigram-cli
 
 ## Why tuigram
 
-- **Your real account, not a bot.** Log in with your phone number, the code Telegram sends, and your two-step password, just like the official apps.
+- **Your real account, not a bot.** Log in by scanning a QR code with Telegram on your phone, or with your phone number and the code Telegram sends, plus your two-step password if you have one, just like the official apps.
 - **Vim all the way.** Normal mode to move around (`j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u`), `i` to write, `Esc` to stop. Your hands never leave the keyboard.
 - **Photos and stickers, inline.** Real images in kitty, Ghostty, WezTerm and iTerm2, and block-character previews in any other terminal.
 - **Search everything.** `/` in the chat list filters chats as you type. `/` inside a chat searches its entire history, and `n`/`N` jump between matches, highlighted where they appear.
@@ -49,7 +49,7 @@ Works on Linux, macOS and Windows, on x86_64 and ARM64.
 tuigram
 ```
 
-Paste your `api_id` and `api_hash` when asked, then log in. That's it: next time, `tuigram` takes you straight to your chats.
+Paste your `api_id` and `api_hash` when asked, then log in: type your phone number, or press Tab to scan a QR code instead. That's it: next time, `tuigram` takes you straight to your chats.
 
 > **Why your own keys?** tuigram doesn't ship shared credentials. A key published in public source code can be abused and then blocked by Telegram for everyone who uses it. Your own key means your access never depends on anyone else's.
 

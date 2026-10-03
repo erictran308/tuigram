@@ -156,6 +156,15 @@ impl Images {
         self.ready.clear();
     }
 
+    /// Forgets every file, for a new TDLib client: it numbers files afresh.
+    pub fn forget_files(&mut self) {
+        self.ready.clear();
+        self.building.clear();
+        self.failed.clear();
+        self.files.clear();
+        self.wanted.clear();
+    }
+
     /// Decodes and encodes on a blocking thread, once per key.
     fn build(
         &mut self,

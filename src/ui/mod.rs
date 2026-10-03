@@ -8,8 +8,8 @@ use unicode_width::UnicodeWidthStr;
 use ratatui_textarea::TextArea;
 
 use crate::app::{
-    App, DeleteMenu, Focus, HelpTab, Login, LoginStep, MenuAction, PickMenu, Screen, SearchTarget,
-    SettingsMenu, Target, Toast,
+    App, Command, DeleteMenu, Focus, HelpTab, Login, LoginStep, MenuAction, PickMenu, PromptKind,
+    Screen, SettingsMenu, Target, Toast,
 };
 use crate::messages::{OpenChat, Replied};
 use crate::search;
@@ -22,6 +22,7 @@ const REPLY_BAR_ROWS: u16 = 2;
 
 mod help;
 mod messages;
+mod qr;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let colors = app.settings.theme.colors();
@@ -84,6 +85,12 @@ fn border(focused: bool, colors: &Colors) -> Style {
 }
 
 fn draw_login(frame: &mut Frame, login: &Login, colors: &Colors) {
+    if let LoginStep::OtherDevice { link } = &login.step
+        && let Some(code) = qr::lines(link, colors)
+    {
+        draw_qr_login(frame, login, code, colors);
+        return;
+    }
     let area = center(frame.area(), 64, 12);
     let block = Block::bordered()
         .title(" Log in ")
@@ -103,6 +110,10 @@ fn draw_login(frame: &mut Frame, login: &Login, colors: &Colors) {
 
     let (title, text) = match &login.step {
         LoginStep::Connecting => ("Connecting…".to_string(), String::new()),
+        LoginStep::LoggingOut => (
+            "Logging out…".to_string(),
+            "Then you can log in again, as yourself or someone else.".into(),
+        ),
         LoginStep::ApiId => (
             "Telegram API ID".into(),
             "Telegram gives every app its own API ID and hash. Get yours once at \
@@ -115,7 +126,9 @@ fn draw_login(frame: &mut Frame, login: &Login, colors: &Colors) {
         ),
         LoginStep::Phone => (
             "Phone number".into(),
-            "Include the country code, e.g. +1 415 555 0123".into(),
+            "Include the country code, e.g. +1 415 555 0123. Or press Tab to log in \
+             by scanning a QR code with Telegram on your phone."
+                .into(),
         ),
         LoginStep::Code { sent_via } => (
             "Login code".into(),
@@ -157,14 +170,66 @@ fn draw_login(frame: &mut Frame, login: &Login, colors: &Colors) {
     if let Some(message) = &login.error {
         frame.render_widget(Line::from(message.as_str()).fg(colors.error), error);
     }
-    let hint = if login.busy {
-        "Sending…"
-    } else if login.takes_input() {
-        "Enter submit · Ctrl-c quit"
-    } else {
-        "Ctrl-c quit"
+    let hint = match login.step {
+        _ if login.busy => "Sending…",
+        LoginStep::Phone => "Enter submit · Tab QR code · Ctrl-c quit",
+        LoginStep::OtherDevice { .. } => QR_KEYS,
+        _ if login.takes_input() => "Enter submit · Ctrl-c quit",
+        _ => "Ctrl-c quit",
     };
     frame.render_widget(Line::from(hint).fg(colors.muted).right_aligned(), footer);
+}
+
+const QR_KEYS: &str = "Esc use phone number · Ctrl-c quit";
+
+/// A compact login box for the QR code, which is most of it: the code needs
+/// about 20 rows, and this fits it in an 80×24 terminal.
+fn draw_qr_login(frame: &mut Frame, login: &Login, code: Vec<Line<'static>>, colors: &Colors) {
+    // Borders and one column of margin on each side; borders, help and keys.
+    let width = (code[0].width() as u16 + 4).max(64);
+    let height = code.len() as u16 + 5;
+    let screen = frame.area();
+    let fits = width <= screen.width && height <= screen.height;
+    let area = if fits {
+        center(screen, width, height)
+    } else {
+        center(screen, 64, 7)
+    };
+    let block = Block::bordered()
+        .title(" Scan the QR code ")
+        .title_alignment(Alignment::Center)
+        .border_style(Style::new().fg(colors.accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [help, body, footer] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner.inner(ratatui::layout::Margin::new(1, 0)));
+    let text = if fits {
+        "In Telegram on your phone: Settings → Devices → Link Desktop Device, then point \
+         the camera at this code."
+            .into()
+    } else {
+        format!("Make the terminal at least {width} columns by {height} rows to show the QR code.")
+    };
+    frame.render_widget(
+        Paragraph::new(text)
+            .fg(colors.subtle)
+            .wrap(Wrap { trim: true }),
+        help,
+    );
+    if fits {
+        frame.render_widget(Paragraph::new(code).centered(), body);
+    }
+    // No room for an error line: an error takes the keys' place.
+    let footer_line = match &login.error {
+        Some(message) => Line::from(message.as_str()).fg(colors.error),
+        None => Line::from(QR_KEYS).fg(colors.muted).right_aligned(),
+    };
+    frame.render_widget(footer_line, footer);
 }
 
 fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
@@ -215,6 +280,13 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         ),
     }
     draw_status(frame, app, status, colors);
+    if let Some(prompt) = app
+        .prompt
+        .as_ref()
+        .filter(|p| p.kind == PromptKind::Command)
+    {
+        draw_commands(frame, body, &prompt.query(), colors);
+    }
     if let Some(menu) = &app.menu {
         draw_menu(frame, chat_area, menu, colors);
     }
@@ -606,27 +678,88 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     let Some(prompt) = &app.prompt else {
         return;
     };
-    let hints = match prompt.target {
-        SearchTarget::Chats => "  Enter done · Esc cancel ",
-        SearchTarget::Messages => "  Enter search · Esc cancel ",
+    let (label, color, prefix, hints) = match prompt.kind {
+        PromptKind::Chats => (
+            " SEARCH ",
+            colors.search,
+            " /",
+            "  Enter done · Esc cancel ",
+        ),
+        PromptKind::Messages => (
+            " SEARCH ",
+            colors.search,
+            " /",
+            "  Enter search · Esc cancel ",
+        ),
+        PromptKind::Command => (
+            " COMMAND ",
+            colors.command,
+            " :",
+            "  Enter run · Esc cancel ",
+        ),
     };
     let [mode, slash, input, keys] = Layout::horizontal([
-        Constraint::Length(8),
+        Constraint::Length(label.width() as u16),
         Constraint::Length(2),
         Constraint::Fill(1),
         Constraint::Length(hints.width() as u16),
     ])
     .areas(area);
-    frame.render_widget(
-        Span::from(" SEARCH ")
-            .fg(colors.bg)
-            .bg(colors.search)
-            .bold(),
-        mode,
-    );
-    frame.render_widget(Span::from(" /"), slash);
+    frame.render_widget(Span::from(label).fg(colors.bg).bg(color).bold(), mode);
+    frame.render_widget(Span::from(prefix), slash);
     frame.render_widget(&prompt.input, input);
     frame.render_widget(Line::from(hints).fg(colors.muted).right_aligned(), keys);
+}
+
+/// Every `:` command, over the bottom left corner while typing one. Names
+/// starting with what's typed so far stand out.
+fn draw_commands(frame: &mut Frame, area: Rect, typed: &str, colors: &Colors) {
+    let typed = typed.trim();
+    let name_width = Command::ALL
+        .iter()
+        .map(|c| c.name().len())
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<Line> = Command::ALL
+        .iter()
+        .map(|command| {
+            let name = command.name();
+            let padding = " ".repeat(name_width - name.len());
+            if !name.starts_with(typed) {
+                return Line::from(format!(" {name}{padding}  {}", command.about()))
+                    .fg(colors.muted);
+            }
+            let mut spans = vec![Span::from(" ")];
+            if !typed.is_empty() {
+                spans.push(Span::styled(typed.to_string(), match_style(colors)));
+            }
+            spans.push(Span::from(format!("{}{padding}", &name[typed.len()..])).fg(colors.primary));
+            spans.push(Span::from(format!("  {}", command.about())).fg(colors.subtle));
+            Line::from(spans)
+        })
+        .collect();
+    let title = " Commands · type the full name ";
+    let longest = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .max(title.width());
+    let width = (longest as u16 + 3).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x,
+        y: area.bottom().saturating_sub(height),
+        width,
+        height,
+    };
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::new().fg(colors.accent))
+        .style(Style::new().bg(colors.popup_bg));
+    // Clear first: the popup must cover text and photos underneath.
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// Hints for keys that depend on the cursor: `gd` on a reply, and Ctrl-o
@@ -670,7 +803,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Chats => (
             normal,
-            "  j/k move · Enter open · i write · / search · H highlight · gg/G top/bottom · Ctrl-d/u half page · ? help · q quit",
+            "  j/k move · Enter open · i write · / search · H highlight · gg/G top/bottom · Ctrl-d/u half page · : commands · ? help · q quit",
         ),
         Focus::Messages if searching => (
             normal,
@@ -682,7 +815,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages => (
             normal,
-            "  j/k newer/older · y copy · r reply · d delete · Enter open media · i write · / search · gg/G oldest/newest · h back · ? help · q quit",
+            "  j/k newer/older · y copy · r reply · d delete · Enter open media · i write · / search · gg/G oldest/newest · h back · : commands · ? help · q quit",
         ),
         Focus::Input if replying => (
             insert,
@@ -1028,6 +1161,120 @@ mod tests {
         assert!(text.contains("Telegram API ID"));
         assert!(text.contains("my.telegram.org"), "says where to get it");
         assert!(text.contains("paste api_id"), "help text isn't cut off");
+    }
+
+    fn draw_login_rows(step: LoginStep, width: u16, height: u16) -> Vec<String> {
+        let colors = Theme::Mocha.colors();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| draw_login(f, &Login::new(step), &colors))
+            .unwrap();
+        buffer_rows(terminal.backend().buffer())
+    }
+
+    const LOGIN_LINK: &str = "tg://login?token=AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA";
+
+    #[test]
+    fn the_phone_step_offers_qr_login_on_tab() {
+        let rows = draw_login_rows(LoginStep::Phone, 80, 24).concat();
+        assert!(
+            rows.contains("scanning a QR code"),
+            "help text isn't cut off"
+        );
+        assert!(rows.contains("Tab QR code"));
+    }
+
+    #[test]
+    fn qr_login_fits_the_code_and_where_to_scan_it_in_80_by_24() {
+        let colors = Theme::Mocha.colors();
+        let link = LOGIN_LINK.to_string();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| draw_login(f, &Login::new(LoginStep::OtherDevice { link }), &colors))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows = buffer_rows(buf);
+        let row = |needle: &str| rows.iter().any(|r| r.contains(needle));
+        assert!(row("Link Desktop"));
+        assert!(
+            row("point the camera at this code"),
+            "help text isn't cut off"
+        );
+        assert!(row("Esc use phone number"));
+
+        let code = qr::lines(LOGIN_LINK, &colors).unwrap();
+        let drawn: Vec<u16> = (0..buf.area.height)
+            .filter(|&y| rows[y as usize].contains(['█', '▀', '▄']))
+            .collect();
+        // The first and last rows are all margin.
+        assert_eq!(drawn.len(), code.len() - 2, "no row is cut off");
+        let light = (0..buf.area.width)
+            .filter(|&x| buf[(x, drawn[0])].bg == colors.qr_light)
+            .count();
+        assert_eq!(
+            light,
+            code[0].width(),
+            "only the code and its margin are light"
+        );
+    }
+
+    #[test]
+    fn a_terminal_too_small_for_the_qr_code_says_how_big_it_needs_to_be() {
+        let link = LOGIN_LINK.to_string();
+        let rows = draw_login_rows(LoginStep::OtherDevice { link }, 80, 20);
+        let text = rows.concat();
+        assert!(!text.contains('█'), "no cut-off code");
+        assert!(text.contains("Make the terminal at least"));
+        assert!(text.contains("QR code."), "help text isn't cut off");
+    }
+
+    /// The column where `needle` starts in a buffer row; every cell there is
+    /// one character.
+    fn column(row: &str, needle: &str) -> u16 {
+        row[..row.find(needle).unwrap()].chars().count() as u16
+    }
+
+    #[test]
+    fn commands_run_only_by_their_full_name() {
+        assert_eq!(Command::parse("logout"), Some(Command::Logout));
+        for typo in ["", "l", "log", "logou", "logout!", "Logout", " logout"] {
+            assert_eq!(Command::parse(typo), None, "{typo:?}");
+        }
+    }
+
+    #[test]
+    fn the_command_list_shows_every_command_and_marks_what_is_typed() {
+        let colors = Theme::Mocha.colors();
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal
+            .draw(|f| draw_commands(f, f.area(), "lo", &colors))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows = buffer_rows(buf);
+        assert!(rows.iter().any(|r| r.contains("type the full name")));
+        for command in Command::ALL {
+            let y = rows
+                .iter()
+                .position(|r| r.contains(command.about()))
+                .unwrap();
+            assert!(
+                rows[y].contains(command.name()),
+                "name and about on one row"
+            );
+        }
+        let y = rows.iter().position(|r| r.contains("logout")).unwrap() as u16;
+        let x = column(&rows[y as usize], "logout");
+        assert_eq!(buf[(x, y)].bg, colors.search, "typed part marked");
+        assert_eq!(buf[(x + 2, y)].fg, colors.primary, "rest of the name not");
+
+        terminal
+            .draw(|f| draw_commands(f, f.area(), "x", &colors))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows = buffer_rows(buf);
+        let y = rows.iter().position(|r| r.contains("logout")).unwrap() as u16;
+        let x = column(&rows[y as usize], "logout");
+        assert_eq!(buf[(x, y)].fg, colors.muted, "still listed, dimmed");
     }
 
     #[test]

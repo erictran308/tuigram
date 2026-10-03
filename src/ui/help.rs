@@ -15,6 +15,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         "Everywhere",
         &[
             ("?", "This help, and settings"),
+            (":", "Type a command, like logout"),
             ("H", "Highlight or unhighlight the selected chat"),
             ("q", "Quit (press again to stop waiting)"),
             ("Ctrl-c", "Quit, except while writing"),
@@ -60,9 +61,9 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
-        "Search prompt",
+        "Search and command prompts",
         &[
-            ("Enter", "Search, or keep the chat filter"),
+            ("Enter", "Search, keep the chat filter, or run the command"),
             ("Esc / Ctrl-c", "Cancel"),
         ],
     ),

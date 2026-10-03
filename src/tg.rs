@@ -223,6 +223,16 @@ impl Tg {
         ));
     }
 
+    /// Asks for a link to show as a QR code. TDLib answers with
+    /// `authorizationStateWaitOtherDeviceConfirmation`, and again with a new
+    /// link whenever the old one expires.
+    pub fn request_qr_code(&self) {
+        self.spawn(functions::request_qr_code_authentication(
+            Vec::new(),
+            self.client_id,
+        ));
+    }
+
     pub fn send_email_code(&self, code: String) {
         self.spawn(functions::check_authentication_email_code(
             enums::EmailAddressAuthentication::Code(types::EmailAddressAuthenticationCode { code }),
@@ -445,6 +455,22 @@ impl Tg {
     /// Flushes TDLib's database and ends with `authorizationStateClosed`.
     pub fn close(&self) {
         self.spawn(functions::close(self.client_id));
+    }
+
+    /// Ends the session and deletes TDLib's database, ending with
+    /// `authorizationStateClosed`. Before login finishes, it's the only way out
+    /// of a QR login: TDLib takes no phone number in that state, and keeps the
+    /// state across restarts.
+    pub fn log_out(&self) {
+        self.spawn(functions::log_out(self.client_id));
+    }
+
+    /// Replaces a closed client with a new one, which starts over at
+    /// `authorizationStateWaitTdlibParameters`.
+    pub fn reopen(&mut self) {
+        self.client_id = tdlib_rs::create_client();
+        // A new client sends no updates until it gets its first request.
+        self.spawn(functions::get_option("version".into(), self.client_id));
     }
 
     fn spawn<T: Send + 'static>(
