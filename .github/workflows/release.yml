@@ -209,6 +209,25 @@ jobs:
         working-directory: dist
         run: sha256sum tuigram-* > SHA256SUMS
 
+      # The notes are the tag's message (git tag -a vX.Y.Z -F notes.md), and
+      # GitHub adds a link to the full list of changes after them. A tag
+      # without a message just gets the link.
+      - name: Release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+            --jq '.object.type + " " + .object.sha')
+          touch notes.md
+          if [ "${ref%% *}" = tag ]; then
+            gh api "repos/$GITHUB_REPOSITORY/git/tags/${ref#* }" --jq .message > notes.md
+          fi
+          # `git tag -a vX.Y.Z -m vX.Y.Z` has only the version for a message.
+          if [ "$(tr -d '[:space:]' < notes.md)" = "$GITHUB_REF_NAME" ]; then
+            : > notes.md
+          fi
+          cat notes.md
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -216,4 +235,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/*
           --repo "$GITHUB_REPOSITORY"
           --title "$GITHUB_REF_NAME"
+          --notes-file notes.md
           --generate-notes
