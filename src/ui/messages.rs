@@ -646,6 +646,7 @@ mod tests {
             outgoing,
             date,
             text: text.into(),
+            source_text: text.into(),
             preview: None,
             file: None,
             links: Vec::new(),

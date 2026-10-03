@@ -1,5 +1,6 @@
 mod app;
 mod chats;
+mod clipboard;
 mod config;
 mod images;
 mod messages;
@@ -64,8 +65,10 @@ async fn main() -> Result<()> {
 
     let (image_tx, image_rx) = tokio::sync::mpsc::unbounded_channel();
     let images = images::Images::new(picker, image_tx);
-    let result = app::App::new(tg, images, settings, settings_path, env_keys)
-        .run(&mut terminal, rx, image_rx)
+    let (decoded_tx, decoded_rx) = tokio::sync::mpsc::unbounded_channel();
+    let clipboard = clipboard::Clipboard::new(decoded_tx);
+    let result = app::App::new(tg, images, clipboard, settings, settings_path, env_keys)
+        .run(&mut terminal, rx, image_rx, decoded_rx)
         .await;
 
     if enhanced {

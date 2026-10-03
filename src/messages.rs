@@ -135,6 +135,8 @@ pub struct Msg {
     pub date: i32,
     /// Message text; with a preview, just the caption (plus a video's length).
     pub text: String,
+    /// The text or caption as sent, without labels like "[File]". What `y` copies.
+    pub source_text: String,
     pub preview: Option<Preview>,
     /// The file Enter opens: the full photo, the video, the document…
     pub file: Option<MediaFile>,
@@ -200,10 +202,13 @@ impl Replied {
 pub struct MediaFile {
     pub id: i32,
     pub label: String,
+    /// A photo: copied as an image, not as a file.
+    pub photo: bool,
 }
 
 struct Body {
     text: String,
+    source_text: String,
     preview: Option<Preview>,
     file: Option<MediaFile>,
     links: Vec<String>,
@@ -214,12 +219,19 @@ fn body(content: &MessageContent) -> Body {
     use MessageContent as C;
     let mut body = Body {
         text: content_text(content),
+        source_text: String::new(),
         preview: None,
         file: None,
         links: Vec::new(),
         link_ranges: Vec::new(),
     };
-    let file = |id: i32, label: String| Some(MediaFile { id, label });
+    let file = |id: i32, label: String| {
+        Some(MediaFile {
+            id,
+            label,
+            photo: false,
+        })
+    };
     // The text or caption whose links count.
     let mut source = None;
     match content {
@@ -229,7 +241,11 @@ fn body(content: &MessageContent) -> Body {
             if body.preview.is_some() {
                 body.text = m.caption.text.clone();
             }
-            body.file = largest(&m.photo).and_then(|s| file(s.photo.id, "Photo".into()));
+            body.file = largest(&m.photo).map(|s| MediaFile {
+                id: s.photo.id,
+                label: "Photo".into(),
+                photo: true,
+            });
             source = Some(&m.caption);
         }
         C::MessageVideo(m) => {
@@ -278,6 +294,7 @@ fn body(content: &MessageContent) -> Body {
         _ => {}
     }
     if let Some(source) = source {
+        body.source_text = source.text.clone();
         let found = links(source);
         // The caption ends the shown text (after e.g. "[File] " or a video's
         // length), so its link ranges shift by whatever comes before it.
@@ -403,6 +420,7 @@ impl From<Message> for Msg {
             outgoing: message.is_outgoing,
             date: message.date,
             text: body.text,
+            source_text: body.source_text,
             preview: body.preview,
             file: body.file,
             links: body.links,
@@ -598,6 +616,7 @@ impl OpenChat {
         if let Some(msg) = self.messages.get_mut(&message_id) {
             let body = body(content);
             (msg.text, msg.preview, msg.file) = (body.text, body.preview, body.file);
+            msg.source_text = body.source_text;
             (msg.links, msg.link_ranges) = (body.links, body.link_ranges);
             if let Some(reply) = self.reply.as_mut().filter(|r| r.id == message_id) {
                 reply.snippet = msg.snippet();
@@ -835,6 +854,7 @@ mod tests {
         });
         let body = body(&content);
         assert_eq!(body.text, "[File: a.pdf] see x.dev");
+        assert_eq!(body.source_text, "see x.dev", "copies only the caption");
         let range = body.link_ranges[0].clone();
         assert_eq!(&body.text[range], "x.dev");
     }
@@ -848,6 +868,7 @@ mod tests {
                     outgoing: false,
                     date: 0,
                     text: format!("message {id}"),
+                    source_text: format!("message {id}"),
                     preview: None,
                     file: None,
                     links: Vec::new(),
@@ -931,6 +952,7 @@ mod tests {
         msg.file = Some(MediaFile {
             id: 3,
             label: "Photo".into(),
+            photo: true,
         });
         assert_eq!(msg.snippet(), "Photo", "a photo without a caption");
     }

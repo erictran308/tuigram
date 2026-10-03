@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Instant, sleep_until};
 
 use crate::chats::Chats;
+use crate::clipboard::{Clipboard, Copied, Decoded};
 use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
 use crate::messages::{MediaFile, OpenChat, Replied, SendState};
@@ -39,6 +40,8 @@ const LOAD_AHEAD: usize = 10;
 const HALF_PAGE: isize = 10;
 /// How long to wait for TDLib to flush its database on quit.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a toast stays up.
+const TOAST_TIME: Duration = Duration::from_secs(2);
 
 pub enum Screen {
     Login(Box<Login>),
@@ -100,10 +103,12 @@ impl Login {
     }
 }
 
-/// Something Enter can open from a message.
+/// Something in a message that Enter opens or `y` copies.
 pub enum Target {
     File(MediaFile),
     Link(String),
+    /// The whole text or caption; only copied.
+    Text(String),
 }
 
 impl Target {
@@ -111,14 +116,31 @@ impl Target {
         match self {
             Target::File(file) => &file.label,
             Target::Link(url) => url,
+            Target::Text(_) => "Whole message",
         }
     }
 }
 
-/// Menu for picking what to open when a message has several files/links.
-pub struct OpenMenu {
+/// What picking from a [`PickMenu`] does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    Open,
+    Copy,
+}
+
+/// Menu for picking what to open or copy when a message holds several things.
+pub struct PickMenu {
+    pub action: MenuAction,
     pub targets: Vec<Target>,
     pub selected: usize,
+}
+
+/// A note in the corner that something worked, gone after [`TOAST_TIME`].
+pub struct Toast {
+    pub title: String,
+    /// What it was about, e.g. what got copied.
+    pub detail: String,
+    pub until: Instant,
 }
 
 /// One way to delete a message.
@@ -161,9 +183,19 @@ impl DeleteMenu {
     }
 }
 
-/// The settings popup (`?`). Moving the cursor previews a theme; Esc puts the
-/// saved one back.
+/// The tabs of the `?` popup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelpTab {
+    Shortcuts,
+    Settings,
+}
+
+/// The `?` popup: every keyboard shortcut, and the settings. On the settings
+/// tab, moving the cursor previews a theme; Esc puts the saved one back.
 pub struct SettingsMenu {
+    pub tab: HelpTab,
+    /// First row shown on the shortcuts tab. Drawing keeps it in range.
+    pub scroll: usize,
     pub selected: usize,
     pub saved: Theme,
 }
@@ -214,8 +246,12 @@ pub struct App {
     pub images: Images,
     /// Files being downloaded to open in their default app when done.
     pub opening: HashSet<i32>,
-    /// Shown over everything when Enter finds several things to open.
-    pub menu: Option<OpenMenu>,
+    clipboard: Clipboard,
+    /// Files being downloaded to copy when done, by file id.
+    pub copying: HashMap<i32, MediaFile>,
+    pub toast: Option<Toast>,
+    /// Shown over everything when Enter or `y` finds several things.
+    pub menu: Option<PickMenu>,
     pub delete_menu: Option<DeleteMenu>,
     pub settings: Settings,
     settings_path: PathBuf,
@@ -239,6 +275,7 @@ impl App {
     pub fn new(
         tg: Tg,
         images: Images,
+        clipboard: Clipboard,
         settings: Settings,
         settings_path: PathBuf,
         env_keys: Option<ApiKeys>,
@@ -256,6 +293,9 @@ impl App {
             composer: new_composer(),
             images,
             opening: HashSet::new(),
+            clipboard,
+            copying: HashMap::new(),
+            toast: None,
             menu: None,
             delete_menu: None,
             settings,
@@ -277,9 +317,17 @@ impl App {
         terminal: &mut DefaultTerminal,
         mut events: UnboundedReceiver<TgEvent>,
         mut image_events: UnboundedReceiver<ImageEvent>,
+        mut decoded: UnboundedReceiver<Decoded>,
     ) -> Result<()> {
         let mut keys = EventStream::new();
         while !self.exit {
+            if self
+                .toast
+                .as_ref()
+                .is_some_and(|t| t.until <= Instant::now())
+            {
+                self.toast = None;
+            }
             self.chats.refresh();
             if self
                 .selected
@@ -297,6 +345,7 @@ impl App {
             }
 
             let deadline = self.quit_deadline;
+            let toast_until = self.toast.as_ref().map(|t| t.until);
             tokio::select! {
                 Some(event) = events.recv() => {
                     self.on_tg(event);
@@ -306,6 +355,7 @@ impl App {
                     }
                 }
                 Some(event) = image_events.recv() => self.images.on_built(event),
+                Some(decoded) = decoded.recv() => self.on_decoded(decoded),
                 Some(event) = keys.next() => match event? {
                     Event::Key(key) => self.on_key(key),
                     Event::Paste(text) if self.prompt.is_some() => {
@@ -320,6 +370,8 @@ impl App {
                     _ => {}
                 },
                 _ = sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => break,
+                // Wakes up to take the toast down.
+                _ = sleep_until(toast_until.unwrap_or_else(Instant::now)), if toast_until.is_some() => {}
                 else => break,
             }
         }
@@ -379,6 +431,12 @@ impl App {
                                 self.status = Some(format!("Couldn't open file: {e}"));
                             }
                         }
+                        None => self.status = Some("Download failed".into()),
+                    }
+                }
+                if let Some(file) = self.copying.remove(&file_id) {
+                    match &path {
+                        Some(path) => self.copy_downloaded(file, path),
                         None => self.status = Some("Download failed".into()),
                     }
                 }
@@ -575,7 +633,7 @@ impl App {
         self.status = None;
         match self.screen {
             Screen::Login(_) => self.on_login_key(key),
-            Screen::Main if self.settings_menu.is_some() => self.on_settings_key(key),
+            Screen::Main if self.settings_menu.is_some() => self.on_settings_key(key, ctrl),
             Screen::Main if self.delete_menu.is_some() => self.on_delete_key(key),
             Screen::Main if self.menu.is_some() => self.on_menu_key(key),
             Screen::Main if self.prompt.is_some() => self.on_prompt_key(key, ctrl),
@@ -697,6 +755,8 @@ impl App {
             (_, KeyCode::Char('?')) => {
                 let saved = self.settings.theme;
                 self.settings_menu = Some(SettingsMenu {
+                    tab: HelpTab::Shortcuts,
+                    scroll: 0,
                     selected: Theme::ALL.iter().position(|&t| t == saved).unwrap_or(0),
                     saved,
                 });
@@ -722,6 +782,7 @@ impl App {
                 }
             }
             (Focus::Messages, KeyCode::Char('r')) => self.reply_to_selected(),
+            (Focus::Messages, KeyCode::Char('y')) => self.copy_selected(),
             (Focus::Messages, KeyCode::Char('d')) if pending_g => self.go_to_replied(),
             (Focus::Messages, KeyCode::Char('d')) => self.open_delete_menu(),
             (Focus::Messages, KeyCode::Char('o')) if ctrl => self.jump_back(),
@@ -960,7 +1021,8 @@ impl App {
             0 => self.status = Some("Nothing to open in this message".into()),
             1 => self.open_target(targets.remove(0)),
             _ => {
-                self.menu = Some(OpenMenu {
+                self.menu = Some(PickMenu {
+                    action: MenuAction::Open,
                     targets,
                     selected: 0,
                 })
@@ -1108,7 +1170,88 @@ impl App {
                     self.status = Some(format!("Couldn't open link: {e}"));
                 }
             }
+            Target::Text(_) => {}
         }
+    }
+
+    /// `y`: copies what's in the message under the cursor, like Telegram's
+    /// Copy. With links or media as well as text, a menu asks which.
+    fn copy_selected(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let Some(msg) = open.cursor_id().and_then(|id| open.messages.get(&id)) else {
+            return;
+        };
+        let mut targets = Vec::new();
+        if !msg.source_text.is_empty() {
+            targets.push(Target::Text(msg.source_text.clone()));
+        }
+        targets.extend(msg.links.iter().cloned().map(Target::Link));
+        targets.extend(msg.file.clone().map(Target::File));
+        match targets.len() {
+            0 => self.status = Some("Nothing to copy in this message".into()),
+            1 => self.copy_target(targets.remove(0)),
+            _ => {
+                self.menu = Some(PickMenu {
+                    action: MenuAction::Copy,
+                    targets,
+                    selected: 0,
+                })
+            }
+        }
+    }
+
+    /// Text and links are copied at once. Media is downloaded first (TDLib
+    /// answers at once if it already is), then copied by `copy_downloaded`.
+    fn copy_target(&mut self, target: Target) {
+        let text = match target {
+            Target::Text(text) => text,
+            Target::Link(url) => url,
+            Target::File(file) => {
+                let id = file.id;
+                if self.copying.insert(id, file).is_none() {
+                    self.tg.download(id);
+                }
+                return;
+            }
+        };
+        match self.clipboard.copy_text(&text) {
+            Ok(Copied::System) => self.show_toast("Copied", &text),
+            Ok(Copied::Terminal) => self.show_toast("Sent to the terminal's clipboard", &text),
+            Err(e) => self.status = Some(format!("Couldn't copy: {e}")),
+        }
+    }
+
+    /// Photos are copied as images, after decoding off the UI thread; other
+    /// files as files, so pasting attaches them.
+    fn copy_downloaded(&mut self, file: MediaFile, path: &str) {
+        if file.photo {
+            self.clipboard.decode_image(path.to_string(), file.label);
+            return;
+        }
+        match self.clipboard.copy_file(Path::new(path)) {
+            Ok(()) => self.show_toast("Copied", &file.label),
+            Err(e) => self.status = Some(format!("Couldn't copy: {e}")),
+        }
+    }
+
+    fn on_decoded(&mut self, decoded: Decoded) {
+        let result = decoded
+            .image
+            .and_then(|image| self.clipboard.copy_image(image).map_err(|e| e.to_string()));
+        match result {
+            Ok(()) => self.show_toast("Copied", &decoded.label),
+            Err(e) => self.status = Some(format!("Couldn't copy: {e}")),
+        }
+    }
+
+    fn show_toast(&mut self, title: &str, detail: &str) {
+        self.toast = Some(Toast {
+            title: title.into(),
+            detail: detail.split_whitespace().collect::<Vec<_>>().join(" "),
+            until: Instant::now() + TOAST_TIME,
+        });
     }
 
     /// The open menu takes all keys while it's up.
@@ -1121,17 +1264,14 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => menu.selected = (menu.selected + 1).min(last),
             KeyCode::Char('k') | KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
             KeyCode::Enter | KeyCode::Char('l') => {
-                let target = menu.targets.swap_remove(menu.selected);
-                self.menu = None;
-                self.open_target(target);
+                let index = menu.selected;
+                self.pick(index);
             }
             // 1-9 pick an item directly.
             KeyCode::Char(c @ '1'..='9') => {
                 let index = c as usize - '1' as usize;
                 if index <= last {
-                    let target = menu.targets.swap_remove(index);
-                    self.menu = None;
-                    self.open_target(target);
+                    self.pick(index);
                 }
             }
             KeyCode::Esc | KeyCode::Char('q' | 'h') => self.menu = None,
@@ -1139,31 +1279,65 @@ impl App {
         }
     }
 
-    /// The settings popup takes all keys while it's up.
-    fn on_settings_key(&mut self, key: KeyEvent) {
+    /// Opens or copies item `index` of the menu, and closes it.
+    fn pick(&mut self, index: usize) {
+        let Some(mut menu) = self.menu.take() else {
+            return;
+        };
+        let target = menu.targets.swap_remove(index);
+        match menu.action {
+            MenuAction::Open => self.open_target(target),
+            MenuAction::Copy => self.copy_target(target),
+        }
+    }
+
+    /// The `?` popup takes all keys while it's up. Tab (or h/l) switches
+    /// between the shortcuts and the settings.
+    fn on_settings_key(&mut self, key: KeyEvent, ctrl: bool) {
         let Some(menu) = self.settings_menu.as_mut() else {
             return;
         };
-        let last = Theme::ALL.len() - 1;
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => menu.selected = (menu.selected + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
-            KeyCode::Enter | KeyCode::Char('l') => {
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('h' | 'l') => {
+                menu.tab = match menu.tab {
+                    HelpTab::Shortcuts => HelpTab::Settings,
+                    HelpTab::Settings => HelpTab::Shortcuts,
+                };
+                return;
+            }
+            KeyCode::Enter => {
                 self.settings_menu = None;
                 if let Err(e) = self.settings.save(&self.settings_path) {
                     self.status = Some(format!("Settings not saved: {e:#}"));
                 }
                 return;
             }
-            KeyCode::Esc | KeyCode::Char('q' | 'h' | '?') => {
+            KeyCode::Esc | KeyCode::Char('q' | '?') => {
                 self.settings.theme = menu.saved;
                 self.settings_menu = None;
                 return;
             }
-            _ => return,
+            _ => {}
         }
-        // Preview: the whole app redraws in the theme under the cursor.
-        self.settings.theme = Theme::ALL[menu.selected];
+        let delta = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => 1,
+            KeyCode::Char('k') | KeyCode::Up => -1,
+            KeyCode::Char('d') if ctrl => HALF_PAGE,
+            KeyCode::Char('u') if ctrl => -HALF_PAGE,
+            KeyCode::Char('g') => isize::MIN,
+            KeyCode::Char('G') => isize::MAX,
+            _ => return,
+        };
+        match menu.tab {
+            // Drawing stops it at the end of the list.
+            HelpTab::Shortcuts => menu.scroll = menu.scroll.saturating_add_signed(delta),
+            HelpTab::Settings => {
+                let last = Theme::ALL.len() - 1;
+                menu.selected = menu.selected.saturating_add_signed(delta).min(last);
+                // Preview: the whole app redraws in the theme under the cursor.
+                self.settings.theme = Theme::ALL[menu.selected];
+            }
+        }
     }
 
     fn load_older_messages(&mut self) {

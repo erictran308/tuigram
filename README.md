@@ -65,13 +65,14 @@ The status bar always shows the keys for where you are. The essentials:
 | `Enter` / `l` | Open a chat, or the file or link in a message |
 | `h` / `Esc` | Back to the chat list |
 | `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line |
+| `y` | Copy the selected message: its text, a link, or the photo or file |
 | `r` | Reply to the selected message (`Esc` twice cancels the reply) |
 | `gd` / `Ctrl-o` | Go to the message a reply answers / back to the reply |
 | `d` | Delete the selected message, for everyone or just you (asks first) |
 | `/` | Search chat names, or messages in the open chat |
 | `n` / `N` | Next older / newer match |
 | `H` | Highlight a chat |
-| `?` | Settings and themes |
+| `?` | Every shortcut, plus settings and themes |
 | `q` | Quit |
 
 ## Your data

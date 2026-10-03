@@ -2,13 +2,14 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use ratatui_textarea::TextArea;
 
 use crate::app::{
-    App, DeleteMenu, Focus, Login, LoginStep, OpenMenu, Screen, SearchTarget, SettingsMenu,
+    App, DeleteMenu, Focus, HelpTab, Login, LoginStep, MenuAction, PickMenu, Screen, SearchTarget,
+    SettingsMenu, Target, Toast,
 };
 use crate::messages::{OpenChat, Replied};
 use crate::search;
@@ -19,6 +20,7 @@ const MAX_COMPOSER_ROWS: usize = 6;
 /// The "Reply to …" bar at the top of the composer: who, then what they said.
 const REPLY_BAR_ROWS: u16 = 2;
 
+mod help;
 mod messages;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -219,9 +221,43 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     if let Some(menu) = &app.delete_menu {
         draw_delete(frame, chat_area, menu, colors);
     }
-    if let Some(menu) = &app.settings_menu {
+    if let Some(menu) = &mut app.settings_menu {
         draw_settings(frame, menu, colors);
     }
+    if let Some(toast) = &app.toast {
+        draw_toast(frame, toast, colors);
+    }
+}
+
+/// The toast: bottom right, just above the status bar.
+fn draw_toast(frame: &mut Frame, toast: &Toast, colors: &Colors) {
+    let area = frame.area();
+    let rows = if toast.detail.is_empty() { 1 } else { 2 };
+    let text = toast.title.width().max(toast.detail.width()) as u16;
+    let width = (text + 6).clamp(24, 50).min(area.width);
+    let height = (rows + 2).min(area.height.saturating_sub(1));
+    let rect = Rect {
+        x: area.right().saturating_sub(width + 1).max(area.x),
+        y: area.bottom().saturating_sub(height + 1),
+        width,
+        height,
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(colors.success))
+        .style(Style::new().bg(colors.popup_bg));
+    let inner_width = (block.inner(rect).width as usize).saturating_sub(3);
+    let mut lines = vec![Line::from(vec![
+        Span::from(" ✓ ").fg(colors.success).bold(),
+        Span::from(toast.title.clone()).bold(),
+    ])];
+    if !toast.detail.is_empty() {
+        lines.push(
+            Line::from(format!("   {}", truncate(&toast.detail, inner_width))).fg(colors.subtle),
+        );
+    }
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 /// The `d` popup over the message pane: the message, then how to delete it.
@@ -277,14 +313,40 @@ fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors
     );
 }
 
-/// The settings popup (`?`), centered on the screen. Only the theme for now.
-fn draw_settings(frame: &mut Frame, menu: &SettingsMenu, colors: &Colors) {
-    // Borders, the "Theme" heading, then one row per theme.
-    let popup = center(frame.area(), 44, Theme::ALL.len() as u16 + 3);
-    let block = popup_block(" Settings ", " Enter save · Esc cancel ", colors);
+/// The `?` popup, centered on the screen: a tab with every shortcut, and one
+/// with the settings (only the theme for now).
+fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, colors: &Colors) {
+    let area = frame.area();
+    // Both tabs get the same size, so the tabs don't move when switching.
+    let width = 72.min(area.width.saturating_sub(2));
+    let height = (help::height() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = center(area, width, height);
+    let tab = |label: &'static str, active: bool| {
+        if active {
+            Span::from(label).fg(colors.bg).bg(colors.accent).bold()
+        } else {
+            Span::from(label).fg(colors.muted)
+        }
+    };
+    let tabs = Line::from(vec![
+        Span::from(" "),
+        tab(" Shortcuts ", menu.tab == HelpTab::Shortcuts),
+        Span::from(" "),
+        tab(" Settings ", menu.tab == HelpTab::Settings),
+        Span::from(" "),
+    ]);
+    let keys = match menu.tab {
+        HelpTab::Shortcuts => " j/k scroll · Tab settings · Esc close ",
+        HelpTab::Settings => " j/k preview · Enter save · Tab shortcuts · Esc cancel ",
+    };
+    let block = popup_block(tabs, keys, colors);
     let inner = block.inner(popup);
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
+    if menu.tab == HelpTab::Shortcuts {
+        help::draw(frame, inner, &mut menu.scroll, colors);
+        return;
+    }
 
     let [heading, list] =
         Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
@@ -320,7 +382,7 @@ fn draw_settings(frame: &mut Frame, menu: &SettingsMenu, colors: &Colors) {
 
 /// A popup's frame: accent border and its own background, so it stands out
 /// from what's underneath. Callers draw `Clear` first.
-fn popup_block<'a>(title: &'a str, keys: &'a str, colors: &Colors) -> Block<'a> {
+fn popup_block<'a>(title: impl Into<Line<'a>>, keys: &'a str, colors: &Colors) -> Block<'a> {
     Block::bordered()
         .title(title)
         .title_bottom(Line::from(keys).fg(colors.muted).right_aligned())
@@ -328,12 +390,16 @@ fn popup_block<'a>(title: &'a str, keys: &'a str, colors: &Colors) -> Block<'a> 
         .style(Style::new().bg(colors.popup_bg))
 }
 
-/// The "what to open" popup, centered over the message pane.
-fn draw_menu(frame: &mut Frame, area: Rect, menu: &OpenMenu, colors: &Colors) {
+/// The "what to open" or "what to copy" popup, centered over the message pane.
+fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
     let longest = menu
         .targets
         .iter()
-        .map(|t| t.label().width())
+        .map(|t| match t {
+            // The label, then how the message starts.
+            Target::Text(text) => t.label().width() + 2 + one_line(text).width(),
+            _ => t.label().width(),
+        })
         .max()
         .unwrap_or(0);
     // Room for borders, the bar and the "1 " shortcut, within the pane.
@@ -341,7 +407,10 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &OpenMenu, colors: &Colors) {
         .min(area.width.saturating_sub(4))
         .max(36.min(area.width));
     let popup = center(area, width, menu.targets.len() as u16 + 2);
-    let block = popup_block(" Open ", " Enter open · 1-9 pick · Esc close ", colors);
+    let block = match menu.action {
+        MenuAction::Open => popup_block(" Open ", " Enter open · 1-9 pick · Esc close ", colors),
+        MenuAction::Copy => popup_block(" Copy ", " Enter copy · 1-9 pick · Esc close ", colors),
+    };
     let text_width = (block.inner(popup).width as usize).saturating_sub(3);
 
     let items: Vec<ListItem> = menu
@@ -359,11 +428,20 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &OpenMenu, colors: &Colors) {
             } else {
                 "  ".into()
             };
-            ListItem::new(Line::from(vec![
+            let label = target.label();
+            let mut line = vec![
                 bar,
                 Span::from(shortcut).fg(colors.muted),
-                Span::from(truncate(target.label(), text_width)),
-            ]))
+                Span::from(truncate(label, text_width)),
+            ];
+            // The whole message is easier to recognize by how it starts.
+            if let Target::Text(text) = target {
+                let room = text_width.saturating_sub(label.width() + 2);
+                line.push(
+                    Span::from(format!("  {}", truncate(&one_line(text), room))).fg(colors.subtle),
+                );
+            }
+            ListItem::new(Line::from(line))
         })
         .collect();
     let list = List::new(items)
@@ -578,9 +656,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     let replying = app.open.as_ref().is_some_and(|o| o.reply.is_some());
     let insert = Span::from(" INSERT ").fg(colors.bg).bg(colors.insert);
     let (mode, hints) = match app.focus {
-        _ if app.settings_menu.is_some() => {
-            (normal, "  j/k preview theme · Enter save · Esc cancel")
+        _ if app.settings_menu.as_ref().map(|m| m.tab) == Some(HelpTab::Shortcuts) => {
+            (normal, "  j/k scroll · Tab settings · Esc close")
         }
+        _ if app.settings_menu.is_some() => (
+            normal,
+            "  j/k preview theme · Enter save · Tab shortcuts · Esc cancel",
+        ),
         _ if app.delete_menu.is_some() => (normal, "  j/k choose · Enter delete · Esc cancel"),
         Focus::Chats if !app.chats.filter().is_empty() => (
             normal,
@@ -588,7 +670,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Chats => (
             normal,
-            "  j/k move · Enter open · i write · / search · H highlight · gg/G top/bottom · Ctrl-d/u half page · ? settings · q quit",
+            "  j/k move · Enter open · i write · / search · H highlight · gg/G top/bottom · Ctrl-d/u half page · ? help · q quit",
         ),
         Focus::Messages if searching => (
             normal,
@@ -600,7 +682,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages => (
             normal,
-            "  j/k newer/older · r reply · d delete · Enter open media · i write · / search · gg/G oldest/newest · Ctrl-d/u half page · h back · ? settings · q quit",
+            "  j/k newer/older · y copy · r reply · d delete · Enter open media · i write · / search · gg/G oldest/newest · h back · ? help · q quit",
         ),
         Focus::Input if replying => (
             insert,
@@ -633,6 +715,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         spans.push(Span::from("  Closing… (q again to force)").fg(colors.warning));
     } else if !app.opening.is_empty() {
         spans.push(Span::from("  Downloading… opens when done").fg(colors.warning));
+    } else if !app.copying.is_empty() {
+        spans.push(Span::from("  Downloading… copies when done").fg(colors.warning));
     } else if let Some(message) = &app.status {
         spans.push(Span::from(format!("  {message}")).fg(colors.error));
     }
@@ -647,6 +731,10 @@ fn center(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(area);
     area
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Cuts `text` to at most `max` terminal columns, ending with `…` if cut.
@@ -674,16 +762,116 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::app::Target;
     use crate::messages::MediaFile;
+
+    /// Every row of the buffer as a string.
+    fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn help_opens_on_the_shortcuts_and_scrolls_to_the_end() {
+        let colors = Theme::Mocha.colors();
+        let mut menu = SettingsMenu {
+            tab: HelpTab::Shortcuts,
+            scroll: 0,
+            selected: 3,
+            saved: Theme::Mocha,
+        };
+        // Too short for the whole list.
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut draw = |menu: &mut SettingsMenu| {
+            terminal.draw(|f| draw_settings(f, menu, &colors)).unwrap();
+            buffer_rows(terminal.backend().buffer())
+        };
+        let has = |rows: &[String], needle: &str| rows.iter().any(|r| r.contains(needle));
+
+        let rows = draw(&mut menu);
+        assert!(
+            has(&rows, "Shortcuts") && has(&rows, "Settings"),
+            "both tabs"
+        );
+        assert!(has(&rows, "Everywhere"));
+        assert!(!has(&rows, "Menus and popups"), "further down");
+
+        // G scrolls past the end; drawing stops it at the last row.
+        menu.scroll = usize::MAX;
+        let rows = draw(&mut menu);
+        assert!(has(&rows, "Switch tabs in this popup"), "the last shortcut");
+        assert_eq!(
+            menu.scroll,
+            help::height() - 16,
+            "the popup is 2 rows shorter than the screen, then borders"
+        );
+
+        menu.tab = HelpTab::Settings;
+        let rows = draw(&mut menu);
+        assert!(has(&rows, "Catppuccin Mocha") && !has(&rows, "Everywhere"));
+    }
+
+    #[test]
+    fn a_toast_says_what_was_copied_in_the_corner() {
+        let colors = Theme::Mocha.colors();
+        let toast = Toast {
+            title: "Copied".into(),
+            detail: "https://example.com/a".into(),
+            until: tokio::time::Instant::now(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| draw_toast(f, &toast, &colors)).unwrap();
+        let buf = terminal.backend().buffer();
+        let rows = buffer_rows(buf);
+
+        // Bottom right, with the status bar row (19) left free.
+        assert!(rows[16].contains("✓ Copied"), "{}", rows[16]);
+        assert!(rows[17].contains("https://example.com/a"));
+        assert!(rows[18].trim_end().ends_with('╯'), "rounded corner");
+        assert!(rows[19].trim().is_empty());
+        assert_eq!(buf[(78, 18)].fg, colors.success);
+    }
+
+    #[test]
+    fn the_copy_menu_offers_the_text_then_links_then_media() {
+        let menu = PickMenu {
+            action: MenuAction::Copy,
+            targets: vec![
+                Target::Text("look at\nthis https://x.dev".into()),
+                Target::Link("https://x.dev".into()),
+                Target::File(MediaFile {
+                    id: 1,
+                    label: "Photo".into(),
+                    photo: true,
+                }),
+            ],
+            selected: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        terminal
+            .draw(|f| draw_menu(f, f.area(), &menu, &Theme::Mocha.colors()))
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+        let has = |needle: &str| rows.iter().any(|r| r.contains(needle));
+
+        assert!(has("Copy") && has("Enter copy"));
+        assert!(
+            has("1 Whole message  look at this https://x.dev"),
+            "on one line"
+        );
+        assert!(has("2 https://x.dev"));
+        assert!(has("3 Photo"));
+    }
 
     #[test]
     fn open_menu_lists_targets_with_shortcuts() {
-        let menu = OpenMenu {
+        let menu = PickMenu {
+            action: MenuAction::Open,
             targets: vec![
                 Target::File(MediaFile {
                     id: 1,
                     label: "Photo".into(),
+                    photo: true,
                 }),
                 Target::Link("https://example.com/a".into()),
                 Target::Link("https://docs.rs".into()),
@@ -802,6 +990,7 @@ mod tests {
             outgoing: false,
             date: 0,
             text: "text".into(),
+            source_text: "text".into(),
             preview: None,
             file: None,
             links: Vec::new(),
@@ -875,13 +1064,17 @@ mod tests {
     #[test]
     fn settings_list_every_theme_and_mark_the_saved_one() {
         // Previewing Latte while Mocha is saved.
-        let menu = SettingsMenu {
+        let mut menu = SettingsMenu {
+            tab: HelpTab::Settings,
+            scroll: 0,
             selected: 0,
             saved: Theme::Mocha,
         };
         let colors = Theme::Latte.colors();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        terminal.draw(|f| draw_settings(f, &menu, &colors)).unwrap();
+        terminal
+            .draw(|f| draw_settings(f, &mut menu, &colors))
+            .unwrap();
         let buf = terminal.backend().buffer();
         let rows: Vec<String> = (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())

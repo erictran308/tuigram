@@ -39,13 +39,15 @@ Replies (`Msg.reply_to`) show the message they answer above their text: the load
 
 TDLib `Message`s are converted to `Msg` once on arrival (`body()`): display text, inline `Preview`, the file Enter opens, and links. Only http(s) links are kept (so a crafted link can't open local files/apps), and TDLib entity offsets are UTF-16 code units, converted to byte ranges.
 
-**Modes and keys.** `Focus::Chats` / `Focus::Messages` are Normal mode; `Focus::Input` is Insert mode (the composer). `on_key` routes to the first modal layer that's open, in this order: settings popup (`?`), delete popup (`d`), open-file menu, `/` search prompt, Insert mode, Normal mode. The status bar shows the mode and the key hints for the current state, so update the hints when adding keys.
+**Modes and keys.** `Focus::Chats` / `Focus::Messages` are Normal mode; `Focus::Input` is Insert mode (the composer). `on_key` routes to the first modal layer that's open, in this order: settings popup (`?`), delete popup (`d`), open-file menu, `/` search prompt, Insert mode, Normal mode. The status bar shows the mode and the key hints for the current state, and `?` lists every shortcut (`SHORTCUTS` in `ui/help.rs`), so update both when adding keys.
 
 **Search (`search.rs`).** `/` in the chat list filters titles live (local). `/` in a chat runs TDLib `searchChatMessages` over the whole history; `n`/`N` go to older/newer matches, and a match that isn't loaded is reached with an `Around` page. `search::find` gives case-insensitive byte ranges, used for both filtering and highlighting.
 
 **Rendering (`ui/`).** `ui/messages.rs` lays out every loaded message into lines each frame (bubbles, wrapping, date separators, sender names except in channels), then picks the scroll window. Photos are not text: layout reserves blank rows (`PhotoSlot`) and `draw_photos` paints images over them afterwards.
 
 **Images (`images.rs`).** Drawing calls `want()` for photos on screen; after the frame, `fetch()` starts TDLib downloads and decode/encode on blocking threads, which report back as `ImageEvent`s. The message's embedded blurry thumbnail is shown until the real image is ready. The terminal's image protocol and cell size are queried once at startup (`main.rs`), before key reading starts.
+
+**Clipboard (`clipboard.rs`).** `y` copies with arboard. Text falls back to an OSC 52 escape sequence when there's no system clipboard (e.g. over SSH). Media is downloaded through TDLib first (`App.copying`); photos are decoded on a blocking thread and come back as `Decoded` to be copied as images, other files are copied as file references. Tests never touch the real clipboard: it would overwrite whatever the user had copied.
 
 **Theme (`theme.rs`).** Drawing code uses `Colors` roles (`accent`, `own_bubble`, `search`, …), never Catppuccin palette names directly. Add a role when a new kind of thing needs a color.
 
