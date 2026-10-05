@@ -148,7 +148,8 @@ async fn show(dir: &Path) -> Result<()> {
 }
 
 /// The app with the made-up chats, on the main screen.
-fn demo_app(tg: Tg, images: Images, dir: &Path) -> App {
+/// Also for tests elsewhere that need a whole app; it makes no TDLib requests.
+pub(crate) fn demo_app(tg: Tg, images: Images, dir: &Path) -> App {
     let (clipboard_tx, _) = unbounded_channel();
     let settings = Settings::default();
     // Settings are never saved: the demo's popup has no Enter.

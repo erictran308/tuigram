@@ -27,6 +27,9 @@ pub struct Settings {
     pub block_gaps: bool,
     /// A blank row between chats in the chat list.
     pub chat_gaps: bool,
+    /// The chat list's share of the window's width, in percent. Ctrl-r
+    /// changes it; see [`Settings::list_width`].
+    pub chat_list_width: u16,
     /// Telegram API credentials entered on the login screen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<ApiKeys>,
@@ -41,10 +44,19 @@ impl Default for Settings {
             normal_after_send: false,
             block_gaps: true,
             chat_gaps: true,
+            chat_list_width: DEFAULT_LIST_WIDTH,
             api_keys: None,
         }
     }
 }
+
+/// The chat list's width, in percent of the window, at first and after `=`.
+pub const DEFAULT_LIST_WIDTH: u16 = 35;
+/// How narrow and how wide the chat list can be, in percent, so neither
+/// pane disappears.
+const LIST_WIDTHS: std::ops::RangeInclusive<u16> = 15..=70;
+/// Percent a press of `h` or `l` moves the line between the panes.
+const LIST_STEP: u16 = 5;
 
 impl Settings {
     /// Defaults if the file doesn't exist yet; an error if it can't be read.
@@ -55,6 +67,20 @@ impl Settings {
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
         toml::from_str(&text).with_context(|| format!("{} is invalid", path.display()))
+    }
+
+    /// The chat list's width as drawn, in percent: within [`LIST_WIDTHS`],
+    /// whatever the file says.
+    pub fn list_width(&self) -> u16 {
+        self.chat_list_width
+            .clamp(*LIST_WIDTHS.start(), *LIST_WIDTHS.end())
+    }
+
+    /// Makes the chat list `steps` steps wider, or narrower if negative.
+    pub fn resize_list(&mut self, steps: i16) {
+        let width = self.list_width() as i16 + steps * LIST_STEP as i16;
+        self.chat_list_width =
+            (width.max(0) as u16).clamp(*LIST_WIDTHS.start(), *LIST_WIDTHS.end());
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -86,12 +112,13 @@ mod tests {
             normal_after_send: true,
             block_gaps: false,
             chat_gaps: false,
+            chat_list_width: 40,
             api_keys: None,
         };
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false"
+            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false\nchat_list_width = 40"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
 
@@ -106,10 +133,30 @@ mod tests {
         std::fs::write(&file, r#"theme = "latte""#).unwrap();
         let old = Settings::load(&file).unwrap();
         assert!(old.block_gaps && old.chat_gaps);
+        assert_eq!(old.chat_list_width, DEFAULT_LIST_WIDTH);
 
         std::fs::write(&file, r#"theme = "dracula""#).unwrap();
         let error = format!("{:#}", Settings::load(&file).unwrap_err());
         assert!(error.contains("mocha"), "lists the valid themes: {error}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_chat_list_resizes_in_steps_and_keeps_both_panes() {
+        let mut settings = Settings::default();
+        settings.resize_list(1);
+        assert_eq!(settings.list_width(), 40);
+        settings.resize_list(-3);
+        assert_eq!(settings.list_width(), 25);
+        settings.resize_list(-10);
+        assert_eq!(settings.list_width(), 15, "the chat list stays");
+        settings.resize_list(20);
+        assert_eq!(settings.list_width(), 70, "the chat stays");
+
+        // Hand-edited files can't hide a pane either.
+        settings.chat_list_width = 200;
+        assert_eq!(settings.list_width(), 70);
+        settings.resize_list(-1);
+        assert_eq!(settings.list_width(), 65);
     }
 }

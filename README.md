@@ -145,6 +145,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `/` | Search chat names, or messages in the open chat |
 | `n` / `N` | Next older / newer match |
 | `H` | Highlight a chat |
+| `Ctrl-r` | Resize the panes: `h` / `l` make the chat list narrower / wider, `=` puts it back as at first, `Enter` keeps it (also next time), `Esc` cancels |
 | `:` | Run a command, typed in full: `:logout` logs out of Telegram on this computer |
 | `?` | Every shortcut, plus settings and themes |
 | `q` | Quit |

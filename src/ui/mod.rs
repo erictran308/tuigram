@@ -303,8 +303,11 @@ fn draw_qr_login(frame: &mut Frame, login: &Login, code: Vec<Line<'static>>, col
 fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     let [body, status] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
-    let [list_area, chat_area] =
-        Layout::horizontal([Constraint::Percentage(35), Constraint::Fill(1)]).areas(body);
+    let [list_area, chat_area] = Layout::horizontal([
+        Constraint::Percentage(app.settings.list_width()),
+        Constraint::Fill(1),
+    ])
+    .areas(body);
 
     let list = chat_list::ChatList {
         chats: &app.chats,
@@ -1218,6 +1221,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     let sticker = Span::from(" STICKERS ").fg(colors.bg).bg(colors.insert);
     let picking = app.focus == Focus::Input && app.stickers.is_some();
     let (mode, hints) = match app.focus {
+        _ if app.resizing.is_some() => (
+            Span::from(" RESIZE ").fg(colors.bg).bg(colors.accent),
+            "  `h` narrower · `l` wider · `=` as at first · `Enter` keep · `Esc` cancel",
+        ),
         _ if app
             .confirm
             .as_ref()
@@ -1250,7 +1257,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Chats => (
             normal,
-            "  `j/k` move · `Enter` open · `i` write · `/` search · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `:` commands · `?` help · `q` quit",
+            "  `j/k` move · `Enter` open · `i` write · `/` search · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         Focus::Messages if searching => (
             normal,
@@ -1270,7 +1277,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages => (
             normal,
-            "  `j/k` newer/older · `y` copy · `r` reply · `R` react · `X` unreact · `e` edit · `d` delete · `Enter` open media · `i` write · `a` attach · `p` paste · `/` search · `gg/G` oldest/newest · `h` back · `:` commands · `?` help · `q` quit",
+            "  `j/k` newer/older · `y` copy · `r` reply · `R` react · `X` unreact · `e` edit · `d` delete · `Enter` open media · `i` write · `a` attach · `p` paste · `/` search · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         _ if picking && app.stickers.as_ref().is_some_and(|p| p.query.is_some()) => (
             sticker,
@@ -1302,6 +1309,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
     };
     let popup = app.settings_menu.is_some()
+        || app.resizing.is_some()
         || app.delete_menu.is_some()
         || app.react_menu.is_some()
         || app.confirm.is_some();
@@ -1325,6 +1333,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         let here = format!("  {} · ", context.join(" · "));
         spans.extend(hint_spans(&here, Style::new().fg(colors.fg), colors));
         spans.extend(hint_spans(hints.trim_start(), muted, colors));
+    }
+    if app.resizing.is_some() {
+        let width = format!("  chat list {}%", app.settings.list_width());
+        spans.push(Span::from(width).fg(colors.fg));
     }
     if app.quit_deadline.is_some() {
         spans.push(Span::from("  Closing… (q again to force)").fg(colors.warning));

@@ -27,7 +27,7 @@ use crate::messages::{Editable, Editing, Link, MediaFile, OpenChat, Replied, Sen
 use crate::notify::{self, Note, Notifications, Notifier};
 use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search::MessageSearch;
-use crate::settings::Settings;
+use crate::settings::{self, Settings};
 use crate::stickers::{self, Source, StickerPanel};
 use crate::text;
 use crate::tg::{Deletable, Found, Page, Tagged, Tg, TgEvent};
@@ -390,6 +390,9 @@ pub struct App {
     pub react_menu: Option<ReactMenu>,
     /// Opened with Tab while writing; only open in Insert mode.
     pub stickers: Option<StickerPanel>,
+    /// In resize mode (Ctrl-r): the chat list's width before, which Esc
+    /// puts back.
+    pub resizing: Option<u16>,
     pub confirm: Option<Confirm>,
     pub settings: Settings,
     settings_path: PathBuf,
@@ -477,6 +480,7 @@ impl App {
             delete_menu: None,
             react_menu: None,
             stickers: None,
+            resizing: None,
             confirm: None,
             settings,
             settings_path,
@@ -937,6 +941,7 @@ impl App {
             Screen::Main if self.delete_menu.is_some() => self.on_delete_key(key),
             Screen::Main if self.react_menu.is_some() => self.on_react_key(key, ctrl),
             Screen::Main if self.menu.is_some() => self.on_menu_key(key),
+            Screen::Main if self.resizing.is_some() => self.on_resize_key(key, ctrl),
             Screen::Main if self.prompt.is_some() => self.on_prompt_key(key, ctrl),
             Screen::Main if self.focus == Focus::Input && self.stickers.is_some() => {
                 self.on_sticker_key(key, ctrl)
@@ -1100,6 +1105,10 @@ impl App {
             return;
         }
         match (self.focus, key.code) {
+            // Before `r`, which replies.
+            (_, KeyCode::Char('r')) if ctrl => {
+                self.resizing = Some(self.settings.chat_list_width);
+            }
             (_, KeyCode::Char('g')) => self.pending_g = true,
             (_, KeyCode::Char('q')) => self.quit(),
             (_, KeyCode::Char('H')) => self.toggle_highlight(),
@@ -2031,6 +2040,37 @@ impl App {
         }
     }
 
+    /// Resize mode takes the keys: `h` and `l` move the line between the
+    /// chat list and the chat as you press them, `=` puts it back where it
+    /// starts out, Enter keeps it and Esc puts back where it was.
+    fn on_resize_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let Some(before) = self.resizing else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char('h') | KeyCode::Left => self.settings.resize_list(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.settings.resize_list(1),
+            KeyCode::Char('=') => self.settings.chat_list_width = settings::DEFAULT_LIST_WIDTH,
+            KeyCode::Esc => {
+                self.settings.chat_list_width = before;
+                self.resizing = None;
+            }
+            KeyCode::Enter => self.end_resize(),
+            KeyCode::Char('r') if ctrl => self.end_resize(),
+            _ => {}
+        }
+    }
+
+    /// Leaves resize mode with the panes as they are, saved for next time.
+    fn end_resize(&mut self) {
+        let before = self.resizing.take();
+        if before != Some(self.settings.chat_list_width)
+            && let Err(e) = self.settings.save(&self.settings_path)
+        {
+            self.status = Some(format!("Couldn't save settings: {e:#}"));
+        }
+    }
+
     /// Tab while writing: the sticker panel. It opens at once and fills in
     /// as TDLib sends your recent and favorite stickers and your sets.
     fn open_stickers(&mut self) {
@@ -2789,7 +2829,65 @@ fn unix_now() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui_image::picker::Picker;
+    use tokio::sync::mpsc::unbounded_channel;
+
     use super::*;
+
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        app.on_key(KeyEvent::new(code, modifiers));
+    }
+
+    /// The screen's rows as text.
+    fn screen(app: &mut App) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn ctrl_r_resizes_the_panes_and_enter_keeps_it_for_next_time() {
+        let dir = std::env::temp_dir().join(format!("tuigram-resize-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        app.focus = Focus::Messages;
+        // Where the chat list's top right corner is.
+        let edge = |rows: &[String]| rows[0].chars().position(|c| c == '┐').unwrap();
+        let none = KeyModifiers::NONE;
+        assert_eq!(edge(&screen(&mut app)), 34, "35% of 100 columns");
+
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(app.open.as_ref().unwrap().reply.is_none(), "not a reply");
+        press(&mut app, KeyCode::Char('l'), none);
+        press(&mut app, KeyCode::Char('l'), none);
+        let rows = screen(&mut app);
+        assert_eq!(edge(&rows), 44, "wider as you press");
+        let status = rows.last().unwrap();
+        assert!(
+            status.contains(" RESIZE ") && status.contains("chat list 45%"),
+            "{status}"
+        );
+
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.resizing.is_none());
+        let saved = Settings::load(&settings::path(&dir)).unwrap();
+        assert_eq!(saved.chat_list_width, 45);
+
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('h'), none);
+        assert_eq!(edge(&screen(&mut app)), 39);
+        press(&mut app, KeyCode::Esc, none);
+        assert_eq!(edge(&screen(&mut app)), 44, "Esc puts it back");
+        assert!(app.focus == Focus::Messages, "and stays in the chat");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn only_files_that_cant_run_code_open_without_asking() {

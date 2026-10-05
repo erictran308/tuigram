@@ -18,6 +18,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("?", "This help, and settings"),
             (":", "Type a command, like logout"),
             ("H", "Highlight or unhighlight the selected chat"),
+            (
+                "Ctrl-r",
+                "Resize the panes: h / l, = as at first, Enter keeps, Esc cancels",
+            ),
             ("q", "Quit (press again to stop waiting)"),
             ("Ctrl-c", "Quit, except while writing"),
         ],
