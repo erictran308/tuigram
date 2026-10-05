@@ -281,12 +281,9 @@ pub struct SettingsMenu {
     /// Row on the settings tab: a theme, or one of the checkboxes after them
     /// ([`SettingsMenu::NOTIFICATIONS`] and on).
     pub selected: usize,
-    pub saved: Theme,
+    /// How notifications went out when the popup opened, so turning them
+    /// off and on again keeps the way, e.g. "bell".
     pub saved_notifications: Notifications,
-    pub saved_normal_after_send: bool,
-    pub saved_block_gaps: bool,
-    pub saved_chat_gaps: bool,
-    pub saved_chat_list_side: Side,
 }
 
 impl SettingsMenu {
@@ -1122,17 +1119,12 @@ impl App {
             (_, KeyCode::Char('q')) => self.quit(),
             (_, KeyCode::Char('H')) => self.toggle_highlight(),
             (_, KeyCode::Char('?')) => {
-                let saved = self.settings.theme;
+                let theme = self.settings.theme;
                 self.settings_menu = Some(SettingsMenu {
                     tab: HelpTab::Shortcuts,
                     scroll: 0,
-                    selected: Theme::ALL.iter().position(|&t| t == saved).unwrap_or(0),
-                    saved,
+                    selected: Theme::ALL.iter().position(|&t| t == theme).unwrap_or(0),
                     saved_notifications: self.settings.notifications,
-                    saved_normal_after_send: self.settings.normal_after_send,
-                    saved_block_gaps: self.settings.block_gaps,
-                    saved_chat_gaps: self.settings.chat_gaps,
-                    saved_chat_list_side: self.settings.chat_list_side,
                 });
             }
             (_, KeyCode::Char(':')) => self.open_prompt(PromptKind::Command),
@@ -2558,7 +2550,8 @@ impl App {
     }
 
     /// The `?` popup takes all keys while it's up. Tab (or h/l) switches
-    /// between the shortcuts and the settings.
+    /// between the shortcuts and the settings. On the settings, Enter or
+    /// Space changes the one under the cursor and saves it at once.
     fn on_settings_key(&mut self, key: KeyEvent, ctrl: bool) {
         let Some(menu) = self.settings_menu.as_mut() else {
             return;
@@ -2571,64 +2564,12 @@ impl App {
                 };
                 return;
             }
-            KeyCode::Enter => {
-                self.settings_menu = None;
-                if let Err(e) = self.settings.save(&self.settings_path) {
-                    self.status = Some(format!("Settings not saved: {e:#}"));
-                }
+            KeyCode::Enter | KeyCode::Char(' ') if menu.tab == HelpTab::Settings => {
+                self.change_setting();
                 return;
             }
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
-                self.settings.theme = menu.saved;
-                self.settings.normal_after_send = menu.saved_normal_after_send;
-                self.settings.block_gaps = menu.saved_block_gaps;
-                self.settings.chat_gaps = menu.saved_chat_gaps;
-                self.settings.chat_list_side = menu.saved_chat_list_side;
-                let saved = menu.saved_notifications;
                 self.settings_menu = None;
-                self.set_notifications(saved);
-                return;
-            }
-            KeyCode::Char(' ')
-                if menu.tab == HelpTab::Settings
-                    && menu.selected == SettingsMenu::NOTIFICATIONS =>
-            {
-                // Back on, they go out the way they did before, e.g. "bell".
-                let on = match menu.saved_notifications {
-                    Notifications::Off => Notifications::Auto,
-                    saved => saved,
-                };
-                self.set_notifications(match self.settings.notifications {
-                    Notifications::Off => on,
-                    _ => Notifications::Off,
-                });
-                return;
-            }
-            KeyCode::Char(' ')
-                if menu.tab == HelpTab::Settings && menu.selected == SettingsMenu::AFTER_SEND =>
-            {
-                self.settings.normal_after_send = !self.settings.normal_after_send;
-                return;
-            }
-            KeyCode::Char(' ')
-                if menu.tab == HelpTab::Settings && menu.selected == SettingsMenu::BLOCK_GAPS =>
-            {
-                self.settings.block_gaps = !self.settings.block_gaps;
-                return;
-            }
-            KeyCode::Char(' ')
-                if menu.tab == HelpTab::Settings && menu.selected == SettingsMenu::CHAT_GAPS =>
-            {
-                self.settings.chat_gaps = !self.settings.chat_gaps;
-                return;
-            }
-            KeyCode::Char(' ')
-                if menu.tab == HelpTab::Settings && menu.selected == SettingsMenu::LIST_RIGHT =>
-            {
-                self.settings.chat_list_side = match self.settings.chat_list_side {
-                    Side::Left => Side::Right,
-                    Side::Right => Side::Left,
-                };
                 return;
             }
             _ => {}
@@ -2648,11 +2589,44 @@ impl App {
             HelpTab::Settings => {
                 let last = SettingsMenu::AFTER_SEND;
                 menu.selected = menu.selected.saturating_add_signed(delta).min(last);
-                // Preview: the whole app redraws in the theme under the cursor.
-                if let Some(&theme) = Theme::ALL.get(menu.selected) {
-                    self.settings.theme = theme;
-                }
             }
+        }
+    }
+
+    /// Enter or Space on the settings tab: picks the theme under the cursor,
+    /// or turns the setting under it on or off. Saved at once.
+    fn change_setting(&mut self) {
+        let Some(menu) = self.settings_menu.as_mut() else {
+            return;
+        };
+        let settings = &mut self.settings;
+        match menu.selected {
+            i if i < SettingsMenu::NOTIFICATIONS => settings.theme = Theme::ALL[i],
+            SettingsMenu::NOTIFICATIONS => {
+                // Back on, they go out the way they did before, e.g. "bell".
+                let on = match menu.saved_notifications {
+                    Notifications::Off => Notifications::Auto,
+                    saved => saved,
+                };
+                let next = match settings.notifications {
+                    Notifications::Off => on,
+                    _ => Notifications::Off,
+                };
+                self.set_notifications(next);
+            }
+            SettingsMenu::CHAT_GAPS => settings.chat_gaps = !settings.chat_gaps,
+            SettingsMenu::LIST_RIGHT => {
+                settings.chat_list_side = match settings.chat_list_side {
+                    Side::Left => Side::Right,
+                    Side::Right => Side::Left,
+                };
+            }
+            SettingsMenu::BLOCK_GAPS => settings.block_gaps = !settings.block_gaps,
+            SettingsMenu::AFTER_SEND => settings.normal_after_send = !settings.normal_after_send,
+            _ => return,
+        }
+        if let Err(e) = self.settings.save(&self.settings_path) {
+            self.status = Some(format!("Settings not saved: {e:#}"));
         }
     }
 
@@ -2890,12 +2864,7 @@ mod tests {
         let mut app = crate::demo::demo_app(tg, images, &dir);
         app.focus = Focus::Chats;
         let none = KeyModifiers::NONE;
-        let tick_the_box = |app: &mut App| {
-            press(app, KeyCode::Char('?'), none);
-            press(app, KeyCode::Tab, none);
-            app.settings_menu.as_mut().unwrap().selected = SettingsMenu::LIST_RIGHT;
-            press(app, KeyCode::Char(' '), none);
-        };
+        let saved = || Settings::load(&settings::path(&dir)).unwrap();
         // The text left and right of the first pane's top right corner.
         let halves = |app: &mut App| {
             let top = screen(app).remove(0);
@@ -2903,18 +2872,18 @@ mod tests {
             (left.to_string(), right.to_string())
         };
 
-        tick_the_box(&mut app);
-        assert!(app.settings.chat_list_side == Side::Right, "shown at once");
-        press(&mut app, KeyCode::Esc, none);
-        assert!(
-            app.settings.chat_list_side == Side::Left,
-            "Esc puts it back"
-        );
-
-        tick_the_box(&mut app);
+        press(&mut app, KeyCode::Char('?'), none);
+        press(&mut app, KeyCode::Tab, none);
+        app.settings_menu.as_mut().unwrap().selected = SettingsMenu::LIST_RIGHT;
+        press(&mut app, KeyCode::Char(' '), none);
+        assert_eq!(saved().chat_list_side, Side::Right, "saved at once");
         press(&mut app, KeyCode::Enter, none);
-        let saved = Settings::load(&settings::path(&dir)).unwrap();
-        assert_eq!(saved.chat_list_side, Side::Right);
+        assert_eq!(saved().chat_list_side, Side::Left, "Enter toggles too");
+        assert!(app.settings_menu.is_some(), "the popup stays open");
+        press(&mut app, KeyCode::Enter, none);
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.settings_menu.is_none());
+        assert_eq!(saved().chat_list_side, Side::Right, "Esc keeps it");
         let (left, right) = halves(&mut app);
         assert!(
             left.contains("Weekend Hike") && right.contains("Chats ("),
@@ -2944,6 +2913,30 @@ mod tests {
         press(&mut app, KeyCode::Char('h'), none);
         assert_eq!(app.settings.list_width(), 40);
         press(&mut app, KeyCode::Esc, none);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_theme_is_used_and_saved_as_soon_as_it_is_picked() {
+        let dir = std::env::temp_dir().join(format!("tuigram-theme-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        let none = KeyModifiers::NONE;
+        let first = app.settings.theme;
+        press(&mut app, KeyCode::Char('?'), none);
+        press(&mut app, KeyCode::Tab, none);
+        // The cursor starts on the theme in use, Mocha, the last one.
+        press(&mut app, KeyCode::Char('k'), none);
+        assert!(app.settings.theme == first, "moving doesn't change it");
+        let picked = Theme::ALL[app.settings_menu.as_ref().unwrap().selected];
+        press(&mut app, KeyCode::Char(' '), none);
+        assert!(app.settings.theme == picked && picked != first);
+        let saved = Settings::load(&settings::path(&dir)).unwrap();
+        assert!(saved.theme == picked);
+        press(&mut app, KeyCode::Char('q'), none);
+        assert!(app.settings.theme == picked, "closing keeps it");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -261,12 +261,7 @@ fn help(app: &App, tab: HelpTab) -> SettingsMenu {
         tab,
         scroll: 0,
         selected: Theme::ALL.iter().position(|&t| t == theme).unwrap_or(0),
-        saved: theme,
         saved_notifications: app.settings.notifications,
-        saved_normal_after_send: app.settings.normal_after_send,
-        saved_block_gaps: app.settings.block_gaps,
-        saved_chat_gaps: app.settings.chat_gaps,
-        saved_chat_list_side: app.settings.chat_list_side,
     }
 }
 

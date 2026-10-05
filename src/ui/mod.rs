@@ -125,6 +125,13 @@ fn hint_spans(hints: &str, text: Style, colors: &Colors) -> Vec<Span<'static>> {
         .collect()
 }
 
+/// A popup's own background, and the theme's text color: `Clear` resets
+/// both to the terminal's, which a light theme on a dark terminal (or the
+/// other way round) can barely be read on.
+fn popup_style(colors: &Colors) -> Style {
+    Style::new().fg(colors.fg).bg(colors.popup_bg)
+}
+
 /// Focused pane gets a bright border.
 fn border(focused: bool, colors: &Colors) -> Style {
     Style::new().fg(if focused {
@@ -443,7 +450,7 @@ fn draw_toast(frame: &mut Frame, toast: &Toast, colors: &Colors) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(colors.success))
-        .style(Style::new().bg(colors.popup_bg));
+        .style(popup_style(colors));
     let inner_width = (block.inner(rect).width as usize).saturating_sub(3);
     let mut lines = vec![Line::from(vec![
         Span::from(" ✓ ").fg(colors.success).bold(),
@@ -690,9 +697,9 @@ fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, settings: &Settings
     let keys = match menu.tab {
         HelpTab::Shortcuts => " `j/k` scroll · `Tab` settings · `Esc` close ",
         HelpTab::Settings if menu.selected >= SettingsMenu::NOTIFICATIONS => {
-            " `Space` on/off · `Enter` save · `Tab` shortcuts · `Esc` cancel "
+            " `Enter` or `Space` on/off · `Tab` shortcuts · `Esc` close "
         }
-        HelpTab::Settings => " `j/k` preview · `Enter` save · `Tab` shortcuts · `Esc` cancel ",
+        HelpTab::Settings => " `Enter` or `Space` use · `Tab` shortcuts · `Esc` close ",
     };
     let block = popup_block(tabs, keys, colors);
     let inner = block.inner(popup);
@@ -720,8 +727,8 @@ fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, settings: &Settings
     let heading = |text: &'static str| Line::from(text).fg(colors.muted).bold();
     let mut lines = vec![heading(" Theme")];
     for (i, &theme) in Theme::ALL.iter().enumerate() {
-        // The dot marks the saved theme, which Esc goes back to.
-        let mark = if theme == menu.saved {
+        // The dot marks the theme in use.
+        let mark = if theme == settings.theme {
             " ● "
         } else {
             " ○ "
@@ -805,7 +812,7 @@ fn popup_block<'a>(title: impl Into<Line<'a>>, keys: &'a str, colors: &Colors) -
             Line::from(hint_spans(keys, Style::new().fg(colors.muted), colors)).right_aligned(),
         )
         .border_style(Style::new().fg(colors.accent))
-        .style(Style::new().bg(colors.popup_bg))
+        .style(popup_style(colors))
 }
 
 /// The "what to open" or "what to copy" popup, centered over the message pane.
@@ -1137,7 +1144,7 @@ fn draw_commands(frame: &mut Frame, area: Rect, typed: &str, colors: &Colors) {
     let block = Block::bordered()
         .title(title)
         .border_style(Style::new().fg(colors.accent))
-        .style(Style::new().bg(colors.popup_bg));
+        .style(popup_style(colors));
     // Clear first: the popup must cover text and photos underneath.
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
@@ -1181,7 +1188,7 @@ fn draw_completions(frame: &mut Frame, area: Rect, names: &[String], colors: &Co
     let block = Block::bordered()
         .title(title)
         .border_style(Style::new().fg(colors.accent))
-        .style(Style::new().bg(colors.popup_bg));
+        .style(popup_style(colors));
     // Clear first: the popup must cover text and photos underneath.
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
@@ -1253,7 +1260,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         }
         _ if app.settings_menu.is_some() => (
             normal,
-            "  `j/k` preview theme · `Enter` save · `Tab` shortcuts · `Esc` cancel",
+            "  `j/k` move · `Enter` or `Space` change, saved at once · `Tab` shortcuts · `Esc` close",
         ),
         _ if app.delete_menu.is_some() => {
             (normal, "  `j/k` choose · `Enter` delete · `Esc` cancel")
@@ -1430,12 +1437,7 @@ mod tests {
             tab: HelpTab::Shortcuts,
             scroll: 0,
             selected: 3,
-            saved: Theme::Mocha,
             saved_notifications: Notifications::Auto,
-            saved_normal_after_send: false,
-            saved_block_gaps: true,
-            saved_chat_gaps: true,
-            saved_chat_list_side: Side::Left,
         };
         // Too short for the whole list.
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -2048,6 +2050,37 @@ mod tests {
     }
 
     #[test]
+    fn popups_write_in_the_themes_text_color_whatever_the_terminals_is() {
+        for theme in Theme::ALL {
+            let colors = theme.colors();
+            let mut menu = SettingsMenu {
+                tab: HelpTab::Settings,
+                scroll: 0,
+                selected: 0,
+                saved_notifications: Notifications::Auto,
+            };
+            let settings = Settings {
+                theme,
+                ..Settings::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(70, 30)).unwrap();
+            terminal
+                .draw(|f| draw_settings(f, &mut menu, &settings, &colors))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let rows = buffer_rows(buf);
+            let y = rows
+                .iter()
+                .position(|r| r.contains("A gap between chats"))
+                .unwrap();
+            let x = (0..buf.area.width)
+                .find(|&x| buf[(x, y as u16)].symbol() == "A")
+                .unwrap();
+            assert_eq!(buf[(x, y as u16)].fg, colors.fg, "{theme:?}");
+        }
+    }
+
+    #[test]
     fn keys_in_hints_stand_out_from_what_they_do() {
         let colors = Theme::Mocha.colors();
         let muted = Style::new().fg(colors.muted);
@@ -2156,12 +2189,7 @@ mod tests {
             tab: HelpTab::Settings,
             scroll: 0,
             selected: 0,
-            saved: Theme::Mocha,
             saved_notifications: Notifications::Auto,
-            saved_normal_after_send: false,
-            saved_block_gaps: true,
-            saved_chat_gaps: true,
-            saved_chat_list_side: Side::Left,
         };
         let colors = Theme::Latte.colors();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
@@ -2196,12 +2224,7 @@ mod tests {
             tab: HelpTab::Settings,
             scroll: 0,
             selected: SettingsMenu::NOTIFICATIONS,
-            saved: Theme::Mocha,
             saved_notifications: Notifications::Auto,
-            saved_normal_after_send: false,
-            saved_block_gaps: true,
-            saved_chat_gaps: true,
-            saved_chat_list_side: Side::Left,
         };
         let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
         let mut draw = |notifications| {
@@ -2222,7 +2245,7 @@ mod tests {
         assert!(row(&rows, "Notifications").contains("Notifications"));
         assert!(row(&rows, "New messages").contains("▌ [✓] New messages"));
         assert!(
-            row(&rows, "Space on/off").contains("Esc cancel"),
+            row(&rows, "Space on/off").contains("Esc close"),
             "key hints"
         );
 
@@ -2237,12 +2260,7 @@ mod tests {
             tab: HelpTab::Settings,
             scroll: 0,
             selected: SettingsMenu::AFTER_SEND,
-            saved: Theme::Mocha,
             saved_notifications: Notifications::Auto,
-            saved_normal_after_send: false,
-            saved_block_gaps: true,
-            saved_chat_gaps: true,
-            saved_chat_list_side: Side::Left,
         };
         let mut terminal = Terminal::new(TestBackend::new(70, 22)).unwrap();
         let mut draw = |gaps, normal_after_send| {
@@ -2268,7 +2286,7 @@ mod tests {
         assert!(row(&rows, "A gap between messages").contains("  [✓] A gap between messages"));
         assert!(row(&rows, "Composer").contains("Composer"));
         assert!(row(&rows, "Back to Normal").contains("▌ [ ] Back to Normal mode after sending"));
-        assert!(row(&rows, "Space on/off").contains("Esc cancel"));
+        assert!(row(&rows, "Space on/off").contains("Esc close"));
 
         let rows = draw(false, true);
         assert!(row(&rows, "A gap between chats").contains("[ ] A gap between chats"));
