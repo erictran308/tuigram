@@ -8,7 +8,7 @@ repository = "https://github.com/erictran308/tuigram"
 readme = "README.md"
 keywords = ["telegram", "tui", "terminal", "tdlib", "vim"]
 categories = ["command-line-utilities"]
-exclude = ["CLAUDE.md", ".env.example", ".github"]
+exclude = ["CLAUDE.md", ".env.example", ".github", "docs"]
 
 # The command is `tuigram`; the crate name `tuigram` was taken on crates.io.
 [[bin]]

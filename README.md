@@ -14,7 +14,7 @@ Written in Rust on [TDLib](https://github.com/tdlib/td), the library behind Tele
 **[Download for macOS, Linux or Windows](#get-started)** and log in. Nothing to set up.<br>
 With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 
-<!-- TODO: add a screenshot or GIF here, e.g. ![tuigram](docs/screenshot.png) -->
+<img src="docs/screenshot.png" alt="tuigram: the chat list with photos, unread counts and someone typing, beside a group chat with a photo, a link and a reply">
 
 </div>
 
@@ -33,12 +33,25 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Private by design.** tuigram talks only to Telegram. No telemetry, no accounts and no servers in between. Your session stays on your machine, and read receipts go out only for messages you've actually had in front of you.
 - **Careful with what others send.** A file that could run a program, or a link whose text hides where it really goes, asks before opening.
 
+<table>
+  <tr>
+    <td><img src="docs/replying.png" alt="Replying to a message in Insert mode: the reply bar over the composer, and the message being answered marked in the chat"></td>
+    <td><img src="docs/shortcuts.png" alt="The ? popup listing every keyboard shortcut, grouped by where it works"></td>
+  </tr>
+  <tr>
+    <td align="center">Reply with <code>r</code>, write in Insert mode, send with <code>Enter</code></td>
+    <td align="center">Every shortcut is one <code>?</code> away</td>
+  </tr>
+</table>
+
 ## Get started
 
 There are two ways to install tuigram:
 
 - **Download it** (or `cargo binstall tuigram-cli`). Ready-made apps come with tuigram's own Telegram API key, so you just log in.
 - **Build it from source** with `cargo install`. You bring your own API key, which takes two minutes on Telegram's site.
+
+To look around first, `tuigram --demo` shows made-up chats without logging in: `1`–`5` switch scenes, `t` changes the theme, `q` quits.
 
 ### Download (recommended)
 

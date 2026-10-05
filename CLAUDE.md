@@ -6,7 +6,7 @@ tuigram: a Telegram *user* client (not a bot) for the terminal, built on TDLib (
 
 ## Never run the app against the real session
 
-The data directory holds the user's logged-in Telegram session: the platform app-data dir (`tuigram --help` prints it), or `TG_DATA_DIR` if set (e.g. `./.tdlib`). Running the binary reads their chats and sends read receipts (`view_messages`) to real people. Do not `cargo run` to check a change; verify with tests that render into ratatui's `TestBackend` (see existing tests in `src/ui/`). Ask the user to run the app when a change needs to be seen live.
+The data directory holds the user's logged-in Telegram session: the platform app-data dir (`tuigram --help` prints it), or `TG_DATA_DIR` if set (e.g. `./.tdlib`). Running the binary reads their chats and sends read receipts (`view_messages`) to real people. Do not `cargo run` to check a change; verify with tests that render into ratatui's `TestBackend` (see existing tests in `src/ui/`). Ask the user to run the app when a change needs to be seen live, or `cargo run -- --demo`, which never starts TDLib.
 
 ## Commands
 
@@ -73,6 +73,8 @@ TDLib `Message`s are converted to `Msg` once on arrival (`body()`): display text
 **Notifications (`notify.rs`).** TDLib's notification API, switched on at `authorizationStateReady` (`notification_group_count_max`). It already applies mutes and drops messages read elsewhere; `App::on_notifications` also drops messages from before startup (`notify_since`) and any the user sees anyway (`App::sees`: the window has focus, or, where the terminal never reports focus, the chat is open on its newest message). `Notifier` sends at most one notification per `GAP`, everything waiting as one, and drops a chat's messages for `QUIET_CHAT` after it had one. The code is picked from the `notifications` setting (on/off with Space in the `?` popup, `App::set_notifications`) or the environment (`notify::detect`: OSC 99, 777, 9 or the bell) and wrapped for tmux passthrough. The window title counts unread unmuted chats (`updateUnreadChatCount`); it's saved at startup and put back at exit and in the panic hook.
 
 **Clipboard (`clipboard.rs`).** `y` copies with arboard. Text falls back to an OSC 52 escape sequence when there's no system clipboard (e.g. over SSH). Media is downloaded through TDLib first (`App.copying`); photos are decoded on a blocking thread and come back as `Decoded` to be copied as images, other files are copied as file references. Tests never touch the real clipboard: it would overwrite whatever the user had copied.
+
+**Demo (`demo.rs`).** `tuigram --demo` builds an `App` with made-up chats (`Chats::add_local`, `OpenChat.messages`) and draws it with `ui::draw` in a loop of its own, switching between scenes (Normal, replying, search, the `?` popup) by setting `App` fields. It never calls `App::run` or `on_key`, which talk to TDLib: its `Tg::detached` must make no requests. Photos are drawn procedurally, saved to a temp folder and registered with `Images::on_downloaded`, so `Images::fetch` never asks for a download. README screenshots come from it.
 
 **Theme (`theme.rs`).** Drawing code uses `Colors` roles (`accent`, `own_bubble`, `search`, …), never Catppuccin palette names directly. Add a role when a new kind of thing needs a color.
 

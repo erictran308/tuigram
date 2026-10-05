@@ -927,8 +927,7 @@ mod tests {
     #[test]
     fn the_title_says_when_the_other_person_is_typing() {
         let mut chats = Chats::default();
-        chats.add_for_test(42, "Chardy", None);
-        chats.make_private_for_test(42);
+        chats.add_local(42, "Chardy", None).is_private = true;
         let typing = tdlib_rs::enums::ChatAction::Typing;
         let chardy =
             tdlib_rs::enums::MessageSender::User(tdlib_rs::types::MessageSenderUser { user_id: 2 });

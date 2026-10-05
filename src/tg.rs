@@ -196,6 +196,21 @@ impl Tg {
         })
     }
 
+    /// A client that was never started, for `--demo`, which must make no
+    /// requests: TDLib isn't set up, so one would start it with its logs on
+    /// the terminal.
+    pub fn detached(tx: UnboundedSender<Tagged>) -> Self {
+        let client_id = 0;
+        Self {
+            client_id,
+            tx: Events { client_id, tx },
+            config: Arc::new(Config {
+                api_keys: None,
+                data_dir: std::env::temp_dir(),
+            }),
+        }
+    }
+
     /// The client events must come from to count; see [`Tagged`].
     pub fn client_id(&self) -> i32 {
         self.client_id

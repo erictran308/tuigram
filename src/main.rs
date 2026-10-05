@@ -2,6 +2,7 @@ mod app;
 mod chats;
 mod clipboard;
 mod config;
+mod demo;
 mod images;
 mod messages;
 mod notify;
@@ -32,6 +33,7 @@ async fn main() -> Result<()> {
         Some("-V" | "--version") => {
             return print(&format!("tuigram {}\n", env!("CARGO_PKG_VERSION")));
         }
+        Some("--demo") => return demo::run().await,
         Some(other) => anyhow::bail!("unknown argument {other:?}; see tuigram --help"),
     }
 
@@ -124,10 +126,13 @@ development tools). Or install the ready-made app, which has one:
         "tuigram {version}
 Telegram in your terminal, with vim-style keys.
 
-Usage: tuigram [-h | --help] [-V | --version]
+Usage: tuigram [-h | --help] [-V | --version] [--demo]
 
 Inside the app, the status bar lists the keys for wherever you are;
 press ? for settings and q to quit.
+
+--demo shows made-up chats without logging in or touching your session:
+1-5 or Tab switch scenes, t changes the theme, q quits.
 
 {keys}
 

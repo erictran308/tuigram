@@ -287,15 +287,15 @@ impl Chats {
     }
 }
 
-#[cfg(test)]
 impl Chats {
-    /// Adds a chat below the others, for tests elsewhere: TDLib's `Chat` is
-    /// too big to build by hand.
-    pub fn add_for_test(&mut self, id: i64, title: &str, photo: Option<ChatPhoto>) {
+    /// Adds a chat that didn't come from TDLib, below the others, for
+    /// `--demo` and tests: TDLib's `Chat` is too big to build by hand.
+    pub fn add_local(&mut self, id: i64, title: &str, photo: Option<ChatPhoto>) -> &mut Chat {
         let order = 1000 - self.by_id.len() as i64;
-        self.by_id.insert(
-            id,
-            Chat {
+        self.dirty = true;
+        self.by_id
+            .entry(id)
+            .insert_entry(Chat {
                 title: title.into(),
                 is_channel: false,
                 is_private: false,
@@ -305,15 +305,8 @@ impl Chats {
                 photo,
                 accent: 0,
                 activity: Vec::new(),
-            },
-        );
-        self.dirty = true;
-    }
-
-    pub fn make_private_for_test(&mut self, id: i64) {
-        if let Some(chat) = self.by_id.get_mut(&id) {
-            chat.is_private = true;
-        }
+            })
+            .into_mut()
     }
 }
 

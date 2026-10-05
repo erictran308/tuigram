@@ -280,8 +280,8 @@ mod tests {
     fn chats_without_a_photo_get_a_square_of_their_color() {
         let colors = Theme::Mocha.colors();
         let mut chats = Chats::default();
-        chats.add_for_test(1, "Alice Smith", None);
-        chats.add_for_test(2, "bob", photo(20));
+        chats.add_local(1, "Alice Smith", None);
+        chats.add_local(2, "bob", photo(20));
         chats.set_accent(1, 3);
         chats.refresh();
         let mut images = images(ProtocolType::Halfblocks);
@@ -304,7 +304,7 @@ mod tests {
     fn the_selected_chat_is_highlighted_but_not_the_blank_row_below_it() {
         let colors = Theme::Mocha.colors();
         let mut chats = Chats::default();
-        chats.add_for_test(1, "Alice Smith", None);
+        chats.add_local(1, "Alice Smith", None);
         chats.refresh();
         let buf = render(
             &list(&chats, Some(1)),
@@ -325,9 +325,8 @@ mod tests {
     fn typing_shows_in_place_of_the_last_message_while_it_lasts() {
         let colors = Theme::Mocha.colors();
         let mut chats = Chats::default();
-        chats.add_for_test(1, "Alice", None);
-        chats.add_for_test(2, "Climbing club", None);
-        chats.make_private_for_test(1);
+        chats.add_local(1, "Alice", None).is_private = true;
+        chats.add_local(2, "Climbing club", None);
         chats.refresh();
         let user = |user_id| MessageSender::User(MessageSenderUser { user_id });
         chats.set_action(1, &user(7), &ChatAction::Typing);
@@ -359,7 +358,7 @@ mod tests {
         let mut chats = Chats::default();
         let mut images = images(ProtocolType::Kitty);
         for id in 1..=30 {
-            chats.add_for_test(id, &format!("chat {id}"), photo(id as i32));
+            chats.add_local(id, &format!("chat {id}"), photo(id as i32));
             // Odd chats have photos ready, even ones still show squares.
             if id % 2 == 1 {
                 add_photo(&mut images, id as i32);
@@ -381,7 +380,7 @@ mod tests {
     fn a_new_photo_waits_while_a_popup_could_hide_it() {
         let colors = Theme::Mocha.colors();
         let mut chats = Chats::default();
-        chats.add_for_test(1, "Alice", photo(10));
+        chats.add_local(1, "Alice", photo(10));
         chats.refresh();
         let mut images = images(ProtocolType::Kitty);
         add_photo(&mut images, 10);
@@ -403,7 +402,7 @@ mod tests {
     fn saved_messages_is_a_square_of_the_app_color() {
         let colors = Theme::Mocha.colors();
         let mut chats = Chats::default();
-        chats.add_for_test(7, "Eric", photo(10));
+        chats.add_local(7, "Eric", photo(10));
         chats.set_my_id(7);
         chats.refresh();
         let mut images = images(ProtocolType::Kitty);
@@ -416,7 +415,7 @@ mod tests {
     #[test]
     fn narrow_lists_leave_photos_out() {
         let mut chats = Chats::default();
-        chats.add_for_test(1, "Alice Smith", None);
+        chats.add_local(1, "Alice Smith", None);
         chats.refresh();
         let buf = render(
             &list(&chats, None),

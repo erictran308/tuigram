@@ -2053,7 +2053,7 @@ fn login_screen(step: LoginStep) -> Screen {
     Screen::Login(Box::new(Login::new(step)))
 }
 
-fn new_composer() -> TextArea<'static> {
+pub fn new_composer() -> TextArea<'static> {
     let mut composer = TextArea::default();
     composer.set_cursor_line_style(Style::default());
     composer
