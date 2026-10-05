@@ -8,12 +8,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ApiKeys;
 use crate::notify::Notifications;
-use crate::theme::Theme;
+use crate::theme;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub theme: Theme,
+    /// The theme in use, by file name without `.toml`: a built-in one or one
+    /// in the themes folder.
+    pub theme: String,
     /// Chats highlighted with `H`, by id.
     pub highlighted_chats: Vec<i64>,
     /// How new messages are announced: "auto" picks what the terminal
@@ -40,7 +42,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: Theme::default(),
+            theme: theme::DEFAULT.into(),
             highlighted_chats: Vec::new(),
             notifications: Notifications::default(),
             normal_after_send: false,
@@ -116,9 +118,9 @@ mod tests {
         let file = path(&dir);
         let _ = std::fs::remove_file(&file);
 
-        assert_eq!(Settings::load(&file).unwrap().theme, Theme::Mocha);
+        assert_eq!(Settings::load(&file).unwrap().theme, "mocha");
         let mut settings = Settings {
-            theme: Theme::Latte,
+            theme: "latte".into(),
             highlighted_chats: vec![-1001234567890, 42],
             notifications: Notifications::Off,
             normal_after_send: true,
@@ -149,9 +151,9 @@ mod tests {
         assert_eq!(old.chat_list_width, DEFAULT_LIST_WIDTH);
         assert_eq!(old.chat_list_side, Side::Left);
 
-        std::fs::write(&file, r#"theme = "dracula""#).unwrap();
-        let error = format!("{:#}", Settings::load(&file).unwrap_err());
-        assert!(error.contains("mocha"), "lists the valid themes: {error}");
+        // A theme that's gone is the app's to deal with, not a broken file.
+        std::fs::write(&file, r#"theme = "deleted""#).unwrap();
+        assert_eq!(Settings::load(&file).unwrap().theme, "deleted");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

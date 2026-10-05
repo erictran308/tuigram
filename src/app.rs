@@ -31,7 +31,7 @@ use crate::settings::{self, Settings, Side};
 use crate::stickers::{self, Source, StickerPanel};
 use crate::text;
 use crate::tg::{Deletable, Found, Page, Tagged, Tg, TgEvent};
-use crate::theme::Theme;
+use crate::theme::{Colors, Themes};
 use crate::ui;
 
 /// Chats requested per `loadChats` call.
@@ -270,33 +270,49 @@ pub enum HelpTab {
 }
 
 /// The `?` popup: every keyboard shortcut, and the settings. On the settings
-/// tab, moving the cursor previews a theme and Space ticks a checkbox
-/// (notifications, gaps in the chat list and in message blocks, Normal mode
-/// after sending);
-/// Enter saves, Esc puts the saved settings back.
+/// tab, Enter or Space ticks a checkbox (notifications, gaps in the chat list
+/// and in message blocks, Normal mode after sending) or picks a theme, and
+/// saves it at once.
 pub struct SettingsMenu {
     pub tab: HelpTab,
     /// First row shown on the shortcuts tab. Drawing keeps it in range.
     pub scroll: usize,
-    /// Row on the settings tab: a theme, or one of the checkboxes after them
-    /// ([`SettingsMenu::NOTIFICATIONS`] and on).
+    /// Row on the settings tab: one of the checkboxes, then the themes from
+    /// [`SettingsMenu::THEMES`] on.
     pub selected: usize,
+    /// First line shown on the settings tab. Drawing moves it to show the
+    /// selected row.
+    pub settings_scroll: usize,
     /// How notifications went out when the popup opened, so turning them
     /// off and on again keeps the way, e.g. "bell".
     pub saved_notifications: Notifications,
 }
 
 impl SettingsMenu {
-    /// The notifications row, after the themes.
-    pub const NOTIFICATIONS: usize = Theme::ALL.len();
+    /// The notifications row, the first one.
+    pub const NOTIFICATIONS: usize = 0;
     /// The "gap between chats" row.
     pub const CHAT_GAPS: usize = Self::NOTIFICATIONS + 1;
     /// The "chat list on the right" row.
     pub const LIST_RIGHT: usize = Self::CHAT_GAPS + 1;
     /// The "gap between messages" row.
     pub const BLOCK_GAPS: usize = Self::LIST_RIGHT + 1;
-    /// The "Normal mode after sending" row, the last one.
+    /// The "Normal mode after sending" row.
     pub const AFTER_SEND: usize = Self::BLOCK_GAPS + 1;
+    /// The first theme's row. The themes come last, since the user's own
+    /// can make a long list.
+    pub const THEMES: usize = Self::AFTER_SEND + 1;
+
+    /// Opens on `tab` with the cursor on the first setting.
+    pub fn new(tab: HelpTab, settings: &Settings) -> Self {
+        Self {
+            tab,
+            scroll: 0,
+            selected: 0,
+            settings_scroll: 0,
+            saved_notifications: settings.notifications,
+        }
+    }
 }
 
 /// What the status bar prompt is for: a `/` search through chat titles or the
@@ -396,6 +412,10 @@ pub struct App {
     pub confirm: Option<Confirm>,
     pub settings: Settings,
     settings_path: PathBuf,
+    /// Every theme, read again whenever `?` opens, so changes to a file show.
+    pub themes: Themes,
+    /// The colors of the theme in use.
+    pub colors: Colors,
     /// You have Telegram Premium, so Premium stickers can be sent.
     premium: bool,
     /// API credentials from the environment, which win over saved ones.
@@ -461,7 +481,7 @@ impl App {
         let notify_with = settings
             .notifications
             .resolve(|name| std::env::var(name).ok());
-        Self {
+        let mut app = Self {
             tg,
             screen: login_screen(LoginStep::Connecting),
             focus: Focus::Chats,
@@ -483,7 +503,9 @@ impl App {
             resizing: None,
             confirm: None,
             settings,
+            themes: Themes::load(&settings_path.with_file_name("themes")),
             settings_path,
+            colors: Colors::default(),
             premium: false,
             env_keys,
             keys_source: None,
@@ -508,6 +530,21 @@ impl App {
             unread_chats: 0,
             relogin: false,
             exit: false,
+        };
+        app.use_saved_theme();
+        app
+    }
+
+    /// Uses the theme the settings name, or the default one, saying why, if
+    /// it can't be used: a broken file never leaves the app unreadable. The
+    /// setting stays, so fixing the file is enough.
+    fn use_saved_theme(&mut self) {
+        match self.themes.colors(&self.settings.theme) {
+            Ok(colors) => self.colors = colors,
+            Err(e) => {
+                self.colors = Colors::default();
+                self.status = Some(format!("Theme not used: {e}"));
+            }
         }
     }
 
@@ -1119,13 +1156,11 @@ impl App {
             (_, KeyCode::Char('q')) => self.quit(),
             (_, KeyCode::Char('H')) => self.toggle_highlight(),
             (_, KeyCode::Char('?')) => {
-                let theme = self.settings.theme;
-                self.settings_menu = Some(SettingsMenu {
-                    tab: HelpTab::Shortcuts,
-                    scroll: 0,
-                    selected: Theme::ALL.iter().position(|&t| t == theme).unwrap_or(0),
-                    saved_notifications: self.settings.notifications,
-                });
+                if let Some(dir) = self.themes.dir.clone() {
+                    self.themes = Themes::load(&dir);
+                }
+                self.use_saved_theme();
+                self.settings_menu = Some(SettingsMenu::new(HelpTab::Shortcuts, &self.settings));
             }
             (_, KeyCode::Char(':')) => self.open_prompt(PromptKind::Command),
             (Focus::Chats, KeyCode::Char('/')) => self.open_prompt(PromptKind::Chats),
@@ -2587,7 +2622,7 @@ impl App {
             // Drawing stops it at the end of the list.
             HelpTab::Shortcuts => menu.scroll = menu.scroll.saturating_add_signed(delta),
             HelpTab::Settings => {
-                let last = SettingsMenu::AFTER_SEND;
+                let last = SettingsMenu::THEMES + self.themes.list.len() - 1;
                 menu.selected = menu.selected.saturating_add_signed(delta).min(last);
             }
         }
@@ -2601,7 +2636,21 @@ impl App {
         };
         let settings = &mut self.settings;
         match menu.selected {
-            i if i < SettingsMenu::NOTIFICATIONS => settings.theme = Theme::ALL[i],
+            i if i >= SettingsMenu::THEMES => {
+                let Some(theme) = self.themes.list.get(i - SettingsMenu::THEMES) else {
+                    return;
+                };
+                match &theme.colors {
+                    Ok(colors) => {
+                        self.colors = *colors;
+                        settings.theme = theme.id.clone();
+                    }
+                    Err(e) => {
+                        self.status = Some(format!("Theme not used: {e}"));
+                        return;
+                    }
+                }
+            }
             SettingsMenu::NOTIFICATIONS => {
                 // Back on, they go out the way they did before, e.g. "bell".
                 let on = match menu.saved_notifications {
@@ -2832,6 +2881,7 @@ fn unix_now() -> i32 {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
     use ratatui_image::picker::Picker;
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -2924,19 +2974,51 @@ mod tests {
         let tg = Tg::detached(unbounded_channel().0);
         let mut app = crate::demo::demo_app(tg, images, &dir);
         let none = KeyModifiers::NONE;
-        let first = app.settings.theme;
         press(&mut app, KeyCode::Char('?'), none);
         press(&mut app, KeyCode::Tab, none);
-        // The cursor starts on the theme in use, Mocha, the last one.
-        press(&mut app, KeyCode::Char('k'), none);
-        assert!(app.settings.theme == first, "moving doesn't change it");
-        let picked = Theme::ALL[app.settings_menu.as_ref().unwrap().selected];
+        // The themes are the last rows.
+        press(&mut app, KeyCode::Char('G'), none);
+        assert_eq!(app.settings.theme, "mocha", "moving doesn't change it");
         press(&mut app, KeyCode::Char(' '), none);
-        assert!(app.settings.theme == picked && picked != first);
+        assert_eq!(app.settings.theme, "rose-pine");
+        assert_eq!(app.colors, app.themes.colors("rose-pine").unwrap());
         let saved = Settings::load(&settings::path(&dir)).unwrap();
-        assert!(saved.theme == picked);
+        assert_eq!(saved.theme, "rose-pine");
         press(&mut app, KeyCode::Char('q'), none);
-        assert!(app.settings.theme == picked, "closing keeps it");
+        assert_eq!(app.settings.theme, "rose-pine", "closing keeps it");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn themes_in_the_data_folder_are_read_again_when_the_popup_opens() {
+        let dir = std::env::temp_dir().join(format!("tuigram-own-theme-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        let none = KeyModifiers::NONE;
+        let file = dir.join("themes/mine.toml");
+        app.settings.theme = "mine".into();
+        std::fs::write(&file, "inherits = \"mocha\"\n[colors]\nbg = \"#000000\"").unwrap();
+        press(&mut app, KeyCode::Char('?'), none);
+        assert_eq!(app.colors.bg, Color::Rgb(0, 0, 0));
+        assert_eq!(app.status, None);
+        press(&mut app, KeyCode::Esc, none);
+
+        // A broken file leaves the default theme in use, saying why.
+        std::fs::write(&file, "inherits = 3").unwrap();
+        press(&mut app, KeyCode::Char('?'), none);
+        assert_eq!(app.colors, Colors::default());
+        let status = app.status.clone().unwrap();
+        assert!(status.contains("mine.toml: line 1"), "{status}");
+        assert_eq!(app.settings.theme, "mine", "kept, for when it's fixed");
+
+        // Picking it says why too, and changes nothing.
+        press(&mut app, KeyCode::Tab, none);
+        press(&mut app, KeyCode::Char('G'), none);
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.status.as_ref().unwrap().contains("mine.toml"));
+        assert_eq!(app.colors, Colors::default());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

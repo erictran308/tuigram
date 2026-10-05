@@ -47,12 +47,11 @@ pub fn lines(text: &str, colors: &Colors) -> Option<Vec<Line<'static>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::Theme;
 
     #[test]
     fn the_drawn_code_scans_back_to_the_link() {
         let link = "tg://login?token=AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA";
-        let rows = lines(link, &Theme::Mocha.colors()).unwrap();
+        let rows = lines(link, &Colors::default()).unwrap();
 
         // Back to modules: each character is two of them, top then bottom.
         let mut modules: Vec<Vec<bool>> = Vec::new();

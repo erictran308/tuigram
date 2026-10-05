@@ -32,7 +32,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app.
 - **Send photos and files.** Drop them on the window, paste a screenshot with `p`, or type a path with `a` (Tab completes it). What you write goes with them as the caption, and several photos go as one album.
 - **Notifications.** New messages pop up as system notifications while you're in another window, and the window title counts your unread chats. Telegram's mute settings apply.
-- **Make it yours.** Four Catppuccin themes, and highlights that make your important chats stand out.
+- **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord and Rosé Pine themes or [your own](#themes), and highlights that make your important chats stand out.
 - **Private by design.** tuigram talks only to Telegram. No telemetry, no accounts and no servers in between. Your session stays on your machine, and read receipts go out only for messages you've actually had in front of you.
 - **Careful with what others send.** A file that could run a program, or a link whose text hides where it really goes, asks before opening.
 
@@ -160,6 +160,56 @@ To turn them off or on, press `?`, go to **Settings**, and press `Space` or `Ent
 
 Like Telegram Desktop, tuigram shows you as online while its window is focused and you've pressed a key in the last minute, so notifications arrive right away instead of waiting to see if you read them on your phone.
 
+## Themes
+
+Press `?`, go to **Settings**, and pick a theme at the bottom of the list: Catppuccin (Latte, Frappé, Macchiato, Mocha), Tokyo Night, Dracula, Gruvbox, Nord or Rosé Pine. It's saved at once.
+
+To make your own, put a `.toml` file in the `themes` folder inside [your data folder](#your-data), then pick it in the same list. tuigram reads the folder again each time `?` opens, so you can edit a theme and see the change by pressing `?`. A theme can start from another one and change only a few colors:
+
+```toml
+# themes/my-mocha.toml
+name = "My Mocha"    # what the list shows; the file name otherwise
+inherits = "mocha"   # a built-in theme's file name, or one of yours
+
+[palette]
+blue = "#7aa2f7"     # your bubbles, unread counts and the rest follow
+
+[colors]
+bg = "reset"         # let the terminal's own background show through
+search = "orange"
+```
+
+Sixteen `[palette]` colors make a whole theme: `bg`, `bg_alt`, `surface`, `overlay`, `comment`, `subtext`, `fg`, `red`, `orange`, `yellow`, `green`, `cyan`, `blue`, `purple`, `pink` and `accent`. To start one, copy a [built-in theme](themes/); [mocha.toml](themes/mocha.toml) says what each color paints. A file named like a built-in theme, such as `mocha.toml`, replaces it, and `inherits = "mocha"` in it then means the original.
+
+`[colors]` sets single things, to a palette color, `"#rrggbb"`, or `"reset"` for the terminal's own color:
+
+| Name | What it paints | Unless set |
+| --- | --- | --- |
+| `bg`, `fg` | Background and text | `bg`, `fg` |
+| `subtle` | Chat previews, photo placeholders | `subtext` |
+| `muted` | Key hints, dates, placeholders | `comment` |
+| `border` | Borders of the pane not in use | `overlay` |
+| `accent` | The pane in use, cursors, popups | `accent` |
+| `selection` | The selected row | `surface` |
+| `popup_bg` | Popups | `bg_alt` |
+| `primary` | Unread counts, NORMAL, Saved Messages | `blue` |
+| `highlighted` | Chats you highlighted with `H` | `orange` |
+| `insert`, `command`, `search` | INSERT, COMMAND and SEARCH; search matches | `green`, `purple`, `yellow` |
+| `error` | Errors, messages that failed to send, deleting | `red` |
+| `warning` | "Are you sure" popups, things still in progress | `yellow` |
+| `success` | Notes that something worked | `green` |
+| `reply`, `edit` | The bar over the composer, and the message it's about | `cyan`, `orange` |
+| `activity` | "typing…" | `blue` |
+| `attach` | Files waiting to be sent | `blue` |
+| `own_bubble`, `other_bubble` | Your messages, and other people's | `bg` tinted `blue`, `surface` |
+| `own_meta`, `other_meta` | The time and ✓ on them | `fg` mixed with `blue`, `subtext` |
+| `own_reaction`, `other_reaction` | Reactions on them | A shade off the bubble |
+| `your_reaction` | Reactions you added | `blue` |
+| `names` | Seven colors for people's names in groups | `red`, `orange`, `purple`, `green`, `cyan`, `blue`, `pink` |
+| `qr_dark`, `qr_light` | The QR code for logging in | Near black, near white |
+
+If a theme can't be used, tuigram says why in the status bar and uses Catppuccin Mocha until the file is fixed.
+
 ## Your data
 
 Everything lives in one folder on your machine (`tuigram --help` prints its path):
@@ -170,7 +220,7 @@ Everything lives in one folder on your machine (`tuigram --help` prints its path
 | Linux | `~/.local/share/tuigram` |
 | Windows | `%LOCALAPPDATA%\tuigram` |
 
-It holds your login session, API keys, downloaded files and settings. Deleting it removes your session from this computer. To end the session completely, go to **Settings → Devices** in another Telegram app.
+It holds your login session, API keys, downloaded files, settings and [your own themes](#themes). Deleting it removes your session from this computer. To end the session completely, go to **Settings → Devices** in another Telegram app.
 
 Environment variables (they can also go in a `.env` file in the current directory):
 
@@ -193,7 +243,7 @@ Copy `.env.example` to `.env` to keep a separate development session (for exampl
 
 - [TDLib](https://github.com/tdlib/td) through [tdlib-rs](https://github.com/FedericoBruzzone/tdlib-rs)
 - [ratatui](https://ratatui.rs) and [ratatui-image](https://github.com/benjajaja/ratatui-image)
-- [Catppuccin](https://catppuccin.com) colors
+- Colors from [Catppuccin](https://catppuccin.com), [Tokyo Night](https://github.com/folke/tokyonight.nvim), [Dracula](https://draculatheme.com), [Gruvbox](https://github.com/morhetz/gruvbox), [Nord](https://www.nordtheme.com) and [Rosé Pine](https://rosepinetheme.com)
 
 ## License
 

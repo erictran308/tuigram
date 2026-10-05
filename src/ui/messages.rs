@@ -21,7 +21,6 @@ use crate::messages::{
 };
 use crate::reactions::{self, Reaction};
 use crate::search;
-use crate::settings::Settings;
 use crate::theme::Colors;
 
 /// Bubbles take at most this share of the pane width.
@@ -107,6 +106,7 @@ struct PhotoSlot {
     photo: Preview,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
@@ -114,9 +114,9 @@ pub fn draw(
     names: &Names,
     images: &mut Images,
     focused: bool,
-    settings: &Settings,
+    colors: &Colors,
+    block_gaps: bool,
 ) {
-    let colors = &settings.theme.colors();
     let chat = names.chats.get(open.chat_id);
     let mut title = vec![
         Span::from(format!(
@@ -167,7 +167,7 @@ pub fn draw(
         open,
         names,
         show_names,
-        settings.block_gaps,
+        block_gaps,
         body.width as usize,
         font,
         colors,
@@ -999,7 +999,7 @@ mod tests {
     use super::*;
     use crate::images::Key;
     use crate::messages::Editable;
-    use crate::theme::Theme;
+    use crate::settings::Settings;
 
     /// Halfblocks need no terminal query, and their cells are easy to assert on.
     fn images() -> Images {
@@ -1071,7 +1071,8 @@ mod tests {
                     &names,
                     images,
                     focused,
-                    &Settings::default(),
+                    &Colors::default(),
+                    Settings::default().block_gaps,
                 )
             })
             .unwrap();
@@ -1156,7 +1157,7 @@ mod tests {
             width: 10,
             height: 20,
         };
-        let colors = Theme::default().colors();
+        let colors = Colors::default();
         let (lines, _, _) = layout(&sample(), &names, true, true, 58, font, &colors);
         let text: Vec<String> = lines
             .iter()
@@ -1181,7 +1182,7 @@ mod tests {
             width: 10,
             height: 20,
         };
-        let colors = Theme::default().colors();
+        let colors = Colors::default();
         let mut open = sample();
         // A second message from Chardy right after the first.
         open.messages
@@ -1261,7 +1262,7 @@ mod tests {
         open.messages
             .insert(3, msg(true, day + 120, "a longer one of mine"));
         open.messages.insert(4, msg(true, day + 180, "ok"));
-        let colors = Theme::default().colors();
+        let colors = Colors::default();
         let buf = render_buffer(&mut open, false, &mut images());
         let row = |needle: &str| {
             (0..buf.area.height)
@@ -1315,7 +1316,7 @@ mod tests {
             width: 10,
             height: 20,
         };
-        let colors = Theme::default().colors();
+        let colors = Colors::default();
         let mut open = OpenChat::new(42);
         open.messages.insert(1, msg(false, 1_790_000_000, "one"));
         open.messages.insert(2, msg(false, 1_790_000_060, "two"));
@@ -1335,7 +1336,7 @@ mod tests {
             width: 10,
             height: 20,
         };
-        let colors = Theme::default().colors();
+        let colors = Colors::default();
         let photo = |file_id, caption: &str| Msg {
             preview: Some(Preview {
                 file_id,
@@ -1530,7 +1531,7 @@ mod tests {
             .collect();
         assert!(rows[0].contains("/HELLO 1 of 1"), "title: {}", rows[0]);
 
-        let colors = Theme::default().colors();
+        let colors = Colors::default();
         let lit: String = buf
             .content()
             .iter()
@@ -1594,7 +1595,7 @@ mod tests {
         // 512x512 at 10x20 px cells: 20 cols by 10 rows.
         assert_eq!(photo_cells(&sticker, 56, images.font_size()), (20, 10));
         let buf = render_buffer(&mut open, false, &mut images);
-        let own = Theme::default().colors().own_bubble;
+        let own = Colors::default().own_bubble;
         assert!(
             buf.content().iter().all(|c| c.bg != own),
             "no bubble color anywhere"
@@ -1613,7 +1614,7 @@ mod tests {
             width: 10,
             height: 20,
         };
-        let colors = Theme::default().colors();
+        let colors = Colors::default();
         let reply = |message_id, quote: Option<&str>| {
             Some(ReplyTo {
                 message_id,
@@ -1691,7 +1692,7 @@ mod tests {
         open.reply = Some(crate::messages::Replied::new(1, &open.messages[&1]));
         // Typing the reply: the message pane isn't focused.
         let buf = render_buffer(&mut open, false, &mut images());
-        let colors = Theme::default().colors();
+        let colors = Colors::default();
         let y = (0..buf.area.height)
             .find(|&y| {
                 let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
@@ -1720,7 +1721,7 @@ mod tests {
             attachments: Vec::new(),
         });
         let buf = render_buffer(&mut open, false, &mut images());
-        let colors = Theme::default().colors();
+        let colors = Colors::default();
         let (y, row) = (0..buf.area.height)
             .map(|y| {
                 let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
@@ -1747,7 +1748,7 @@ mod tests {
         open.messages.get_mut(&1).unwrap().reactions =
             vec![reaction("👍", 3, true), reaction("❤", 1, false)];
         let buf = render_buffer(&mut open, false, &mut images());
-        let colors = Theme::default().colors();
+        let colors = Colors::default();
         let rows: Vec<String> = (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
             .collect();

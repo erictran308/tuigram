@@ -142,7 +142,7 @@ press ? for settings and q to quit.
 {keys}
 
 Your login session, API credentials, downloaded files and settings are
-kept in:
+kept in this folder, and your own color themes in its themes folder:
   {data}
 
 Environment:

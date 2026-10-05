@@ -23,7 +23,7 @@ use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search;
 use crate::settings::{Settings, Side};
 use crate::text;
-use crate::theme::{Colors, Theme};
+use crate::theme::{Colors, Themes};
 
 /// The composer grows with its text up to this many rows, then scrolls.
 const MAX_COMPOSER_ROWS: usize = 6;
@@ -41,7 +41,7 @@ mod qr;
 mod stickers;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let colors = app.settings.theme.colors();
+    let colors = app.colors;
     // The theme's background and text color everywhere; widgets drawn on top
     // only change what they style themselves.
     frame.render_widget(
@@ -364,7 +364,8 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 &names,
                 &mut app.images,
                 app.focus == Focus::Messages,
-                &app.settings,
+                colors,
+                app.settings.block_gaps,
             );
             if let Some(panel) = panel {
                 stickers::draw(frame, panel_area, panel, &mut app.images, colors);
@@ -427,7 +428,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         draw_confirm(frame, chat_area, confirm, colors);
     }
     if let Some(menu) = &mut app.settings_menu {
-        draw_settings(frame, menu, &app.settings, colors);
+        draw_settings(frame, menu, &app.settings, &app.themes, colors);
     }
     if let Some(toast) = &app.toast {
         draw_toast(frame, toast, colors);
@@ -673,8 +674,14 @@ fn draw_react(
 }
 
 /// The `?` popup, centered on the screen: a tab with every shortcut, and one
-/// with the settings (only the theme for now).
-fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, settings: &Settings, colors: &Colors) {
+/// with the settings.
+fn draw_settings(
+    frame: &mut Frame,
+    menu: &mut SettingsMenu,
+    settings: &Settings,
+    themes: &Themes,
+    colors: &Colors,
+) {
     let area = frame.area();
     // Both tabs get the same size, so the tabs don't move when switching.
     let width = (help::width() as u16 + 2).min(area.width.saturating_sub(2));
@@ -696,10 +703,10 @@ fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, settings: &Settings
     ]);
     let keys = match menu.tab {
         HelpTab::Shortcuts => " `j/k` scroll · `Tab` settings · `Esc` close ",
-        HelpTab::Settings if menu.selected >= SettingsMenu::NOTIFICATIONS => {
-            " `Enter` or `Space` on/off · `Tab` shortcuts · `Esc` close "
+        HelpTab::Settings if menu.selected >= SettingsMenu::THEMES => {
+            " `Enter` or `Space` use · `Tab` shortcuts · `Esc` close "
         }
-        HelpTab::Settings => " `Enter` or `Space` use · `Tab` shortcuts · `Esc` close ",
+        HelpTab::Settings => " `Enter` or `Space` on/off · `Tab` shortcuts · `Esc` close ",
     };
     let block = popup_block(tabs, keys, colors);
     let inner = block.inner(popup);
@@ -710,14 +717,14 @@ fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, settings: &Settings
         return;
     }
 
-    let row = |i: usize, mark: &'static str, label: &'static str| {
+    let row = |i: usize, mark: &'static str, label: Span<'static>| {
         let selected = i == menu.selected;
         let bar = if selected {
             Span::from("▌").fg(colors.accent)
         } else {
             Span::from(" ")
         };
-        let line = Line::from(vec![bar, Span::from(mark).fg(colors.accent), label.into()]);
+        let line = Line::from(vec![bar, Span::from(mark).fg(colors.accent), label]);
         if selected {
             line.style(Style::new().bg(colors.selection))
         } else {
@@ -725,60 +732,122 @@ fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, settings: &Settings
         }
     };
     let heading = |text: &'static str| Line::from(text).fg(colors.muted).bold();
-    let mut lines = vec![heading(" Theme")];
-    for (i, &theme) in Theme::ALL.iter().enumerate() {
+    let check = |on: bool| if on { " [✓] " } else { " [ ] " };
+    let last_row = SettingsMenu::THEMES + themes.list.len() - 1;
+    // The line the cursor is on, and the last one to show with it.
+    let mut lines = Vec::new();
+    let (mut cursor, mut cursor_end) = (0, 0);
+    let mut add = |lines: &mut Vec<Line<'static>>, i: usize, mark, label: &str| {
+        if i == menu.selected {
+            cursor = lines.len();
+            cursor_end = cursor;
+        }
+        lines.push(row(i, mark, Span::from(label.to_string())));
+    };
+    lines.push(heading(" Notifications"));
+    add(
+        &mut lines,
+        SettingsMenu::NOTIFICATIONS,
+        check(settings.notifications != Notifications::Off),
+        "New messages, while tuigram is in the background",
+    );
+    lines.push(Line::default());
+    lines.push(heading(" Chat list"));
+    add(
+        &mut lines,
+        SettingsMenu::CHAT_GAPS,
+        check(settings.chat_gaps),
+        "A gap between chats",
+    );
+    add(
+        &mut lines,
+        SettingsMenu::LIST_RIGHT,
+        check(settings.chat_list_side == Side::Right),
+        "On the right side of the window",
+    );
+    lines.push(Line::default());
+    lines.push(heading(" Messages"));
+    add(
+        &mut lines,
+        SettingsMenu::BLOCK_GAPS,
+        check(settings.block_gaps),
+        "A gap between messages in a row from one person",
+    );
+    lines.push(Line::default());
+    lines.push(heading(" Composer"));
+    add(
+        &mut lines,
+        SettingsMenu::AFTER_SEND,
+        check(settings.normal_after_send),
+        "Back to Normal mode after sending a message",
+    );
+    lines.push(Line::default());
+    lines.push(heading(" Theme"));
+    for (i, theme) in themes.list.iter().enumerate() {
         // The dot marks the theme in use.
-        let mark = if theme == settings.theme {
+        let mark = if theme.id == settings.theme {
             " ● "
         } else {
             " ○ "
         };
-        lines.push(row(i, mark, theme.label()));
+        add(&mut lines, SettingsMenu::THEMES + i, mark, &theme.label);
+        // One that can't be used is dimmed; picking it says why.
+        if theme.colors.is_err()
+            && let Some(line) = lines.last_mut()
+            && let Some(label) = line.spans.last_mut()
+        {
+            label.style = label.style.fg(colors.muted);
+        }
     }
-    let check = |on: bool| if on { " [✓] " } else { " [ ] " };
-    lines.push(Line::default());
-    lines.push(heading(" Notifications"));
-    lines.push(row(
-        SettingsMenu::NOTIFICATIONS,
-        check(settings.notifications != Notifications::Off),
-        "New messages, while tuigram is in the background",
-    ));
-    lines.push(Line::default());
-    lines.push(heading(" Chat list"));
-    lines.push(row(
-        SettingsMenu::CHAT_GAPS,
-        check(settings.chat_gaps),
-        "A gap between chats",
-    ));
-    lines.push(row(
-        SettingsMenu::LIST_RIGHT,
-        check(settings.chat_list_side == Side::Right),
-        "On the right side of the window",
-    ));
-    lines.push(Line::default());
-    lines.push(heading(" Messages"));
-    lines.push(row(
-        SettingsMenu::BLOCK_GAPS,
-        check(settings.block_gaps),
-        "A gap between messages in a row from one person",
-    ));
-    lines.push(Line::default());
-    lines.push(heading(" Composer"));
-    lines.push(row(
-        SettingsMenu::AFTER_SEND,
-        check(settings.normal_after_send),
-        "Back to Normal mode after sending a message",
-    ));
-    for (line, y) in lines.into_iter().zip(inner.y..inner.bottom()) {
-        frame.render_widget(
-            line,
-            Rect {
-                y,
-                height: 1,
-                ..inner
-            },
-        );
+    if let Some(dir) = &themes.dir {
+        lines.push(Line::default());
+        lines.push(Line::from(" Your own themes go in").fg(colors.muted));
+        lines.push(Line::from(format!(" {}", short_path(dir))).fg(colors.muted));
     }
+    // On the last theme, the lines after it show too.
+    if menu.selected == last_row {
+        cursor_end = lines.len() - 1;
+    }
+
+    // Scrolled as little as keeps the cursor in view, with the line above
+    // it: the heading, for the first row of a group.
+    let rows = usize::from(inner.height);
+    let scroll = &mut menu.settings_scroll;
+    *scroll = (*scroll).min(cursor.saturating_sub(1));
+    if cursor_end >= *scroll + rows {
+        *scroll = cursor_end + 1 - rows;
+    }
+    let max = lines.len().saturating_sub(rows);
+    *scroll = (*scroll).min(max);
+    frame.render_widget(Paragraph::new(lines).scroll((*scroll as u16, 0)), inner);
+    scrollbar(frame, inner, max, *scroll, colors);
+}
+
+/// A scrollbar down the right of `area`, for a list scrolled `position` rows
+/// of the most it can be, `max`. None if it all fits.
+fn scrollbar(frame: &mut Frame, area: Rect, max: usize, position: usize, colors: &Colors) {
+    if max == 0 {
+        return;
+    }
+    let mut state = ScrollbarState::new(max).position(position);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .thumb_style(colors.accent)
+            .track_style(colors.border),
+        area,
+        &mut state,
+    );
+}
+
+/// `path` with the home folder written `~`, to keep it short.
+fn short_path(path: &std::path::Path) -> String {
+    let path = match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) => std::path::Path::new("~").join(rest),
+        None => path.to_path_buf(),
+    };
+    text::clean(&path.display().to_string())
 }
 
 /// A popup's frame: accent border and its own background, so it stands out
@@ -1432,18 +1501,18 @@ mod tests {
 
     #[test]
     fn help_opens_on_the_shortcuts_and_scrolls_to_the_end() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut menu = SettingsMenu {
-            tab: HelpTab::Shortcuts,
-            scroll: 0,
             selected: 3,
-            saved_notifications: Notifications::Auto,
+            ..SettingsMenu::new(HelpTab::Shortcuts, &Settings::default())
         };
         // Too short for the whole list.
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         let mut draw = |menu: &mut SettingsMenu| {
             terminal
-                .draw(|f| draw_settings(f, menu, &Settings::default(), &colors))
+                .draw(|f| {
+                    draw_settings(f, menu, &Settings::default(), &Themes::built_in(), &colors)
+                })
                 .unwrap();
             buffer_rows(terminal.backend().buffer())
         };
@@ -1469,12 +1538,12 @@ mod tests {
 
         menu.tab = HelpTab::Settings;
         let rows = draw(&mut menu);
-        assert!(has(&rows, "Catppuccin Mocha") && !has(&rows, "Everywhere"));
+        assert!(has(&rows, "New messages") && !has(&rows, "Everywhere"));
     }
 
     #[test]
     fn a_toast_says_what_was_copied_in_the_corner() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let toast = Toast {
             title: "Copied".into(),
             detail: "https://example.com/a".into(),
@@ -1510,7 +1579,7 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(70, 12)).unwrap();
         terminal
-            .draw(|f| draw_menu(f, f.area(), &menu, &Theme::Mocha.colors()))
+            .draw(|f| draw_menu(f, f.area(), &menu, &Colors::default()))
             .unwrap();
         let rows = buffer_rows(terminal.backend().buffer());
         let has = |needle: &str| rows.iter().any(|r| r.contains(needle));
@@ -1541,7 +1610,7 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(70, 12)).unwrap();
         terminal
-            .draw(|f| draw_menu(f, f.area(), &menu, &Theme::Mocha.colors()))
+            .draw(|f| draw_menu(f, f.area(), &menu, &Colors::default()))
             .unwrap();
         let buf = terminal.backend().buffer();
         let rows: Vec<String> = (0..buf.area.height)
@@ -1560,7 +1629,7 @@ mod tests {
 
     #[test]
     fn the_composer_says_a_message_is_being_edited() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let users = std::collections::HashMap::new();
         let chats = crate::chats::Chats::default();
         let names = messages::Names {
@@ -1608,7 +1677,7 @@ mod tests {
 
     #[test]
     fn the_composer_says_which_message_a_reply_answers() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let users = std::collections::HashMap::from([(2, "Chardy".to_string())]);
         let chats = crate::chats::Chats::default();
         let names = messages::Names {
@@ -1665,7 +1734,7 @@ mod tests {
 
     #[test]
     fn files_to_send_are_listed_under_the_reply_and_the_text_is_their_caption() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let users = std::collections::HashMap::new();
         let chats = crate::chats::Chats::default();
         let names = messages::Names {
@@ -1751,7 +1820,7 @@ mod tests {
 
     #[test]
     fn tab_in_the_attach_prompt_lists_what_matched() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let names: Vec<String> = (0..14).map(|i| format!("photo-{i:02}.jpg")).collect();
         let mut names = names;
         names.insert(0, "photos/".into());
@@ -1776,7 +1845,7 @@ mod tests {
     #[test]
     fn deleting_shows_the_message_and_only_the_choices_telegram_allows() {
         use crate::tg::Deletable;
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut menu = DeleteMenu {
             message_id: 5,
             snippet: "see you at 7".into(),
@@ -1822,7 +1891,7 @@ mod tests {
 
     #[test]
     fn the_reaction_popup_marks_the_cursor_and_yours_and_searches_by_name() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut menu = ReactMenu::new(5, "see you at 7".into());
         let render = |menu: &mut ReactMenu| {
             let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
@@ -1914,7 +1983,7 @@ mod tests {
 
     #[test]
     fn first_run_asks_for_api_credentials_and_says_where_to_get_them() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
             .draw(|f| draw_login(f, &Login::new(LoginStep::ApiId), &colors))
@@ -1936,7 +2005,7 @@ mod tests {
     }
 
     fn draw_login_rows(step: LoginStep, width: u16, height: u16) -> Vec<String> {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|f| draw_login(f, &Login::new(step), &colors))
@@ -1958,7 +2027,7 @@ mod tests {
 
     #[test]
     fn qr_login_fits_the_code_and_where_to_scan_it_in_80_by_24() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let link = LOGIN_LINK.to_string();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
@@ -2016,7 +2085,7 @@ mod tests {
 
     #[test]
     fn the_command_list_shows_every_command_and_marks_what_is_typed() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
         terminal
             .draw(|f| draw_commands(f, f.area(), "lo", &colors))
@@ -2051,21 +2120,19 @@ mod tests {
 
     #[test]
     fn popups_write_in_the_themes_text_color_whatever_the_terminals_is() {
-        for theme in Theme::ALL {
-            let colors = theme.colors();
+        for theme in Themes::built_in().list {
+            let colors = theme.colors.unwrap();
             let mut menu = SettingsMenu {
-                tab: HelpTab::Settings,
-                scroll: 0,
                 selected: 0,
-                saved_notifications: Notifications::Auto,
+                ..SettingsMenu::new(HelpTab::Settings, &Settings::default())
             };
             let settings = Settings {
-                theme,
+                theme: theme.id.clone(),
                 ..Settings::default()
             };
             let mut terminal = Terminal::new(TestBackend::new(70, 30)).unwrap();
             terminal
-                .draw(|f| draw_settings(f, &mut menu, &settings, &colors))
+                .draw(|f| draw_settings(f, &mut menu, &settings, &Themes::built_in(), &colors))
                 .unwrap();
             let buf = terminal.backend().buffer();
             let rows = buffer_rows(buf);
@@ -2076,13 +2143,13 @@ mod tests {
             let x = (0..buf.area.width)
                 .find(|&x| buf[(x, y as u16)].symbol() == "A")
                 .unwrap();
-            assert_eq!(buf[(x, y as u16)].fg, colors.fg, "{theme:?}");
+            assert_eq!(buf[(x, y as u16)].fg, colors.fg, "{}", theme.id);
         }
     }
 
     #[test]
     fn keys_in_hints_stand_out_from_what_they_do() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let muted = Style::new().fg(colors.muted);
         let spans = hint_spans(
             "  `Alt-Enter` or `Ctrl-j` new line · `/` search",
@@ -2123,7 +2190,7 @@ mod tests {
 
     #[test]
     fn a_disguised_link_asks_first_and_shows_where_it_goes() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let confirm = Confirm {
             title: "Open this link?".into(),
             lines: vec![
@@ -2153,7 +2220,7 @@ mod tests {
 
     #[test]
     fn highlight_marks_every_match() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let spans = highlight("Alice & ALI", "ali", Style::new(), &colors);
         let lit: Vec<&str> = spans
             .iter()
@@ -2167,7 +2234,7 @@ mod tests {
 
     #[test]
     fn highlighted_chats_get_their_own_title_color() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut chats = crate::chats::Chats::default();
         chats.set_my_id(7);
         chats.set_highlighted(&[3, 7]);
@@ -2183,31 +2250,41 @@ mod tests {
     }
 
     #[test]
-    fn settings_list_every_theme_and_mark_the_saved_one() {
-        // Previewing Latte while Mocha is saved.
+    fn settings_list_every_theme_last_and_mark_the_saved_one() {
+        // On Latte while Mocha is saved.
         let mut menu = SettingsMenu {
-            tab: HelpTab::Settings,
-            scroll: 0,
-            selected: 0,
-            saved_notifications: Notifications::Auto,
+            selected: SettingsMenu::THEMES,
+            ..SettingsMenu::new(HelpTab::Settings, &Settings::default())
         };
-        let colors = Theme::Latte.colors();
-        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let themes = Themes::built_in();
+        let colors = themes.colors("latte").unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
         terminal
-            .draw(|f| draw_settings(f, &mut menu, &Settings::default(), &colors))
+            .draw(|f| draw_settings(f, &mut menu, &Settings::default(), &themes, &colors))
             .unwrap();
         let buf = terminal.backend().buffer();
-        let rows: Vec<String> = (0..buf.area.height)
-            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
-            .collect();
-        let row = |needle: &str| rows.iter().find(|r| r.contains(needle)).unwrap();
+        let rows = buffer_rows(buf);
+        let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+        let row = |needle: &str| &rows[at(needle)];
 
         assert!(row("Settings").contains("Settings"));
-        assert!(row("Theme").contains("Theme"));
+        assert!(
+            at("Theme") > at("Back to Normal mode"),
+            "after the checkboxes"
+        );
         assert!(row("Catppuccin Latte").contains("▌ ○"), "cursor on Latte");
         assert!(row("Catppuccin Frappé").contains("○"));
         assert!(row("Catppuccin Macchiato").contains("○"));
         assert!(row("Catppuccin Mocha").contains("●"), "Mocha is saved");
+        for theme in [
+            "Tokyo Night",
+            "Dracula",
+            "Gruvbox Dark",
+            "Nord",
+            "Rosé Pine",
+        ] {
+            assert!(row(theme).contains("○"), "{theme}");
+        }
 
         // The popup paints its own background, so it covers what's below.
         let y = rows.iter().position(|r| r.contains("Frappé")).unwrap() as u16;
@@ -2218,13 +2295,55 @@ mod tests {
     }
 
     #[test]
-    fn notifications_show_as_a_checkbox_under_the_themes() {
-        let colors = Theme::Mocha.colors();
+    fn the_settings_scroll_to_the_cursor_and_dim_a_theme_that_cant_be_used() {
+        let dir = std::env::temp_dir().join(format!("tuigram-popup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zz-broken.toml"), "inherits = 3").unwrap();
+        let themes = Themes::load(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let colors = Colors::default();
+        let mut menu = SettingsMenu::new(HelpTab::Settings, &Settings::default());
+        // Too short for every row.
+        let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
+        let mut draw = |menu: &mut SettingsMenu| {
+            terminal
+                .draw(|f| draw_settings(f, menu, &Settings::default(), &themes, &colors))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let has = |rows: &[String], needle: &str| rows.iter().any(|r| r.contains(needle));
+
+        let rows = buffer_rows(&draw(&mut menu));
+        assert!(has(&rows, "Notifications") && !has(&rows, "Rosé Pine"));
+
+        // On the last theme, the lines after it show too.
+        menu.selected = SettingsMenu::THEMES + themes.list.len() - 1;
+        let buf = draw(&mut menu);
+        let rows = buffer_rows(&buf);
+        assert!(
+            has(&rows, "▌ ○ zz-broken"),
+            "the user's after the built-in ones"
+        );
+        assert!(has(&rows, "Your own themes go in"));
+        assert!(!has(&rows, "Notifications"), "scrolled past");
+        let y = rows.iter().position(|r| r.contains("zz-broken")).unwrap();
+        let x = column(&rows[y], "zz-broken");
+        assert_eq!(buf[(x, y as u16)].fg, colors.muted, "dimmed");
+
+        // Back up on the first theme, its heading shows above it.
+        menu.selected = SettingsMenu::THEMES;
+        let rows = buffer_rows(&draw(&mut menu));
+        let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+        assert_eq!(at("Catppuccin Latte"), at("Theme") + 1);
+        assert!(!has(&rows, "Notifications"));
+    }
+
+    #[test]
+    fn notifications_show_as_a_checkbox() {
+        let colors = Colors::default();
         let mut menu = SettingsMenu {
-            tab: HelpTab::Settings,
-            scroll: 0,
             selected: SettingsMenu::NOTIFICATIONS,
-            saved_notifications: Notifications::Auto,
+            ..SettingsMenu::new(HelpTab::Settings, &Settings::default())
         };
         let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
         let mut draw = |notifications| {
@@ -2233,7 +2352,7 @@ mod tests {
                 ..Settings::default()
             };
             terminal
-                .draw(|f| draw_settings(f, &mut menu, &settings, &colors))
+                .draw(|f| draw_settings(f, &mut menu, &settings, &Themes::built_in(), &colors))
                 .unwrap();
             buffer_rows(terminal.backend().buffer())
         };
@@ -2255,12 +2374,10 @@ mod tests {
 
     #[test]
     fn gaps_and_normal_mode_after_sending_are_checkboxes() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut menu = SettingsMenu {
-            tab: HelpTab::Settings,
-            scroll: 0,
             selected: SettingsMenu::AFTER_SEND,
-            saved_notifications: Notifications::Auto,
+            ..SettingsMenu::new(HelpTab::Settings, &Settings::default())
         };
         let mut terminal = Terminal::new(TestBackend::new(70, 22)).unwrap();
         let mut draw = |gaps, normal_after_send| {
@@ -2271,7 +2388,7 @@ mod tests {
                 ..Settings::default()
             };
             terminal
-                .draw(|f| draw_settings(f, &mut menu, &settings, &colors))
+                .draw(|f| draw_settings(f, &mut menu, &settings, &Themes::built_in(), &colors))
                 .unwrap();
             buffer_rows(terminal.backend().buffer())
         };

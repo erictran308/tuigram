@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Colors;
@@ -186,33 +186,21 @@ pub fn draw(frame: &mut Frame, area: Rect, scroll: &mut usize, colors: &Colors) 
     let max = lines.len().saturating_sub(usize::from(area.height));
     *scroll = (*scroll).min(max);
     frame.render_widget(Paragraph::new(lines).scroll((*scroll as u16, 0)), area);
-    if max > 0 {
-        let mut state = ScrollbarState::new(max).position(*scroll);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .thumb_style(colors.accent)
-                .track_style(colors.border),
-            area,
-            &mut state,
-        );
-    }
+    super::scrollbar(frame, area, max, *scroll, colors);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::Theme;
 
     #[test]
     fn height_counts_every_line() {
-        assert_eq!(height(), lines(&Theme::Mocha.colors()).len());
+        assert_eq!(height(), lines(&Colors::default()).len());
     }
 
     #[test]
     fn width_leaves_room_for_every_line_and_the_scrollbar() {
-        let widest = lines(&Theme::Mocha.colors())
+        let widest = lines(&Colors::default())
             .iter()
             .map(Line::width)
             .max()

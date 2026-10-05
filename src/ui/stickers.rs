@@ -206,7 +206,6 @@ mod tests {
 
     use super::*;
     use crate::stickers::{Source, Sticker};
-    use crate::theme::Theme;
 
     fn stickers(emoji: &[&str]) -> Vec<Sticker> {
         (1..)
@@ -222,7 +221,7 @@ mod tests {
     }
 
     fn render(panel: &mut StickerPanel, width: u16, height: u16) -> ratatui::buffer::Buffer {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut images = Images::new(Picker::halfblocks(), unbounded_channel().0);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
@@ -275,7 +274,7 @@ mod tests {
 
     #[test]
     fn stickers_without_a_picture_show_their_emoji_and_the_cursor_is_filled_in() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut panel = StickerPanel::new(1);
         panel.set_stickers(
             Source::Recent,

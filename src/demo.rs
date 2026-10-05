@@ -30,7 +30,6 @@ use crate::reactions::{ReactMenu, Reaction, ReactionKind};
 use crate::search::MessageSearch;
 use crate::settings::Settings;
 use crate::tg::Tg;
-use crate::theme::Theme;
 use crate::ui;
 
 // People, by user id. A private chat has the other person's id, and Saved
@@ -201,12 +200,16 @@ fn on_key(app: &mut App, scene: &mut usize, key: KeyEvent) -> bool {
 }
 
 fn change_theme(app: &mut App, step: isize) {
-    let at = Theme::ALL
+    let themes = &app.themes.list;
+    let at = themes
         .iter()
-        .position(|&t| t == app.settings.theme)
+        .position(|t| t.id == app.settings.theme)
         .unwrap_or(0);
-    let len = Theme::ALL.len() as isize;
-    app.settings.theme = Theme::ALL[(at as isize + step).rem_euclid(len) as usize];
+    let next = &themes[(at as isize + step).rem_euclid(themes.len() as isize) as usize];
+    if let Ok(colors) = &next.colors {
+        app.colors = *colors;
+    }
+    app.settings.theme = next.id.clone();
 }
 
 fn show_scene(app: &mut App, scene: Scene) {
@@ -255,13 +258,17 @@ fn show_scene(app: &mut App, scene: Scene) {
     }
 }
 
+/// The popup, with the cursor on the theme in use.
 fn help(app: &App, tab: HelpTab) -> SettingsMenu {
-    let theme = app.settings.theme;
+    let theme = app
+        .themes
+        .list
+        .iter()
+        .position(|t| t.id == app.settings.theme)
+        .unwrap_or(0);
     SettingsMenu {
-        tab,
-        scroll: 0,
-        selected: Theme::ALL.iter().position(|&t| t == theme).unwrap_or(0),
-        saved_notifications: app.settings.notifications,
+        selected: SettingsMenu::THEMES + theme,
+        ..SettingsMenu::new(tab, &app.settings)
     }
 }
 
@@ -707,7 +714,7 @@ mod tests {
         assert!(on_key(&mut app, &mut scene, press(KeyCode::BackTab)));
         assert_eq!(SCENES[scene], Scene::Shortcuts, "wraps around");
 
-        let before = app.settings.theme;
+        let before = app.settings.theme.clone();
         on_key(&mut app, &mut scene, press(KeyCode::Char('t')));
         assert_ne!(app.settings.theme, before);
         assert!(!on_key(&mut app, &mut scene, press(KeyCode::Char('q'))));

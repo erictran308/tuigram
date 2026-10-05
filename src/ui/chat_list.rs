@@ -211,7 +211,6 @@ mod tests {
     use super::*;
     use crate::chats::ChatPhoto;
     use crate::images::Key;
-    use crate::theme::Theme;
 
     /// What the kitty protocol puts in every cell of an image.
     const KITTY_CELL: char = '\u{10EEEE}';
@@ -259,7 +258,7 @@ mod tests {
     }
 
     fn render(list: &ChatList, images: &mut Images, width: u16, height: u16) -> Buffer {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|f| draw(f, f.area(), list, images, &colors))
@@ -284,7 +283,7 @@ mod tests {
 
     #[test]
     fn chats_without_a_photo_get_a_square_of_their_color() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut chats = Chats::default();
         chats.add_local(1, "Alice Smith", None);
         chats.add_local(2, "bob", photo(20));
@@ -308,7 +307,7 @@ mod tests {
 
     #[test]
     fn the_selected_chat_is_highlighted_but_not_the_blank_row_below_it() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut chats = Chats::default();
         chats.add_local(1, "Alice Smith", None);
         chats.refresh();
@@ -329,7 +328,7 @@ mod tests {
 
     #[test]
     fn typing_shows_in_place_of_the_last_message_while_it_lasts() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut chats = Chats::default();
         chats.add_local(1, "Alice", None).is_private = true;
         chats.add_local(2, "Climbing club", None);
@@ -360,7 +359,7 @@ mod tests {
 
     #[test]
     fn photos_are_drawn_beside_the_chats_scrolled_into_view() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut chats = Chats::default();
         let mut images = images(ProtocolType::Kitty);
         for id in 1..=30 {
@@ -404,7 +403,7 @@ mod tests {
 
     #[test]
     fn a_new_photo_waits_while_a_popup_could_hide_it() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut chats = Chats::default();
         chats.add_local(1, "Alice", photo(10));
         chats.refresh();
@@ -426,7 +425,7 @@ mod tests {
 
     #[test]
     fn saved_messages_is_a_square_of_the_app_color() {
-        let colors = Theme::Mocha.colors();
+        let colors = Colors::default();
         let mut chats = Chats::default();
         chats.add_local(7, "Eric", photo(10));
         chats.set_my_id(7);
