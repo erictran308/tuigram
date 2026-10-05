@@ -1,6 +1,7 @@
 //! The chat list: two rows per chat, its title over its last message (or
 //! "typing…" while someone is), with the chat's photo on the left (a square
-//! of color if it has none), and a blank row between chats.
+//! of color if it has none), and a blank row between chats unless that's
+//! turned off.
 
 use std::collections::HashMap;
 
@@ -22,8 +23,6 @@ use super::{activity, border, highlight, title_style, truncate};
 
 /// Rows of text per chat, so also the height of its photo.
 const PHOTO_ROWS: u16 = 2;
-/// The text, then a blank row that sets chats apart.
-const ITEM_ROWS: u16 = PHOTO_ROWS + 1;
 /// Narrower than this inside its border, the list leaves photos out to keep
 /// room for titles.
 const MIN_WIDTH_FOR_PHOTOS: u16 = 24;
@@ -38,6 +37,8 @@ pub struct ChatList<'a> {
     pub focused: bool,
     /// A popup that may be drawn over the list is open.
     pub covered: bool,
+    /// A blank row between chats.
+    pub gaps: bool,
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images, colors: &Colors) {
@@ -116,11 +117,14 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
                 Some(doing) => Span::from(truncate(&doing, width)).fg(colors.activity),
                 None => Span::from(truncate(&chat.preview, width)).fg(colors.subtle),
             };
-            ListItem::new(vec![
+            let mut lines = vec![
                 Line::from(first).style(row_style),
                 Line::from(vec![bar, gap, second]).style(row_style),
-                Line::default(),
-            ])
+            ];
+            if list.gaps {
+                lines.push(Line::default());
+            }
+            ListItem::new(lines)
         })
         .collect();
 
@@ -140,14 +144,15 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
         return;
     }
     // The list draws only whole chats, from where it scrolled to.
+    let item_rows = PHOTO_ROWS + u16::from(list.gaps);
     let shown = rows
         .iter()
         .skip(state.offset())
-        .take(usize::from(inner.height / ITEM_ROWS));
+        .take(usize::from(inner.height / item_rows));
     for (i, &(id, _)) in shown.enumerate() {
         let area = Rect {
             x: inner.x + 1,
-            y: inner.y + i as u16 * ITEM_ROWS,
+            y: inner.y + i as u16 * item_rows,
             width: photo_cols,
             height: PHOTO_ROWS,
         };
@@ -245,6 +250,7 @@ mod tests {
         ChatList {
             chats,
             users: &NO_USERS,
+            gaps: true,
             selected,
             loading: false,
             focused: true,
@@ -374,6 +380,26 @@ mod tests {
         assert!(!is_kitty_image(&buf, 2, 6), "the blank row");
         assert_eq!(cells(&buf, 7, 13, 7), "chat 20");
         assert!(!is_kitty_image(&buf, 2, 13));
+    }
+
+    #[test]
+    fn without_gaps_chats_and_their_photos_follow_each_other() {
+        let mut chats = Chats::default();
+        let mut images = images(ProtocolType::Kitty);
+        for id in 1..=3 {
+            chats.add_local(id, &format!("chat {id}"), photo(id as i32));
+            add_photo(&mut images, id as i32);
+        }
+        chats.refresh();
+        let compact = ChatList {
+            gaps: false,
+            ..list(&chats, None)
+        };
+        let buf = render(&compact, &mut images, 40, 10);
+        assert_eq!(cells(&buf, 7, 1, 6), "chat 1");
+        assert_eq!(cells(&buf, 7, 3, 6), "chat 2");
+        assert_eq!(cells(&buf, 7, 5, 6), "chat 3");
+        assert!(is_kitty_image(&buf, 2, 3) && is_kitty_image(&buf, 5, 4));
     }
 
     #[test]

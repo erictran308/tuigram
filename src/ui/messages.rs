@@ -20,6 +20,7 @@ use crate::messages::{
     Fetched, Msg, OpenChat, Preview, Replied, ReplyTo, ScrollAnchor, SendState, Sender,
 };
 use crate::search;
+use crate::settings::Settings;
 use crate::theme::Colors;
 
 /// Bubbles take at most this share of the pane width.
@@ -110,8 +111,9 @@ pub fn draw(
     names: &Names,
     images: &mut Images,
     focused: bool,
-    colors: &Colors,
+    settings: &Settings,
 ) {
+    let colors = &settings.theme.colors();
     let chat = names.chats.get(open.chat_id);
     let mut title = vec![
         Span::from(format!(
@@ -158,8 +160,15 @@ pub fn draw(
     .areas(inner);
     let show_names = chat.is_none_or(|c| !c.is_channel);
     let font = images.font_size();
-    let (lines, placed, photos) =
-        layout(open, names, show_names, body.width as usize, font, colors);
+    let (lines, placed, photos) = layout(
+        open,
+        names,
+        show_names,
+        settings.block_gaps,
+        body.width as usize,
+        font,
+        colors,
+    );
 
     let height = body.height as usize;
     let selected = match open.selected {
@@ -311,10 +320,13 @@ fn scroll_top(
     top
 }
 
+/// Lays out every loaded message. With `gaps`, messages in a block have a
+/// row of their bubble's background between them.
 fn layout(
     open: &OpenChat,
     names: &Names,
     show_names: bool,
+    gaps: bool,
     width: usize,
     font: FontSize,
     colors: &Colors,
@@ -396,8 +408,12 @@ fn layout(
             }
             lines.push(Line::from(label).fg(colors.muted).centered());
         }
+        // Inside a block the gap keeps the bubble's background, so the
+        // messages read as one block but still apart.
         if !m.joined {
             lines.push(Line::default());
+        } else if gaps {
+            lines.push(m.bubble.gap(inner, colors));
         }
         let bubble_start = lines.len();
         let msg = m.bubble.msg;
@@ -553,6 +569,19 @@ impl<'a> Bubble<'a> {
         self.msg.preview.as_ref().is_some_and(|p| p.sticker)
     }
 
+    /// A blank row in the bubble's background, `inner` columns wide inside
+    /// the padding: the gap above it when it continues a block.
+    fn gap(&self, inner: usize, colors: &Colors) -> Line<'static> {
+        let (bg, _) = bubble_colors(self.msg.outgoing, colors);
+        let row = " ".repeat(inner.max(self.width) + 2);
+        let line = Line::from(Span::styled(row, Style::new().bg(bg)));
+        if self.msg.outgoing {
+            line.right_aligned()
+        } else {
+            line
+        }
+    }
+
     /// The message as padded, colored lines, `inner` columns wide inside the
     /// padding (at least its own `width`). `meta` sits at the bottom right, on
     /// the last text line if it fits. A photo gets blank rows right under the
@@ -570,11 +599,7 @@ impl<'a> Bubble<'a> {
             width,
         } = self;
         let inner = inner.max(width);
-        let (bg, meta_fg) = if msg.outgoing {
-            (colors.own_bubble, colors.own_meta)
-        } else {
-            (colors.other_bubble, colors.other_meta)
-        };
+        let (bg, meta_fg) = bubble_colors(msg.outgoing, colors);
         let style = if sticker {
             Style::new()
         } else {
@@ -649,6 +674,15 @@ impl<'a> Bubble<'a> {
             ));
         }
         out
+    }
+}
+
+/// A bubble's background and the color of its time and send status.
+fn bubble_colors(outgoing: bool, colors: &Colors) -> (Color, Color) {
+    if outgoing {
+        (colors.own_bubble, colors.own_meta)
+    } else {
+        (colors.other_bubble, colors.other_meta)
     }
 }
 
@@ -788,8 +822,15 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
         terminal
             .draw(|f| {
-                let colors = Theme::default().colors();
-                draw(f, f.area(), open, &names, images, focused, &colors)
+                draw(
+                    f,
+                    f.area(),
+                    open,
+                    &names,
+                    images,
+                    focused,
+                    &Settings::default(),
+                )
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -874,7 +915,7 @@ mod tests {
             height: 20,
         };
         let colors = Theme::default().colors();
-        let (lines, _, _) = layout(&sample(), &names, true, 58, font, &colors);
+        let (lines, _, _) = layout(&sample(), &names, true, true, 58, font, &colors);
         let text: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -904,7 +945,7 @@ mod tests {
         open.messages
             .insert(0, msg(false, 1_790_000_000 - 60, "first"));
         let text = |show_names| -> Vec<String> {
-            let (lines, _, _) = layout(&open, &names, show_names, 58, font, &colors);
+            let (lines, _, _) = layout(&open, &names, show_names, true, 58, font, &colors);
             lines
                 .iter()
                 .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -965,20 +1006,48 @@ mod tests {
         };
 
         let (short, longer) = (row("short"), row("somewhat"));
-        assert_eq!(longer, short + 1, "no gap inside a block");
+        assert_eq!(longer, short + 2, "a row between them");
+        let bubble = painted(longer, colors.other_bubble);
         assert_eq!(
             painted(short, colors.other_bubble),
-            painted(longer, colors.other_bubble),
+            bubble,
             "as wide as the widest"
+        );
+        assert_eq!(
+            painted(short + 1, colors.other_bubble),
+            bubble,
+            "the row between keeps the background"
         );
 
         let (mine, ok) = (row("one of mine"), row("ok "));
-        assert!(mine > longer + 1, "a gap between blocks");
-        assert_eq!(ok, mine + 1);
-        assert_eq!(
-            painted(mine, colors.own_bubble),
-            painted(ok, colors.own_bubble)
+        assert!(
+            painted(longer + 1, colors.other_bubble).is_empty(),
+            "a blank gap between blocks"
         );
+        assert_eq!(ok, mine + 2);
+        let bubble = painted(ok, colors.own_bubble);
+        assert_eq!(painted(mine, colors.own_bubble), bubble);
+        assert_eq!(painted(mine + 1, colors.own_bubble), bubble);
+    }
+
+    #[test]
+    fn the_gap_inside_a_block_can_be_turned_off() {
+        let users = HashMap::new();
+        let chats = Chats::default();
+        let names = Names {
+            users: &users,
+            chats: &chats,
+        };
+        let font = FontSize {
+            width: 10,
+            height: 20,
+        };
+        let colors = Theme::default().colors();
+        let mut open = OpenChat::new(42);
+        open.messages.insert(1, msg(false, 1_790_000_000, "one"));
+        open.messages.insert(2, msg(false, 1_790_000_060, "two"));
+        let rows = |gaps| layout(&open, &names, true, gaps, 58, font, &colors).0.len();
+        assert_eq!(rows(true), rows(false) + 1);
     }
 
     #[test]
@@ -1244,7 +1313,7 @@ mod tests {
             },
         );
 
-        let (lines, _, photos) = layout(&open, &names, true, 58, font, &colors);
+        let (lines, _, photos) = layout(&open, &names, true, true, 58, font, &colors);
         let text: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())

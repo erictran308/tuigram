@@ -294,6 +294,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 .prompt
                 .as_ref()
                 .is_some_and(|p| p.kind == PromptKind::Command),
+        gaps: app.settings.chat_gaps,
     };
     chat_list::draw(frame, list_area, &list, &mut app.images, colors);
     match app.open.as_mut() {
@@ -316,7 +317,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 &names,
                 &mut app.images,
                 app.focus == Focus::Messages,
-                colors,
+                &app.settings,
             );
             draw_composer(
                 frame,
@@ -515,6 +516,20 @@ fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, settings: &Settings
         SettingsMenu::NOTIFICATIONS,
         check(settings.notifications != Notifications::Off),
         "New messages, while tuigram is in the background",
+    ));
+    lines.push(Line::default());
+    lines.push(heading(" Chat list"));
+    lines.push(row(
+        SettingsMenu::CHAT_GAPS,
+        check(settings.chat_gaps),
+        "A gap between chats",
+    ));
+    lines.push(Line::default());
+    lines.push(heading(" Messages"));
+    lines.push(row(
+        SettingsMenu::BLOCK_GAPS,
+        check(settings.block_gaps),
+        "A gap between messages in a row from one person",
     ));
     lines.push(Line::default());
     lines.push(heading(" Composer"));
@@ -946,6 +961,8 @@ mod tests {
             saved: Theme::Mocha,
             saved_notifications: Notifications::Auto,
             saved_normal_after_send: false,
+            saved_block_gaps: true,
+            saved_chat_gaps: true,
         };
         // Too short for the whole list.
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -1401,6 +1418,8 @@ mod tests {
             saved: Theme::Mocha,
             saved_notifications: Notifications::Auto,
             saved_normal_after_send: false,
+            saved_block_gaps: true,
+            saved_chat_gaps: true,
         };
         let colors = Theme::Latte.colors();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
@@ -1438,6 +1457,8 @@ mod tests {
             saved: Theme::Mocha,
             saved_notifications: Notifications::Auto,
             saved_normal_after_send: false,
+            saved_block_gaps: true,
+            saved_chat_gaps: true,
         };
         let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
         let mut draw = |notifications| {
@@ -1467,7 +1488,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_mode_after_sending_is_a_checkbox_under_notifications() {
+    fn gaps_and_normal_mode_after_sending_are_checkboxes() {
         let colors = Theme::Mocha.colors();
         let mut menu = SettingsMenu {
             tab: HelpTab::Settings,
@@ -1476,10 +1497,14 @@ mod tests {
             saved: Theme::Mocha,
             saved_notifications: Notifications::Auto,
             saved_normal_after_send: false,
+            saved_block_gaps: true,
+            saved_chat_gaps: true,
         };
-        let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
-        let mut draw = |normal_after_send| {
+        let mut terminal = Terminal::new(TestBackend::new(70, 22)).unwrap();
+        let mut draw = |gaps, normal_after_send| {
             let settings = Settings {
+                chat_gaps: gaps,
+                block_gaps: gaps,
                 normal_after_send,
                 ..Settings::default()
             };
@@ -1492,12 +1517,18 @@ mod tests {
             rows.iter().find(|r| r.contains(needle)).unwrap().clone()
         };
 
-        let rows = draw(false);
+        let rows = draw(true, false);
+        assert!(row(&rows, "Chat list").contains("Chat list"));
+        assert!(row(&rows, "A gap between chats").contains("  [✓] A gap between chats"));
+        assert!(row(&rows, "Messages").contains("Messages"));
+        assert!(row(&rows, "A gap between messages").contains("  [✓] A gap between messages"));
         assert!(row(&rows, "Composer").contains("Composer"));
         assert!(row(&rows, "Back to Normal").contains("▌ [ ] Back to Normal mode after sending"));
         assert!(row(&rows, "Space on/off").contains("Esc cancel"));
 
-        let rows = draw(true);
+        let rows = draw(false, true);
+        assert!(row(&rows, "A gap between chats").contains("[ ] A gap between chats"));
+        assert!(row(&rows, "A gap between messages").contains("[ ] A gap between"));
         assert!(row(&rows, "Back to Normal").contains("▌ [✓] Back to Normal mode"));
     }
 }

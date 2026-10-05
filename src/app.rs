@@ -256,25 +256,32 @@ pub enum HelpTab {
 
 /// The `?` popup: every keyboard shortcut, and the settings. On the settings
 /// tab, moving the cursor previews a theme and Space ticks a checkbox
-/// (notifications, Normal mode after sending); Enter saves, Esc puts the
-/// saved settings back.
+/// (notifications, gaps in the chat list and in message blocks, Normal mode
+/// after sending);
+/// Enter saves, Esc puts the saved settings back.
 pub struct SettingsMenu {
     pub tab: HelpTab,
     /// First row shown on the shortcuts tab. Drawing keeps it in range.
     pub scroll: usize,
-    /// Row on the settings tab: a theme, [`SettingsMenu::NOTIFICATIONS`] or
-    /// [`SettingsMenu::AFTER_SEND`].
+    /// Row on the settings tab: a theme, or one of the checkboxes after them
+    /// ([`SettingsMenu::NOTIFICATIONS`] and on).
     pub selected: usize,
     pub saved: Theme,
     pub saved_notifications: Notifications,
     pub saved_normal_after_send: bool,
+    pub saved_block_gaps: bool,
+    pub saved_chat_gaps: bool,
 }
 
 impl SettingsMenu {
     /// The notifications row, after the themes.
     pub const NOTIFICATIONS: usize = Theme::ALL.len();
+    /// The "gap between chats" row.
+    pub const CHAT_GAPS: usize = Self::NOTIFICATIONS + 1;
+    /// The "gap between messages" row.
+    pub const BLOCK_GAPS: usize = Self::CHAT_GAPS + 1;
     /// The "Normal mode after sending" row, the last one.
-    pub const AFTER_SEND: usize = Self::NOTIFICATIONS + 1;
+    pub const AFTER_SEND: usize = Self::BLOCK_GAPS + 1;
 }
 
 /// What the status bar prompt is for: a `/` search through chat titles or the
@@ -1019,6 +1026,8 @@ impl App {
                     saved,
                     saved_notifications: self.settings.notifications,
                     saved_normal_after_send: self.settings.normal_after_send,
+                    saved_block_gaps: self.settings.block_gaps,
+                    saved_chat_gaps: self.settings.chat_gaps,
                 });
             }
             (_, KeyCode::Char(':')) => self.open_prompt(PromptKind::Command),
@@ -1841,6 +1850,8 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
                 self.settings.theme = menu.saved;
                 self.settings.normal_after_send = menu.saved_normal_after_send;
+                self.settings.block_gaps = menu.saved_block_gaps;
+                self.settings.chat_gaps = menu.saved_chat_gaps;
                 let saved = menu.saved_notifications;
                 self.settings_menu = None;
                 self.set_notifications(saved);
@@ -1865,6 +1876,18 @@ impl App {
                 if menu.tab == HelpTab::Settings && menu.selected == SettingsMenu::AFTER_SEND =>
             {
                 self.settings.normal_after_send = !self.settings.normal_after_send;
+                return;
+            }
+            KeyCode::Char(' ')
+                if menu.tab == HelpTab::Settings && menu.selected == SettingsMenu::BLOCK_GAPS =>
+            {
+                self.settings.block_gaps = !self.settings.block_gaps;
+                return;
+            }
+            KeyCode::Char(' ')
+                if menu.tab == HelpTab::Settings && menu.selected == SettingsMenu::CHAT_GAPS =>
+            {
+                self.settings.chat_gaps = !self.settings.chat_gaps;
                 return;
             }
             _ => {}

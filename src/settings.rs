@@ -10,7 +10,7 @@ use crate::config::ApiKeys;
 use crate::notify::Notifications;
 use crate::theme::Theme;
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: Theme,
@@ -22,9 +22,28 @@ pub struct Settings {
     /// After sending a message, go back to Normal mode instead of staying in
     /// Insert mode to write the next one.
     pub normal_after_send: bool,
+    /// Messages in a row from one person have a row of their bubble's
+    /// background between them, so each stands apart within the block.
+    pub block_gaps: bool,
+    /// A blank row between chats in the chat list.
+    pub chat_gaps: bool,
     /// Telegram API credentials entered on the login screen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<ApiKeys>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            highlighted_chats: Vec::new(),
+            notifications: Notifications::default(),
+            normal_after_send: false,
+            block_gaps: true,
+            chat_gaps: true,
+            api_keys: None,
+        }
+    }
 }
 
 impl Settings {
@@ -65,12 +84,14 @@ mod tests {
             highlighted_chats: vec![-1001234567890, 42],
             notifications: Notifications::Off,
             normal_after_send: true,
+            block_gaps: false,
+            chat_gaps: false,
             api_keys: None,
         };
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true"
+            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
 
@@ -80,6 +101,11 @@ mod tests {
         });
         settings.save(&file).unwrap();
         assert_eq!(Settings::load(&file).unwrap(), settings);
+
+        // Files from before a setting existed get its default.
+        std::fs::write(&file, r#"theme = "latte""#).unwrap();
+        let old = Settings::load(&file).unwrap();
+        assert!(old.block_gaps && old.chat_gaps);
 
         std::fs::write(&file, r#"theme = "dracula""#).unwrap();
         let error = format!("{:#}", Settings::load(&file).unwrap_err());
