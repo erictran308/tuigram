@@ -30,6 +30,8 @@ const MAX_PHOTO_ROWS: usize = 16;
 /// Stickers are smaller, as in Telegram.
 const MAX_STICKER_COLS: usize = 20;
 const MAX_STICKER_ROWS: usize = 10;
+/// Least space between a message's last line and the time beside it.
+const META_GAP: usize = 3;
 
 /// Resolves message senders to display names.
 pub struct Names<'a> {
@@ -504,7 +506,7 @@ impl<'a> Bubble<'a> {
         let text = wrap(&msg.text, max_text);
         let meta_w = meta.width();
         let last_w = text.last().map_or(0, |(l, _)| l.width());
-        let meta_inline = last_w + 1 + meta_w <= max_text;
+        let meta_inline = last_w + META_GAP + meta_w <= max_text;
 
         let mut width = text
             .iter()
@@ -513,7 +515,7 @@ impl<'a> Bubble<'a> {
             .unwrap_or(0)
             .max(meta_w);
         if meta_inline {
-            width = width.max(last_w + 1 + meta_w);
+            width = width.max(last_w + META_GAP + meta_w);
         }
         let name = header
             .name
@@ -830,6 +832,17 @@ mod tests {
         let end = mine.len() - 2; // before gutter + border
         assert_eq!(mine[end - 1], ' ', "own bubble has right padding");
         assert!(mine[end - 2].is_ascii_digit(), "time is flush right");
+    }
+
+    #[test]
+    fn the_time_keeps_its_distance_from_the_text() {
+        let rows = render(&mut sample(), false);
+        let row = rows.iter().find(|r| r.contains("hi there")).unwrap();
+        let after = &row[row.find("hi there").unwrap() + "hi there".len()..];
+        assert!(
+            after.starts_with("   ") && after[3..].starts_with(char::is_numeric),
+            "{row}"
+        );
     }
 
     #[test]
