@@ -7,7 +7,8 @@
 //! Keys: 1–6 or Tab / Shift-Tab switch scenes, t / T change the theme, q
 //! quits.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{Local, TimeZone};
@@ -93,11 +94,37 @@ const SCENES: [Scene; 6] = [
 ];
 
 pub async fn run() -> Result<()> {
-    let dir = std::env::temp_dir().join(format!("tuigram-demo-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
+    let dir = new_private_dir()?;
     let result = show(&dir).await;
     let _ = std::fs::remove_dir_all(&dir);
     result
+}
+
+/// A folder of the demo's own in the temporary folder: made new, never one
+/// that's already there, and readable only by the user. On a shared `/tmp`,
+/// a folder someone else made in advance could hold links that the photos
+/// would be written through, onto the user's files.
+fn new_private_dir() -> Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    for attempt in 0..100 {
+        let name = format!("tuigram-demo-{}-{nanos}-{attempt}", std::process::id());
+        let dir = std::env::temp_dir().join(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+                }
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!("can't make a folder in {}", std::env::temp_dir().display())
 }
 
 async fn show(dir: &Path) -> Result<()> {
@@ -660,6 +687,20 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+
+    #[test]
+    fn the_demo_gets_a_new_folder_of_its_own() {
+        let (a, b) = (new_private_dir().unwrap(), new_private_dir().unwrap());
+        assert_ne!(a, b, "never one that's there already");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        std::fs::remove_dir(&a).unwrap();
+        std::fs::remove_dir(&b).unwrap();
+    }
 
     fn rows(app: &mut App) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();

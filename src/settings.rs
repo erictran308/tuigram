@@ -1,6 +1,7 @@
 //! User settings, changed in the app (`?`) and kept in `settings.toml` in the
 //! data directory.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -97,9 +98,25 @@ impl Settings {
             (width.max(0) as u16).clamp(*LIST_WIDTHS.start(), *LIST_WIDTHS.end());
     }
 
+    /// Writes the settings, which can hold API credentials: readable only by
+    /// the user, and all at once, as a new file renamed over the old one, so
+    /// a crash halfway leaves the old settings rather than half of the new.
     pub fn save(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, toml::to_string(self)?)
-            .with_context(|| format!("cannot write {}", path.display()))
+        let text = toml::to_string(self)?;
+        let new = path.with_extension("toml.new");
+        let write = || -> std::io::Result<()> {
+            // One left by a crash, maybe with other permissions.
+            let _ = std::fs::remove_file(&new);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let mut file = options.open(&new)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&new, path)
+        };
+        write().with_context(|| format!("cannot write {}", path.display()))
     }
 }
 
@@ -143,6 +160,16 @@ mod tests {
         });
         settings.save(&file).unwrap();
         assert_eq!(Settings::load(&file).unwrap(), settings);
+        assert!(
+            !file.with_extension("toml.new").exists(),
+            "renamed into place"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "it can hold API keys");
+        }
 
         // Files from before a setting existed get its default.
         std::fs::write(&file, r#"theme = "latte""#).unwrap();

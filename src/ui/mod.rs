@@ -19,7 +19,7 @@ use crate::chats::Chat;
 use crate::config;
 use crate::messages::{Editing, OpenChat, Replied, Sender};
 use crate::notify::Notifications;
-use crate::reactions::{self, ReactMenu, ReactionKind};
+use crate::reactions::{self, ReactMenu};
 use crate::search;
 use crate::settings::{Settings, Side};
 use crate::text;
@@ -409,19 +409,13 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         draw_delete(frame, chat_area, menu, colors);
     }
     if let Some(menu) = &mut app.react_menu {
-        let msg = app
+        let yours: Vec<String> = app
             .open
-            .as_ref()
-            .and_then(|o| o.messages.get(&menu.message_id));
-        let yours: Vec<&str> = msg
             .iter()
-            .flat_map(|m| &m.reactions)
-            .filter(|r| r.chosen)
-            .filter_map(|r| match &r.kind {
-                ReactionKind::Emoji(emoji) => Some(emoji.as_str()),
-                _ => None,
-            })
+            .flat_map(|o| o.your_emoji(menu.message_id))
+            .map(|(_, emoji)| emoji)
             .collect();
+        let yours: Vec<&str> = yours.iter().map(String::as_str).collect();
         draw_react(frame, chat_area, menu, &yours, colors);
     }
     if let Some(confirm) = &app.confirm {
@@ -1061,11 +1055,14 @@ fn attachment_lines(
             )
         })
         .collect();
+    // The rest are named too, as far as the row goes: nothing should go out
+    // that the composer never showed.
     let rest = &attachments[shown..];
     if !rest.is_empty() {
         let size = rest.iter().map(|a| a.size).sum();
-        let count = format!("{} more files", rest.len());
-        lines.push(line(&count, format!(" · {}", attach::size_label(size))));
+        let names: Vec<&str> = rest.iter().map(|a| a.name.as_str()).collect();
+        let more = format!("{} more: {}", rest.len(), names.join(", "));
+        lines.push(line(&more, format!(" · {}", attach::size_label(size))));
     }
     lines
 }
@@ -1815,7 +1812,11 @@ mod tests {
         attachments.extend((0..3).map(|i| file(&format!("{i}.png"), 1024, photo)));
         let (rows, _) = draw(&attachments, false);
         assert!(rows[4].contains("route.gpx"), "{}", rows[4]);
-        assert!(rows[5].contains("📎  3 more files · 3.0 KB"), "{}", rows[5]);
+        assert!(
+            rows[5].contains("📎  3 more: 0.png, 1.png, 2.png · 3.0 KB"),
+            "the rest by name: {}",
+            rows[5]
+        );
     }
 
     #[test]

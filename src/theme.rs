@@ -42,6 +42,9 @@ const PALETTE: [&str; 16] = [
 /// How many themes deep `inherits` may go, so a circle of them ends.
 const MAX_INHERITS: usize = 8;
 
+/// The biggest theme file read. The built-in ones are under 2 KB.
+const MAX_FILE_BYTES: u64 = 64 * 1024;
+
 /// The QR code on the login screen is dark on light in every theme: not
 /// every scanner reads an inverted code.
 const QR_DARK: Color = rgb(0x181825);
@@ -95,10 +98,7 @@ impl Themes {
             let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let file = std::fs::read_to_string(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|text| parse(&text));
-            user.insert(id.to_string(), file);
+            user.insert(id.to_string(), read(&path).and_then(|text| parse(&text)));
         }
         Self::new(user, Some(dir.to_path_buf()))
     }
@@ -201,6 +201,25 @@ impl Files {
         merged.colors.extend(file.colors.clone());
         Ok(merged)
     }
+}
+
+/// A theme file's text. Links are followed, but only to a plain file of a
+/// theme's size: a link to `/dev/zero` or a pipe would otherwise hang
+/// tuigram, or fill its memory, on every start.
+fn read(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a file".into());
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(format!("bigger than {} KB", MAX_FILE_BYTES / 1024));
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_FILE_BYTES).read_to_string(&mut text))
+        .map_err(|e| e.to_string())?;
+    Ok(text)
 }
 
 /// Reads a theme file, or says what's wrong with it and on which line.
@@ -530,11 +549,38 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("mine.toml"), "inherits = \"nord\"").unwrap();
         std::fs::write(dir.join("notes.txt"), "not a theme").unwrap();
+        std::fs::create_dir(dir.join("folder.toml")).unwrap();
+        let huge = "# padding\n".repeat(10_000);
+        std::fs::write(dir.join("huge.toml"), huge).unwrap();
         let themes = Themes::load(&dir);
         let ids: Vec<&str> = themes.list.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids[BUILT_IN.len()..], ["mine"]);
+        assert_eq!(ids[BUILT_IN.len()..], ["folder", "huge", "mine"]);
+        let error = |id| themes.colors(id).unwrap_err();
+        assert!(
+            error("folder").contains("not a file"),
+            "{}",
+            error("folder")
+        );
+        assert!(
+            error("huge").contains("bigger than 64 KB"),
+            "{}",
+            error("huge")
+        );
+        assert!(themes.colors("mine").is_ok());
         assert_eq!(themes.dir.as_deref(), Some(dir.as_path()));
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(Themes::load(&dir).list.len(), BUILT_IN.len(), "no folder");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_theme_linked_to_a_device_is_refused_not_read() {
+        let dir = std::env::temp_dir().join(format!("tuigram-zero-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.join("zero.toml")).unwrap();
+        let themes = Themes::load(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let error = themes.colors("zero").unwrap_err();
+        assert!(error.contains("not a file"), "{error}");
     }
 }

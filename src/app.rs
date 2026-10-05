@@ -556,6 +556,10 @@ impl App {
         mut clipboard: UnboundedReceiver<ClipboardEvent>,
     ) -> Result<()> {
         let mut keys = EventStream::new();
+        let mut signals = quit_signals();
+        // What broke the terminal, if it went away: the app then closes as
+        // `q` closes it, without drawing, and returns this.
+        let mut failed: Option<anyhow::Error> = None;
         while !self.exit {
             if self
                 .toast
@@ -574,7 +578,12 @@ impl App {
             self.mark_seen();
             self.update_online();
             self.send_notification();
-            terminal.draw(|frame| ui::draw(frame, &mut self))?;
+            if failed.is_none()
+                && let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut self))
+            {
+                failed = Some(e.into());
+                self.hang_up();
+            }
             // Start downloads/encodes for photos the frame showed but didn't have.
             self.images.fetch(&self.tg);
             if let Some(open) = self.open.as_mut() {
@@ -604,13 +613,34 @@ impl App {
                 }
                 Some(event) = image_events.recv() => self.images.on_built(event),
                 Some(event) = clipboard.recv() => self.on_clipboard(event),
-                Some(event) = keys.next() => self.on_terminal_event(event?),
+                Some(event) = keys.next(), if failed.is_none() => match event {
+                    Ok(event) => self.on_terminal_event(event),
+                    Err(e) => {
+                        failed = Some(e.into());
+                        self.hang_up();
+                    }
+                },
+                Some(()) = signals.recv() => self.hang_up(),
                 _ = sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => break,
                 _ = sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {}
                 else => break,
             }
         }
-        Ok(())
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// The terminal is gone (a closed window, a dropped SSH connection), or
+    /// tuigram was told to stop: nobody is reading any more, so nothing more
+    /// is marked read, and it quits as `q` does, going offline first.
+    fn hang_up(&mut self) {
+        self.terminal_focused = false;
+        self.focus_reported = true;
+        if self.quit_deadline.is_none() {
+            self.quit();
+        }
     }
 
     fn on_terminal_event(&mut self, event: Event) {
@@ -1425,7 +1455,8 @@ impl App {
 
     /// Sends a read receipt for the newest incoming message once you can
     /// see it: the chat pane and the terminal window have focus, and the view
-    /// is on the newest message. Viewing it marks the whole chat as read.
+    /// is on the newest message (see [`App::watching`]). Viewing it marks the
+    /// whole chat as read.
     fn mark_seen(&mut self) {
         let watched = self.open.as_ref().map(|o| o.chat_id);
         if !watched.is_some_and(|id| self.watching(id)) {
@@ -1444,10 +1475,14 @@ impl App {
     }
 
     /// The chat is open in front of the user, on its newest message, so new
-    /// ones are seen as they arrive.
+    /// ones are seen as they arrive. Where the terminal never says when its
+    /// window loses focus (tmux without `focus-events`, a detached session),
+    /// no key press for [`IDLE_AFTER`] counts as the user being away, so
+    /// messages aren't marked read, and do notify, while nobody is there.
     fn watching(&self, chat_id: i64) -> bool {
         matches!(self.screen, Screen::Main)
             && self.terminal_focused
+            && (self.focus_reported || self.last_input.elapsed() < IDLE_AFTER)
             && matches!(self.focus, Focus::Messages | Focus::Input)
             && self.settings_menu.is_none()
             && self
@@ -1956,21 +1991,6 @@ impl App {
         }
     }
 
-    /// The emoji you put on a message.
-    fn your_reactions(&self, message_id: i64) -> Vec<String> {
-        let Some(msg) = self.open.as_ref().and_then(|o| o.messages.get(&message_id)) else {
-            return Vec::new();
-        };
-        msg.reactions
-            .iter()
-            .filter(|r| r.chosen)
-            .filter_map(|r| match &r.kind {
-                ReactionKind::Emoji(emoji) => Some(emoji.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
     fn on_available_reactions(
         &mut self,
         chat_id: i64,
@@ -1997,7 +2017,12 @@ impl App {
             self.status = Some(reason.into());
             return;
         }
-        let yours = self.your_reactions(message_id);
+        let yours: Vec<String> = self
+            .open
+            .iter()
+            .flat_map(|o| o.your_emoji(message_id))
+            .map(|(_, emoji)| emoji)
+            .collect();
         if let Some(menu) = self.react_menu.as_mut() {
             menu.set_choices(available.emoji, &yours);
         }
@@ -2056,10 +2081,19 @@ impl App {
             return;
         };
         self.react_menu = None;
-        let add = !self.your_reactions(message_id).contains(&emoji);
-        if let Some(open) = &self.open {
-            let kind = ReactionKind::Emoji(emoji);
-            self.tg.react(open.chat_id, message_id, &kind, add);
+        let Some(open) = &self.open else {
+            return;
+        };
+        // Yours already, on this photo or another of its album: taken back
+        // from where it is, rather than added a second time here.
+        let yours = open
+            .your_emoji(message_id)
+            .into_iter()
+            .find(|(_, e)| *e == emoji);
+        let kind = ReactionKind::Emoji(emoji);
+        match yours {
+            Some((on, _)) => self.tg.react(open.chat_id, on, &kind, false),
+            None => self.tg.react(open.chat_id, message_id, &kind, true),
         }
     }
 
@@ -2415,13 +2449,14 @@ impl App {
 
     /// Adds files to the next message and goes to Insert mode for the
     /// caption. `pasted` is the paste they came from, for Ctrl-z. Files that
-    /// can't be sent are left out, and the status bar says why.
-    fn attach(&mut self, paths: Vec<PathBuf>, pasted: Option<String>) {
+    /// can't be sent are left out, and the status bar says why. Returns how
+    /// many were added.
+    fn attach(&mut self, paths: Vec<PathBuf>, pasted: Option<String>) -> usize {
         if !self.can_attach() {
-            return;
+            return 0;
         }
         let Some(open) = self.open.as_mut() else {
-            return;
+            return 0;
         };
         let mut added = 0;
         for path in paths {
@@ -2434,10 +2469,11 @@ impl App {
             }
         }
         if added == 0 {
-            return;
+            return 0;
         }
         open.dropped = pasted.map(|text| Dropped { text, count: added });
         self.focus = Focus::Input;
+        added
     }
 
     /// A paste into the chat (Cmd-V, or files dropped on the window). Paths
@@ -2490,11 +2526,21 @@ impl App {
             return;
         }
         match pasted.content {
-            Ok(Paste::Files(paths)) => self.attach(paths, None),
+            Ok(Paste::Files(paths)) => {
+                // Copied files have absolute paths; anything else would be
+                // looked for wherever tuigram was started.
+                let (paths, relative): (Vec<_>, Vec<_>) =
+                    paths.into_iter().partition(|p| p.is_absolute());
+                if !relative.is_empty() {
+                    self.status = Some("Copied files without a full path were left out".into());
+                }
+                self.attach(paths, None);
+            }
             Ok(Paste::Image(path)) => {
-                self.attach(vec![path], None);
                 // Not the made-up name it was saved under.
-                if let Some(last) = self.open.as_mut().and_then(|o| o.attachments.last_mut()) {
+                if self.attach(vec![path], None) == 1
+                    && let Some(last) = self.open.as_mut().and_then(|o| o.attachments.last_mut())
+                {
                     last.name = "Pasted image".into();
                 }
             }
@@ -2788,6 +2834,35 @@ impl App {
     }
 }
 
+/// SIGHUP (the terminal closed, an SSH connection dropped) and SIGTERM, one
+/// message each. They'd otherwise end tuigram on the spot, leaving the user
+/// online on Telegram for minutes.
+fn quit_signals() -> UnboundedReceiver<()> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut hangup), Ok(mut terminate)) = (
+            signal(SignalKind::hangup()),
+            signal(SignalKind::terminate()),
+        ) else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                _ = hangup.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            if tx.send(()).is_err() {
+                return;
+            }
+        }
+    });
+    #[cfg(not(unix))]
+    drop(tx);
+    rx
+}
+
 /// Hands a file path or web link to the system: the default app for a file
 /// (Preview for images on macOS, QuickTime for video…), the browser for a link.
 /// No shell is involved, so a `&` or `|` in a link stays part of it: Windows
@@ -2964,6 +3039,46 @@ mod tests {
         assert_eq!(app.settings.list_width(), 40);
         press(&mut app, KeyCode::Esc, none);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_focus_reports_a_minute_without_a_key_counts_as_away() {
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &std::env::temp_dir());
+        app.focus = Focus::Messages;
+        let chat = app.open.as_ref().unwrap().chat_id;
+        assert!(
+            app.watching(chat) && app.sees(chat),
+            "a key was just pressed"
+        );
+
+        // tmux without focus-events, or a detached session.
+        app.last_input = Instant::now()
+            .checked_sub(IDLE_AFTER + Duration::from_secs(1))
+            .unwrap();
+        assert!(!app.watching(chat), "new messages aren't marked read");
+        assert!(!app.sees(chat), "and they notify");
+
+        // A terminal that reports focus is believed instead.
+        app.focus_reported = true;
+        assert!(app.watching(chat) && app.sees(chat));
+        app.terminal_focused = false;
+        assert!(!app.watching(chat) && !app.sees(chat));
+    }
+
+    #[test]
+    fn once_the_terminal_is_gone_nothing_more_is_marked_read() {
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &std::env::temp_dir());
+        app.focus = Focus::Messages;
+        let chat = app.open.as_ref().unwrap().chat_id;
+        assert!(app.watching(chat));
+        // Already closing, so the detached client gets no request.
+        app.quit_deadline = Some(Instant::now() + CLOSE_TIMEOUT);
+        app.hang_up();
+        assert!(!app.watching(chat) && !app.sees(chat));
     }
 
     #[test]

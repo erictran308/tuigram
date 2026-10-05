@@ -8,6 +8,8 @@ use std::ffi::{CStr, CString, c_char};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::json;
@@ -126,10 +128,43 @@ const NOTIFICATION_GROUPS: i64 = 5;
 /// Stickers a search in the sticker panel asks for.
 const STICKER_SEARCH_LIMIT: i32 = 100;
 
+/// How long [`offline_now`] gives TDLib to send it before the process ends.
+const OFFLINE_GRACE: Duration = Duration::from_millis(300);
+
+/// The client in use, for [`offline_now`]: 0 until there is one, and in
+/// `--demo`.
+static CLIENT: AtomicI32 = AtomicI32::new(0);
+
 unsafe extern "C" {
     /// TDLib's synchronous entry point, for the few requests that need no
     /// client. It's linked in with tdlib-rs, which doesn't wrap it.
     fn td_execute(request: *const c_char) -> *const c_char;
+    /// Sends a request without waiting for the answer. tdlib-rs wraps it in
+    /// async functions, which [`offline_now`] can't count on.
+    fn td_send(client_id: i32, request: *const c_char);
+}
+
+/// Tells Telegram the user is offline, for the panic hook: without it,
+/// others would see them online for minutes after a crash. It goes without
+/// the async runtime, which may be what panicked, and waits a moment for
+/// TDLib's own threads to send it. Best effort.
+pub fn offline_now() {
+    let client_id = CLIENT.load(Ordering::Relaxed);
+    if client_id == 0 {
+        return;
+    }
+    let request = json!({
+        "@type": "setOption",
+        "name": "online",
+        "value": { "@type": "optionValueBoolean", "value": false },
+    });
+    let Ok(request) = CString::new(request.to_string()) else {
+        return;
+    };
+    // SAFETY: `request` is a NUL-terminated string that outlives the call,
+    // and TDLib takes requests from any thread.
+    unsafe { td_send(client_id, request.as_ptr()) };
+    std::thread::sleep(OFFLINE_GRACE);
 }
 
 /// Sends TDLib's logs (warnings and worse) to `path`. Must run before the
@@ -196,6 +231,7 @@ impl Tg {
     pub async fn start(config: Config, tx: UnboundedSender<Tagged>) -> Result<Self> {
         log_to_file(&config.data_dir.join("tdlib.log"))?;
         let client_id = tdlib_rs::create_client();
+        CLIENT.store(client_id, Ordering::Relaxed);
 
         // `receive` blocks for up to 2s at a time, so it gets a plain thread.
         // It stops once the app drops its end of the channel.
@@ -827,6 +863,7 @@ impl Tg {
     /// `authorizationStateWaitTdlibParameters`.
     pub fn reopen(&mut self) {
         self.client_id = tdlib_rs::create_client();
+        CLIENT.store(self.client_id, Ordering::Relaxed);
         self.tx.client_id = self.client_id;
         // A new client sends no updates until it gets its first request.
         self.spawn(functions::get_option("version".into(), self.client_id));

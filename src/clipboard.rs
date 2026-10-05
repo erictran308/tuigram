@@ -181,19 +181,29 @@ fn save_image(image: RgbaImage, outbox: &Path) -> Result<PathBuf, Box<dyn std::e
 }
 
 /// Removes pasted images older than [`OUTBOX_KEEP`]. Errors don't matter:
-/// it's tried again on the next start.
+/// it's tried again on the next start. Only files named as tuigram names
+/// them go: the data folder can be set from a `.env` file, so this folder
+/// might not be tuigram's own.
 pub fn clean_outbox(outbox: &Path) {
     let Ok(entries) = std::fs::read_dir(outbox) else {
         return;
     };
     for entry in entries.flatten() {
+        let name = entry.file_name();
+        let ours = name.to_str().is_some_and(|name| {
+            name.strip_prefix("pasted-")
+                .and_then(|n| n.strip_suffix(".png").or_else(|| n.strip_suffix(".jpg")))
+                .is_some_and(|stamp| !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()))
+        });
+        // The entry itself, not what a link points to.
         let old = entry
             .metadata()
-            .and_then(|m| m.modified())
             .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| m.modified().ok())
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > OUTBOX_KEEP);
-        if old {
+        if ours && old {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -226,5 +236,28 @@ mod tests {
         clean_outbox(&outbox);
         assert!(path.exists(), "new ones are kept");
         let _ = std::fs::remove_dir_all(&outbox);
+    }
+
+    #[test]
+    fn only_old_pasted_images_are_cleaned_out() {
+        let outbox =
+            std::env::temp_dir().join(format!("tuigram-test-clean-{}", std::process::id()));
+        std::fs::create_dir_all(&outbox).unwrap();
+        let old = SystemTime::now() - OUTBOX_KEEP - Duration::from_secs(60);
+        let file = |name: &str| {
+            let path = outbox.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(old).unwrap();
+            path
+        };
+        let png = file("pasted-1790000000000.png");
+        let jpeg = file("pasted-1790000000001.jpg");
+        let other = file("report.pdf");
+        let lookalike = file("pasted-notes.png");
+        clean_outbox(&outbox);
+        assert!(!png.exists() && !jpeg.exists());
+        assert!(other.exists() && lookalike.exists(), "not tuigram's");
+        std::fs::remove_dir_all(&outbox).unwrap();
     }
 }

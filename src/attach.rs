@@ -62,6 +62,11 @@ impl Attachment {
         if path.to_str().is_none() {
             return Err(format!("Can't send {name}: its path isn't valid UTF-8"));
         }
+        // The name of what goes out: for a link, that's what it points to,
+        // which a link's own name could pass off as something else.
+        let name = path
+            .file_name()
+            .map_or(name, |n| text::clean(&n.to_string_lossy()));
         let kind = match photo_size(&path, meta.len()) {
             Some((width, height)) => Kind::Photo { width, height },
             None => Kind::File,
@@ -134,8 +139,9 @@ impl Kind {
 
 /// The files a paste names, if it names nothing else. Dropping files on a
 /// terminal types their paths, quoted or with `\` before spaces, or as
-/// `file://` URLs, depending on the terminal. Only absolute paths count, so
-/// pasting a word that happens to be a file's name stays text.
+/// `file://` URLs, depending on the terminal. Only absolute paths count, as
+/// written (no `~`), so pasting a word that happens to be a file's name, or
+/// a path quoted in a message, stays text.
 pub fn pasted_paths(text: &str) -> Option<Vec<PathBuf>> {
     let text = text.trim();
     if text.is_empty() {
@@ -151,9 +157,20 @@ pub fn pasted_paths(text: &str) -> Option<Vec<PathBuf>> {
 fn existing_file(word: &str) -> Option<PathBuf> {
     let path = match word.strip_prefix("file://") {
         Some(url) => from_file_url(url)?,
-        None => expand_home(word),
+        None => PathBuf::from(word),
     };
-    (path.is_absolute() && path.is_file()).then_some(path)
+    (path.is_absolute() && !on_another_machine(&path) && path.is_file()).then_some(path)
+}
+
+/// Whether `path` names a file on another machine: `\\server\share\…` (or
+/// `//server/share/…`) on Windows. Even looking at whether such a file
+/// exists connects to that server and hands it the user's Windows login
+/// hash, so a paste never does. Elsewhere, no paste starts with two slashes.
+fn on_another_machine(path: &Path) -> bool {
+    matches!(
+        path.as_os_str().as_encoded_bytes(),
+        [b'/' | b'\\', b'/' | b'\\', ..]
+    )
 }
 
 /// Splits `text` into words the way a shell does, which is how terminals
@@ -226,11 +243,21 @@ fn from_file_url(url: &str) -> Option<PathBuf> {
         }
     }
     let path = String::from_utf8(decoded).ok()?;
-    // `file:///C:/Users/…` on Windows.
-    if cfg!(windows) && path.as_bytes().get(2) == Some(&b':') {
-        return Some(PathBuf::from(&path[1..]));
+    if cfg!(windows)
+        && let Some(drive) = on_a_drive(&path)
+    {
+        return Some(PathBuf::from(drive));
     }
     Some(PathBuf::from(path))
+}
+
+/// `C:/Users/…` from a URL's `/C:/Users/…`, as Windows writes it.
+fn on_a_drive(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix('/')?;
+    match rest.as_bytes() {
+        [letter, b':', ..] if letter.is_ascii_alphabetic() => Some(rest),
+        _ => None,
+    }
 }
 
 /// `~` and `~/…` mean the home folder, as in a shell.
@@ -415,6 +442,18 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_shown_by_the_name_of_what_it_sends() {
+        let dir = TempDir::new("link");
+        let secret = dir.file("id_rsa", b"key");
+        let link = dir.0.join("beach.jpg");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let attachment = Attachment::new(&link).unwrap();
+        assert_eq!(attachment.name, "id_rsa");
+        assert_eq!(attachment.path, std::fs::canonicalize(&secret).unwrap());
+    }
+
     #[test]
     fn file_names_are_shown_without_control_characters() {
         let dir = TempDir::new("names");
@@ -456,8 +495,33 @@ mod tests {
         assert_eq!(pasted_paths(&format!("{f} {f}.missing")), None);
         assert_eq!(pasted_paths(&dir.0.display().to_string()), None, "a folder");
         assert_eq!(pasted_paths("notes.txt"), None, "relative paths are words");
+        assert_eq!(pasted_paths("~/.ssh/id_rsa"), None, "so is ~");
         assert_eq!(pasted_paths(&format!("'{f}")), None, "an open quote");
         assert_eq!(pasted_paths("  \n"), None);
+    }
+
+    #[test]
+    fn a_paste_never_looks_at_another_machines_files() {
+        for path in [
+            r"\\evil.example\s\a.png",
+            "//evil.example/s/a.png",
+            r"\\?\UNC\evil.example\s\a.png",
+            r"\\.\pipe\a",
+        ] {
+            assert!(on_another_machine(Path::new(path)), "{path}");
+            assert_eq!(pasted_paths(path), None, "{path}");
+        }
+        assert_eq!(pasted_paths("file:////evil.example/s/a.png"), None);
+        assert!(!on_another_machine(Path::new("/Users/sam/a.png")));
+        assert!(!on_another_machine(Path::new(r"C:\Users\sam\a.png")));
+    }
+
+    #[test]
+    fn drive_letters_in_file_urls_are_read_without_cutting_a_character() {
+        assert_eq!(on_a_drive("/C:/Users/a.png"), Some("C:/Users/a.png"));
+        assert_eq!(on_a_drive("/é:"), None);
+        assert_eq!(on_a_drive("é:"), None);
+        assert_eq!(on_a_drive("/home/a.png"), None);
     }
 
     #[test]

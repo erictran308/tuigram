@@ -705,20 +705,17 @@ impl OpenChat {
             .find_map(|id| self.uploads.get(&id).copied())
     }
 
-    /// What `e` edits: the message under the cursor, or in an album, the
-    /// one photo sent with the caption, since the caption shows under the
-    /// last photo wherever the cursor is.
+    /// What `e` edits: the message under the cursor, or in an album of
+    /// photos, the one photo sent with the caption, since the caption shows
+    /// under the last photo wherever the cursor is. Files and music in an
+    /// album are drawn one by one, each with its own caption.
     pub fn edit_target(&self) -> Option<i64> {
         let id = self.cursor_id()?;
-        let album = self.messages.get(&id)?.album;
-        if album == 0 {
-            return Some(id);
-        }
         let mut captioned = self
-            .messages
-            .iter()
-            .filter(|(_, m)| m.album == album && !m.source_text.is_empty())
-            .map(|(&id, _)| id);
+            .bubble(id)
+            .into_iter()
+            .filter(|(_, m)| !m.source_text.is_empty())
+            .map(|(id, _)| id);
         match (captioned.next(), captioned.next()) {
             (Some(holder), None) => Some(holder),
             _ => Some(id),
@@ -781,12 +778,28 @@ impl OpenChat {
     }
 
     /// What `X` takes back: your reactions on the message under the cursor,
-    /// or on any photo of its album, with the message each is on. Not the
-    /// paid one, which can't be taken back.
+    /// or on any photo of its album.
     pub fn your_reactions(&self) -> Vec<(i64, ReactionKind)> {
-        let Some(id) = self.cursor_id() else {
-            return Vec::new();
-        };
+        self.cursor_id()
+            .map_or_else(Vec::new, |id| self.your_reactions_on(id))
+    }
+
+    /// Your emoji reactions on message `id`, or on any photo of its album,
+    /// as its bubble shows them, with the message each is on: what the `R`
+    /// popup marks as yours, and Enter there takes back.
+    pub fn your_emoji(&self, id: i64) -> Vec<(i64, String)> {
+        self.your_reactions_on(id)
+            .into_iter()
+            .filter_map(|(id, kind)| match kind {
+                ReactionKind::Emoji(emoji) => Some((id, emoji)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Your reactions on message `id`, or on any photo of its album, with
+    /// the message each is on. Not the paid one, which can't be taken back.
+    fn your_reactions_on(&self, id: i64) -> Vec<(i64, ReactionKind)> {
         self.bubble(id)
             .into_iter()
             .flat_map(|(id, m)| {
@@ -1445,6 +1458,13 @@ mod tests {
             let msg = open.messages.get_mut(&id).unwrap();
             msg.album = 9;
             msg.source_text = caption.into();
+            msg.preview = Some(Preview {
+                file_id: id as i32,
+                width: 10,
+                height: 10,
+                thumbnail: None,
+                sticker: false,
+            });
         }
         open.messages.get_mut(&4).unwrap().source_text = "after".into();
         open.selected = Some(3);
@@ -1454,6 +1474,14 @@ mod tests {
         open.messages.get_mut(&2).unwrap().source_text = "second caption".into();
         open.selected = Some(3);
         assert_eq!(open.edit_target(), Some(3), "with two captions, its own");
+
+        // Files in an album are each their own bubble, with their own caption.
+        open.messages.get_mut(&2).unwrap().source_text = String::new();
+        for id in [1, 2, 3] {
+            open.messages.get_mut(&id).unwrap().preview = None;
+        }
+        open.selected = Some(2);
+        assert_eq!(open.edit_target(), Some(2), "not file 1's caption");
     }
 
     #[test]
@@ -1506,6 +1534,12 @@ mod tests {
                 (1, ReactionKind::Emoji("👍".into())),
                 (3, ReactionKind::Emoji("🔥".into())),
             ]
+        );
+        // The R popup sees them too, wherever it reacts: picking 🔥 on photo 2
+        // takes it back from photo 3 rather than adding a second one.
+        assert_eq!(
+            open.your_emoji(2),
+            [(1, "👍".to_string()), (3, "🔥".to_string())]
         );
 
         let info = types::MessageInteractionInfo {

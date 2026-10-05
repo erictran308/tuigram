@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
         notify::send(notify::RESTORE_TITLE);
         ratatui::restore();
         eprintln!("tuigram crashed: {}", text::clean(&info.to_string()));
+        tg::offline_now();
         std::process::exit(101);
     }));
     // Ask the terminal which image protocol it speaks (Kitty on Ghostty) and its

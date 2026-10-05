@@ -154,7 +154,7 @@ The status bar always shows the keys for where you are. The essentials:
 
 While tuigram's window is in the background, new messages show as notifications from your terminal: messages that arrive together become one, and a busy chat stays quiet for half a minute after each. Chats you muted in Telegram stay silent.
 
-They work in Ghostty, kitty, WezTerm, iTerm2, foot and Konsole, also over SSH. In Windows Terminal, turn on `compatibility.allowOSC777` in its settings. Other terminals ring the bell instead. In tmux, add `set -g allow-passthrough on` and `set -g focus-events on` to `~/.tmux.conf`.
+They work in Ghostty, kitty, WezTerm, iTerm2, foot and Konsole, also over SSH. In Windows Terminal, turn on `compatibility.allowOSC777` in its settings. Other terminals ring the bell instead. In tmux, add `set -g allow-passthrough on` and `set -g focus-events on` to `~/.tmux.conf`. Where the terminal can't say when you switch away (tmux without `focus-events`, GNU screen), tuigram counts you as away after a minute without a key press: new messages then notify, and aren't marked as read until you're back.
 
 To turn them off or on, press `?`, go to **Settings**, and press `Space` or `Enter` on **Notifications**; it's saved at once. To pick how they're sent, set `notifications` in `settings.toml` (in [your data folder](#your-data)) to `"bell"`, `"osc9"`, `"osc777"` or `"osc99"`; the default `"auto"` picks for your terminal.
 

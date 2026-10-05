@@ -226,7 +226,6 @@ jobs:
           if [ "$(tr -d '[:space:]' < notes.md)" = "$GITHUB_REF_NAME" ]; then
             : > notes.md
           fi
-          cat notes.md
 
       - name: Create the release
         env:
