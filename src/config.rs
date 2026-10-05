@@ -1,9 +1,11 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::{attach, text};
 
 /// Telegram API credentials from https://my.telegram.org. Release binaries
 /// come with tuigram's own ([`built_in_keys`]); other builds have none, and
@@ -35,16 +37,26 @@ impl Config {
             _ => bail!("set both TG_API_ID and TG_API_HASH, or neither"),
         };
         let data_dir = data_dir()?;
-        std::fs::create_dir_all(&data_dir)
-            .with_context(|| format!("cannot create {}", data_dir.display()))?;
+        let shown = shown(&data_dir);
+        std::fs::create_dir_all(&data_dir).with_context(|| format!("cannot create {shown}"))?;
         // It holds the login session and message cache: only for this user,
         // whatever the umask or the folder it's in allow.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("cannot protect {}", data_dir.display()))?;
+                .with_context(|| format!("cannot protect {shown}"))?;
         }
+        // The default folder is in your own home; one set elsewhere must be
+        // somewhere nobody else can swap it out. TDLib then gets the path
+        // that was checked, with any links in it resolved.
+        #[cfg(unix)]
+        let data_dir = if var("TG_DATA_DIR").is_some() {
+            private_place(&data_dir)?;
+            std::fs::canonicalize(&data_dir).with_context(|| format!("cannot read {shown}"))?
+        } else {
+            data_dir
+        };
 
         Ok(Self { api_keys, data_dir })
     }
@@ -79,11 +91,67 @@ fn unmask(masked: &[u8], mask: &[u8]) -> Option<ApiKeys> {
 /// Support/tuigram` on macOS, `~/.local/share/tuigram` on Linux, `%LOCALAPPDATA%\tuigram`
 /// on Windows. The same wherever the command is run from.
 pub fn data_dir() -> Result<PathBuf> {
-    if let Some(dir) = var("TG_DATA_DIR") {
-        return Ok(PathBuf::from(dir));
+    data_dir_from(var("TG_DATA_DIR"))
+}
+
+fn data_dir_from(set: Option<String>) -> Result<PathBuf> {
+    if let Some(dir) = set {
+        let dir = PathBuf::from(dir);
+        // On Windows even creating a folder there hands that server your
+        // login hash, and the session would live on it. A single leading
+        // slash can also name one there (`\??\UNC\…`); `C:\` does the rest.
+        let elsewhere = attach::on_another_machine(&dir)
+            || (cfg!(windows) && matches!(dir.as_os_str().as_encoded_bytes(), [b'/' | b'\\', ..]));
+        if elsewhere {
+            bail!("TG_DATA_DIR must be a folder on this computer, with a drive letter on Windows");
+        }
+        return Ok(dir);
     }
     let base = dirs::data_local_dir().context("no home directory found; set TG_DATA_DIR")?;
     Ok(base.join("tuigram"))
+}
+
+/// A path as it can be printed: it may come from the environment.
+pub fn shown(path: &Path) -> String {
+    text::clean(&path.display().to_string())
+}
+
+/// Checks that only you or the system can change the folders above `dir`:
+/// otherwise another account could rename the data folder away and put its
+/// own in its place, after this check and before TDLib writes the session
+/// into it. A link as the folder itself must be yours too. Folders anyone
+/// may write to, like `/tmp`, are fine when only an entry's owner can move
+/// it (the sticky bit).
+#[cfg(unix)]
+fn private_place(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata(dir)?.uid();
+    // SAFETY: getgid can't fail and touches no memory.
+    let gid = unsafe { libc::getgid() };
+    let unsafe_place = |what: &Path| {
+        anyhow::anyhow!(
+            "{} can be changed by other users, so it's no place for your session; \
+             set TG_DATA_DIR somewhere in your home folder",
+            shown(what)
+        )
+    };
+    if std::fs::symlink_metadata(dir)?.uid() != uid {
+        return Err(unsafe_place(dir));
+    }
+    for folder in std::fs::canonicalize(dir)?.ancestors().skip(1) {
+        let meta = std::fs::metadata(folder)?;
+        let mode = meta.mode();
+        // Your own group is only yours on Linux (user private groups); on
+        // macOS every account is in `staff`.
+        let group_is_others = cfg!(target_os = "macos") || meta.gid() != gid;
+        let others_write = mode & 0o002 != 0 || (mode & 0o020 != 0 && group_is_others);
+        let sticky = mode & 0o1000 != 0;
+        let owner_ok = meta.uid() == uid || meta.uid() == 0;
+        if !owner_ok || (others_write && !(sticky && meta.uid() == 0)) {
+            return Err(unsafe_place(folder));
+        }
+    }
+    Ok(())
 }
 
 /// What my.telegram.org calls `api_id`: a positive number.
@@ -102,8 +170,14 @@ static DOTENV: OnceLock<HashMap<String, String>> = OnceLock::new();
 /// Reads `.env` from the current directory, not its parents, and keeps only
 /// its `TG_*` keys, without touching the process environment. So a `.env` in
 /// some untrusted folder can't set `LD_PRELOAD` or `BROWSER` for the
-/// programs tuigram starts.
+/// programs tuigram starts. Only development builds read it: in an installed
+/// tuigram, a `.env` in a cloned repository could pick the folder your
+/// session is kept in, or hand you one prepared by whoever wrote it.
 pub fn load_dotenv() {
+    if !cfg!(debug_assertions) {
+        let _ = DOTENV.set(HashMap::new());
+        return;
+    }
     let vars = dotenvy::from_path_iter(".env")
         .into_iter()
         .flatten()
@@ -111,6 +185,12 @@ pub fn load_dotenv() {
         .filter(|(key, _)| key.starts_with("TG_"))
         .collect();
     let _ = DOTENV.set(vars);
+}
+
+/// There's a `.env` here that this build doesn't read: worth saying, since a
+/// developer may expect it to pick a separate session.
+pub fn dotenv_ignored() -> bool {
+    !cfg!(debug_assertions) && Path::new(".env").is_file()
 }
 
 /// A variable's trimmed value from the environment, else from `.env`, or
@@ -126,6 +206,50 @@ fn var(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_data_folder_on_another_machine_is_refused() {
+        for dir in ["//evil.example/s/tg", "\\\\evil.example\\s\\tg"] {
+            assert!(data_dir_from(Some(dir.into())).is_err(), "{dir}");
+        }
+        let local = data_dir_from(Some("./.tdlib".into())).unwrap();
+        assert_eq!(local, PathBuf::from("./.tdlib"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_data_folder_others_could_swap_out_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        // As root, a folder you make is the system's, which is fine.
+        // SAFETY: geteuid can't fail and touches no memory.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let parent = std::env::temp_dir().join(format!("tuigram-place-{}", std::process::id()));
+        let dir = parent.join("tg");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(&parent, 0o777);
+        assert!(private_place(&dir).is_err(), "anyone could rename it");
+        mode(&parent, 0o1777);
+        assert!(private_place(&dir).is_err(), "sticky, but not the system's");
+        // Every macOS account is in the same group.
+        #[cfg(target_os = "macos")]
+        {
+            mode(&parent, 0o775);
+            assert!(private_place(&dir).is_err(), "the group is everyone");
+        }
+        mode(&parent, 0o755);
+        private_place(&dir).unwrap();
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn paths_are_printed_without_control_characters() {
+        assert_eq!(shown(Path::new("/tmp/a\u{1b}]0;x\u{7}b")), "/tmp/a]0;xb");
+    }
 
     #[test]
     fn a_masked_built_in_key_unmasks_to_the_key() {

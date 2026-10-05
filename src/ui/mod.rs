@@ -15,7 +15,7 @@ use crate::app::{
     PickMenu, PromptKind, Screen, SettingsMenu, Target, Toast,
 };
 use crate::attach::{self, Attachment, Kind};
-use crate::chats::Chat;
+use crate::chats::{Badge, Chat};
 use crate::config;
 use crate::messages::{Editing, OpenChat, Replied, Sender};
 use crate::notify::Notifications;
@@ -325,9 +325,10 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         selected: app.selected,
         loading: app.chats_loading,
         focused: app.focus == Focus::Chats,
-        // The settings popup, the command list and toasts can reach over it.
+        // The settings popup, the command list and toasts can reach over it;
+        // a toast only when the list is on the right, where toasts go.
         covered: app.settings_menu.is_some()
-            || app.toast.is_some()
+            || (app.toast.is_some() && app.settings.chat_list_side == Side::Right)
             || app
                 .prompt
                 .as_ref()
@@ -335,6 +336,18 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         gaps: app.settings.chat_gaps,
     };
     chat_list::draw(frame, list_area, &list, &mut app.images, colors);
+    // Popups drawn over the messages, below. Not the toast, which only says
+    // what just happened: holding photos back under it would blank them all
+    // on every copy.
+    let popup_over_chat = app.menu.is_some()
+        || app.delete_menu.is_some()
+        || app.react_menu.is_some()
+        || app.confirm.is_some()
+        || app.settings_menu.is_some()
+        || app
+            .prompt
+            .as_ref()
+            .is_some_and(|p| p.kind == PromptKind::Command || !p.completions.is_empty());
     match app.open.as_mut() {
         Some(open) => {
             let names = messages::Names {
@@ -364,6 +377,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 &names,
                 &mut app.images,
                 app.focus == Focus::Messages,
+                popup_over_chat,
                 colors,
                 app.settings.block_gaps,
             );
@@ -849,21 +863,32 @@ fn short_path(path: &std::path::Path) -> String {
 /// The "are you sure" popup over the message pane, for a file that could
 /// run code or a link that hides where it goes.
 fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Colors) {
+    const SITE: &str = "It goes to:    ";
     let title = format!(" {} ", confirm.title);
+    let site_width = confirm
+        .site
+        .as_ref()
+        .map_or(0, |s| SITE.width() + s.width());
     let longest = confirm.lines.iter().map(|l| l.width()).max().unwrap_or(0);
-    let width = (longest.max(title.width()) as u16 + 4)
+    let width = (longest.max(title.width()).max(site_width) as u16 + 4)
         .min(area.width)
         .max(40.min(area.width));
-    let popup = center(area, width, confirm.lines.len() as u16 + 2);
+    let height = confirm.lines.len() + usize::from(confirm.site.is_some());
+    let popup = center(area, width, height as u16 + 2);
     let keys = format!(" `y` {} · `Esc` cancel ", confirm.action.verb());
     let block = popup_block(title, &keys, colors).border_style(Style::new().fg(colors.warning));
-    // Long URLs keep their start, where the site's name is.
     let room = (block.inner(popup).width as usize).saturating_sub(2);
-    let lines: Vec<Line> = confirm
+    let mut lines: Vec<Line> = confirm
         .lines
         .iter()
         .map(|line| Line::from(format!(" {}", truncate(line, room))))
         .collect();
+    // The site goes right after what the text says, and keeps its end: a
+    // long host can only hide the part a sender made up.
+    if let Some(site) = &confirm.site {
+        let host = truncate_start(site, room.saturating_sub(SITE.width()));
+        lines.insert(lines.len().min(1), Line::from(format!(" {SITE}{host}")));
+    }
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
@@ -1459,6 +1484,38 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Telegram's mark after a name: SCAM and FAKE as warnings, ✓ for verified
+/// and official accounts.
+pub(crate) fn badge_span(badge: Badge, colors: &Colors) -> Span<'static> {
+    match badge {
+        Badge::Scam | Badge::Fake => Span::from(badge.mark()).fg(colors.error).bold(),
+        Badge::Official => Span::from(badge.mark()).fg(colors.accent),
+    }
+}
+
+/// Like [`truncate`], but keeps the end and cuts the start.
+fn truncate_start(text: &str, max: usize) -> String {
+    if text.width() <= max {
+        return text.to_string();
+    }
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 0;
+    for c in text.chars().rev() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w + 1 > max {
+            break;
+        }
+        kept.push(c);
+        used += w;
+    }
+    let mut out = String::from("…");
+    out.extend(kept.into_iter().rev());
+    while out.width() > max && out.len() > '…'.len_utf8() {
+        out.remove('…'.len_utf8());
+    }
+    out
+}
+
 /// Cuts `text` to at most `max` terminal columns, ending with `…` if cut.
 pub(crate) fn truncate(text: &str, max: usize) -> String {
     if text.width() <= max {
@@ -1466,7 +1523,10 @@ pub(crate) fn truncate(text: &str, max: usize) -> String {
     }
     let mut out = String::new();
     let mut used = 0;
-    for c in text.chars() {
+    // Zero-width characters don't add to `used`, so a run of them would all
+    // be kept, and the check below measures the whole string once per one it
+    // takes off. A few per column is more than any real text needs.
+    for c in text.chars().take(max * 8 + 16) {
         let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
         if used + w + 1 > max {
             break;
@@ -1749,6 +1809,7 @@ mod tests {
             name: name.into(),
             size,
             kind,
+            identity: Default::default(),
         };
         let photo = Kind::Photo {
             width: 4,
@@ -2186,20 +2247,56 @@ mod tests {
             assert!(cut.width() <= max, "{max}: {cut:?} is {}", cut.width());
         }
         assert_eq!(truncate("short", 10), "short");
+        // Hearts, then thousands of zero-width selectors: cut quickly.
+        let crafted = "❤️".repeat(50) + &"\u{fe0f}".repeat(4000);
+        let started = std::time::Instant::now();
+        let cut = truncate(&crafted, 71);
+        assert!(cut.width() <= 71 && cut.ends_with('…'));
+        // Quadratic work took seconds; a loaded machine still does this in far
+        // less than one.
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(truncate("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn a_long_host_in_a_link_warning_keeps_its_end() {
+        let colors = Colors::default();
+        let host = "bank.com.secure-session-verification-portal-login-account.evil.example";
+        let url = format!("https://{host}/");
+        let mut confirm = Confirm::new(
+            "Open this link?",
+            vec![
+                "The text says: bank.com".into(),
+                format!("Full address:  {url}"),
+            ],
+            crate::app::Confirmed::OpenLink(url),
+        );
+        confirm.site = Some(host.into());
+        for width in [60, 78, 80] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            terminal
+                .draw(|f| draw_confirm(f, f.area(), &confirm, &colors))
+                .unwrap();
+            let rows = buffer_rows(terminal.backend().buffer());
+            let site = rows.iter().find(|r| r.contains("It goes to:")).unwrap();
+            assert!(site.contains("evil.example"), "{width}: {site}");
+        }
+        assert_eq!(truncate_start("abcdef", 4), "…def");
+        assert_eq!(truncate_start("abc", 4), "abc");
     }
 
     #[test]
     fn a_disguised_link_asks_first_and_shows_where_it_goes() {
         let colors = Colors::default();
-        let confirm = Confirm {
-            title: "Open this link?".into(),
-            lines: vec![
+        let mut confirm = Confirm::new(
+            "Open this link?",
+            vec![
                 "The text says: bank.com".into(),
-                "It goes to:    https://evil.example/login".into(),
+                "Full address:  https://evil.example/login".into(),
             ],
-            action: crate::app::Confirmed::OpenLink("https://evil.example/login".into()),
-        };
+            crate::app::Confirmed::OpenLink("https://evil.example/login".into()),
+        );
+        confirm.site = Some("evil.example".into());
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|f| draw_confirm(f, f.area(), &confirm, &colors))
@@ -2209,7 +2306,8 @@ mod tests {
         let row = |needle: &str| rows.iter().position(|r| r.contains(needle));
         assert!(row("Open this link?").is_some());
         assert!(row("The text says: bank.com").is_some());
-        assert!(row("It goes to:    https://evil.example/login").is_some());
+        assert!(row("It goes to:    evil.example").is_some());
+        assert!(row("Full address:  https://evil.example/login").is_some());
         let keys = row("y open · Esc cancel").expect("says how to answer");
         let x = column(&rows[keys], "y open");
         assert_eq!(

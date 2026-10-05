@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -19,11 +19,13 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Instant, sleep_until};
 
 use crate::attach::{self, Attachment, Dropped};
-use crate::chats::Chats;
+use crate::chats::{Badge, Chats, Peer};
 use crate::clipboard::{Clipboard, ClipboardEvent, Copied, Decoded, Paste, Pasted};
 use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
-use crate::messages::{Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState};
+use crate::messages::{
+    Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState, link_host,
+};
 use crate::notify::{self, Note, Notifications, Notifier};
 use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search::MessageSearch;
@@ -51,8 +53,15 @@ const HALF_PAGE: isize = 10;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a toast stays up.
 const TOAST_TIME: Duration = Duration::from_secs(2);
+/// A confirmation ignores `y` for this long after it comes up.
+const CONFIRM_GRACE: Duration = Duration::from_millis(500);
 /// Without a key press for this long, you're no longer shown as online.
 const IDLE_AFTER: Duration = Duration::from_secs(60);
+/// Even in a window the terminal says has focus, nothing is marked read
+/// after this long without a key: the screen can be left showing while
+/// nobody is at it, or the connection behind it can be gone without the
+/// terminal saying so.
+const AWAY_AFTER: Duration = Duration::from_secs(5 * 60);
 /// While typing, the chat is told again this often: others' apps stop
 /// showing it after 5.5 s without a repeat.
 const TYPING_EVERY: Duration = Duration::from_secs(5);
@@ -153,7 +162,25 @@ pub struct Confirm {
     pub title: String,
     /// Why it asks, and what exactly would open.
     pub lines: Vec<String>,
+    /// For a link: the site it goes to, on a line of its own. A site's name
+    /// is at the end of its host, so a long one is cut from the left.
+    pub site: Option<String>,
     pub action: Confirmed,
+    /// When it came up. A `y` in the first moments was typed for whatever
+    /// was on screen before, so it doesn't count.
+    pub shown: Instant,
+}
+
+impl Confirm {
+    pub fn new(title: impl Into<String>, lines: Vec<String>, action: Confirmed) -> Self {
+        Self {
+            title: title.into(),
+            lines,
+            site: None,
+            action,
+            shown: Instant::now(),
+        }
+    }
 }
 
 /// What `y` does in a [`Confirm`].
@@ -443,6 +470,9 @@ pub struct App {
     focus_reported: bool,
     /// The last key press or paste, or the window getting focus.
     last_input: Instant,
+    /// The same moment by the wall clock. `Instant` stops while the computer
+    /// sleeps, so after a wake only this one shows how long you were away.
+    last_input_wall: SystemTime,
     /// What TDLib was last told: shown as online to others.
     online: bool,
     /// The chat last told you're typing, and when. `None` once it was told
@@ -514,12 +544,16 @@ impl App {
             prompt: None,
             chats_loading: false,
             all_chats_loaded: false,
-            status: None,
+            // Only development builds read `.env`; someone expecting it to
+            // pick a separate session should know this one didn't.
+            status: config::dotenv_ignored()
+                .then(|| "./.env is ignored: only development builds read it".into()),
             pending_g: false,
             quit_deadline: None,
             terminal_focused: true,
             focus_reported: false,
             last_input: Instant::now(),
+            last_input_wall: SystemTime::now(),
             online: false,
             typing: None,
             notifier: Notifier::default(),
@@ -646,6 +680,7 @@ impl App {
     fn on_terminal_event(&mut self, event: Event) {
         if matches!(event, Event::Key(_) | Event::Paste(_) | Event::FocusGained) {
             self.last_input = Instant::now();
+            self.last_input_wall = SystemTime::now();
         }
         match event {
             Event::Key(key) => self.on_key(key),
@@ -766,7 +801,12 @@ impl App {
                 }
                 if let Some(file) = self.copying.remove(&file_id) {
                     match &path {
-                        Some(path) => self.copy_downloaded(file, path),
+                        // Pasted in a file manager, the copy keeps the mark,
+                        // as the file would if opened with Enter.
+                        Some(path) => {
+                            mark_downloaded(path);
+                            self.copy_downloaded(file, path)
+                        }
                         None => self.status = Some("Download failed".into()),
                     }
                 }
@@ -866,6 +906,13 @@ impl App {
             Update::User(u) => {
                 let name = format!("{} {}", u.user.first_name, u.user.last_name);
                 self.users.insert(u.user.id, text::clean(name.trim()));
+                let badge = Badge::of(u.user.verification_status.as_ref(), u.user.is_support);
+                self.chats.set_badge(Peer::User(u.user.id), badge);
+            }
+            Update::Supergroup(u) => {
+                let badge = Badge::of(u.supergroup.verification_status.as_ref(), false);
+                self.chats
+                    .set_badge(Peer::Supergroup(u.supergroup.id), badge);
             }
             Update::NewMessage(u) => {
                 // While older messages are shown, new ones load with the rest.
@@ -1334,6 +1381,13 @@ impl App {
         if text.is_empty() && open.attachments.is_empty() {
             return;
         }
+        if let Some(changed) = open.attachments.iter().find(|a| a.swapped()) {
+            self.status = Some(format!(
+                "{} changed since it was attached. Drop the files (Esc in Normal mode) and attach it again",
+                changed.name
+            ));
+            return;
+        }
         let reply_to = open.reply.take().map(|r| r.id);
         if open.attachments.is_empty() {
             self.tg.send_text(open.chat_id, text, reply_to);
@@ -1474,15 +1528,26 @@ impl App {
         }
     }
 
+    /// How long since the last key, by whichever clock says longer: the
+    /// monotonic one doesn't count time the computer spent asleep.
+    fn idle(&self) -> Duration {
+        let wall = SystemTime::now()
+            .duration_since(self.last_input_wall)
+            .unwrap_or_default();
+        self.last_input.elapsed().max(wall)
+    }
+
     /// The chat is open in front of the user, on its newest message, so new
     /// ones are seen as they arrive. Where the terminal never says when its
     /// window loses focus (tmux without `focus-events`, a detached session),
     /// no key press for [`IDLE_AFTER`] counts as the user being away, so
     /// messages aren't marked read, and do notify, while nobody is there.
+    /// A window the terminal says has focus gets [`AWAY_AFTER`].
     fn watching(&self, chat_id: i64) -> bool {
+        let idle = self.idle();
         matches!(self.screen, Screen::Main)
             && self.terminal_focused
-            && (self.focus_reported || self.last_input.elapsed() < IDLE_AFTER)
+            && (idle < IDLE_AFTER || (self.focus_reported && idle < AWAY_AFTER))
             && matches!(self.focus, Focus::Messages | Focus::Input)
             && self.settings_menu.is_none()
             && self
@@ -1508,7 +1573,7 @@ impl App {
         let online = matches!(self.screen, Screen::Main)
             && self.quit_deadline.is_none()
             && self.terminal_focused
-            && self.last_input.elapsed() < IDLE_AFTER;
+            && self.idle() < IDLE_AFTER;
         if online != self.online {
             self.online = online;
             self.tg.set_online(online);
@@ -1539,7 +1604,11 @@ impl App {
             let note = Note {
                 id: notification.id,
                 chat_id,
-                chat: self.chats.title(chat_id).unwrap_or("Telegram").into(),
+                chat: format!(
+                    "{}{}",
+                    self.chats.title(chat_id).unwrap_or("Telegram"),
+                    self.chats.badge(chat_id).map_or("", Badge::mark)
+                ),
                 text,
                 silent: notification.is_silent,
             };
@@ -1805,14 +1874,14 @@ impl App {
             None => {}
             Some(false) => self.status = Some("You can't edit this message".into()),
             Some(true) if msg.formatted => {
-                self.confirm = Some(Confirm {
-                    title: "Edit without formatting?".into(),
-                    lines: vec![
+                self.confirm = Some(Confirm::new(
+                    "Edit without formatting?",
+                    vec![
                         "tuigram edits plain text, so this message would lose".into(),
                         "its bold, italics, links behind words and the like.".into(),
                     ],
-                    action: Confirmed::Edit(message_id),
-                });
+                    Confirmed::Edit(message_id),
+                ));
             }
             Some(true) => self.start_edit(message_id),
         }
@@ -2303,14 +2372,22 @@ impl App {
                 url,
                 disguise: Some(shown),
             }) => {
-                self.confirm = Some(Confirm {
-                    title: "Open this link?".into(),
-                    lines: vec![
+                // Browsers show other scripts' letters as such, so a look-alike
+                // host can pass for a familiar one.
+                let site = link_host(&url).map(|host| match host.is_ascii() {
+                    true => host,
+                    false => format!("{host} (has non-Latin letters)"),
+                });
+                let mut confirm = Confirm::new(
+                    "Open this link?",
+                    vec![
                         format!("The text says: {shown}"),
-                        format!("It goes to:    {url}"),
+                        format!("Full address:  {url}"),
                     ],
-                    action: Confirmed::OpenLink(url),
-                })
+                    Confirmed::OpenLink(url),
+                );
+                confirm.site = site;
+                self.confirm = Some(confirm);
             }
             Target::Link(link) => self.open_externally(&link.url),
             Target::Text(_) => {}
@@ -2325,18 +2402,41 @@ impl App {
             self.open_externally(&path);
             return;
         }
-        let name = Path::new(&path)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.confirm = Some(Confirm {
-            title: format!("Open {name}?"),
-            lines: vec![
+        // The file name is the sender's.
+        let name = text::clean(
+            &Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+        // A slow download can finish while you're busy with something else:
+        // a warning popping up then would take keys meant for that.
+        if self.busy() {
+            self.status = Some(format!(
+                "{name} downloaded: press Enter on it again to open it"
+            ));
+            return;
+        }
+        self.confirm = Some(Confirm::new(
+            format!("Open {name}?"),
+            vec![
                 "Files like this can run programs on your computer.".into(),
                 "Only open it if you trust whoever sent it.".into(),
             ],
-            action: Confirmed::OpenFile(path),
-        });
+            Confirmed::OpenFile(path),
+        ));
+    }
+
+    /// A popup, a prompt or the composer is taking keys.
+    fn busy(&self) -> bool {
+        self.confirm.is_some()
+            || self.settings_menu.is_some()
+            || self.delete_menu.is_some()
+            || self.react_menu.is_some()
+            || self.menu.is_some()
+            || self.resizing.is_some()
+            || self.prompt.is_some()
+            || self.focus == Focus::Input
     }
 
     fn open_externally(&mut self, target: &str) {
@@ -2349,7 +2449,12 @@ impl App {
     /// an Enter pressed out of habit can't.
     fn on_confirm_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('y') => {
+            KeyCode::Char('y')
+                if self
+                    .confirm
+                    .as_ref()
+                    .is_some_and(|c| c.shown.elapsed() >= CONFIRM_GRACE) =>
+            {
                 if let Some(confirm) = self.confirm.take() {
                     match confirm.action {
                         Confirmed::OpenFile(target) | Confirmed::OpenLink(target) => {
@@ -3054,17 +3159,42 @@ mod tests {
         );
 
         // tmux without focus-events, or a detached session.
-        app.last_input = Instant::now()
-            .checked_sub(IDLE_AFTER + Duration::from_secs(1))
-            .unwrap();
+        // By the wall clock: Instant can't go back past boot on Windows.
+        app.last_input_wall = SystemTime::now() - (IDLE_AFTER + Duration::from_secs(1));
         assert!(!app.watching(chat), "new messages aren't marked read");
         assert!(!app.sees(chat), "and they notify");
 
-        // A terminal that reports focus is believed instead.
+        // A terminal that reports focus is believed instead, for a while.
         app.focus_reported = true;
         assert!(app.watching(chat) && app.sees(chat));
+        app.last_input_wall = SystemTime::now() - AWAY_AFTER;
+        assert!(
+            !app.watching(chat),
+            "not for good: the screen may be left on"
+        );
+        assert!(app.sees(chat), "the window has focus, so no notification");
+        app.last_input_wall = SystemTime::now();
         app.terminal_focused = false;
         assert!(!app.watching(chat) && !app.sees(chat));
+    }
+
+    #[test]
+    fn time_the_computer_slept_counts_as_time_away() {
+        let mut app = test_app("sleep");
+        app.focus = Focus::Messages;
+        let chat = app.open.as_ref().unwrap().chat_id;
+        // A key ten seconds before a two-hour sleep: the monotonic clock
+        // didn't run while asleep, the wall clock did.
+        app.last_input = Instant::now();
+        app.last_input_wall = SystemTime::now() - Duration::from_secs(2 * 3600);
+        assert!(!app.watching(chat), "nothing is marked read on waking");
+        app.online = false;
+        app.update_online();
+        assert!(!app.online, "and you aren't shown online");
+
+        // A wall clock set back doesn't make you away.
+        app.last_input_wall = SystemTime::now() + Duration::from_secs(3600);
+        assert!(app.watching(chat));
     }
 
     #[test]
@@ -3199,5 +3329,61 @@ mod tests {
         ] {
             assert!(!safe_to_open(path), "{path}");
         }
+    }
+
+    /// The demo app, with its data in a temp folder of its own.
+    fn test_app(tag: &str) -> App {
+        // One folder per test, reused by later runs rather than piling up.
+        let dir = std::env::temp_dir().join(format!("tuigram-test-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        crate::demo::demo_app(Tg::detached(unbounded_channel().0), images, &dir)
+    }
+
+    #[test]
+    fn a_y_typed_just_before_a_warning_came_up_does_not_answer_it() {
+        let mut app = test_app("grace");
+        app.confirm = Some(Confirm::new("Edit?", vec![], Confirmed::Edit(-1)));
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.confirm.is_some(), "too soon to count");
+        let confirm = app.confirm.as_mut().unwrap();
+        confirm.shown = Instant::now().checked_sub(CONFIRM_GRACE).unwrap();
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(
+            app.confirm.is_none(),
+            "answered once it has been up a moment"
+        );
+    }
+
+    #[test]
+    fn a_download_finishing_while_you_type_waits_for_enter_instead_of_asking() {
+        let mut app = test_app("busy");
+        let dir = std::env::temp_dir().join("tuigram-no-such-folder");
+        let downloaded = |app: &mut App, name: &str| {
+            app.opening.insert(77);
+            let path = dir.join(name).to_string_lossy().into_owned();
+            app.on_tg(TgEvent::Downloaded {
+                file_id: 77,
+                path: Some(path),
+            });
+        };
+        app.focus = Focus::Input;
+        downloaded(&mut app, "run me.sh");
+        assert!(app.confirm.is_none(), "no popup over the composer");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("run me.sh downloaded"), "{status}");
+
+        app.focus = Focus::Messages;
+        // Not a safe type, so nothing is opened.
+        downloaded(&mut app, "evil\u{202e}txt.sh");
+        let title = &app
+            .confirm
+            .as_ref()
+            .expect("asks when nothing else is up")
+            .title;
+        assert!(
+            !title.contains('\u{202e}'),
+            "the sender's name is cleaned: {title:?}"
+        );
     }
 }

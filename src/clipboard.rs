@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, RgbaImage};
+use image::{DynamicImage, ImageFormat, RgbaImage};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Telegram takes photos up to 10 MB. A pasted image saved bigger than this
@@ -104,7 +104,9 @@ impl Clipboard {
     pub fn decode_image(&self, path: String, label: String) {
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
-            let image = crate::images::open_image(&path)
+            // The photo is another user's, so a decoder panic is caught here
+            // as it is for the chat's own copy.
+            let image = crate::images::contained(|| Ok(crate::images::open_image(&path)?))
                 .map(|i| i.to_rgba8())
                 .map_err(|e| e.to_string());
             let _ = tx.send(ClipboardEvent::Decoded(Decoded { label, image }));
@@ -163,21 +165,43 @@ fn read(outbox: &Path) -> Result<Paste, String> {
 /// Saves a pasted image in `outbox` as PNG, or as JPEG when the PNG would
 /// be too big for Telegram to take as a photo.
 fn save_image(image: RgbaImage, outbox: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(outbox)?;
+    private_folder(outbox)?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let png = outbox.join(format!("pasted-{stamp}.png"));
-    image.save(&png)?;
+    image.write_to(
+        &mut std::io::BufWriter::new(new_file(&png)?),
+        ImageFormat::Png,
+    )?;
     if std::fs::metadata(&png)?.len() <= PNG_MAX_BYTES {
         return Ok(png);
     }
     std::fs::remove_file(&png)?;
     let jpeg = outbox.join(format!("pasted-{stamp}.jpg"));
-    let file = std::io::BufWriter::new(std::fs::File::create(&jpeg)?);
+    let file = std::io::BufWriter::new(new_file(&jpeg)?);
     // JPEG has no transparency.
     DynamicImage::ImageRgba8(image)
         .to_rgb8()
         .write_with_encoder(JpegEncoder::new_with_quality(file, 90))?;
     Ok(jpeg)
+}
+
+/// The outbox, readable only by you, like the data folder it's in, so what
+/// you pasted stays yours even if that folder's own protection fails.
+fn private_folder(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path)
+}
+
+/// A new file only you can read. Never one that's there already, or a link.
+fn new_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
 }
 
 /// Removes pasted images older than [`OUTBOX_KEEP`]. Errors don't matter:
@@ -233,6 +257,13 @@ mod tests {
         let path = save_image(RgbaImage::new(30, 20), &outbox).unwrap();
         assert_eq!(path.extension().unwrap(), "png");
         assert_eq!(image::image_dimensions(&path).unwrap(), (30, 20));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600, "only you can read what you pasted");
+            assert_eq!(mode(&outbox), 0o700);
+        }
         clean_outbox(&outbox);
         assert!(path.exists(), "new ones are kept");
         let _ = std::fs::remove_dir_all(&outbox);

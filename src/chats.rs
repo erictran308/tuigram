@@ -36,6 +36,47 @@ pub struct Chat {
     /// Who is typing (or recording, sending a photo, …) right now, in the
     /// order they started, with what they're doing, e.g. "typing".
     pub activity: Vec<(Sender, &'static str)>,
+    /// The person or group the chat is with, for its [`Badge`].
+    pub peer: Option<Peer>,
+}
+
+/// Whom a chat is with: a person, or a group or channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Peer {
+    User(i64),
+    Supergroup(i64),
+}
+
+/// What Telegram itself says about an account or group, shown after its
+/// name, as Telegram's apps do. A private chat's name and photo are the other
+/// person's choice, so without these an account named "Telegram" would look
+/// like the one login codes come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Badge {
+    Scam,
+    Fake,
+    /// Verified, or Telegram's own (support and service notifications).
+    Official,
+}
+
+impl Badge {
+    pub fn of(status: Option<&types::VerificationStatus>, official: bool) -> Option<Self> {
+        match status {
+            Some(s) if s.is_scam => Some(Badge::Scam),
+            Some(s) if s.is_fake => Some(Badge::Fake),
+            Some(s) if s.is_verified => Some(Badge::Official),
+            _ => official.then_some(Badge::Official),
+        }
+    }
+
+    /// The mark after the name, with its leading space.
+    pub fn mark(self) -> &'static str {
+        match self {
+            Badge::Scam => " SCAM",
+            Badge::Fake => " FAKE",
+            Badge::Official => " ✓",
+        }
+    }
 }
 
 /// A chat's photo, for its avatar in the list.
@@ -83,12 +124,20 @@ pub struct Chats {
     /// Accent color ids past the seven built-in ones, mapped to the built-in
     /// one they look like.
     accent_colors: HashMap<i32, i32>,
+    /// What Telegram says about the people and groups chats are with.
+    badges: HashMap<Peer, Badge>,
 }
 
 impl Chats {
     pub fn insert(&mut self, chat: types::Chat) {
         let is_channel = matches!(&chat.r#type, ChatType::Supergroup(s) if s.is_channel);
         let is_private = matches!(chat.r#type, ChatType::Private(_) | ChatType::Secret(_));
+        let peer = match &chat.r#type {
+            ChatType::Private(p) => Some(Peer::User(p.user_id)),
+            ChatType::Secret(s) => Some(Peer::User(s.user_id)),
+            ChatType::Supergroup(s) => Some(Peer::Supergroup(s.supergroup_id)),
+            ChatType::BasicGroup(_) => None,
+        };
         let entry = Chat {
             title: text::clean(&chat.title),
             is_channel,
@@ -100,6 +149,7 @@ impl Chats {
             photo: chat.photo.as_ref().map(ChatPhoto::new),
             accent: chat.accent_color_id,
             activity: Vec::new(),
+            peer,
         };
         self.by_id.insert(chat.id, entry);
         self.dirty = true;
@@ -280,6 +330,21 @@ impl Chats {
     }
 
     /// The title to show: "Saved Messages" for your own chat, else the chat's title.
+    /// Telegram's word on someone a chat is with, from `updateUser` or
+    /// `updateSupergroup`.
+    pub fn set_badge(&mut self, peer: Peer, badge: Option<Badge>) {
+        match badge {
+            Some(badge) => self.badges.insert(peer, badge),
+            None => self.badges.remove(&peer),
+        };
+    }
+
+    /// The badge after a chat's title, if Telegram gave one.
+    pub fn badge(&self, chat_id: i64) -> Option<Badge> {
+        let peer = self.by_id.get(&chat_id)?.peer?;
+        self.badges.get(&peer).copied()
+    }
+
     pub fn title(&self, chat_id: i64) -> Option<&str> {
         if self.is_saved(chat_id) {
             return Some(SAVED_MESSAGES);
@@ -316,6 +381,7 @@ impl Chats {
                 photo,
                 accent: 0,
                 activity: Vec::new(),
+                peer: None,
             })
             .into_mut()
     }
@@ -350,8 +416,13 @@ fn main_order(positions: &[ChatPosition]) -> Option<i64> {
         .map(|p| p.order)
 }
 
+/// How much of the last message a chat list row keeps.
+const PREVIEW_CHARS: usize = 300;
+
 fn preview(message: &Message) -> String {
-    let text = text::clean(&content_text(&message.content)).replace(['\n', '\t'], " ");
+    let text = text::clean(&content_text(&message.content));
+    // Only the start fits in a chat list row, and it's drawn every frame.
+    let text = text::first_chars(&text, PREVIEW_CHARS).replace(['\n', '\t'], " ");
     if message.is_outgoing {
         format!("You: {text}")
     } else {
@@ -408,6 +479,7 @@ mod tests {
                     photo: None,
                     accent: 0,
                     activity: Vec::new(),
+                    peer: None,
                 },
             );
         }
@@ -493,6 +565,7 @@ mod tests {
                 photo: None,
                 accent: 0,
                 activity: Vec::new(),
+                peer: None,
             },
         );
 

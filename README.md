@@ -154,7 +154,7 @@ The status bar always shows the keys for where you are. The essentials:
 
 While tuigram's window is in the background, new messages show as notifications from your terminal: messages that arrive together become one, and a busy chat stays quiet for half a minute after each. Chats you muted in Telegram stay silent.
 
-They work in Ghostty, kitty, WezTerm, iTerm2, foot and Konsole, also over SSH. In Windows Terminal, turn on `compatibility.allowOSC777` in its settings. Other terminals ring the bell instead. In tmux, add `set -g allow-passthrough on` and `set -g focus-events on` to `~/.tmux.conf`. Where the terminal can't say when you switch away (tmux without `focus-events`, GNU screen), tuigram counts you as away after a minute without a key press: new messages then notify, and aren't marked as read until you're back.
+They work in Ghostty, kitty, WezTerm, iTerm2, foot and Konsole, also over SSH. In Windows Terminal, turn on `compatibility.allowOSC777` in its settings. Other terminals ring the bell instead. In tmux, add `set -g allow-passthrough on` and `set -g focus-events on` to `~/.tmux.conf`. Where the terminal can't say when you switch away (tmux without `focus-events`, GNU screen), tuigram counts you as away after a minute without a key press: new messages then notify, and aren't marked as read until you're back. Where it can, messages stop being marked as read after five minutes without a key press, in case the screen was left on. Time the computer spent asleep counts as time away.
 
 To turn them off or on, press `?`, go to **Settings**, and press `Space` or `Enter` on **Notifications**; it's saved at once. To pick how they're sent, set `notifications` in `settings.toml` (in [your data folder](#your-data)) to `"bell"`, `"osc9"`, `"osc777"` or `"osc99"`; the default `"auto"` picks for your terminal.
 
@@ -222,7 +222,7 @@ Everything lives in one folder on your machine (`tuigram --help` prints its path
 
 It holds your login session, API keys, downloaded files, settings and [your own themes](#themes). Deleting it removes your session from this computer. To end the session completely, go to **Settings → Devices** in another Telegram app.
 
-Environment variables (they can also go in a `.env` file in the current directory):
+Environment variables:
 
 | Variable | Use |
 | --- | --- |
@@ -237,7 +237,7 @@ cargo run       # uses the same data folder as the installed app, or TG_DATA_DIR
 cargo test
 ```
 
-Copy `.env.example` to `.env` to keep a separate development session (for example `TG_DATA_DIR=./.tdlib`).
+Copy `.env.example` to `.env` to keep a separate development session (for example `TG_DATA_DIR=./.tdlib`). Only development builds (`cargo run`) read `.env`: an installed tuigram ignores it, so a `.env` in a folder you cloned can't choose where your session is kept.
 
 ## Built with
 

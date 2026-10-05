@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ApiKeys;
+use crate::config::{self, ApiKeys};
 use crate::notify::Notifications;
 use crate::theme;
 
@@ -79,9 +79,11 @@ impl Settings {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+            Err(e) => {
+                return Err(e).with_context(|| format!("cannot read {}", config::shown(path)));
+            }
         };
-        toml::from_str(&text).with_context(|| format!("{} is invalid", path.display()))
+        toml::from_str(&text).with_context(|| format!("{} is invalid", config::shown(path)))
     }
 
     /// The chat list's width as drawn, in percent: within [`LIST_WIDTHS`],
@@ -116,7 +118,7 @@ impl Settings {
             file.sync_all()?;
             std::fs::rename(&new, path)
         };
-        write().with_context(|| format!("cannot write {}", path.display()))
+        write().with_context(|| format!("cannot write {}", config::shown(path)))
     }
 }
 

@@ -24,6 +24,9 @@ const PHOTO_MIN_SIDE: i32 = 640;
 
 /// Messages kept loaded while following new ones; see [`OpenChat::add_new`].
 const MAX_FOLLOWED: usize = 1000;
+/// While reading older messages, new ones are taken until this many are
+/// loaded; after that they load again on moving down to them.
+const MAX_LOADED: usize = 2 * MAX_FOLLOWED;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sender {
@@ -223,12 +226,19 @@ impl Msg {
     }
 }
 
+/// The text on one line, at most [`SNIPPET_CHARS`] long: a quote or a popup
+/// shows only its start, and a sender's 4096 characters would be measured
+/// again on every frame.
 fn one_line(text: &str) -> String {
-    text::clean(text)
+    let line = text::clean(text)
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    text::first_chars(&line, SNIPPET_CHARS).to_string()
 }
+
+/// How much of a message a one-line snippet keeps.
+const SNIPPET_CHARS: usize = 300;
 
 /// A web link in a message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -411,10 +421,19 @@ fn body(content: &MessageContent) -> Body {
                 .iter()
                 .map(|(_, r)| r.start + shift..r.end + shift)
                 .collect();
+            // Drawing looks ranges up by position.
+            body.link_ranges.sort_by_key(|r| r.start);
         }
         for (link, _) in found {
-            if !body.links.iter().any(|l| l.url == link.url) {
-                body.links.push(link);
+            match body.links.iter_mut().find(|l| l.url == link.url) {
+                // The same URL also behind other words keeps its warning,
+                // whichever came first.
+                Some(seen) => {
+                    if seen.disguise.is_none() {
+                        seen.disguise = link.disguise;
+                    }
+                }
+                None => body.links.push(link),
             }
         }
     }
@@ -522,6 +541,11 @@ fn byte_offset(text: &str, utf16: i32) -> usize {
 fn web_url(url: &str) -> Option<String> {
     let url = text::clean(url);
     let url = url.trim();
+    // A link with a line break in it would be copied as several lines, and
+    // no web address has spaces.
+    if url.contains(char::is_whitespace) {
+        return None;
+    }
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("https://") || lower.starts_with("http://") {
         Some(url.to_string())
@@ -530,6 +554,26 @@ fn web_url(url: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// The host a web link really goes to, read the way browsers do: past the
+/// scheme and any slashes, up to the first `/`, `\\`, `?` or `#`, after the
+/// last `@` and without the port. Lowercased.
+pub fn link_host(url: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https:")
+        .or_else(|| lower.strip_prefix("http:"))?;
+    let rest = rest.trim_start_matches(['/', '\\']);
+    let authority = &rest[..rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len())];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match host.find(']') {
+        Some(end) if host.starts_with('[') => &host[..=end],
+        _ => host.rsplit_once(':').map_or(host, |(host, _)| host),
+    };
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// `1:05`, or `1:02:05` past an hour.
@@ -888,13 +932,36 @@ impl OpenChat {
     /// layout done every frame without end.
     fn add_new(&mut self, id: i64, msg: Msg) {
         self.messages.insert(id, msg);
-        // Not mid-request: a page of older messages must still join up.
-        if self.selected.is_none() && self.loading.is_none() {
+        // Not mid-request: a page must still join up.
+        if self.loading.is_some() {
+            return;
+        }
+        let loaded = self.messages.len();
+        if self.selected.is_none() {
             while self.messages.len() > MAX_FOLLOWED {
                 self.messages.pop_first();
                 self.all_loaded = false;
             }
+        } else if self.messages.len() > MAX_LOADED {
+            // Reading older messages while new ones pour in: stop taking
+            // them, as after a jump into the past. They load again on the way
+            // down.
+            while self.messages.len() > MAX_LOADED
+                && self.messages.last_key_value().map(|(&id, _)| id) != self.selected
+            {
+                self.messages.pop_last();
+            }
+            self.at_newest = false;
         }
+        if self.messages.len() < loaded {
+            self.prune_replied();
+        }
+    }
+
+    /// Forgets what unloaded replies answer.
+    fn prune_replied(&mut self) {
+        let messages = &self.messages;
+        self.replied.retain(|id, _| messages.contains_key(id));
     }
 
     /// Adds a page of history, as (message id, message) pairs. A `Latest` or
@@ -925,6 +992,7 @@ impl OpenChat {
                     .next_back()
                     .or_else(|| self.messages.first_key_value())
                     .map(|(&id, _)| id);
+                self.prune_replied();
                 return;
             }
             Page::Older(_) => {
@@ -939,6 +1007,7 @@ impl OpenChat {
             }
         }
         self.messages.extend(messages);
+        self.prune_replied();
     }
 
     /// Swaps a message sent under a temporary id for the server's version.
@@ -1170,6 +1239,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_hidden_link_keeps_its_warning_when_its_url_is_also_shown_plainly() {
+        let text = |entities| {
+            body(&MessageContent::MessageText(types::MessageText {
+                text: types::FormattedText {
+                    text: "evil.example then bank.com".into(),
+                    entities,
+                },
+                link_preview: None,
+                link_preview_options: None,
+            }))
+        };
+        let hidden = TextEntityType::TextUrl(types::TextEntityTypeTextUrl {
+            url: "https://evil.example".into(),
+        });
+        let both = text(vec![
+            entity(0, 12, TextEntityType::Url),
+            entity(18, 8, hidden),
+        ]);
+        assert_eq!(
+            both.links,
+            [Link {
+                url: "https://evil.example".into(),
+                disguise: Some("bank.com".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_links_host_is_read_the_way_browsers_read_it() {
+        let host = |url| link_host(url);
+        assert_eq!(
+            host("https://bank.com.secure-login.evil.example/x").as_deref(),
+            Some("bank.com.secure-login.evil.example")
+        );
+        assert_eq!(
+            host("https://bank.com@evil.example/").as_deref(),
+            Some("evil.example")
+        );
+        assert_eq!(
+            host("https://evil.example\\@bank.com/").as_deref(),
+            Some("evil.example")
+        );
+        assert_eq!(
+            host("HTTPS:///Evil.Example:8443?x").as_deref(),
+            Some("evil.example")
+        );
+        assert_eq!(host("http://[::1]:80/").as_deref(), Some("[::1]"));
+        assert_eq!(host("https:///"), None);
+        assert_eq!(host("ftp://a.example"), None);
+    }
+
+    #[test]
+    fn urls_with_spaces_or_line_breaks_are_not_links() {
+        assert_eq!(web_url("https://a.example/x y"), None);
+        assert_eq!(web_url("a.example/\nx"), None);
+        assert_eq!(
+            web_url("a.example/x").as_deref(),
+            Some("https://a.example/x")
+        );
+    }
+
     fn sticker(format: StickerFormat, thumbnail: Option<ThumbnailFormat>) -> MessageContent {
         MessageContent::MessageSticker(types::MessageSticker {
             sticker: types::Sticker {
@@ -1343,12 +1474,30 @@ mod tests {
             "the dropped ones load again on scrolling up"
         );
 
-        // Reading further up, nothing goes.
+        // Reading further up, nothing goes, up to a point.
         open.selected = open.oldest_id();
         for (id, msg) in page(5000..5010) {
             open.add_new(id, msg);
         }
         assert_eq!(open.messages.len(), MAX_FOLLOWED + 10);
+        for (id, msg) in page(6000..6000 + MAX_LOADED as i64) {
+            open.add_new(id, msg);
+        }
+        assert_eq!(open.messages.len(), MAX_LOADED, "then new ones wait");
+        assert!(!open.at_newest, "and load again on the way down");
+        assert_eq!(open.selected, open.oldest_id(), "the cursor stays put");
+    }
+
+    #[test]
+    fn what_replies_answer_is_forgotten_with_the_replies() {
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page(0..10));
+        open.set_replied(3, None);
+        open.set_replied(4, None);
+        for (id, msg) in page(10..MAX_FOLLOWED as i64 + 50) {
+            open.add_new(id, msg);
+        }
+        assert!(open.replied.is_empty(), "replies 3 and 4 were unloaded");
     }
 
     #[test]
@@ -1559,6 +1708,7 @@ mod tests {
             name: name.into(),
             size: 1,
             kind: crate::attach::Kind::File,
+            identity: Default::default(),
         };
         let mut open = OpenChat::new(1);
         open.attachments = vec![file("chosen.pdf"), file("a.txt"), file("b.txt")];

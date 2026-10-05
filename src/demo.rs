@@ -137,6 +137,7 @@ async fn show(dir: &Path) -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    crate::tmux::save();
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     let (image_tx, mut image_rx) = unbounded_channel();
     let mut images = Images::new(picker, image_tx);
@@ -170,6 +171,7 @@ async fn show(dir: &Path) -> Result<()> {
         }
     };
     ratatui::restore();
+    crate::tmux::restore();
     result
 }
 

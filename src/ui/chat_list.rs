@@ -100,11 +100,16 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
                 String::new()
             };
             let title = chats.title(id).unwrap_or_default();
-            let title = truncate(title, width.saturating_sub(badge.width() + 1));
-            let pad = width.saturating_sub(title.width() + badge.width());
+            let mark = chats.badge(id);
+            let mark_w = mark.map_or(0, |m| m.mark().width());
+            let title = truncate(title, width.saturating_sub(badge.width() + mark_w + 1));
+            let pad = width.saturating_sub(title.width() + mark_w + badge.width());
             let style = title_style(chats, id, colors).bold();
             let mut first = vec![bar.clone(), gap.clone()];
             first.extend(highlight(&title, filter, style, colors));
+            if let Some(mark) = mark {
+                first.push(super::badge_span(mark, colors));
+            }
             first.push(Span::from(" ".repeat(pad)));
             first.push(Span::from(badge).fg(colors.bg).bg(colors.primary));
             // Highlighted by hand too, so the blank row below stays blank.
@@ -255,6 +260,31 @@ mod tests {
             focused: true,
             covered: false,
         }
+    }
+
+    #[test]
+    fn telegrams_scam_and_official_marks_follow_the_name() {
+        use crate::chats::{Badge, Peer};
+        let mut chats = Chats::default();
+        chats.add_local(1, "Telegram", None).peer = Some(Peer::User(777000));
+        chats.add_local(2, "Telegram", None).peer = Some(Peer::User(42));
+        chats.set_badge(Peer::User(777000), Some(Badge::Official));
+        chats.set_badge(Peer::User(42), Some(Badge::Scam));
+        chats.refresh();
+        let buf = render(
+            &list(&chats, None),
+            &mut images(ProtocolType::Halfblocks),
+            40,
+            10,
+        );
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert!(rows.iter().any(|r| r.contains("Telegram ✓")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("Telegram SCAM")),
+            "{rows:#?}"
+        );
     }
 
     fn render(list: &ChatList, images: &mut Images, width: u16, height: u16) -> Buffer {

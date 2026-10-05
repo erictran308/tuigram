@@ -6,7 +6,9 @@
 //! blocking thread. Until the real photo is ready, the blurry thumbnail that
 //! came with the message (or chat) stands in.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -46,19 +48,64 @@ pub struct Key {
 /// 2560px a side and stickers 512px, so a bigger one is only a way to run
 /// memory out.
 fn limits() -> image::Limits {
+    sized(4096)
+}
+
+/// Caps of `side` pixels a side. Decoders allocate more than `max_alloc`
+/// counts (WebP's scratch and frame buffers), so the side is what bounds it.
+fn sized(side: u32) -> image::Limits {
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(4096);
-    limits.max_image_height = Some(4096);
+    limits.max_image_width = Some(side);
+    limits.max_image_height = Some(side);
     limits.max_alloc = Some(128 * 1024 * 1024);
     limits
 }
 
+/// Stickers are 512px a side; this leaves room to spare.
+const STICKER_SIDE: u32 = 1024;
+
 /// Like `image::open` (the format comes from the extension), within [`limits`].
 pub fn open_image(path: &str) -> image::ImageResult<image::DynamicImage> {
+    open_within(path, limits())
+}
+
+fn open_within(path: &str, limits: image::Limits) -> image::ImageResult<image::DynamicImage> {
     let mut reader = image::ImageReader::open(path)?;
-    reader.limits(limits());
+    reader.limits(limits);
     reader.decode()
 }
+
+/// At most this many images decode at once; the rest wait for a later frame.
+/// Each may take a few hundred MB while it decodes.
+const MAX_BUILDING: usize = 4;
+
+/// Encoded photos kept for the open chat; the least recently drawn go first.
+const MAX_READY: usize = 200;
+
+thread_local! {
+    /// Set while this thread decodes another user's image.
+    static DECODING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The panic is in an image decoder, where it's caught: the image shows as
+/// broken and the app carries on, rather than every chat holding that image
+/// becoming one that can't be opened.
+pub fn panic_is_contained() -> bool {
+    DECODING.with(Cell::get)
+}
+
+/// Runs `decode`, with a panic in it caught and turned into an error. Every
+/// decode of another user's image goes through this.
+pub fn contained<T>(decode: impl FnOnce() -> Result<T>) -> Result<T> {
+    DECODING.with(|d| d.set(true));
+    let result = catch_unwind(AssertUnwindSafe(decode))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("the image couldn't be decoded")));
+    DECODING.with(|d| d.set(false));
+    result
+}
+
+/// An image still building after this long counts as failed.
+const BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Like `image::load_from_memory`, within [`limits`].
 fn decode_bytes(data: &[u8]) -> image::ImageResult<image::DynamicImage> {
@@ -102,6 +149,8 @@ pub fn circle(photo: &DynamicImage, width: u32, height: u32) -> RgbaImage {
 /// An image finished encoding (or failed) on a background thread.
 pub struct ImageEvent {
     key: Key,
+    /// [`Images::generation`] when it was started.
+    generation: u64,
     result: Result<SlicedProtocol>,
 }
 
@@ -125,12 +174,20 @@ struct Avatar {
 pub struct Images {
     picker: Picker,
     tx: UnboundedSender<ImageEvent>,
-    ready: HashMap<Key, SlicedProtocol>,
+    /// Encoded photos, with the frame each was last drawn in.
+    ready: HashMap<Key, (SlicedProtocol, u64)>,
+    /// Counts frames, for `ready`.
+    frame: u64,
+    /// Goes up when the files are forgotten, for a new TDLib client: an
+    /// image still being built for the old one numbers its file the old way,
+    /// and is dropped when it's done.
+    generation: u64,
     /// Kept apart from `ready`: they stay when another chat is opened.
     avatars: HashMap<Key, Avatar>,
     /// Counts calls to [`Images::avatar`], to find the least recently drawn.
     avatar_clock: u64,
-    building: HashSet<Key>,
+    /// Images being built, and when each started.
+    building: HashMap<Key, std::time::Instant>,
     /// Keys that failed to decode; never retried.
     failed: HashSet<Key>,
     files: HashMap<i32, FileState>,
@@ -146,9 +203,11 @@ impl Images {
             picker,
             tx,
             ready: HashMap::new(),
+            frame: 0,
+            generation: 0,
             avatars: HashMap::new(),
             avatar_clock: 0,
-            building: HashSet::new(),
+            building: HashMap::new(),
             failed: HashSet::new(),
             files: HashMap::new(),
             wanted: Vec::new(),
@@ -162,13 +221,23 @@ impl Images {
         self.picker.protocol_type() != ProtocolType::Halfblocks
     }
 
+    /// The terminal paints each image (or each of its rows) from one cell,
+    /// and repaints the whole of it whenever that cell is sent again, over
+    /// anything drawn on top since: sixel and iTerm2's protocol.
+    pub fn paints_over(&self) -> bool {
+        matches!(
+            self.picker.protocol_type(),
+            ProtocolType::Sixel | ProtocolType::Iterm2
+        )
+    }
+
     /// Pixel size of one terminal cell, for sizing photos by aspect ratio.
     pub fn font_size(&self) -> FontSize {
         self.picker.font_size()
     }
 
     /// The best image ready to draw: the photo, else its blurry thumbnail.
-    pub fn get(&self, photo: &Preview, cols: u16, rows: u16) -> Option<&SlicedProtocol> {
+    pub fn get(&mut self, photo: &Preview, cols: u16, rows: u16) -> Option<&SlicedProtocol> {
         let key = |thumbnail| Key {
             file_id: photo.file_id,
             cols,
@@ -176,9 +245,13 @@ impl Images {
             thumbnail,
             avatar: false,
         };
-        self.ready
-            .get(&key(false))
-            .or_else(|| self.ready.get(&key(true)))
+        let key = [key(false), key(true)]
+            .into_iter()
+            .find(|k| self.ready.contains_key(k))?;
+        let frame = self.frame;
+        let (image, used) = self.ready.get_mut(&key)?;
+        *used = frame;
+        Some(image)
     }
 
     /// True when the photo can't be shown: its download or decode failed.
@@ -208,6 +281,10 @@ impl Images {
             thumbnail,
             avatar: true,
         };
+        // See paints_over: a popup may be over the list.
+        if covered && self.paints_over() {
+            return None;
+        }
         let key = [key(false), key(true)]
             .into_iter()
             .find(|k| self.avatars.get(k).is_some_and(|a| a.shown || !covered))?;
@@ -225,6 +302,7 @@ impl Images {
 
     /// Starts downloads and encodes for what the last frame wanted.
     pub fn fetch(&mut self, tg: &Tg) {
+        self.frame += 1;
         self.fetch_avatars(tg);
         for (photo, cols, rows) in std::mem::take(&mut self.wanted) {
             let full = Key {
@@ -240,7 +318,12 @@ impl Images {
             match self.files.get(&photo.file_id) {
                 Some(FileState::Ready(path)) => {
                     let path = path.clone();
-                    self.build(full, move || Ok(open_image(&path)?));
+                    let limits = if photo.sticker {
+                        sized(STICKER_SIDE)
+                    } else {
+                        limits()
+                    };
+                    self.build(full, move || Ok(open_within(&path, limits)?));
                 }
                 Some(FileState::Downloading | FileState::Failed) => {}
                 None => {
@@ -309,12 +392,13 @@ impl Images {
     }
 
     pub fn on_built(&mut self, event: ImageEvent) {
+        if event.generation != self.generation {
+            return;
+        }
         self.building.remove(&event.key);
         match event.result {
             Ok(image) if event.key.avatar => self.add_avatar(event.key, image),
-            Ok(image) => {
-                self.ready.insert(event.key, image);
-            }
+            Ok(image) => self.add_ready(event.key, image),
             Err(_) => {
                 self.failed.insert(event.key);
                 if !event.key.thumbnail {
@@ -322,6 +406,19 @@ impl Images {
                 }
             }
         }
+    }
+
+    fn add_ready(&mut self, key: Key, image: SlicedProtocol) {
+        if self.ready.len() >= MAX_READY
+            && let Some(oldest) = self
+                .ready
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(&k, _)| k)
+        {
+            self.ready.remove(&oldest);
+        }
+        self.ready.insert(key, (image, self.frame));
     }
 
     fn add_avatar(&mut self, key: Key, image: SlicedProtocol) {
@@ -350,6 +447,7 @@ impl Images {
 
     /// Forgets every file, for a new TDLib client: it numbers files afresh.
     pub fn forget_files(&mut self) {
+        self.generation += 1;
         self.ready.clear();
         self.avatars.clear();
         self.building.clear();
@@ -370,20 +468,41 @@ impl Images {
         } else {
             self.ready.contains_key(&key)
         };
-        if built || self.building.contains(&key) || self.failed.contains(&key) {
+        // One that never finishes mustn't hold its place for good: it counts
+        // as failed, and the others get their turn.
+        let failed = &mut self.failed;
+        self.building.retain(|&key, started| {
+            let alive = started.elapsed() < BUILD_TIMEOUT;
+            if !alive {
+                failed.insert(key);
+            }
+            alive
+        });
+        if built
+            || self.building.contains_key(&key)
+            || self.failed.contains(&key)
+            || self.building.len() >= MAX_BUILDING
+        {
             return;
         }
-        self.building.insert(key);
+        self.building.insert(key, std::time::Instant::now());
         let picker = self.picker.clone();
         let tx = self.tx.clone();
+        let generation = self.generation;
         tokio::task::spawn_blocking(move || {
-            let result = decode().and_then(|image| {
-                let size = Size::new(key.cols, key.rows);
-                Ok(SlicedProtocol::new_with_resize(
-                    &picker, image, size, RESIZE,
-                )?)
+            let result = contained(|| {
+                decode().and_then(|image| {
+                    let size = Size::new(key.cols, key.rows);
+                    Ok(SlicedProtocol::new_with_resize(
+                        &picker, image, size, RESIZE,
+                    )?)
+                })
             });
-            let _ = tx.send(ImageEvent { key, result });
+            let _ = tx.send(ImageEvent {
+                key,
+                generation,
+                result,
+            });
         });
     }
 
@@ -394,7 +513,7 @@ impl Images {
         if key.avatar {
             self.add_avatar(key, image);
         } else {
-            self.ready.insert(key, image);
+            self.add_ready(key, image);
         }
     }
 }
@@ -427,6 +546,103 @@ mod tests {
         let edge = alpha(6, 7);
         assert!(edge > 0 && edge < 255, "a soft edge: {edge}");
         assert_eq!(circle(&photo, 0, 44).dimensions(), (0, 44), "no panic");
+    }
+
+    fn key(file_id: i32) -> Key {
+        Key {
+            file_id,
+            cols: 4,
+            rows: 2,
+            thumbnail: false,
+            avatar: false,
+        }
+    }
+
+    fn preview(file_id: i32) -> Preview {
+        Preview {
+            file_id,
+            width: 8,
+            height: 8,
+            thumbnail: None,
+            sticker: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_decoder_panic_marks_the_photo_broken_instead_of_ending_the_app() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        images.build(key(7), || panic!("a decoder bug"));
+        images.on_built(rx.recv().await.unwrap());
+        assert!(images.is_broken(&preview(7)));
+        assert!(!panic_is_contained(), "only while decoding");
+    }
+
+    #[tokio::test]
+    async fn an_image_built_for_a_logged_out_session_is_dropped() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        images.build(key(7), move || {
+            wait.recv().ok();
+            Ok(DynamicImage::new_rgba8(8, 8))
+        });
+        images.forget_files();
+        go.send(()).unwrap();
+        images.on_built(rx.recv().await.unwrap());
+        assert!(
+            images.get(&preview(7), 4, 2).is_none(),
+            "not the new session's"
+        );
+        assert!(!images.is_broken(&preview(7)));
+    }
+
+    #[tokio::test]
+    async fn only_a_few_images_decode_at_once() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Arc::new(std::sync::Mutex::new(wait));
+        for id in 0..10 {
+            let wait = wait.clone();
+            images.build(key(id), move || {
+                let _ = wait.lock().unwrap().recv();
+                Ok(DynamicImage::new_rgba8(8, 8))
+            });
+        }
+        assert_eq!(images.building.len(), MAX_BUILDING);
+        drop(go);
+    }
+
+    #[tokio::test]
+    async fn a_decode_that_never_finishes_gives_up_its_place() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        for id in 0..MAX_BUILDING as i32 {
+            let long_ago = std::time::Instant::now() - BUILD_TIMEOUT;
+            images.building.insert(key(id), long_ago);
+        }
+        images.build(key(99), || Ok(DynamicImage::new_rgba8(8, 8)));
+        assert!(images.building.contains_key(&key(99)), "its turn came");
+        assert!(
+            images.failed.contains(&key(0)),
+            "the stuck one counts as failed"
+        );
+    }
+
+    #[test]
+    fn the_photo_cache_keeps_the_ones_drawn_lately() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        images.insert_ready(key(0), DynamicImage::new_rgba8(8, 8));
+        for id in 1..MAX_READY as i32 + 10 {
+            images.frame += 1;
+            assert!(images.get(&preview(0), 4, 2).is_some(), "still drawn");
+            images.insert_ready(key(id), DynamicImage::new_rgba8(8, 8));
+        }
+        assert_eq!(images.ready.len(), MAX_READY);
+        assert!(images.get(&preview(0), 4, 2).is_some());
+        assert!(images.get(&preview(1), 4, 2).is_none(), "the oldest went");
     }
 
     #[test]

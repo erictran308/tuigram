@@ -87,6 +87,7 @@ impl Header {
 }
 
 /// Where one message landed in the laid-out lines.
+#[derive(Clone)]
 struct Placed {
     id: i64,
     /// First line, including the date separator and gap above the bubble.
@@ -114,17 +115,22 @@ pub fn draw(
     names: &Names,
     images: &mut Images,
     focused: bool,
+    covered: bool,
     colors: &Colors,
     block_gaps: bool,
 ) {
     let chat = names.chats.get(open.chat_id);
     let mut title = vec![
         Span::from(format!(
-            " {} ",
+            " {}",
             names.chats.title(open.chat_id).unwrap_or_default()
         ))
         .style(super::title_style(names.chats, open.chat_id, colors)),
     ];
+    if let Some(badge) = names.chats.badge(open.chat_id) {
+        title.push(super::badge_span(badge, colors));
+    }
+    title.push(Span::from(" "));
     if let Some(doing) = chat.and_then(|c| super::activity(c, names)) {
         title.push(Span::from(format!("· {doing} ")).fg(colors.activity));
     }
@@ -163,7 +169,7 @@ pub fn draw(
     .areas(inner);
     let show_names = chat.is_none_or(|c| !c.is_channel);
     let font = images.font_size();
-    let (lines, placed, photos) = layout(
+    let mut laid = measure(
         open,
         names,
         show_names,
@@ -174,13 +180,15 @@ pub fn draw(
     );
 
     let height = body.height as usize;
+    let placed = laid.placed.clone();
     let selected = match open.selected {
         Some(id) => placed.iter().find(|p| p.id == id),
         None => placed.last(),
     };
-    let top = scroll_top(open, &placed, selected, lines.len(), height);
-
-    let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
+    let (top, anchor) = scroll_top(open, &placed, selected, laid.total, height);
+    let photos = std::mem::take(&mut laid.photos);
+    let visible = laid.lines(top, height, block_gaps, colors);
+    open.scroll = anchor;
     // Short chats sit at the bottom of the pane, like in Telegram.
     let pad = (height - visible.len()) as u16;
     let shift = |r: Rect| Rect {
@@ -189,7 +197,7 @@ pub fn draw(
         ..r
     };
     frame.render_widget(Paragraph::new(visible), shift(body));
-    draw_photos(frame, shift(body), &photos, top, images, colors);
+    draw_photos(frame, shift(body), &photos, top, images, covered, colors);
 
     let gutters = [shift(left), shift(right)];
     // The message being answered or edited stays marked while writing.
@@ -237,6 +245,7 @@ fn draw_photos(
     photos: &[PhotoSlot],
     top: usize,
     images: &mut Images,
+    covered: bool,
     colors: &Colors,
 ) {
     for slot in photos {
@@ -245,6 +254,12 @@ fn draw_photos(
             continue;
         }
         images.want(&slot.photo, slot.cols, slot.rows);
+        // Sixel and iTerm2 images are painted from one cell outside the
+        // popup, and a later repaint would cover the popup's text, which
+        // isn't sent again. So under a popup they wait until it closes.
+        if covered && images.paints_over() {
+            continue;
+        }
         if let Some(image) = images.get(&slot.photo, slot.cols, slot.rows) {
             let position = SignedPosition::from((slot.x as i16, y as i16));
             frame.render_widget(SlicedImage::new(image, position), area);
@@ -290,12 +305,12 @@ fn photo_cells(photo: &Preview, max_cols: usize, font: FontSize) -> (u16, u16) {
 /// Picks the first visible line: stick to the bottom while following new
 /// messages, otherwise scroll as little as possible to keep the cursor in view.
 fn scroll_top(
-    open: &mut OpenChat,
+    open: &OpenChat,
     placed: &[Placed],
     selected: Option<&Placed>,
     total: usize,
     height: usize,
-) -> usize {
+) -> (usize, Option<ScrollAnchor>) {
     let max_top = total.saturating_sub(height);
     let mut top = match (open.selected, open.scroll) {
         (Some(_), Some(anchor)) => placed
@@ -317,7 +332,7 @@ fn scroll_top(
         }
     }
     let top = top.min(max_top);
-    open.scroll = placed
+    let anchor = placed
         .iter()
         .rev()
         .find(|p| p.start <= top)
@@ -325,20 +340,21 @@ fn scroll_top(
             msg_id: p.id,
             offset: top - p.start,
         });
-    top
+    (top, anchor)
 }
 
-/// Lays out every loaded message. With `gaps`, messages in a block have a
-/// row of their bubble's background between them.
-fn layout(
-    open: &OpenChat,
+/// Measures every loaded message and works out where each goes. With
+/// `gaps`, messages in a block have a row of their bubble's background
+/// between them.
+fn measure<'a>(
+    open: &'a OpenChat,
     names: &Names,
     show_names: bool,
     gaps: bool,
     width: usize,
     font: FontSize,
     colors: &Colors,
-) -> (Vec<Line<'static>>, Vec<Placed>, Vec<PhotoSlot>) {
+) -> Laid<'a> {
     // Text width inside a bubble, after one column of padding each side.
     let max_text = (width * BUBBLE_WIDTH_PERCENT / 100)
         .max(12)
@@ -466,25 +482,21 @@ fn layout(
         widths.extend(std::iter::repeat_n(widest, block.len()));
     }
 
-    let mut lines = Vec::new();
-    let mut placed = Vec::new();
-    let mut photos = Vec::new();
+    // Where everything goes, counted without building the rows: only the
+    // messages on screen are built (see [`Laid::lines`]). A sender decides
+    // how many rows a message takes, up to thousands of line breaks.
+    let mut laid = Laid {
+        messages: Vec::with_capacity(measured.len()),
+        placed: Vec::with_capacity(measured.len()),
+        photos: Vec::new(),
+        total: 0,
+    };
     for (m, inner) in measured.into_iter().zip(widths) {
-        let start = lines.len();
-        if let Some(label) = m.separator {
-            if !lines.is_empty() {
-                lines.push(Line::default());
-            }
-            lines.push(Line::from(label).fg(colors.muted).centered());
+        let start = laid.total;
+        let mut bubble_start = start + usize::from(!m.joined || gaps);
+        if m.separator.is_some() {
+            bubble_start += 1 + usize::from(start > 0);
         }
-        // Inside a block the gap keeps the bubble's background, so the
-        // messages read as one block but still apart.
-        if !m.joined {
-            lines.push(Line::default());
-        } else if gaps {
-            lines.push(m.bubble.gap(inner, colors));
-        }
-        let bubble_start = lines.len();
         let msg = m.bubble.msg;
         if let (Some(photo), Some((cols, photo_rows))) = (&msg.preview, m.bubble.photo) {
             // Rows are right-aligned for own messages, so measure from the right.
@@ -493,7 +505,7 @@ fn layout(
             } else {
                 0
             };
-            photos.push(PhotoSlot {
+            laid.photos.push(PhotoSlot {
                 line: bubble_start + m.bubble.header.rows(),
                 x: (bubble_x + 1) as u16,
                 cols,
@@ -501,15 +513,79 @@ fn layout(
                 photo: photo.clone(),
             });
         }
-        lines.extend(m.bubble.rows(inner, colors));
-        placed.push(Placed {
+        let end = bubble_start + m.bubble.height();
+        laid.placed.push(Placed {
             id: m.id,
             start,
             bubble_start,
-            end: lines.len(),
+            end,
         });
+        laid.messages.push((m, inner));
+        laid.total = end;
     }
-    (lines, placed, photos)
+    laid
+}
+
+/// The chat measured for drawing: where each message goes, and what it takes
+/// to build its rows.
+struct Laid<'a> {
+    messages: Vec<(Measured<'a>, usize)>,
+    placed: Vec<Placed>,
+    photos: Vec<PhotoSlot>,
+    /// Rows in all.
+    total: usize,
+}
+
+impl Laid<'_> {
+    /// Rows `top..top + height`, building only the messages they show.
+    fn lines(self, top: usize, height: usize, gaps: bool, colors: &Colors) -> Vec<Line<'static>> {
+        let bottom = top.saturating_add(height);
+        let mut out = Vec::new();
+        for ((m, inner), placed) in self.messages.into_iter().zip(&self.placed) {
+            if placed.end <= top || placed.start >= bottom {
+                continue;
+            }
+            let mut lines = Vec::with_capacity(placed.end - placed.start);
+            if let Some(label) = m.separator {
+                if placed.start > 0 {
+                    lines.push(Line::default());
+                }
+                lines.push(Line::from(label).fg(colors.muted).centered());
+            }
+            // Inside a block the gap keeps the bubble's background, so the
+            // messages read as one block but still apart.
+            if !m.joined {
+                lines.push(Line::default());
+            } else if gaps {
+                lines.push(m.bubble.gap(inner, colors));
+            }
+            lines.extend(m.bubble.rows(inner, colors));
+            debug_assert_eq!(lines.len(), placed.end - placed.start, "measured right");
+            let from = top.saturating_sub(placed.start);
+            let to = bottom.min(placed.end) - placed.start;
+            out.extend(lines.into_iter().take(to).skip(from));
+        }
+        out
+    }
+}
+
+/// Every row of the chat, built: what [`draw`] would show if the pane were
+/// tall enough.
+#[cfg(test)]
+fn layout(
+    open: &OpenChat,
+    names: &Names,
+    show_names: bool,
+    gaps: bool,
+    width: usize,
+    font: FontSize,
+    colors: &Colors,
+) -> (Vec<Line<'static>>, Vec<Placed>, Vec<PhotoSlot>) {
+    let mut laid = measure(open, names, show_names, gaps, width, font, colors);
+    let placed = laid.placed.clone();
+    let photos = std::mem::take(&mut laid.photos);
+    let total = laid.total;
+    (laid.lines(0, total, gaps, colors), placed, photos)
 }
 
 /// Where a message sits in an album, which is drawn as one bubble: the
@@ -761,6 +837,15 @@ impl<'a> Bubble<'a> {
         }
     }
 
+    /// Rows [`Bubble::rows`] makes.
+    fn height(&self) -> usize {
+        self.header.rows()
+            + self.photo.map_or(0, |(_, rows)| usize::from(rows))
+            + self.text.len()
+            + self.chips.len()
+            + usize::from(self.meta_at == MetaAt::Own && self.meta.is_some())
+    }
+
     /// Stickers float on the pane, without a bubble behind them.
     fn sticker(&self) -> bool {
         self.msg.preview.as_ref().is_some_and(|p| p.sticker)
@@ -961,6 +1046,10 @@ fn line_spans(
     found: Style,
 ) -> Vec<Span<'static>> {
     let end = start + line.len();
+    // Only the ranges on this line: a message can have thousands, and each
+    // of its lines is drawn on every frame.
+    let links = overlapping(links, start, end);
+    let matches = overlapping(matches, start, end);
     // Every offset in the line where the style can change.
     let mut cuts = vec![0, line.len()];
     for range in links.iter().chain(matches) {
@@ -988,6 +1077,14 @@ fn line_spans(
         spans.push(Span::styled(String::new(), style));
     }
     spans
+}
+
+/// The ranges that overlap `start..end`, out of ranges in order that don't
+/// overlap each other (links, and search matches, are).
+fn overlapping(ranges: &[Range<usize>], start: usize, end: usize) -> &[Range<usize>] {
+    let first = ranges.partition_point(|r| r.end <= start);
+    let count = ranges[first..].partition_point(|r| r.start < end);
+    &ranges[first..first + count]
 }
 
 #[cfg(test)]
@@ -1071,6 +1168,7 @@ mod tests {
                     &names,
                     images,
                     focused,
+                    false,
                     &Colors::default(),
                     Settings::default().block_gaps,
                 )
@@ -1394,6 +1492,68 @@ mod tests {
     }
 
     #[test]
+    fn sixel_photos_wait_while_a_popup_is_over_them() {
+        use ratatui_image::picker::ProtocolType;
+        let mut open = sample();
+        let photo = Preview {
+            file_id: 7,
+            width: 800,
+            height: 600,
+            thumbnail: None,
+            sticker: false,
+        };
+        open.messages.insert(
+            5,
+            Msg {
+                preview: Some(photo.clone()),
+                ..msg(true, 1_790_086_500, "look")
+            },
+        );
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Sixel);
+        let mut images = Images::new(picker, tokio::sync::mpsc::unbounded_channel().0);
+        let (cols, rows) = photo_cells(&photo, 56, images.font_size());
+        let key = Key {
+            file_id: 7,
+            cols,
+            rows,
+            thumbnail: false,
+            avatar: false,
+        };
+        let red = image::RgbImage::from_pixel(80, 60, image::Rgb([255, 0, 0]));
+        images.insert_ready(key, red.into());
+        let mut painted = |covered| {
+            let users = HashMap::new();
+            let chats = Chats::default();
+            let names = Names {
+                users: &users,
+                chats: &chats,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            terminal
+                .draw(|f| {
+                    let colors = Colors::default();
+                    draw(
+                        f,
+                        f.area(),
+                        &mut open,
+                        &names,
+                        &mut images,
+                        false,
+                        covered,
+                        &colors,
+                        true,
+                    )
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            buf.content().iter().any(|c| c.symbol().contains('\x1b'))
+        };
+        assert!(painted(false), "drawn as usual");
+        assert!(!painted(true), "held back under a popup");
+    }
+
+    #[test]
     fn photos_show_a_placeholder_then_the_image() {
         let mut open = sample();
         let photo = Preview {
@@ -1516,6 +1676,51 @@ mod tests {
             }
         }
         assert_eq!(underlined, "https://example.com/a/long/path");
+    }
+
+    #[test]
+    fn a_flood_of_line_breaks_draws_only_what_is_on_screen() {
+        let mut open = OpenChat::new(42);
+        let text = format!("a{}b", "\n".repeat(4094));
+        for id in 1..=200 {
+            open.messages.insert(id, msg(false, 1_790_000_000, &text));
+        }
+        let started = std::time::Instant::now();
+        let buf = render_buffer(&mut open, false, &mut images());
+        let took = started.elapsed();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        // A bubble taller than the pane shows from its top.
+        assert!(
+            rows.iter().any(|r| r.contains("│  a ")),
+            "the newest message: {rows:#?}"
+        );
+        eprintln!("200 messages of 4095 rows: {took:?}");
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    }
+
+    #[test]
+    fn thousands_of_links_in_one_message_are_drawn_quickly() {
+        let text = "ab".repeat(2048);
+        let links: Vec<_> = (0..2048).map(|i| 2 * i..2 * i + 1).collect();
+        let started = std::time::Instant::now();
+        let mut underlined = 0;
+        for (line, start) in wrap(&text, 71) {
+            for span in line_spans(&line, start, &links, &[], Style::new(), Style::new()) {
+                if span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+                {
+                    underlined += span.content.len();
+                }
+            }
+        }
+        assert_eq!(underlined, 2048, "every 'a', and nothing else");
+        // Quadratic work took seconds; a loaded machine still does this in far
+        // less than one.
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

@@ -4,3 +4,7 @@
 .env
 .tdlib/
 src/credentials.rs
+# Local AI tool folders: never committed or published.
+/.agents/
+/.claude/
+/skills-lock.json

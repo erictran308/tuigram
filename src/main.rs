@@ -14,6 +14,7 @@ mod stickers;
 mod text;
 mod tg;
 mod theme;
+mod tmux;
 mod ui;
 
 use std::io::{Write, stdout};
@@ -55,11 +56,15 @@ async fn main() -> Result<()> {
     // The title shows unread chats while tuigram runs, then goes back.
     notify::send(notify::SAVE_TITLE);
     notify::send(&notify::title(0));
-    // A panic, on any thread, ends the app: the terminal is put back, then
+    // A panic, on any thread but an image decoder's (which is caught there),
+    // ends the app: the terminal is put back, then
     // the message is printed without control characters, since it can quote
     // text from a message. Carrying on after a background thread died would
     // leave the screen restored under a running app.
     std::panic::set_hook(Box::new(|info| {
+        if images::panic_is_contained() {
+            return;
+        }
         let _ = execute!(
             stdout(),
             PopKeyboardEnhancementFlags,
@@ -68,12 +73,14 @@ async fn main() -> Result<()> {
         );
         notify::send(notify::RESTORE_TITLE);
         ratatui::restore();
+        tmux::restore();
         eprintln!("tuigram crashed: {}", text::clean(&info.to_string()));
         tg::offline_now();
         std::process::exit(101);
     }));
     // Ask the terminal which image protocol it speaks (Kitty on Ghostty) and its
     // cell size in pixels. Must happen before key reading starts.
+    tmux::save();
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     // Pasted text arrives as one event instead of keystrokes, so a pasted line
     // break can't send a half-written message.
@@ -105,6 +112,7 @@ async fn main() -> Result<()> {
     let _ = execute!(stdout(), DisableBracketedPaste, DisableFocusChange);
     notify::send(notify::RESTORE_TITLE);
     ratatui::restore();
+    tmux::restore();
     result
 }
 
@@ -152,6 +160,6 @@ Environment:
   TG_API_HASH
 ",
         version = env!("CARGO_PKG_VERSION"),
-        data = config::data_dir()?.display(),
+        data = config::shown(&config::data_dir()?),
     ))
 }

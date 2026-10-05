@@ -2,6 +2,7 @@
 //! a typed path (`a`), the clipboard (`p`), or a paste of file paths, which
 //! is what dropping files on a terminal window types.
 
+use std::ops::Not;
 use std::path::{Path, PathBuf};
 
 use crate::text;
@@ -37,6 +38,36 @@ pub struct Attachment {
     pub name: String,
     pub size: u64,
     pub kind: Kind,
+    /// Which file it was when listed, to tell if it was swapped since.
+    pub identity: Identity,
+}
+
+/// What tells one file from another that took its place: on Unix its device
+/// and inode, everywhere its size and when it last changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Identity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Identity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (device, inode) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (device, inode) = (0, 0);
+        Self {
+            device,
+            inode,
+            size: meta.len(),
+            modified: meta.modified().ok(),
+        }
+    }
 }
 
 impl Attachment {
@@ -71,12 +102,26 @@ impl Attachment {
             Some((width, height)) => Kind::Photo { width, height },
             None => Kind::File,
         };
+        let identity = std::fs::symlink_metadata(&path)
+            .map(|meta| Identity::of(&meta))
+            .map_err(|e| format!("Can't read {name}: {e}"))?;
         Ok(Self {
             path,
             name,
             size: meta.len(),
             kind,
+            identity,
         })
+    }
+
+    /// The file listed is no longer the one there: it was changed, or
+    /// something else took its place, such as a link to another file. In a
+    /// folder others can write to, that could swap in a file of yours you
+    /// never chose to send.
+    pub fn swapped(&self) -> bool {
+        std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|meta| meta.is_file() && Identity::of(&meta) == self.identity)
+            .not()
     }
 }
 
@@ -166,7 +211,7 @@ fn existing_file(word: &str) -> Option<PathBuf> {
 /// `//server/share/…`) on Windows. Even looking at whether such a file
 /// exists connects to that server and hands it the user's Windows login
 /// hash, so a paste never does. Elsewhere, no paste starts with two slashes.
-fn on_another_machine(path: &Path) -> bool {
+pub fn on_another_machine(path: &Path) -> bool {
     matches!(
         path.as_os_str().as_encoded_bytes(),
         [b'/' | b'\\', b'/' | b'\\', ..]
@@ -558,12 +603,36 @@ mod tests {
     }
 
     #[test]
+    fn a_file_swapped_after_it_was_listed_is_noticed() {
+        let dir = std::env::temp_dir().join(format!("tuigram-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "mine to send").unwrap();
+        let listed = Attachment::new(&path).unwrap();
+        assert!(!listed.swapped());
+
+        // Moved away and replaced by another file under the same name.
+        std::fs::rename(&path, dir.join("moved.txt")).unwrap();
+        std::fs::write(&path, "something else").unwrap();
+        assert!(listed.swapped());
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(dir.join("moved.txt"), &path).unwrap();
+            assert!(listed.swapped(), "a link isn't the file listed");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn photos_and_files_go_in_separate_albums_of_up_to_ten() {
         let file = |kind| Attachment {
             path: PathBuf::new(),
             name: String::new(),
             size: 1,
             kind,
+            identity: Identity::default(),
         };
         let photo = Kind::Photo {
             width: 1,

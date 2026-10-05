@@ -52,14 +52,24 @@ ratatui-image = { version = "11.1", default-features = false, features = ["image
 ratatui-textarea = "0.9.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tdlib-rs = { version = "1.4.0", features = ["download-tdlib", "static"] }
+tdlib-rs = { version = "1.4.0", features = ["static"] }
 textwrap = "0.16.4"
 tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.6"
 unicode-width = "0.2.2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
-tdlib-rs = { version = "1.4.0", features = ["download-tdlib", "static"] }
+tdlib-rs = { version = "1.4.0", features = ["static"] }
+
+[features]
+default = ["download-tdlib"]
+# Where TDLib comes from: tdlib-rs's build script downloads it (the default),
+# or it's a copy already checked, in LOCAL_TDLIB_PATH, as release builds use.
+download-tdlib = ["tdlib-rs/download-tdlib"]
+local-tdlib = ["tdlib-rs/local-tdlib"]
 
 [dev-dependencies]
 rqrr = { version = "0.11.0", default-features = false }

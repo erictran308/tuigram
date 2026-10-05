@@ -98,10 +98,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libc++-dev libc++abi-dev
 
-      # Fetches the same zip tdlib-rs will, and stops if it isn't the pinned
-      # one. After the build, its files are compared with what tdlib-rs
-      # actually linked, which also catches a different zip being served to
-      # tdlib-rs's own download.
+      # Fetches the zip tdlib-rs would, and stops if it isn't the pinned one.
+      # The build then uses this checked copy (the local-tdlib feature), so
+      # tdlib-rs's build script downloads and unpacks nothing itself.
       - name: Download and check TDLib
         shell: bash
         env:
@@ -130,17 +129,19 @@ jobs:
         env:
           TUIGRAM_API_ID: ${{ secrets.TUIGRAM_API_ID }}
           TUIGRAM_API_HASH: ${{ secrets.TUIGRAM_API_HASH }}
-        run: cargo build --release --locked --target ${{ matrix.target }}
+          # A native path on every OS (bash's $PWD isn't one on Windows).
+          LOCAL_TDLIB_PATH: ${{ github.workspace }}/verified-tdlib/tdlib
+        run: cargo build --release --locked --no-default-features --features local-tdlib --target ${{ matrix.target }}
 
-      # tdlib-rs and tuigram's build.rs each extract a TDLib into their build
-      # output; both must match the checked zip file for file.
+      # tdlib-rs copies the TDLib it builds with into its build output; it
+      # must match the checked zip file for file.
       - name: Check the linked TDLib is the checked one
         shell: bash
         run: |
           shopt -s nullglob
           dirs=(target/${{ matrix.target }}/release/build/*/out/tdlib)
           if [ ${#dirs[@]} -eq 0 ]; then
-            echo "::error::Found no TDLib downloaded by tdlib-rs"
+            echo "::error::Found no TDLib in tdlib-rs's build output"
             exit 1
           fi
           for dir in "${dirs[@]}"; do

@@ -142,6 +142,24 @@ unsafe extern "C" {
     /// Sends a request without waiting for the answer. tdlib-rs wraps it in
     /// async functions, which [`offline_now`] can't count on.
     fn td_send(client_id: i32, request: *const c_char);
+    /// OpenSSL's setup, from the libcrypto linked in with TDLib.
+    fn OPENSSL_init_crypto(opts: u64, settings: *const std::ffi::c_void) -> std::ffi::c_int;
+}
+
+/// `OPENSSL_INIT_NO_LOAD_CONFIG`, the same in OpenSSL 1.1 and 3.
+const OPENSSL_INIT_NO_LOAD_CONFIG: u64 = 0x80;
+
+/// Keeps the OpenSSL inside TDLib from reading a configuration file. By
+/// default it reads `openssl.cnf` from a folder fixed when TDLib was built,
+/// which on some systems another account can create, and that file can load
+/// code into tuigram, next to your session. OpenSSL sets itself up once, so
+/// this must come before TDLib uses it.
+fn no_openssl_config() -> Result<()> {
+    // SAFETY: a plain call into the linked libcrypto with no settings; it
+    // only records what to skip when OpenSSL sets itself up.
+    let done = unsafe { OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, std::ptr::null()) };
+    anyhow::ensure!(done == 1, "OpenSSL couldn't be set up");
+    Ok(())
 }
 
 /// Tells Telegram the user is offline, for the panic hook: without it,
@@ -229,6 +247,7 @@ pub struct Tg {
 
 impl Tg {
     pub async fn start(config: Config, tx: UnboundedSender<Tagged>) -> Result<Self> {
+        no_openssl_config()?;
         log_to_file(&config.data_dir.join("tdlib.log"))?;
         let client_id = tdlib_rs::create_client();
         CLIENT.store(client_id, Ordering::Relaxed);
@@ -941,5 +960,15 @@ fn plain(text: String) -> types::FormattedText {
     types::FormattedText {
         text,
         entities: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn openssl_is_told_not_to_read_a_config_file() {
+        super::no_openssl_config().unwrap();
+        // Again, as after a logout's new client: still fine.
+        super::no_openssl_config().unwrap();
     }
 }
