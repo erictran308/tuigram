@@ -27,7 +27,7 @@ use crate::messages::{Editable, Editing, Link, MediaFile, OpenChat, Replied, Sen
 use crate::notify::{self, Note, Notifications, Notifier};
 use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search::MessageSearch;
-use crate::settings::{self, Settings};
+use crate::settings::{self, Settings, Side};
 use crate::stickers::{self, Source, StickerPanel};
 use crate::text;
 use crate::tg::{Deletable, Found, Page, Tagged, Tg, TgEvent};
@@ -286,6 +286,7 @@ pub struct SettingsMenu {
     pub saved_normal_after_send: bool,
     pub saved_block_gaps: bool,
     pub saved_chat_gaps: bool,
+    pub saved_chat_list_side: Side,
 }
 
 impl SettingsMenu {
@@ -293,8 +294,10 @@ impl SettingsMenu {
     pub const NOTIFICATIONS: usize = Theme::ALL.len();
     /// The "gap between chats" row.
     pub const CHAT_GAPS: usize = Self::NOTIFICATIONS + 1;
+    /// The "chat list on the right" row.
+    pub const LIST_RIGHT: usize = Self::CHAT_GAPS + 1;
     /// The "gap between messages" row.
-    pub const BLOCK_GAPS: usize = Self::CHAT_GAPS + 1;
+    pub const BLOCK_GAPS: usize = Self::LIST_RIGHT + 1;
     /// The "Normal mode after sending" row, the last one.
     pub const AFTER_SEND: usize = Self::BLOCK_GAPS + 1;
 }
@@ -1085,6 +1088,12 @@ impl App {
     /// Normal mode: every key is a command, nothing is typed.
     fn on_normal_key(&mut self, key: KeyEvent, ctrl: bool) {
         let pending_g = std::mem::take(&mut self.pending_g);
+        // `h` and `l` go toward the pane on that side of the screen, so they
+        // swap when the chat list is on the right.
+        let (to_chat, to_list) = match self.settings.chat_list_side {
+            Side::Left => ('l', 'h'),
+            Side::Right => ('h', 'l'),
+        };
         // Motions work the same in both panes. In the message pane, down
         // (`j`, `G`) is newer and up (`k`, `gg`) is older, as on screen.
         let motion = match key.code {
@@ -1123,6 +1132,7 @@ impl App {
                     saved_normal_after_send: self.settings.normal_after_send,
                     saved_block_gaps: self.settings.block_gaps,
                     saved_chat_gaps: self.settings.chat_gaps,
+                    saved_chat_list_side: self.settings.chat_list_side,
                 });
             }
             (_, KeyCode::Char(':')) => self.open_prompt(PromptKind::Command),
@@ -1175,7 +1185,8 @@ impl App {
             (Focus::Messages, KeyCode::Char('R')) => self.open_react_menu(),
             (Focus::Messages, KeyCode::Char('X')) => self.remove_reactions(),
             (Focus::Messages, KeyCode::Char('o')) if ctrl => self.jump_back(),
-            (Focus::Chats, KeyCode::Enter | KeyCode::Char('l')) => self.open_selected_chat(),
+            (Focus::Chats, KeyCode::Enter) => self.open_selected_chat(),
+            (Focus::Chats, KeyCode::Char(c)) if c == to_chat => self.open_selected_chat(),
             (Focus::Chats, KeyCode::Char('i')) => {
                 self.open_selected_chat();
                 if self.open.is_some() {
@@ -1184,7 +1195,8 @@ impl App {
             }
             (Focus::Messages, KeyCode::Char('i')) => self.focus = Focus::Input,
             (Focus::Messages, KeyCode::Enter) => self.open_selected_message(),
-            (Focus::Messages, KeyCode::Esc | KeyCode::Char('h')) => self.focus = Focus::Chats,
+            (Focus::Messages, KeyCode::Esc) => self.focus = Focus::Chats,
+            (Focus::Messages, KeyCode::Char(c)) if c == to_list => self.focus = Focus::Chats,
             _ => {}
         }
     }
@@ -2047,9 +2059,14 @@ impl App {
         let Some(before) = self.resizing else {
             return;
         };
+        // `h` and `l` move the line between the panes that way.
+        let left = match self.settings.chat_list_side {
+            Side::Left => -1,
+            Side::Right => 1,
+        };
         match key.code {
-            KeyCode::Char('h') | KeyCode::Left => self.settings.resize_list(-1),
-            KeyCode::Char('l') | KeyCode::Right => self.settings.resize_list(1),
+            KeyCode::Char('h') | KeyCode::Left => self.settings.resize_list(left),
+            KeyCode::Char('l') | KeyCode::Right => self.settings.resize_list(-left),
             KeyCode::Char('=') => self.settings.chat_list_width = settings::DEFAULT_LIST_WIDTH,
             KeyCode::Esc => {
                 self.settings.chat_list_width = before;
@@ -2566,6 +2583,7 @@ impl App {
                 self.settings.normal_after_send = menu.saved_normal_after_send;
                 self.settings.block_gaps = menu.saved_block_gaps;
                 self.settings.chat_gaps = menu.saved_chat_gaps;
+                self.settings.chat_list_side = menu.saved_chat_list_side;
                 let saved = menu.saved_notifications;
                 self.settings_menu = None;
                 self.set_notifications(saved);
@@ -2602,6 +2620,15 @@ impl App {
                 if menu.tab == HelpTab::Settings && menu.selected == SettingsMenu::CHAT_GAPS =>
             {
                 self.settings.chat_gaps = !self.settings.chat_gaps;
+                return;
+            }
+            KeyCode::Char(' ')
+                if menu.tab == HelpTab::Settings && menu.selected == SettingsMenu::LIST_RIGHT =>
+            {
+                self.settings.chat_list_side = match self.settings.chat_list_side {
+                    Side::Left => Side::Right,
+                    Side::Right => Side::Left,
+                };
                 return;
             }
             _ => {}
@@ -2842,12 +2869,82 @@ mod tests {
 
     /// The screen's rows as text.
     fn screen(app: &mut App) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        screen_of(app, 100)
+    }
+
+    fn screen_of(app: &mut App, width: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
         terminal.draw(|f| ui::draw(f, app)).unwrap();
         let buf = terminal.backend().buffer();
         (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    #[test]
+    fn the_chat_list_can_go_on_the_right_where_h_and_l_follow_it() {
+        let dir = std::env::temp_dir().join(format!("tuigram-side-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        app.focus = Focus::Chats;
+        let none = KeyModifiers::NONE;
+        let tick_the_box = |app: &mut App| {
+            press(app, KeyCode::Char('?'), none);
+            press(app, KeyCode::Tab, none);
+            app.settings_menu.as_mut().unwrap().selected = SettingsMenu::LIST_RIGHT;
+            press(app, KeyCode::Char(' '), none);
+        };
+        // The text left and right of the first pane's top right corner.
+        let halves = |app: &mut App| {
+            let top = screen(app).remove(0);
+            let (left, right) = top.split_once('┐').unwrap();
+            (left.to_string(), right.to_string())
+        };
+
+        tick_the_box(&mut app);
+        assert!(app.settings.chat_list_side == Side::Right, "shown at once");
+        press(&mut app, KeyCode::Esc, none);
+        assert!(
+            app.settings.chat_list_side == Side::Left,
+            "Esc puts it back"
+        );
+
+        tick_the_box(&mut app);
+        press(&mut app, KeyCode::Enter, none);
+        let saved = Settings::load(&settings::path(&dir)).unwrap();
+        assert_eq!(saved.chat_list_side, Side::Right);
+        let (left, right) = halves(&mut app);
+        assert!(
+            left.contains("Weekend Hike") && right.contains("Chats ("),
+            "{left}┐{right}"
+        );
+
+        press(&mut app, KeyCode::Char('l'), none);
+        assert!(app.focus == Focus::Chats, "l points away from the chat");
+        press(&mut app, KeyCode::Char('h'), none);
+        assert!(
+            app.focus == Focus::Messages,
+            "h goes to the chat, on the left"
+        );
+        // Wide enough for every hint.
+        let status = screen_of(&mut app, 300).pop().unwrap();
+        assert!(
+            status.contains("l back") && !status.contains("h back"),
+            "{status}"
+        );
+        press(&mut app, KeyCode::Char('h'), none);
+        assert!(app.focus == Focus::Messages);
+        press(&mut app, KeyCode::Char('l'), none);
+        assert!(app.focus == Focus::Chats, "l goes back to the list");
+
+        // h moves the line left, which widens a list on the right.
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('h'), none);
+        assert_eq!(app.settings.list_width(), 40);
+        press(&mut app, KeyCode::Esc, none);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

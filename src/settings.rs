@@ -27,6 +27,8 @@ pub struct Settings {
     pub block_gaps: bool,
     /// A blank row between chats in the chat list.
     pub chat_gaps: bool,
+    /// Which side of the window the chat list is on.
+    pub chat_list_side: Side,
     /// The chat list's share of the window's width, in percent. Ctrl-r
     /// changes it; see [`Settings::list_width`].
     pub chat_list_width: u16,
@@ -44,10 +46,20 @@ impl Default for Settings {
             normal_after_send: false,
             block_gaps: true,
             chat_gaps: true,
+            chat_list_side: Side::Left,
             chat_list_width: DEFAULT_LIST_WIDTH,
             api_keys: None,
         }
     }
+}
+
+/// A side of the window, for the chat list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    #[default]
+    Left,
+    Right,
 }
 
 /// The chat list's width, in percent of the window, at first and after `=`.
@@ -112,13 +124,14 @@ mod tests {
             normal_after_send: true,
             block_gaps: false,
             chat_gaps: false,
+            chat_list_side: Side::Right,
             chat_list_width: 40,
             api_keys: None,
         };
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false\nchat_list_width = 40"
+            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
 
@@ -134,6 +147,7 @@ mod tests {
         let old = Settings::load(&file).unwrap();
         assert!(old.block_gaps && old.chat_gaps);
         assert_eq!(old.chat_list_width, DEFAULT_LIST_WIDTH);
+        assert_eq!(old.chat_list_side, Side::Left);
 
         std::fs::write(&file, r#"theme = "dracula""#).unwrap();
         let error = format!("{:#}", Settings::load(&file).unwrap_err());

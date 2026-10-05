@@ -32,7 +32,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("j / k", "Move down / up"),
             ("gg / G", "First / last chat"),
             ("Ctrl-d / Ctrl-u", "Half a page down / up"),
-            ("Enter / l", "Open the chat"),
+            (
+                "Enter / l",
+                "Open the chat (Enter / h with the list on the right)",
+            ),
             ("i", "Open the chat and write"),
             ("/", "Filter chats by name"),
             ("Esc", "Clear the filter"),
@@ -65,7 +68,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Esc",
                 "End the search, cancel the edit, remove the files, cancel the reply, or go back",
             ),
-            ("h", "Back to the chat list"),
+            ("h", "Back to the chat list (l with the list on the right)"),
         ],
     ),
     (

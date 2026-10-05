@@ -132,7 +132,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `gg` / `G` | Jump to top / bottom |
 | `Ctrl-d` / `Ctrl-u` | Half a page down / up |
 | `Enter` / `l` | Open a chat, or the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens) |
-| `h` / `Esc` | Back to the chat list |
+| `h` / `Esc` | Back to the chat list. To have the list on the right, tick **On the right side of the window** in `?` > **Settings**; `h` and `l` then swap, to follow the screen |
 | `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
 | `Tab` | While writing: stickers. `h/j/k/l` pick one, `H` / `L` switch between Recent, Favorites and your sets, `/` finds stickers by emoji or word, `Enter` sends |
 | `y` | Copy the selected message: its text, a link, or the photo or file |
@@ -145,7 +145,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `/` | Search chat names, or messages in the open chat |
 | `n` / `N` | Next older / newer match |
 | `H` | Highlight a chat |
-| `Ctrl-r` | Resize the panes: `h` / `l` make the chat list narrower / wider, `=` puts it back as at first, `Enter` keeps it (also next time), `Esc` cancels |
+| `Ctrl-r` | Resize the panes: `h` / `l` move the line between them left / right, `=` puts it back as at first, `Enter` keeps it (also next time), `Esc` cancels |
 | `:` | Run a command, typed in full: `:logout` logs out of Telegram on this computer |
 | `?` | Every shortcut, plus settings and themes |
 | `q` | Quit |

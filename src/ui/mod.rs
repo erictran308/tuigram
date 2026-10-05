@@ -21,7 +21,7 @@ use crate::messages::{Editing, OpenChat, Replied, Sender};
 use crate::notify::Notifications;
 use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search;
-use crate::settings::Settings;
+use crate::settings::{Settings, Side};
 use crate::text;
 use crate::theme::{Colors, Theme};
 
@@ -303,11 +303,14 @@ fn draw_qr_login(frame: &mut Frame, login: &Login, code: Vec<Line<'static>>, col
 fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     let [body, status] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
-    let [list_area, chat_area] = Layout::horizontal([
-        Constraint::Percentage(app.settings.list_width()),
-        Constraint::Fill(1),
-    ])
-    .areas(body);
+    let list_width = Constraint::Percentage(app.settings.list_width());
+    let [list_area, chat_area] = match app.settings.chat_list_side {
+        Side::Left => Layout::horizontal([list_width, Constraint::Fill(1)]).areas(body),
+        Side::Right => {
+            let [chat, list] = Layout::horizontal([Constraint::Fill(1), list_width]).areas(body);
+            [list, chat]
+        }
+    };
 
     let list = chat_list::ChatList {
         chats: &app.chats,
@@ -739,6 +742,11 @@ fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, settings: &Settings
         SettingsMenu::CHAT_GAPS,
         check(settings.chat_gaps),
         "A gap between chats",
+    ));
+    lines.push(row(
+        SettingsMenu::LIST_RIGHT,
+        check(settings.chat_list_side == Side::Right),
+        "On the right side of the window",
     ));
     lines.push(Line::default());
     lines.push(heading(" Messages"));
@@ -1223,7 +1231,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     let (mode, hints) = match app.focus {
         _ if app.resizing.is_some() => (
             Span::from(" RESIZE ").fg(colors.bg).bg(colors.accent),
-            "  `h` narrower · `l` wider · `=` as at first · `Enter` keep · `Esc` cancel",
+            match app.settings.chat_list_side {
+                Side::Left => {
+                    "  `h` narrower · `l` wider · `=` as at first · `Enter` keep · `Esc` cancel"
+                }
+                Side::Right => {
+                    "  `h` wider · `l` narrower · `=` as at first · `Enter` keep · `Esc` cancel"
+                }
+            },
         ),
         _ if app
             .confirm
@@ -1308,6 +1323,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             "  `Enter` send · `Alt-Enter` or `Ctrl-j` new line · `Tab` stickers · `Ctrl-v` paste photo or file · `Esc` normal mode",
         ),
     };
+    // `l` goes back to a chat list on the right.
+    let hints = match app.settings.chat_list_side {
+        Side::Left => hints.to_string(),
+        Side::Right => hints.replace("`h` back", "`l` back"),
+    };
     let popup = app.settings_menu.is_some()
         || app.resizing.is_some()
         || app.delete_menu.is_some()
@@ -1327,7 +1347,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     let mut spans = vec![mode.bold()];
     let muted = Style::new().fg(colors.muted);
     if context.is_empty() {
-        spans.extend(hint_spans(hints, muted, colors));
+        spans.extend(hint_spans(&hints, muted, colors));
     } else {
         // Keys that only work right here go first, a bit brighter.
         let here = format!("  {} · ", context.join(" · "));
@@ -1415,6 +1435,7 @@ mod tests {
             saved_normal_after_send: false,
             saved_block_gaps: true,
             saved_chat_gaps: true,
+            saved_chat_list_side: Side::Left,
         };
         // Too short for the whole list.
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -2140,6 +2161,7 @@ mod tests {
             saved_normal_after_send: false,
             saved_block_gaps: true,
             saved_chat_gaps: true,
+            saved_chat_list_side: Side::Left,
         };
         let colors = Theme::Latte.colors();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
@@ -2179,6 +2201,7 @@ mod tests {
             saved_normal_after_send: false,
             saved_block_gaps: true,
             saved_chat_gaps: true,
+            saved_chat_list_side: Side::Left,
         };
         let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
         let mut draw = |notifications| {
@@ -2219,6 +2242,7 @@ mod tests {
             saved_normal_after_send: false,
             saved_block_gaps: true,
             saved_chat_gaps: true,
+            saved_chat_list_side: Side::Left,
         };
         let mut terminal = Terminal::new(TestBackend::new(70, 22)).unwrap();
         let mut draw = |gaps, normal_after_send| {
