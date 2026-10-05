@@ -32,7 +32,7 @@ Release binaries carry tuigram's API key, so they're built only by `.github/work
 1. Bump `version` in `Cargo.toml`, run `cargo build` (updates `Cargo.lock`), then tests, clippy, `cargo fmt --check` and `actionlint`.
 2. Commit and push `main`.
 3. Write a short changelog (a few bullets, for users) to a file outside the repo, then `git tag -a vX.Y.Z --cleanup=whitespace -F <file> && git push origin vX.Y.Z` (without `--cleanup`, git drops `#` lines such as Markdown headings). The workflow builds six targets (Linux/macOS/Windows × x86_64/ARM64) and, only if all succeed, creates the GitHub release with the archives, `SHA256SUMS` and a provenance attestation. The release notes are the tag's message followed by GitHub's "Full Changelog" link. About 15–20 minutes.
-4. Once `releases/download/vX.Y.Z/SHA256SUMS` exists: `cargo publish`.
+4. Once `releases/download/vX.Y.Z/SHA256SUMS` exists: `cargo publish`, then `cargo clean -p tuigram-cli`. Publish (and `--dry-run`) check-builds the packaged copy in `target/package/` into the shared `target/`, which leaves `cargo build`/`cargo run` tracking that copy's sources: later edits to `src/` stop rebuilding the binary until it's cleaned.
 
 When `tdlib-rs` changes in `Cargo.lock`, update `TDLIB_RS_VERSION`, `TDLIB_VERSION` and every target's `tdlib_sha256` in the workflow (the zips are at `github.com/FedericoBruzzone/tdlib-rs/releases`); the build stops until they match. To build a binary with a key baked in locally, set the same variables: `TUIGRAM_API_ID=… TUIGRAM_API_HASH=… cargo build --release` (both or neither, or build.rs fails).
 
