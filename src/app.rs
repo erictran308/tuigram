@@ -22,7 +22,7 @@ use crate::chats::Chats;
 use crate::clipboard::{Clipboard, Copied, Decoded};
 use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
-use crate::messages::{Link, MediaFile, OpenChat, Replied, SendState};
+use crate::messages::{Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState};
 use crate::notify::{self, Note, Notifications, Notifier};
 use crate::search::MessageSearch;
 use crate::settings::Settings;
@@ -157,6 +157,18 @@ pub struct Confirm {
 pub enum Confirmed {
     OpenFile(String),
     OpenLink(String),
+    /// Edit this message, losing its formatting.
+    Edit(i64),
+}
+
+impl Confirmed {
+    /// What `y` does, for the key hints.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Confirmed::OpenFile(_) | Confirmed::OpenLink(_) => "open",
+            Confirmed::Edit(_) => "edit",
+        }
+    }
 }
 
 /// File types that open in a viewer or player, never as a program. Anything
@@ -632,6 +644,11 @@ impl App {
                 message_id,
                 deletable,
             } => self.on_deletable(chat_id, message_id, deletable),
+            TgEvent::Editable {
+                chat_id,
+                message_id,
+                editable,
+            } => self.on_editable(chat_id, message_id, editable),
             TgEvent::Downloaded { file_id, path } => {
                 if self.opening.remove(&file_id) {
                     match &path {
@@ -765,6 +782,11 @@ impl App {
             Update::MessageContent(u) => {
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
                     open.set_content(u.message_id, &u.new_content);
+                }
+            }
+            Update::MessageEdited(u) => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
+                    open.set_edited(u.message_id);
                 }
             }
             Update::DeleteMessages(u) if u.is_permanent => {
@@ -1035,7 +1057,8 @@ impl App {
             (Focus::Messages, KeyCode::Char('/')) => self.open_prompt(PromptKind::Messages),
             (Focus::Messages, KeyCode::Char('n')) => self.next_match(1),
             (Focus::Messages, KeyCode::Char('N')) => self.next_match(-1),
-            // Esc ends a search, then a reply, before it leaves the pane.
+            // Esc ends a search, then an edit, then a reply, before it leaves
+            // the pane.
             (Focus::Chats, KeyCode::Esc) => self.chats.set_filter(""),
             (Focus::Messages, KeyCode::Esc)
                 if self.open.as_ref().is_some_and(|o| o.search.is_some()) =>
@@ -1045,6 +1068,11 @@ impl App {
                 }
             }
             (Focus::Messages, KeyCode::Esc)
+                if self.open.as_ref().is_some_and(|o| o.editing.is_some()) =>
+            {
+                self.end_edit();
+            }
+            (Focus::Messages, KeyCode::Esc)
                 if self.open.as_ref().is_some_and(|o| o.reply.is_some()) =>
             {
                 if let Some(open) = self.open.as_mut() {
@@ -1052,6 +1080,7 @@ impl App {
                 }
             }
             (Focus::Messages, KeyCode::Char('r')) => self.reply_to_selected(),
+            (Focus::Messages, KeyCode::Char('e')) => self.edit_selected(),
             (Focus::Messages, KeyCode::Char('y')) => self.copy_selected(),
             (Focus::Messages, KeyCode::Char('d')) if pending_g => self.go_to_replied(),
             (Focus::Messages, KeyCode::Char('d')) => self.open_delete_menu(),
@@ -1103,8 +1132,10 @@ impl App {
     }
 
     /// You're typing while the composer has text, and stopped once it's empty.
+    /// An edit to a sent message isn't typing.
     fn on_composer_edit(&mut self) {
-        let typing = self.composer.lines().iter().any(|l| !l.trim().is_empty());
+        let editing = self.open.as_ref().is_some_and(|o| o.editing.is_some());
+        let typing = !editing && self.composer.lines().iter().any(|l| !l.trim().is_empty());
         self.set_typing(typing);
     }
 
@@ -1126,6 +1157,10 @@ impl App {
     }
 
     fn send(&mut self) {
+        if self.open.as_ref().is_some_and(|o| o.editing.is_some()) {
+            self.save_edit();
+            return;
+        }
         let Some(open) = self.open.as_mut() else {
             return;
         };
@@ -1513,6 +1548,8 @@ impl App {
     /// `r`: answer the message under the cursor. Goes straight to Insert mode,
     /// keeping whatever was already typed.
     fn reply_to_selected(&mut self) {
+        // Its draft and reply come back, and the new reply replaces that one.
+        self.end_edit();
         let Some(open) = self.open.as_mut() else {
             return;
         };
@@ -1528,6 +1565,120 @@ impl App {
         }
         open.reply = Some(Replied::new(id, msg));
         self.focus = Focus::Input;
+    }
+
+    /// `e`: edits the message under the cursor in the composer, once TDLib
+    /// says it can be.
+    fn edit_selected(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let Some(id) = open.cursor_id() else {
+            return;
+        };
+        match open.cant_edit(id) {
+            Some(why) => self.status = Some(why.into()),
+            None => self.tg.check_editable(open.chat_id, id),
+        }
+    }
+
+    fn on_editable(&mut self, chat_id: i64, message_id: i64, editable: Option<bool>) {
+        // Only while the cursor is still on it, so a late answer can't take
+        // over the composer.
+        let Some(open) = self
+            .open
+            .as_ref()
+            .filter(|o| o.chat_id == chat_id && o.cursor_id() == Some(message_id))
+        else {
+            return;
+        };
+        let Some(msg) = open.messages.get(&message_id) else {
+            return;
+        };
+        // On an error, TDLib's message is already in the status bar.
+        match editable {
+            None => {}
+            Some(false) => self.status = Some("You can't edit this message".into()),
+            Some(true) if msg.formatted => {
+                self.confirm = Some(Confirm {
+                    title: "Edit without formatting?".into(),
+                    lines: vec![
+                        "tuigram edits plain text, so this message would lose".into(),
+                        "its bold, italics, links behind words and the like.".into(),
+                    ],
+                    action: Confirmed::Edit(message_id),
+                });
+            }
+            Some(true) => self.start_edit(message_id),
+        }
+    }
+
+    /// Puts the message's text in the composer, keeping what was there to
+    /// give back when the edit is done.
+    fn start_edit(&mut self, id: i64) {
+        self.end_edit();
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let Some(msg) = open.messages.get(&id) else {
+            return;
+        };
+        let text = msg.source_text.clone();
+        open.editing = Some(Editing {
+            id,
+            snippet: msg.snippet(),
+            editable: msg.editable,
+            draft: self.composer.lines().join("\n"),
+            reply: open.reply.take(),
+        });
+        self.set_typing(false);
+        self.composer = new_composer();
+        self.composer.insert_str(text);
+        self.focus = Focus::Input;
+    }
+
+    /// Ends an edit, saved or not: the draft and reply from before come back.
+    fn end_edit(&mut self) {
+        let Some(editing) = self.open.as_mut().and_then(|o| o.editing.take()) else {
+            return;
+        };
+        self.composer = new_composer();
+        self.composer.insert_str(editing.draft);
+        if let Some(open) = self.open.as_mut() {
+            open.reply = editing.reply;
+        }
+    }
+
+    /// Enter while editing: sends the new text, unless nothing changed.
+    fn save_edit(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let Some(editing) = &open.editing else {
+            return;
+        };
+        let text = self.composer.lines().join("\n");
+        let text = text.trim();
+        if text.is_empty() && editing.editable == Editable::Text {
+            self.status = Some("A message can't be empty (d deletes it)".into());
+            return;
+        }
+        let changed = open
+            .messages
+            .get(&editing.id)
+            .is_none_or(|m| m.source_text != text);
+        if changed {
+            let (chat_id, id, text) = (open.chat_id, editing.id, text.to_string());
+            match editing.editable {
+                Editable::Text => self.tg.edit_text(chat_id, id, text),
+                Editable::Caption { above } => self.tg.edit_caption(chat_id, id, text, above),
+                Editable::No => {}
+            }
+        }
+        self.end_edit();
+        if self.settings.normal_after_send {
+            self.focus = Focus::Messages;
+        }
     }
 
     /// `d`: asks how to delete the message under the cursor. The popup opens
@@ -1701,6 +1852,7 @@ impl App {
                         Confirmed::OpenFile(target) | Confirmed::OpenLink(target) => {
                             self.open_externally(&target)
                         }
+                        Confirmed::Edit(id) => self.start_edit(id),
                     }
                 }
             }

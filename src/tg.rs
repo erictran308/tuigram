@@ -51,6 +51,12 @@ pub enum TgEvent {
         message_id: i64,
         deletable: Option<Deletable>,
     },
+    /// Whether a message can be edited; `None` if TDLib couldn't say.
+    Editable {
+        chat_id: i64,
+        message_id: i64,
+        editable: Option<bool>,
+    },
     /// A download finished; `path` is `None` if it failed.
     Downloaded {
         file_id: i32,
@@ -425,6 +431,56 @@ impl Tg {
         });
     }
 
+    /// Asks whether a message can be edited: TDLib knows whose it is, and
+    /// how long the chat allows edits for.
+    pub fn check_editable(&self, chat_id: i64, message_id: i64) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let result = functions::get_message_properties(chat_id, message_id, client_id).await;
+            let editable = match result {
+                Ok(enums::MessageProperties::MessageProperties(p)) => Some(p.can_be_edited),
+                Err(e) => {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    None
+                }
+            };
+            let _ = tx.send(TgEvent::Editable {
+                chat_id,
+                message_id,
+                editable,
+            });
+        });
+    }
+
+    /// Replaces a text message's text. TDLib then sends
+    /// `updateMessageContent` and `updateMessageEdited`.
+    pub fn edit_text(&self, chat_id: i64, message_id: i64, text: String) {
+        let content = enums::InputMessageContent::InputMessageText(types::InputMessageText {
+            text: plain(text),
+            link_preview_options: None,
+            clear_draft: false,
+        });
+        self.spawn(functions::edit_message_text(
+            chat_id,
+            message_id,
+            content,
+            self.client_id,
+        ));
+    }
+
+    /// Replaces the caption of a photo, video or file; empty removes it.
+    /// `above` keeps it over the media.
+    pub fn edit_caption(&self, chat_id: i64, message_id: i64, text: String, above: bool) {
+        self.spawn(functions::edit_message_caption(
+            chat_id,
+            message_id,
+            Some(plain(text)),
+            above,
+            self.client_id,
+        ));
+    }
+
     /// Deletes a message for everyone in the chat (`revoke`), or only for
     /// you. TDLib confirms with `updateDeleteMessages`.
     pub fn delete_message(&self, chat_id: i64, message_id: i64, revoke: bool) {
@@ -441,10 +497,7 @@ impl Tg {
     /// `updateMessageSendSucceeded` or `…Failed`.
     pub fn send_text(&self, chat_id: i64, text: String, reply_to: Option<i64>) {
         let content = enums::InputMessageContent::InputMessageText(types::InputMessageText {
-            text: types::FormattedText {
-                text,
-                entities: Vec::new(),
-            },
+            text: plain(text),
             link_preview_options: None,
             clear_draft: true,
         });
@@ -583,5 +636,14 @@ impl Tg {
                 let _ = tx.send(TgEvent::Error(e.message));
             }
         });
+    }
+}
+
+/// Text without formatting. Telegram still finds links, mentions and the
+/// like in it by itself.
+fn plain(text: String) -> types::FormattedText {
+    types::FormattedText {
+        text,
+        entities: Vec::new(),
     }
 }

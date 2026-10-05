@@ -189,11 +189,16 @@ pub fn draw(
     draw_photos(frame, shift(body), &photos, top, images, colors);
 
     let gutters = [shift(left), shift(right)];
-    // The message being answered stays marked while the reply is written.
+    // The message being answered or edited stays marked while writing.
     if let Some(reply) = &open.reply
         && let Some(target) = placed.iter().find(|p| p.id == reply.id)
     {
         mark(frame, gutters, target, top, colors.reply);
+    }
+    if let Some(editing) = &open.editing
+        && let Some(target) = placed.iter().find(|p| p.id == editing.id)
+    {
+        mark(frame, gutters, target, top, colors.edit);
     }
     if focused && let Some(sel) = selected {
         mark(frame, gutters, sel, top, colors.accent);
@@ -367,7 +372,14 @@ fn layout(
                 .map(|reply| quote(open, id, reply, names, colors)),
         };
         let meta = match msg.state {
-            SendState::Sent => time.map_or(String::new(), |t| t.format("%H:%M").to_string()),
+            SendState::Sent => time.map_or(String::new(), |t| {
+                let time = t.format("%H:%M");
+                if msg.edited {
+                    format!("edited {time}")
+                } else {
+                    time.to_string()
+                }
+            }),
             SendState::Pending => "sending…".into(),
             SendState::Failed => "not sent".into(),
         };
@@ -762,6 +774,7 @@ mod tests {
 
     use super::*;
     use crate::images::Key;
+    use crate::messages::Editable;
     use crate::theme::Theme;
 
     /// Halfblocks need no terminal query, and their cells are easy to assert on.
@@ -785,6 +798,9 @@ mod tests {
             link_ranges: Vec::new(),
             state: SendState::Sent,
             reply_to: None,
+            editable: Editable::Text,
+            formatted: false,
+            edited: false,
         }
     }
 
@@ -1363,6 +1379,31 @@ mod tests {
         open.reply = None;
         let buf = render_buffer(&mut open, false, &mut images());
         assert_eq!(buf[(1, y)].symbol(), " ", "no marker without a reply");
+    }
+
+    #[test]
+    fn edited_messages_say_so_and_the_one_being_edited_is_marked() {
+        let mut open = sample();
+        open.set_edited(2);
+        open.editing = Some(crate::messages::Editing {
+            id: 2,
+            snippet: "hello from me".into(),
+            editable: Editable::Text,
+            draft: String::new(),
+            reply: None,
+        });
+        let buf = render_buffer(&mut open, false, &mut images());
+        let colors = Theme::default().colors();
+        let (y, row) = (0..buf.area.height)
+            .map(|y| {
+                let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                (y, row)
+            })
+            .find(|(_, row)| row.contains("hello from me"))
+            .unwrap();
+        assert!(row.contains("edited "), "{row}");
+        let left = &buf[(1, y)];
+        assert_eq!((left.symbol(), left.fg), ("▌", colors.edit));
     }
 
     #[test]

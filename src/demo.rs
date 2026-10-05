@@ -23,7 +23,9 @@ use crate::app::{self, App, Focus, HelpTab, Screen, SettingsMenu};
 use crate::chats::{Chat, ChatPhoto, Chats};
 use crate::clipboard::Clipboard;
 use crate::images::Images;
-use crate::messages::{Link, Msg, OpenChat, Preview, Replied, ReplyTo, SendState, Sender};
+use crate::messages::{
+    Editable, Link, Msg, OpenChat, Preview, Replied, ReplyTo, SendState, Sender,
+};
 use crate::search::MessageSearch;
 use crate::settings::Settings;
 use crate::tg::Tg;
@@ -379,6 +381,9 @@ fn hike() -> OpenChat {
         link_ranges: Vec::new(),
         state: SendState::Sent,
         reply_to: None,
+        editable: Editable::Text,
+        formatted: false,
+        edited: false,
     };
     let url = "https://trails.example.com/eagle-ridge";
     let link = msg(LEO, at(2, 19, 5), &format!("Here's the trail: {url}"));

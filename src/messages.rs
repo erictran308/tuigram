@@ -151,6 +151,37 @@ pub struct Msg {
     pub state: SendState,
     /// Set when this message is a reply.
     pub reply_to: Option<ReplyTo>,
+    /// What `e` can change.
+    pub editable: Editable,
+    /// The text has formatting (bold, links behind words…) that an edit,
+    /// which sends plain text, would lose.
+    pub formatted: bool,
+    /// Changed after it was sent.
+    pub edited: bool,
+}
+
+/// What `e` can change in a message, which decides how TDLib is asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Editable {
+    /// No words to edit: a sticker, a video message, a poll…
+    No,
+    /// A text message.
+    Text,
+    /// The caption of a photo, video or file, which may be left empty.
+    /// `above` keeps it over the media, where the sender put it.
+    Caption { above: bool },
+}
+
+/// A message being edited in the composer, set with `e`.
+pub struct Editing {
+    pub id: i64,
+    /// What it said, for the bar over the composer.
+    pub snippet: String,
+    pub editable: Editable,
+    /// What the composer held before, put back once the edit is saved or
+    /// cancelled.
+    pub draft: String,
+    pub reply: Option<Replied>,
 }
 
 impl Msg {
@@ -239,6 +270,8 @@ struct Body {
     file: Option<MediaFile>,
     links: Vec<Link>,
     link_ranges: Vec<Range<usize>>,
+    editable: Editable,
+    formatted: bool,
 }
 
 fn body(content: &MessageContent) -> Body {
@@ -250,6 +283,8 @@ fn body(content: &MessageContent) -> Body {
         file: None,
         links: Vec::new(),
         link_ranges: Vec::new(),
+        editable: Editable::No,
+        formatted: false,
     };
     let file = |id: i32, label: String| {
         Some(MediaFile {
@@ -261,8 +296,14 @@ fn body(content: &MessageContent) -> Body {
     // The text or caption whose links count.
     let mut source = None;
     match content {
-        C::MessageText(m) => source = Some(&m.text),
+        C::MessageText(m) => {
+            source = Some(&m.text);
+            body.editable = Editable::Text;
+        }
         C::MessagePhoto(m) => {
+            body.editable = Editable::Caption {
+                above: m.show_caption_above_media,
+            };
             body.preview = Preview::from_photo(&m.photo);
             if body.preview.is_some() {
                 body.text = m.caption.text.clone();
@@ -275,6 +316,9 @@ fn body(content: &MessageContent) -> Body {
             source = Some(&m.caption);
         }
         C::MessageVideo(m) => {
+            body.editable = Editable::Caption {
+                above: m.show_caption_above_media,
+            };
             body.preview = Preview::from_video(&m.video);
             if body.preview.is_some() {
                 body.text = format!("▶ {}", duration(m.video.duration));
@@ -287,10 +331,14 @@ fn body(content: &MessageContent) -> Body {
             source = Some(&m.caption);
         }
         C::MessageAnimation(m) => {
+            body.editable = Editable::Caption {
+                above: m.show_caption_above_media,
+            };
             body.file = file(m.animation.animation.id, "GIF".into());
             source = Some(&m.caption);
         }
         C::MessageDocument(m) => {
+            body.editable = Editable::Caption { above: false };
             let label = format!("File: {}", text::clean(&m.document.file_name));
             body.file = file(m.document.document.id, label);
             source = Some(&m.caption);
@@ -303,10 +351,12 @@ fn body(content: &MessageContent) -> Body {
                 &a.title
             };
             body.file = file(a.audio.id, format!("Audio: {}", text::clean(name)));
+            body.editable = Editable::Caption { above: false };
             source = Some(&m.caption);
         }
         C::MessageVoiceNote(m) => {
             body.file = file(m.voice_note.voice.id, "Voice message".into());
+            body.editable = Editable::Caption { above: false };
             source = Some(&m.caption);
         }
         C::MessageVideoNote(m) => body.file = file(m.video_note.video.id, "Video message".into()),
@@ -321,6 +371,10 @@ fn body(content: &MessageContent) -> Body {
     }
     if let Some(source) = source {
         body.source_text = text::clean(&source.text);
+        body.formatted = source
+            .entities
+            .iter()
+            .any(|e| !found_by_telegram(&e.r#type));
         let found = links(source);
         // The caption ends the shown text (after e.g. "[File] " or a video's
         // length), so its link ranges shift by whatever comes before it.
@@ -339,6 +393,24 @@ fn body(content: &MessageContent) -> Body {
     }
     body.text = normalize(&body.text, &mut body.link_ranges);
     body
+}
+
+/// Entities Telegram finds in plain text by itself, so an edit sent as
+/// plain text gets them back. Any other kind is formatting the sender chose.
+fn found_by_telegram(kind: &TextEntityType) -> bool {
+    use TextEntityType as T;
+    matches!(
+        kind,
+        T::Mention
+            | T::Hashtag
+            | T::Cashtag
+            | T::BotCommand
+            | T::Url
+            | T::EmailAddress
+            | T::PhoneNumber
+            | T::BankCardNumber
+            | T::MediaTimestamp(_)
+    )
 }
 
 /// Tabs become spaces and hidden characters ([`text::is_hidden`], `\r`
@@ -481,6 +553,9 @@ impl From<Message> for Msg {
             link_ranges: body.link_ranges,
             state,
             reply_to,
+            editable: body.editable,
+            formatted: body.formatted,
+            edited: message.edit_date != 0,
         }
     }
 }
@@ -523,6 +598,8 @@ pub struct OpenChat {
     pub search: Option<MessageSearch>,
     /// Set with `r`; the next message sent answers this one.
     pub reply: Option<Replied>,
+    /// Set with `e`; Enter saves the composer's text into this message.
+    pub editing: Option<Editing>,
     /// What replies answer when it isn't among the loaded messages, by the
     /// id of the reply.
     pub replied: HashMap<i64, Fetched>,
@@ -543,6 +620,7 @@ impl OpenChat {
             at_newest: true,
             search: None,
             reply: None,
+            editing: None,
             replied: HashMap::new(),
             jumps: Vec::new(),
         }
@@ -551,6 +629,27 @@ impl OpenChat {
     /// The message under the cursor: the selected one, else the newest.
     pub fn cursor_id(&self) -> Option<i64> {
         self.selected.or_else(|| self.newest_id())
+    }
+
+    /// Why message `id` can't be edited, as far as can be told without
+    /// asking TDLib, which also knows whose it is and Telegram's time limits.
+    pub fn cant_edit(&self, id: i64) -> Option<&'static str> {
+        let msg = self.messages.get(&id)?;
+        match msg.state {
+            SendState::Pending => Some("Wait until it's sent"),
+            SendState::Failed => Some("This message wasn't sent"),
+            SendState::Sent if msg.editable == Editable::No => {
+                Some("This message has no text to edit")
+            }
+            SendState::Sent => None,
+        }
+    }
+
+    /// TDLib says message `message_id` was changed.
+    pub fn set_edited(&mut self, message_id: i64) {
+        if let Some(msg) = self.messages.get_mut(&message_id) {
+            msg.edited = true;
+        }
     }
 
     /// Where `gd` goes from the message under the cursor: (the reply, the
@@ -690,6 +789,7 @@ impl OpenChat {
             (msg.text, msg.preview, msg.file) = (body.text, body.preview, body.file);
             msg.source_text = body.source_text;
             (msg.links, msg.link_ranges) = (body.links, body.link_ranges);
+            (msg.editable, msg.formatted) = (body.editable, body.formatted);
             if let Some(reply) = self.reply.as_mut().filter(|r| r.id == message_id) {
                 reply.snippet = msg.snippet();
             }
@@ -944,6 +1044,46 @@ mod tests {
     }
 
     #[test]
+    fn messages_know_what_an_edit_can_change() {
+        let text = |entities| {
+            body(&MessageContent::MessageText(types::MessageText {
+                text: types::FormattedText {
+                    text: "see x.dev now".into(),
+                    entities,
+                },
+                link_preview: None,
+                link_preview_options: None,
+            }))
+        };
+        let plain = text(vec![entity(4, 5, TextEntityType::Url)]);
+        assert_eq!(plain.editable, Editable::Text);
+        assert!(!plain.formatted, "Telegram finds the link again by itself");
+        assert!(text(vec![entity(0, 3, TextEntityType::Bold)]).formatted);
+
+        let video = body(&video(ThumbnailFormat::Jpeg, "our trip"));
+        assert_eq!(video.editable, Editable::Caption { above: false });
+        let sticker = body(&sticker(StickerFormat::Tgs, Some(ThumbnailFormat::Tgs)));
+        assert_eq!(sticker.editable, Editable::No);
+    }
+
+    #[test]
+    fn only_sent_messages_with_words_can_be_edited() {
+        let mut open = OpenChat::new(1);
+        let mut msgs = page([1, 2, 3, 4]);
+        msgs[1].1.state = SendState::Pending;
+        msgs[2].1.state = SendState::Failed;
+        msgs[3].1.editable = Editable::No;
+        open.messages.extend(msgs);
+        assert_eq!(open.cant_edit(1), None, "TDLib decides the rest");
+        assert_eq!(open.cant_edit(2), Some("Wait until it's sent"));
+        assert_eq!(open.cant_edit(3), Some("This message wasn't sent"));
+        assert_eq!(open.cant_edit(4), Some("This message has no text to edit"));
+
+        open.set_edited(1);
+        assert!(open.messages[&1].edited);
+    }
+
+    #[test]
     fn caption_links_line_up_after_a_label() {
         let caption = types::FormattedText {
             text: "see x.dev".into(),
@@ -982,6 +1122,9 @@ mod tests {
                     link_ranges: Vec::new(),
                     state: SendState::Sent,
                     reply_to: None,
+                    editable: Editable::Text,
+                    formatted: false,
+                    edited: false,
                 };
                 (id, msg)
             })

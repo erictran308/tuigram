@@ -10,12 +10,12 @@ use unicode_width::UnicodeWidthStr;
 use ratatui_textarea::TextArea;
 
 use crate::app::{
-    App, Command, Confirm, DeleteMenu, Focus, HelpTab, Login, LoginStep, MenuAction, PickMenu,
-    PromptKind, Screen, SettingsMenu, Target, Toast,
+    App, Command, Confirm, Confirmed, DeleteMenu, Focus, HelpTab, Login, LoginStep, MenuAction,
+    PickMenu, PromptKind, Screen, SettingsMenu, Target, Toast,
 };
 use crate::chats::Chat;
 use crate::config;
-use crate::messages::{OpenChat, Replied, Sender};
+use crate::messages::{Editing, OpenChat, Replied, Sender};
 use crate::notify::Notifications;
 use crate::search;
 use crate::settings::Settings;
@@ -23,8 +23,9 @@ use crate::theme::{Colors, Theme};
 
 /// The composer grows with its text up to this many rows, then scrolls.
 const MAX_COMPOSER_ROWS: usize = 6;
-/// The "Reply to …" bar at the top of the composer: who, then what they said.
-const REPLY_BAR_ROWS: u16 = 2;
+/// The bar at the top of the composer while replying or editing: what it's
+/// about, then a line of the message.
+const BAR_ROWS: u16 = 2;
 
 mod chat_list;
 mod help;
@@ -304,8 +305,8 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 chats: &app.chats,
             };
             let mut rows = app.composer.lines().len().clamp(1, MAX_COMPOSER_ROWS) as u16;
-            if open.reply.is_some() {
-                rows += REPLY_BAR_ROWS;
+            if ComposerBar::of(open).is_some() {
+                rows += BAR_ROWS;
             }
             let [history, composer] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(rows + 2)])
@@ -322,7 +323,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             draw_composer(
                 frame,
                 &mut app.composer,
-                open.reply.as_ref(),
+                ComposerBar::of(open),
                 &names,
                 composer,
                 app.focus == Focus::Input,
@@ -561,8 +562,8 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
         .min(area.width)
         .max(40.min(area.width));
     let popup = center(area, width, confirm.lines.len() as u16 + 2);
-    let block = popup_block(title, " y open · Esc cancel ", colors)
-        .border_style(Style::new().fg(colors.warning));
+    let keys = format!(" y {} · Esc cancel ", confirm.action.verb());
+    let block = popup_block(title, &keys, colors).border_style(Style::new().fg(colors.warning));
     // Long URLs keep their start, where the site's name is.
     let room = (block.inner(popup).width as usize).saturating_sub(2);
     let lines: Vec<Line> = confirm
@@ -653,7 +654,7 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
 fn draw_composer(
     frame: &mut Frame,
     composer: &mut TextArea<'static>,
-    reply: Option<&Replied>,
+    bar: Option<ComposerBar>,
     names: &messages::Names,
     area: Rect,
     insert: bool,
@@ -665,10 +666,10 @@ fn draw_composer(
         .padding(Padding::horizontal(1));
     let mut text = block.inner(area);
     frame.render_widget(block, area);
-    if let Some(reply) = reply {
-        let [bar, rest] =
-            Layout::vertical([Constraint::Length(REPLY_BAR_ROWS), Constraint::Fill(1)]).areas(text);
-        draw_reply_bar(frame, reply, names, bar, colors);
+    if let Some(bar) = &bar {
+        let [top, rest] =
+            Layout::vertical([Constraint::Length(BAR_ROWS), Constraint::Fill(1)]).areas(text);
+        draw_bar(frame, bar, names, top, colors);
         text = rest;
     }
     // The cursor only shows in Insert mode, so it's obvious where keys go.
@@ -677,40 +678,66 @@ fn draw_composer(
     } else {
         Style::new()
     });
-    composer.set_placeholder_text(match (insert, reply.is_some()) {
-        (true, true) => "Write a reply…",
-        (true, false) => "Write a message…",
-        (false, true) => "Press i to write your reply",
-        (false, false) => "Press i to write a message",
+    composer.set_placeholder_text(match (insert, &bar) {
+        (true, Some(ComposerBar::Edit(_))) => "Write the new text…",
+        (true, Some(ComposerBar::Reply(_))) => "Write a reply…",
+        (true, None) => "Write a message…",
+        (false, Some(ComposerBar::Edit(_))) => "Press i to edit",
+        (false, Some(ComposerBar::Reply(_))) => "Press i to write your reply",
+        (false, None) => "Press i to write a message",
     });
     composer.set_placeholder_style(Style::new().fg(colors.muted));
     frame.render_widget(&*composer, text);
 }
 
-/// "Reply to Alice" over a line of the message, with a bar down the side
-/// like a quote.
-fn draw_reply_bar(
+/// What sits over the composer's text, with a bar down the side like a
+/// quote: who is being answered, or that a message is being edited, over a
+/// line of that message.
+enum ComposerBar<'a> {
+    Reply(&'a Replied),
+    Edit(&'a Editing),
+}
+
+impl<'a> ComposerBar<'a> {
+    /// An edit hides the reply, which comes back when it's done.
+    fn of(open: &'a OpenChat) -> Option<Self> {
+        open.editing
+            .as_ref()
+            .map(Self::Edit)
+            .or(open.reply.as_ref().map(Self::Reply))
+    }
+}
+
+fn draw_bar(
     frame: &mut Frame,
-    reply: &Replied,
+    bar: &ComposerBar,
     names: &messages::Names,
     area: Rect,
     colors: &Colors,
 ) {
-    let name = names.author(reply.sender, reply.outgoing);
     let width = (area.width as usize).saturating_sub(2);
-    let label = "↩ Reply to ";
-    let bar = || Span::from("▎ ").fg(colors.reply);
+    let (color, title, snippet) = match bar {
+        ComposerBar::Reply(reply) => {
+            let label = "↩ Reply to ";
+            let name = names.author(reply.sender, reply.outgoing);
+            let name = truncate(&name, width.saturating_sub(label.width()));
+            let title = vec![Span::from(label), Span::from(name).bold()];
+            (colors.reply, title, &reply.snippet)
+        }
+        ComposerBar::Edit(editing) => (
+            colors.edit,
+            vec![Span::from("✎ Edit message").bold()],
+            &editing.snippet,
+        ),
+    };
+    let side = || Span::from("▎ ").fg(color);
+    let mut first = vec![side()];
+    first.extend(title.into_iter().map(|span| span.fg(color)));
     let lines = vec![
+        Line::from(first),
         Line::from(vec![
-            bar(),
-            Span::from(label).fg(colors.reply),
-            Span::from(truncate(&name, width.saturating_sub(label.width())))
-                .fg(colors.reply)
-                .bold(),
-        ]),
-        Line::from(vec![
-            bar(),
-            Span::from(truncate(&reply.snippet, width)).fg(colors.subtle),
+            side(),
+            Span::from(truncate(snippet, width)).fg(colors.subtle),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), area);
@@ -830,8 +857,16 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     let normal = Span::from(" NORMAL ").fg(colors.bg).bg(colors.primary);
     let searching = app.open.as_ref().is_some_and(|o| o.search.is_some());
     let replying = app.open.as_ref().is_some_and(|o| o.reply.is_some());
+    let editing = app.open.as_ref().is_some_and(|o| o.editing.is_some());
     let insert = Span::from(" INSERT ").fg(colors.bg).bg(colors.insert);
     let (mode, hints) = match app.focus {
+        _ if app
+            .confirm
+            .as_ref()
+            .is_some_and(|c| matches!(c.action, Confirmed::Edit(_))) =>
+        {
+            (normal, "  y edit · n or Esc cancel")
+        }
         _ if app.confirm.is_some() => (normal, "  y open · n or Esc cancel"),
         _ if app.settings_menu.as_ref().map(|m| m.tab) == Some(HelpTab::Shortcuts) => {
             (normal, "  j/k scroll · Tab settings · Esc close")
@@ -853,13 +888,21 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             normal,
             "  n/N older/newer match · Esc end search · / search again · j/k newer/older · Enter open media · r reply · i write · h back",
         ),
+        Focus::Messages if editing => (
+            normal,
+            "  i edit · Esc cancel edit · e edit selected instead · j/k newer/older · h back",
+        ),
         Focus::Messages if replying => (
             normal,
             "  i write reply · Esc cancel reply · r reply to selected instead · j/k newer/older · Enter open media · h back",
         ),
         Focus::Messages => (
             normal,
-            "  j/k newer/older · y copy · r reply · d delete · Enter open media · i write · / search · gg/G oldest/newest · h back · : commands · ? help · q quit",
+            "  j/k newer/older · y copy · r reply · e edit · d delete · Enter open media · i write · / search · gg/G oldest/newest · h back · : commands · ? help · q quit",
+        ),
+        Focus::Input if editing => (
+            insert,
+            "  Enter save · Alt-Enter or Ctrl-j new line · Esc normal mode · Esc Esc cancel edit",
         ),
         Focus::Input if replying => (
             insert,
@@ -942,7 +985,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::messages::MediaFile;
+    use crate::messages::{Editable, MediaFile};
 
     /// Every row of the buffer as a string.
     fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
@@ -1084,6 +1127,43 @@ mod tests {
     }
 
     #[test]
+    fn the_composer_says_a_message_is_being_edited() {
+        let colors = Theme::Mocha.colors();
+        let users = std::collections::HashMap::new();
+        let chats = crate::chats::Chats::default();
+        let names = messages::Names {
+            users: &users,
+            chats: &chats,
+        };
+        let editing = Editing {
+            id: 7,
+            snippet: "see you at 7".into(),
+            editable: Editable::Text,
+            draft: String::new(),
+            reply: None,
+        };
+        let mut composer = TextArea::default();
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let bar = Some(ComposerBar::Edit(&editing));
+                draw_composer(f, &mut composer, bar, &names, area, true, &colors);
+            })
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+
+        assert!(rows[1].contains("▎ ✎ Edit message"), "{}", rows[1]);
+        assert!(rows[2].contains("▎ see you at 7"), "{}", rows[2]);
+        assert!(rows[3].contains("Write the new text…"));
+        let buf = terminal.backend().buffer();
+        let bar = (0..buf.area.width)
+            .find(|&x| buf[(x, 1)].symbol() == "▎")
+            .unwrap();
+        assert_eq!(buf[(bar, 1)].fg, colors.edit);
+    }
+
+    #[test]
     fn the_composer_says_which_message_a_reply_answers() {
         let colors = Theme::Mocha.colors();
         let users = std::collections::HashMap::from([(2, "Chardy".to_string())]);
@@ -1103,7 +1183,15 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                draw_composer(f, &mut composer, Some(&reply), &names, area, true, &colors);
+                draw_composer(
+                    f,
+                    &mut composer,
+                    Some(ComposerBar::Reply(&reply)),
+                    &names,
+                    area,
+                    true,
+                    &colors,
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -1183,6 +1271,9 @@ mod tests {
             link_ranges: Vec::new(),
             state: SendState::Sent,
             reply_to,
+            editable: Editable::Text,
+            formatted: false,
+            edited: false,
         };
         let mut open = OpenChat::new(1);
         open.messages.insert(1, msg(None));

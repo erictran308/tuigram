@@ -133,6 +133,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
 | `y` | Copy the selected message: its text, a link, or the photo or file |
 | `r` | Reply to the selected message (`Esc` twice cancels the reply) |
+| `e` | Edit your message: `Enter` saves, `Esc` twice cancels |
 | `gd` / `Ctrl-o` | Go to the message a reply answers / back to the reply |
 | `d` | Delete the selected message, for everyone or just you (asks first) |
 | `/` | Search chat names, or messages in the open chat |
