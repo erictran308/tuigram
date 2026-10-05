@@ -113,6 +113,18 @@ fn highlight(text: &str, query: &str, style: Style, colors: &Colors) -> Vec<Span
     spans
 }
 
+/// Key hints with the keys in backticks, like "`Enter` send · `Esc` cancel":
+/// the keys stand out in the accent color, and what they do is in `text`.
+fn hint_spans(hints: &str, text: Style, colors: &Colors) -> Vec<Span<'static>> {
+    let key = text.fg(colors.accent).bold();
+    hints
+        .split('`')
+        .enumerate()
+        .filter(|(_, part)| !part.is_empty())
+        .map(|(i, part)| Span::styled(part.to_string(), if i % 2 == 1 { key } else { text }))
+        .collect()
+}
+
 /// Focused pane gets a bright border.
 fn border(focused: bool, colors: &Colors) -> Style {
     Style::new().fg(if focused {
@@ -224,15 +236,17 @@ fn draw_login(frame: &mut Frame, login: &Login, colors: &Colors) {
     }
     let hint = match login.step {
         _ if login.busy => "Sending…",
-        LoginStep::Phone => "Enter submit · Tab QR code · Ctrl-c quit",
+        LoginStep::Phone => "`Enter` submit · `Tab` QR code · `Ctrl-c` quit",
         LoginStep::OtherDevice { .. } => QR_KEYS,
-        _ if login.takes_input() => "Enter submit · Ctrl-c quit",
-        _ => "Ctrl-c quit",
+        _ if login.takes_input() => "`Enter` submit · `Ctrl-c` quit",
+        _ => "`Ctrl-c` quit",
     };
-    frame.render_widget(Line::from(hint).fg(colors.muted).right_aligned(), footer);
+    let muted = Style::new().fg(colors.muted);
+    let hint = Line::from(hint_spans(hint, muted, colors)).right_aligned();
+    frame.render_widget(hint, footer);
 }
 
-const QR_KEYS: &str = "Esc use phone number · Ctrl-c quit";
+const QR_KEYS: &str = "`Esc` use phone number · `Ctrl-c` quit";
 
 /// A compact login box for the QR code, which is most of it: the code needs
 /// about 20 rows, and this fits it in an 80×24 terminal.
@@ -279,7 +293,9 @@ fn draw_qr_login(frame: &mut Frame, login: &Login, code: Vec<Line<'static>>, col
     // No room for an error line: an error takes the keys' place.
     let footer_line = match &login.error {
         Some(message) => Line::from(message.as_str()).fg(colors.error),
-        None => Line::from(QR_KEYS).fg(colors.muted).right_aligned(),
+        None => {
+            Line::from(hint_spans(QR_KEYS, Style::new().fg(colors.muted), colors)).right_aligned()
+        }
     };
     frame.render_widget(footer_line, footer);
 }
@@ -442,7 +458,11 @@ fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors
     let width = ((menu.snippet.width() + 6).clamp(40, 60) as u16).min(area.width);
     // Borders, the message and a gap, then the choices.
     let popup = center(area, width, rows + 4);
-    let block = popup_block(" Delete message ", " Enter delete · Esc cancel ", colors);
+    let block = popup_block(
+        " Delete message ",
+        " `Enter` delete · `Esc` cancel ",
+        colors,
+    );
     let inner = block.inner(popup);
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
@@ -518,12 +538,12 @@ fn draw_react(
         .min(usize::from(area.height).saturating_sub(fixed).max(1));
     let popup = center(area, REACT_WIDTH.min(area.width), (visible + fixed) as u16);
     let enter = match current {
-        Some(e) if yours.contains(&e) => "Enter take back",
-        _ => "Enter react",
+        Some(e) if yours.contains(&e) => "`Enter` take back",
+        _ => "`Enter` react",
     };
     let keys = match menu.query {
-        Some(_) => format!(" {enter} · Esc back "),
-        None => format!(" / search · {enter} · Esc close "),
+        Some(_) => format!(" {enter} · `Esc` back "),
+        None => format!(" `/` search · {enter} · `Esc` close "),
     };
     let block = popup_block(" React ", &keys, colors);
     let inner = block.inner(popup);
@@ -662,11 +682,11 @@ fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, settings: &Settings
         Span::from(" "),
     ]);
     let keys = match menu.tab {
-        HelpTab::Shortcuts => " j/k scroll · Tab settings · Esc close ",
+        HelpTab::Shortcuts => " `j/k` scroll · `Tab` settings · `Esc` close ",
         HelpTab::Settings if menu.selected >= SettingsMenu::NOTIFICATIONS => {
-            " Space on/off · Enter save · Tab shortcuts · Esc cancel "
+            " `Space` on/off · `Enter` save · `Tab` shortcuts · `Esc` cancel "
         }
-        HelpTab::Settings => " j/k preview · Enter save · Tab shortcuts · Esc cancel ",
+        HelpTab::Settings => " `j/k` preview · `Enter` save · `Tab` shortcuts · `Esc` cancel ",
     };
     let block = popup_block(tabs, keys, colors);
     let inner = block.inner(popup);
@@ -754,7 +774,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
         .min(area.width)
         .max(40.min(area.width));
     let popup = center(area, width, confirm.lines.len() as u16 + 2);
-    let keys = format!(" y {} · Esc cancel ", confirm.action.verb());
+    let keys = format!(" `y` {} · `Esc` cancel ", confirm.action.verb());
     let block = popup_block(title, &keys, colors).border_style(Style::new().fg(colors.warning));
     // Long URLs keep their start, where the site's name is.
     let room = (block.inner(popup).width as usize).saturating_sub(2);
@@ -770,7 +790,9 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
 fn popup_block<'a>(title: impl Into<Line<'a>>, keys: &'a str, colors: &Colors) -> Block<'a> {
     Block::bordered()
         .title(title)
-        .title_bottom(Line::from(keys).fg(colors.muted).right_aligned())
+        .title_bottom(
+            Line::from(hint_spans(keys, Style::new().fg(colors.muted), colors)).right_aligned(),
+        )
         .border_style(Style::new().fg(colors.accent))
         .style(Style::new().bg(colors.popup_bg))
 }
@@ -793,8 +815,16 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
         .max(36.min(area.width));
     let popup = center(area, width, menu.targets.len() as u16 + 2);
     let block = match menu.action {
-        MenuAction::Open => popup_block(" Open ", " Enter open · 1-9 pick · Esc close ", colors),
-        MenuAction::Copy => popup_block(" Copy ", " Enter copy · 1-9 pick · Esc close ", colors),
+        MenuAction::Open => popup_block(
+            " Open ",
+            " `Enter` open · `1-9` pick · `Esc` close ",
+            colors,
+        ),
+        MenuAction::Copy => popup_block(
+            " Copy ",
+            " `Enter` copy · `1-9` pick · `Esc` close ",
+            colors,
+        ),
     };
     let text_width = (block.inner(popup).width as usize).saturating_sub(3);
 
@@ -883,19 +913,26 @@ fn draw_composer(
     } else {
         Style::new()
     });
+    frame.render_widget(&*composer, text);
+    if !composer.is_empty() {
+        return;
+    }
     let caption = !attachments.is_empty();
-    composer.set_placeholder_text(match (insert, &bar) {
+    let placeholder = match (insert, &bar) {
         (true, Some(ComposerBar::Edit(_))) => "Write the new text…",
         (true, _) if caption => "Add a caption…",
-        (true, Some(ComposerBar::Reply(_))) => "Write a reply…",
-        (true, None) => "Write a message…",
-        (false, Some(ComposerBar::Edit(_))) => "Press i to edit",
-        (false, _) if caption => "Press i to add a caption",
-        (false, Some(ComposerBar::Reply(_))) => "Press i to write your reply",
-        (false, None) => "Press i to write a message",
-    });
-    composer.set_placeholder_style(Style::new().fg(colors.muted));
-    frame.render_widget(&*composer, text);
+        // Where it's seen, for those who don't read the status bar.
+        (true, Some(ComposerBar::Reply(_))) => "Write a reply… · `Tab` for stickers",
+        (true, None) => "Write a message… · `Tab` for stickers",
+        (false, Some(ComposerBar::Edit(_))) => "Press `i` to edit",
+        (false, _) if caption => "Press `i` to add a caption",
+        (false, Some(ComposerBar::Reply(_))) => "Press `i` to write your reply",
+        (false, None) => "Press `i` to write a message",
+    };
+    // Drawn over the empty text area rather than as its own placeholder,
+    // which can't make the keys stand out. The cursor's look stays.
+    let muted = Style::new().fg(colors.muted);
+    frame.render_widget(Line::from(hint_spans(placeholder, muted, colors)), text);
 }
 
 fn attachment_rows(attachments: &[Attachment]) -> u16 {
@@ -1009,27 +1046,28 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             " SEARCH ",
             colors.search,
             " /",
-            "  Enter done · Esc cancel ",
+            "  `Enter` done · `Esc` cancel ",
         ),
         PromptKind::Messages => (
             " SEARCH ",
             colors.search,
             " /",
-            "  Enter search · Esc cancel ",
+            "  `Enter` search · `Esc` cancel ",
         ),
         PromptKind::Command => (
             " COMMAND ",
             colors.command,
             " :",
-            "  Enter run · Esc cancel ",
+            "  `Enter` run · `Esc` cancel ",
         ),
         PromptKind::Attach => (
             " ATTACH ",
             colors.attach,
             " ",
-            "  Tab complete · Enter attach · Esc cancel ",
+            "  `Tab` complete · `Enter` attach · `Esc` cancel ",
         ),
     };
+    let hints = Line::from(hint_spans(hints, Style::new().fg(colors.muted), colors));
     let [mode, slash, input, keys] = Layout::horizontal([
         Constraint::Length(label.width() as u16),
         Constraint::Length(2),
@@ -1040,7 +1078,7 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     frame.render_widget(Span::from(label).fg(colors.bg).bg(color).bold(), mode);
     frame.render_widget(Span::from(prefix), slash);
     frame.render_widget(&prompt.input, input);
-    frame.render_widget(Line::from(hints).fg(colors.muted).right_aligned(), keys);
+    frame.render_widget(hints.right_aligned(), keys);
 }
 
 /// Every `:` command, over the bottom left corner while typing one. Names
@@ -1142,9 +1180,9 @@ fn draw_completions(frame: &mut Frame, area: Rect, names: &[String], colors: &Co
 fn as_files_hint(open: &OpenChat) -> Option<&'static str> {
     let photos = open.attachments.iter().any(|a| a.kind.is_photo());
     photos.then_some(if open.as_files {
-        "Ctrl-t send as photos"
+        "`Ctrl-t` send as photos"
     } else {
-        "Ctrl-t send as files"
+        "`Ctrl-t` send as files"
     })
 }
 
@@ -1157,10 +1195,10 @@ fn jump_hints(open: &OpenChat) -> Vec<&'static str> {
         .and_then(|id| open.messages.get(&id))
         .is_some_and(|m| m.reply_to.is_some());
     if on_reply {
-        hints.push("gd go to replied");
+        hints.push("`gd` go to replied");
     }
     if !open.jumps.is_empty() {
-        hints.push("Ctrl-o back to reply");
+        hints.push("`Ctrl-o` back to reply");
     }
     hints
 }
@@ -1185,80 +1223,82 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             .as_ref()
             .is_some_and(|c| matches!(c.action, Confirmed::Edit(_))) =>
         {
-            (normal, "  y edit · n or Esc cancel")
+            (normal, "  `y` edit · `n` or `Esc` cancel")
         }
-        _ if app.confirm.is_some() => (normal, "  y open · n or Esc cancel"),
+        _ if app.confirm.is_some() => (normal, "  `y` open · `n` or `Esc` cancel"),
         _ if app.settings_menu.as_ref().map(|m| m.tab) == Some(HelpTab::Shortcuts) => {
-            (normal, "  j/k scroll · Tab settings · Esc close")
+            (normal, "  `j/k` scroll · `Tab` settings · `Esc` close")
         }
         _ if app.settings_menu.is_some() => (
             normal,
-            "  j/k preview theme · Enter save · Tab shortcuts · Esc cancel",
+            "  `j/k` preview theme · `Enter` save · `Tab` shortcuts · `Esc` cancel",
         ),
-        _ if app.delete_menu.is_some() => (normal, "  j/k choose · Enter delete · Esc cancel"),
+        _ if app.delete_menu.is_some() => {
+            (normal, "  `j/k` choose · `Enter` delete · `Esc` cancel")
+        }
         _ if app.react_menu.as_ref().is_some_and(|m| m.query.is_some()) => (
             normal,
-            "  type a name, like heart or +1 · arrows choose · Enter react · Esc back",
+            "  type a name, like heart or +1 · `arrows` choose · `Enter` react · `Esc` back",
         ),
         _ if app.react_menu.is_some() => (
             normal,
-            "  h/j/k/l choose · Enter react, or take yours back · X take all yours back · / search · Esc close",
+            "  `h/j/k/l` choose · `Enter` react, or take yours back · `X` take all yours back · `/` search · `Esc` close",
         ),
         Focus::Chats if !app.chats.filter().is_empty() => (
             normal,
-            "  j/k move · Enter open · Esc clear search · / search again · i write · q quit",
+            "  `j/k` move · `Enter` open · `Esc` clear search · `/` search again · `i` write · `q` quit",
         ),
         Focus::Chats => (
             normal,
-            "  j/k move · Enter open · i write · / search · H highlight · gg/G top/bottom · Ctrl-d/u half page · : commands · ? help · q quit",
+            "  `j/k` move · `Enter` open · `i` write · `/` search · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `:` commands · `?` help · `q` quit",
         ),
         Focus::Messages if searching => (
             normal,
-            "  n/N older/newer match · Esc end search · / search again · j/k newer/older · Enter open media · r reply · i write · h back",
+            "  `n/N` older/newer match · `Esc` end search · `/` search again · `j/k` newer/older · `Enter` open media · `r` reply · `i` write · `h` back",
         ),
         Focus::Messages if editing => (
             normal,
-            "  i edit · Esc cancel edit · e edit selected instead · j/k newer/older · h back",
+            "  `i` edit · `Esc` cancel edit · `e` edit selected instead · `j/k` newer/older · `h` back",
         ),
         Focus::Messages if attaching => (
             normal,
-            "  i add caption · Esc remove files · a attach more · p paste more · r reply · j/k newer/older · h back",
+            "  `i` add caption · `Esc` remove files · `a` attach more · `p` paste more · `r` reply · `j/k` newer/older · `h` back",
         ),
         Focus::Messages if replying => (
             normal,
-            "  i write reply · Esc cancel reply · r reply to selected instead · j/k newer/older · Enter open media · h back",
+            "  `i` write reply · `Esc` cancel reply · `r` reply to selected instead · `j/k` newer/older · `Enter` open media · `h` back",
         ),
         Focus::Messages => (
             normal,
-            "  j/k newer/older · y copy · r reply · R react · X unreact · e edit · d delete · Enter open media · i write · a attach · p paste · / search · gg/G oldest/newest · h back · : commands · ? help · q quit",
+            "  `j/k` newer/older · `y` copy · `r` reply · `R` react · `X` unreact · `e` edit · `d` delete · `Enter` open media · `i` write · `a` attach · `p` paste · `/` search · `gg/G` oldest/newest · `h` back · `:` commands · `?` help · `q` quit",
         ),
         _ if picking && app.stickers.as_ref().is_some_and(|p| p.query.is_some()) => (
             sticker,
-            "  type an emoji or a word, like cat · arrows choose · Enter send · Esc back",
+            "  type an emoji or a word, like cat · `arrows` choose · `Enter` send · `Esc` back",
         ),
         _ if picking => (
             sticker,
-            "  h/j/k/l choose · H/L previous/next tab · Enter send · / search · Tab or Esc back to writing",
+            "  `h/j/k/l` choose · `H/L` previous/next tab · `Enter` send · `/` search · `Tab` or `Esc` back to writing",
         ),
         Focus::Input if editing => (
             insert,
-            "  Enter save · Alt-Enter or Ctrl-j new line · Esc normal mode · Esc Esc cancel edit",
+            "  `Enter` save · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` cancel edit",
         ),
         Focus::Input if dropped => (
             insert,
-            "  Enter send · Ctrl-z paste as text instead · Alt-Enter or Ctrl-j new line · Esc normal mode · Esc Esc remove files",
+            "  `Enter` send · `Ctrl-z` paste as text instead · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` remove files",
         ),
         Focus::Input if attaching => (
             insert,
-            "  Enter send · Ctrl-v paste more · Alt-Enter or Ctrl-j new line · Esc normal mode · Esc Esc remove files",
+            "  `Enter` send · `Ctrl-v` paste more · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` remove files",
         ),
         Focus::Input if replying => (
             insert,
-            "  Enter send reply · Alt-Enter or Ctrl-j new line · Tab stickers · Esc normal mode · Esc Esc cancel reply",
+            "  `Enter` send reply · `Alt-Enter` or `Ctrl-j` new line · `Tab` stickers · `Esc` normal mode · `Esc Esc` cancel reply",
         ),
         Focus::Input => (
             insert,
-            "  Enter send · Alt-Enter or Ctrl-j new line · Tab stickers · Ctrl-v paste photo or file · Esc normal mode",
+            "  `Enter` send · `Alt-Enter` or `Ctrl-j` new line · `Tab` stickers · `Ctrl-v` paste photo or file · `Esc` normal mode",
         ),
     };
     let popup = app.settings_menu.is_some()
@@ -1277,12 +1317,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         context.insert(0, hint);
     }
     let mut spans = vec![mode.bold()];
+    let muted = Style::new().fg(colors.muted);
     if context.is_empty() {
-        spans.push(Span::from(hints).fg(colors.muted));
+        spans.extend(hint_spans(hints, muted, colors));
     } else {
         // Keys that only work right here go first, a bit brighter.
-        spans.push(Span::from(format!("  {} · ", context.join(" · "))).fg(colors.fg));
-        spans.push(Span::from(hints.trim_start()).fg(colors.muted));
+        let here = format!("  {} · ", context.join(" · "));
+        spans.extend(hint_spans(&here, Style::new().fg(colors.fg), colors));
+        spans.extend(hint_spans(hints.trim_start(), muted, colors));
     }
     if app.quit_deadline.is_some() {
         spans.push(Span::from("  Closing… (q again to force)").fg(colors.warning));
@@ -1570,7 +1612,16 @@ mod tests {
         assert!(rows[1].contains("▎ ↩ Reply to Chardy"), "{}", rows[1]);
         assert!(rows[2].contains("▎ are we still on"), "{}", rows[2]);
         assert!(rows[2].contains('…'), "a long message is cut to fit");
-        assert!(rows[3].contains("Write a reply…"), "typing goes below it");
+        assert!(
+            rows[3].contains("Write a reply… · Tab for stickers"),
+            "typing goes below it: {}",
+            rows[3]
+        );
+        let tab = (0..buf.area.width)
+            .find(|&x| buf[(x, 3)].symbol() == "T")
+            .unwrap();
+        assert_eq!(buf[(tab, 3)].fg, colors.accent, "the key stands out");
+        assert_eq!(buf[(tab + 4, 3)].fg, colors.muted, "what it does doesn't");
         let bar = (0..buf.area.width)
             .find(|&x| buf[(x, 1)].symbol() == "▎")
             .unwrap();
@@ -1815,11 +1866,15 @@ mod tests {
         };
         open.messages.insert(2, msg(Some(to_first)));
 
-        assert_eq!(jump_hints(&open), ["gd go to replied"], "newest is a reply");
+        assert_eq!(
+            jump_hints(&open),
+            ["`gd` go to replied"],
+            "newest is a reply"
+        );
         open.selected = Some(1);
         assert!(jump_hints(&open).is_empty());
         open.jumps.push(2);
-        assert_eq!(jump_hints(&open), ["Ctrl-o back to reply"]);
+        assert_eq!(jump_hints(&open), ["`Ctrl-o` back to reply"]);
     }
 
     #[test]
@@ -1957,6 +2012,36 @@ mod tests {
         let y = rows.iter().position(|r| r.contains("logout")).unwrap() as u16;
         let x = column(&rows[y as usize], "logout");
         assert_eq!(buf[(x, y)].fg, colors.muted, "still listed, dimmed");
+    }
+
+    #[test]
+    fn keys_in_hints_stand_out_from_what_they_do() {
+        let colors = Theme::Mocha.colors();
+        let muted = Style::new().fg(colors.muted);
+        let spans = hint_spans(
+            "  `Alt-Enter` or `Ctrl-j` new line · `/` search",
+            muted,
+            &colors,
+        );
+        let parts: Vec<(&str, bool)> = spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style.fg == Some(colors.accent)))
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                ("  ", false),
+                ("Alt-Enter", true),
+                (" or ", false),
+                ("Ctrl-j", true),
+                (" new line · ", false),
+                ("/", true),
+                (" search", false),
+            ]
+        );
+        let plain = hint_spans("Sending…", muted, &colors);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].style, muted);
     }
 
     #[test]

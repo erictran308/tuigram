@@ -10,7 +10,7 @@ use ratatui_image::FontSize;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
 
-use super::{border, truncate};
+use super::{border, hint_spans, truncate};
 use crate::images::Images;
 use crate::reactions;
 use crate::stickers::StickerPanel;
@@ -69,7 +69,7 @@ pub fn draw(
     frame.render_widget(top_line(panel, top.width as usize, colors), top);
 
     let message = if panel.is_empty() && panel.query.is_none() {
-        Some("No stickers yet · / finds some by emoji or word")
+        Some("No stickers yet · `/` finds some by emoji or word")
     } else {
         match panel.shown() {
             None if panel.search_query().is_some() => Some("Searching…"),
@@ -85,7 +85,9 @@ pub fn draw(
             height: 1.min(grid.height),
             ..grid
         };
-        frame.render_widget(Line::from(message).fg(colors.muted).centered(), row);
+        let muted = Style::new().fg(colors.muted);
+        let line = Line::from(hint_spans(message, muted, colors)).centered();
+        frame.render_widget(line, row);
         return;
     }
     draw_grid(frame, grid, panel, images, colors);
