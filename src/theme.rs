@@ -56,6 +56,7 @@ impl Theme {
             search: p.yellow,
             command: p.mauve,
             reply: p.teal,
+            activity: p.blue,
             success: p.green,
             own_bubble: mix(p.base, p.blue, tint),
             own_meta: mix(p.text, p.blue, 0.5),
@@ -101,6 +102,8 @@ pub struct Colors {
     pub command: Color,
     /// The reply bar over the composer, and the marker on the message it answers.
     pub reply: Color,
+    /// "typing…" and the like, in the chat list and the chat's title.
+    pub activity: Color,
     /// Toasts saying something worked.
     pub success: Color,
     pub own_bubble: Color,

@@ -450,6 +450,17 @@ impl Tg {
         ));
     }
 
+    /// Tells the chat you're typing, or that you stopped. Others see it for
+    /// about 5 seconds unless it's sent again. Failing is harmless (TDLib
+    /// already skips chats you can't write in), so errors aren't shown.
+    pub fn send_typing(&self, chat_id: i64, typing: bool) {
+        let action = typing.then_some(enums::ChatAction::Typing);
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let _ = functions::send_chat_action(chat_id, None, action, client_id).await;
+        });
+    }
+
     /// Downloads a file into TDLib's files directory, or returns at once if it's
     /// already there.
     pub fn download(&self, file_id: i32) {

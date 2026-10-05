@@ -26,7 +26,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Vim all the way.** Normal mode to move around (`j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u`), `i` to write, `Esc` to stop. Your hands never leave the keyboard.
 - **Photos and stickers, inline.** Real images in kitty, Ghostty, WezTerm and iTerm2, and block-character previews in any other terminal.
 - **Search everything.** `/` in the chat list filters chats as you type. `/` inside a chat searches its entire history, and `n`/`N` jump between matches, highlighted where they appear.
-- **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, date separators, and unread chats on top.
+- **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, date separators, "typing…" while someone writes to you, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app.
 - **Notifications.** New messages pop up as system notifications while you're in another window, and the window title counts your unread chats. Telegram's mute settings apply.
 - **Make it yours.** Four Catppuccin themes with live preview, and highlights that make your important chats stand out.

@@ -1,6 +1,8 @@
-//! The chat list: two rows per chat, its title over its last message, with
-//! the chat's photo on the left (a square of color if it has none), and a
-//! blank row between chats.
+//! The chat list: two rows per chat, its title over its last message (or
+//! "typing…" while someone is), with the chat's photo on the left (a square
+//! of color if it has none), and a blank row between chats.
+
+use std::collections::HashMap;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -15,7 +17,8 @@ use crate::chats::Chats;
 use crate::images::Images;
 use crate::theme::Colors;
 
-use super::{border, highlight, title_style, truncate};
+use super::messages::Names;
+use super::{activity, border, highlight, title_style, truncate};
 
 /// Rows of text per chat, so also the height of its photo.
 const PHOTO_ROWS: u16 = 2;
@@ -28,6 +31,8 @@ const MIN_WIDTH_FOR_PHOTOS: u16 = 24;
 /// What the list shows, from the app's state.
 pub struct ChatList<'a> {
     pub chats: &'a Chats,
+    /// Display names by user id, for who's typing in groups.
+    pub users: &'a HashMap<i64, String>,
     pub selected: Option<i64>,
     pub loading: bool,
     pub focused: bool,
@@ -38,6 +43,10 @@ pub struct ChatList<'a> {
 pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images, colors: &Colors) {
     let chats = list.chats;
     let filter = chats.filter();
+    let names = Names {
+        users: list.users,
+        chats,
+    };
     let mut title = if filter.is_empty() {
         format!(" Chats ({}) ", chats.ids().len())
     } else {
@@ -103,14 +112,13 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
             } else {
                 Style::new()
             };
+            let second = match activity(chat, &names) {
+                Some(doing) => Span::from(truncate(&doing, width)).fg(colors.activity),
+                None => Span::from(truncate(&chat.preview, width)).fg(colors.subtle),
+            };
             ListItem::new(vec![
                 Line::from(first).style(row_style),
-                Line::from(vec![
-                    bar,
-                    gap,
-                    Span::from(truncate(&chat.preview, width)).fg(colors.subtle),
-                ])
-                .style(row_style),
+                Line::from(vec![bar, gap, second]).style(row_style),
                 Line::default(),
             ])
         })
@@ -190,6 +198,11 @@ mod tests {
     use ratatui::style::Color;
     use ratatui_image::picker::{Picker, ProtocolType};
 
+    use std::sync::LazyLock;
+
+    use tdlib_rs::enums::{ChatAction, MessageSender};
+    use tdlib_rs::types::MessageSenderUser;
+
     use super::*;
     use crate::chats::ChatPhoto;
     use crate::images::Key;
@@ -228,8 +241,10 @@ mod tests {
     }
 
     fn list(chats: &Chats, selected: Option<i64>) -> ChatList<'_> {
+        static NO_USERS: LazyLock<HashMap<i64, String>> = LazyLock::new(HashMap::new);
         ChatList {
             chats,
+            users: &NO_USERS,
             selected,
             loading: false,
             focused: true,
@@ -304,6 +319,38 @@ mod tests {
         }
         assert_eq!(buf[(1, 3)].symbol(), " ");
         assert_ne!(buf[(7, 3)].bg, colors.selection);
+    }
+
+    #[test]
+    fn typing_shows_in_place_of_the_last_message_while_it_lasts() {
+        let colors = Theme::Mocha.colors();
+        let mut chats = Chats::default();
+        chats.add_for_test(1, "Alice", None);
+        chats.add_for_test(2, "Climbing club", None);
+        chats.make_private_for_test(1);
+        chats.refresh();
+        let user = |user_id| MessageSender::User(MessageSenderUser { user_id });
+        chats.set_action(1, &user(7), &ChatAction::Typing);
+        chats.set_action(2, &user(7), &ChatAction::Typing);
+        chats.set_action(2, &user(8), &ChatAction::Typing);
+        let users = HashMap::from([(7, "Alice".to_string()), (8, "Bob".to_string())]);
+        let draw = |chats: &Chats| {
+            let list = ChatList {
+                users: &users,
+                ..list(chats, None)
+            };
+            render(&list, &mut images(ProtocolType::Halfblocks), 40, 10)
+        };
+
+        // Each chat: its title, then the row under it, then a blank row.
+        let buf = draw(&chats);
+        assert_eq!(cells(&buf, 7, 2, 7), "typing…");
+        assert_eq!(buf[(7, 2)].fg, colors.activity);
+        assert_eq!(cells(&buf, 7, 5, 25), "Alice and Bob are typing…");
+
+        chats.set_action(1, &user(7), &ChatAction::Cancel);
+        let buf = draw(&chats);
+        assert_eq!(cells(&buf, 7, 2, 7), "       ", "back to the last message");
     }
 
     #[test]

@@ -7,11 +7,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tdlib_rs::enums::{ChatList, ChatType, MessageContent};
+use tdlib_rs::enums::{ChatAction, ChatList, ChatType, MessageContent, MessageSender};
 use tdlib_rs::types::{self, AccentColor, ChatPhotoInfo, ChatPosition, Message};
 
 use crate::images::Thumbnail;
-use crate::messages::decode_minithumbnail;
+use crate::messages::{Sender, decode_minithumbnail};
 use crate::search;
 use crate::text;
 
@@ -19,6 +19,8 @@ pub struct Chat {
     pub title: String,
     /// Channel posts all come from the channel, so they show no sender name.
     pub is_channel: bool,
+    /// A one-on-one chat, where only the other person can be typing.
+    pub is_private: bool,
     pub unread: i32,
     /// One-line summary of the last message, e.g. "You: see you at 5".
     pub preview: String,
@@ -28,6 +30,9 @@ pub struct Chat {
     /// Telegram's accent color id, which colors the chat's badge when it has
     /// no photo.
     accent: i32,
+    /// Who is typing (or recording, sending a photo, …) right now, in the
+    /// order they started, with what they're doing, e.g. "typing".
+    pub activity: Vec<(Sender, &'static str)>,
 }
 
 /// A chat's photo, for its avatar in the list.
@@ -80,14 +85,17 @@ pub struct Chats {
 impl Chats {
     pub fn insert(&mut self, chat: types::Chat) {
         let is_channel = matches!(&chat.r#type, ChatType::Supergroup(s) if s.is_channel);
+        let is_private = matches!(chat.r#type, ChatType::Private(_) | ChatType::Secret(_));
         let entry = Chat {
             title: text::clean(&chat.title),
             is_channel,
+            is_private,
             unread: chat.unread_count,
             preview: chat.last_message.as_ref().map(preview).unwrap_or_default(),
             order: main_order(&chat.positions).unwrap_or(0),
             photo: chat.photo.as_ref().map(ChatPhoto::new),
             accent: chat.accent_color_id,
+            activity: Vec::new(),
         };
         self.by_id.insert(chat.id, entry);
         self.dirty = true;
@@ -114,6 +122,25 @@ impl Chats {
                 chat.order = order;
                 self.dirty = true;
             }
+        }
+    }
+
+    /// Someone started or stopped typing (or recording, …). TDLib sends the
+    /// stop itself when the message arrives, or when the action isn't
+    /// repeated within about 5 seconds.
+    pub fn set_action(&mut self, chat_id: i64, sender: &MessageSender, action: &ChatAction) {
+        let Some(chat) = self.by_id.get_mut(&chat_id) else {
+            return;
+        };
+        let sender = Sender::from(sender);
+        let at = chat.activity.iter().position(|(s, _)| *s == sender);
+        match (at, activity(action)) {
+            (Some(i), Some(doing)) => chat.activity[i].1 = doing,
+            (Some(i), None) => {
+                chat.activity.remove(i);
+            }
+            (None, Some(doing)) => chat.activity.push((sender, doing)),
+            (None, None) => {}
         }
     }
 
@@ -271,15 +298,45 @@ impl Chats {
             Chat {
                 title: title.into(),
                 is_channel: false,
+                is_private: false,
                 unread: 0,
                 preview: String::new(),
                 order,
                 photo,
                 accent: 0,
+                activity: Vec::new(),
             },
         );
         self.dirty = true;
     }
+
+    pub fn make_private_for_test(&mut self, id: i64) {
+        if let Some(chat) = self.by_id.get_mut(&id) {
+            chat.is_private = true;
+        }
+    }
+}
+
+/// What a chat action shows as, in Telegram's words: "Alice is
+/// *typing*". `None` to stop showing one. Watching an emoji's animation shows
+/// nothing, as in Telegram, which plays it instead.
+fn activity(action: &ChatAction) -> Option<&'static str> {
+    Some(match action {
+        ChatAction::Typing => "typing",
+        ChatAction::RecordingVideo => "recording a video",
+        ChatAction::UploadingVideo(_) => "sending a video",
+        ChatAction::RecordingVoiceNote => "recording a voice message",
+        ChatAction::UploadingVoiceNote(_) => "sending a voice message",
+        ChatAction::UploadingPhoto(_) => "sending a photo",
+        ChatAction::UploadingDocument(_) => "sending a file",
+        ChatAction::ChoosingSticker => "choosing a sticker",
+        ChatAction::ChoosingLocation => "choosing a location",
+        ChatAction::ChoosingContact => "choosing a contact",
+        ChatAction::StartPlayingGame => "playing a game",
+        ChatAction::RecordingVideoNote => "recording a video message",
+        ChatAction::UploadingVideoNote(_) => "sending a video message",
+        ChatAction::WatchingAnimations(_) | ChatAction::Cancel => return None,
+    })
 }
 
 fn main_order(positions: &[ChatPosition]) -> Option<i64> {
@@ -339,17 +396,52 @@ mod tests {
                 Chat {
                     title: format!("chat {id}"),
                     is_channel: false,
+                    is_private: false,
                     unread,
                     preview: String::new(),
                     order,
                     photo: None,
                     accent: 0,
+                    activity: Vec::new(),
                 },
             );
         }
         chats.dirty = true;
         chats.refresh();
         chats
+    }
+
+    fn user(user_id: i64) -> MessageSender {
+        MessageSender::User(types::MessageSenderUser { user_id })
+    }
+
+    #[test]
+    fn activity_lasts_until_tdlib_says_it_stopped() {
+        let mut list = chats(&[(1, 50, 0)]);
+        let activity = |list: &Chats| list.get(1).unwrap().activity.clone();
+        list.set_action(1, &user(7), &ChatAction::Typing);
+        list.set_action(1, &user(8), &ChatAction::ChoosingSticker);
+        assert_eq!(
+            activity(&list),
+            [
+                (Sender::User(7), "typing"),
+                (Sender::User(8), "choosing a sticker")
+            ]
+        );
+
+        // Someone doing something else keeps their place.
+        let photo = types::ChatActionUploadingPhoto { progress: 10 };
+        list.set_action(1, &user(7), &ChatAction::UploadingPhoto(photo));
+        assert_eq!(activity(&list)[0], (Sender::User(7), "sending a photo"));
+
+        list.set_action(1, &user(7), &ChatAction::Cancel);
+        assert_eq!(activity(&list), [(Sender::User(8), "choosing a sticker")]);
+        // An emoji animation being watched shows nothing.
+        let watching = types::ChatActionWatchingAnimations {
+            emoji: "🎉".into()
+        };
+        list.set_action(1, &user(9), &ChatAction::WatchingAnimations(watching));
+        assert_eq!(activity(&list).len(), 1);
     }
 
     #[test]
@@ -388,11 +480,13 @@ mod tests {
             Chat {
                 title: "Eric".into(),
                 is_channel: false,
+                is_private: true,
                 unread: 0,
                 preview: String::new(),
                 order: 10,
                 photo: None,
                 accent: 0,
+                activity: Vec::new(),
             },
         );
 

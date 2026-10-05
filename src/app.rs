@@ -50,6 +50,9 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const TOAST_TIME: Duration = Duration::from_secs(2);
 /// Without a key press for this long, you're no longer shown as online.
 const IDLE_AFTER: Duration = Duration::from_secs(60);
+/// While typing, the chat is told again this often: others' apps stop
+/// showing it after 5.5 s without a repeat.
+const TYPING_EVERY: Duration = Duration::from_secs(5);
 
 /// Where the API key TDLib was given came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -381,6 +384,9 @@ pub struct App {
     last_input: Instant,
     /// What TDLib was last told: shown as online to others.
     online: bool,
+    /// The chat last told you're typing, and when. `None` once it was told
+    /// you stopped.
+    typing: Option<(i64, Instant)>,
     /// Tells the user about new messages while they're away from tuigram.
     notifier: Notifier,
     /// How notifications reach this terminal (never `Auto`).
@@ -447,6 +453,7 @@ impl App {
             focus_reported: false,
             last_input: Instant::now(),
             online: false,
+            typing: None,
             notifier: Notifier::default(),
             notify_with,
             in_tmux: std::env::var_os("TMUX").is_some(),
@@ -554,6 +561,7 @@ impl App {
             }
             Event::Paste(text) if self.focus == Focus::Input => {
                 self.composer.insert_str(text.replace('\r', ""));
+                self.on_composer_edit();
             }
             _ => {}
         }
@@ -695,6 +703,7 @@ impl App {
                     .set_last_message(u.chat_id, u.last_message.as_ref(), &u.positions)
             }
             Update::ChatTitle(u) => self.chats.set_title(u.chat_id, u.title),
+            Update::ChatAction(u) => self.chats.set_action(u.chat_id, &u.sender_id, &u.action),
             Update::NotificationGroup(u) => self.on_notifications(u),
             Update::UnreadChatCount(u) if matches!(u.chat_list, ChatList::Main) => {
                 self.set_unread_chats(u.unread_unmuted_count)
@@ -1052,16 +1061,52 @@ impl App {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             // Ctrl-c leaves Insert mode like in vim, instead of quitting mid-sentence.
-            KeyCode::Esc => self.focus = Focus::Messages,
-            KeyCode::Char('c') if ctrl => self.focus = Focus::Messages,
+            KeyCode::Esc => self.leave_insert(),
+            KeyCode::Char('c') if ctrl => self.leave_insert(),
             // Shift-Enter only arrives on terminals with the kitty keyboard protocol;
             // Alt-Enter and Ctrl-j work everywhere.
-            KeyCode::Enter if alt || shift => self.composer.insert_newline(),
-            KeyCode::Char('j') if ctrl => self.composer.insert_newline(),
+            KeyCode::Enter if alt || shift => {
+                self.composer.insert_newline();
+                self.on_composer_edit();
+            }
+            KeyCode::Char('j') if ctrl => {
+                self.composer.insert_newline();
+                self.on_composer_edit();
+            }
             KeyCode::Enter => self.send(),
             _ => {
-                self.composer.input(key);
+                if self.composer.input(key) {
+                    self.on_composer_edit();
+                }
             }
+        }
+    }
+
+    fn leave_insert(&mut self) {
+        self.focus = Focus::Messages;
+        self.set_typing(false);
+    }
+
+    /// You're typing while the composer has text, and stopped once it's empty.
+    fn on_composer_edit(&mut self) {
+        let typing = self.composer.lines().iter().any(|l| !l.trim().is_empty());
+        self.set_typing(typing);
+    }
+
+    /// Tells the open chat whether you're typing: again every
+    /// [`TYPING_EVERY`] while you are, and once when you stop.
+    fn set_typing(&mut self, typing: bool) {
+        let chat_id = self.open.as_ref().map(|o| o.chat_id);
+        if typing && let Some(chat_id) = chat_id {
+            let told = self
+                .typing
+                .is_some_and(|(id, at)| id == chat_id && at.elapsed() < TYPING_EVERY);
+            if !told {
+                self.tg.send_typing(chat_id, true);
+                self.typing = Some((chat_id, Instant::now()));
+            }
+        } else if let Some((chat_id, _)) = self.typing.take() {
+            self.tg.send_typing(chat_id, false);
         }
     }
 
@@ -1077,6 +1122,8 @@ impl App {
         let reply_to = open.reply.take().map(|r| r.id);
         self.tg.send_text(open.chat_id, text.to_string(), reply_to);
         self.composer = new_composer();
+        // The message arriving ends the typing status for everyone.
+        self.typing = None;
         // Jump to the bottom to watch it arrive.
         self.jump_to_newest();
     }
@@ -1312,8 +1359,9 @@ impl App {
         self.chats_loading = false;
         self.all_chats_loaded = false;
         self.pending_g = false;
-        // The client that knew about being online is gone.
+        // The client that knew about being online and typing is gone.
         self.online = false;
+        self.typing = None;
         self.notifier.clear();
         self.notify_since = i32::MAX;
         self.set_unread_chats(0);
@@ -1407,6 +1455,7 @@ impl App {
         if self.open.as_ref().is_some_and(|o| o.chat_id == chat_id) {
             return;
         }
+        self.set_typing(false);
         // TDLib only sends some updates (e.g. for channels) while a chat is open.
         if let Some(old) = self.open.take() {
             self.tg.close_chat(old.chat_id);

@@ -11,8 +11,9 @@ use crate::app::{
     App, Command, Confirm, DeleteMenu, Focus, HelpTab, Login, LoginStep, MenuAction, PickMenu,
     PromptKind, Screen, SettingsMenu, Target, Toast,
 };
+use crate::chats::Chat;
 use crate::config;
-use crate::messages::{OpenChat, Replied};
+use crate::messages::{OpenChat, Replied, Sender};
 use crate::notify::Notifications;
 use crate::search;
 use crate::theme::{Colors, Theme};
@@ -51,6 +52,28 @@ fn title_style(chats: &crate::chats::Chats, chat_id: i64, colors: &Colors) -> St
     } else {
         Style::new()
     }
+}
+
+/// What people are doing in a chat, in Telegram's words: "typing…" in a
+/// one-on-one chat; "Alice is typing…", "Alice and Bob are typing…" or "3
+/// people are typing…" in a group. When people are doing different things,
+/// whoever started first decides which one shows.
+fn activity(chat: &Chat, names: &messages::Names) -> Option<String> {
+    let &(_, doing) = chat.activity.first()?;
+    if chat.is_private {
+        return Some(format!("{doing}…"));
+    }
+    let who: Vec<Sender> = chat
+        .activity
+        .iter()
+        .filter(|&&(_, d)| d == doing)
+        .map(|&(sender, _)| sender)
+        .collect();
+    Some(match who[..] {
+        [one] => format!("{} is {doing}…", names.get(one)),
+        [a, b] => format!("{} and {} are {doing}…", names.get(a), names.get(b)),
+        _ => format!("{} people are {doing}…", who.len()),
+    })
 }
 
 /// How text matching a `/` search stands out.
@@ -257,6 +280,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
 
     let list = chat_list::ChatList {
         chats: &app.chats,
+        users: &app.users,
         selected: app.selected,
         loading: app.chats_loading,
         focused: app.focus == Focus::Chats,

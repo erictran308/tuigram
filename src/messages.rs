@@ -23,7 +23,7 @@ const PHOTO_MIN_SIDE: i32 = 640;
 /// Messages kept loaded while following new ones; see [`OpenChat::add_new`].
 const MAX_FOLLOWED: usize = 1000;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sender {
     User(i64),
     /// Channel posts and anonymous group admins are sent "as" a chat.
@@ -443,12 +443,18 @@ fn duration(seconds: i32) -> String {
     }
 }
 
-impl From<Message> for Msg {
-    fn from(message: Message) -> Self {
-        let sender = match message.sender_id {
+impl From<&MessageSender> for Sender {
+    fn from(sender: &MessageSender) -> Self {
+        match sender {
             MessageSender::User(u) => Sender::User(u.user_id),
             MessageSender::Chat(c) => Sender::Chat(c.chat_id),
-        };
+        }
+    }
+}
+
+impl From<Message> for Msg {
+    fn from(message: Message) -> Self {
+        let sender = Sender::from(&message.sender_id);
         let state = match message.sending_state {
             None => SendState::Sent,
             Some(MessageSendingState::Pending(_)) => SendState::Pending,

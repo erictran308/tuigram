@@ -38,7 +38,7 @@ pub struct Names<'a> {
 }
 
 impl Names<'_> {
-    fn get(&self, sender: Sender) -> String {
+    pub(super) fn get(&self, sender: Sender) -> String {
         let name = match sender {
             Sender::User(id) => self.users.get(&id).cloned(),
             Sender::Chat(id) => self.chats.get(id).map(|c| c.title.clone()),
@@ -118,6 +118,9 @@ pub fn draw(
         ))
         .style(super::title_style(names.chats, open.chat_id, colors)),
     ];
+    if let Some(doing) = chat.and_then(|c| super::activity(c, names)) {
+        title.push(Span::from(format!("· {doing} ")).fg(colors.activity));
+    }
     if let Some(search) = &open.search {
         title.push(Span::from(format!(
             "· /{} {} ",
@@ -766,11 +769,19 @@ mod tests {
         focused: bool,
         images: &mut Images,
     ) -> ratatui::buffer::Buffer {
+        render_in(open, &Chats::default(), focused, images)
+    }
+
+    fn render_in(
+        open: &mut OpenChat,
+        chats: &Chats,
+        focused: bool,
+        images: &mut Images,
+    ) -> ratatui::buffer::Buffer {
         let users = HashMap::new();
-        let chats = Chats::default();
         let names = Names {
             users: &users,
-            chats: &chats,
+            chats,
         };
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
         terminal
@@ -898,6 +909,20 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("Chardy") || l.contains("Eric"))
         );
+    }
+
+    #[test]
+    fn the_title_says_when_the_other_person_is_typing() {
+        let mut chats = Chats::default();
+        chats.add_for_test(42, "Chardy", None);
+        chats.make_private_for_test(42);
+        let typing = tdlib_rs::enums::ChatAction::Typing;
+        let chardy =
+            tdlib_rs::enums::MessageSender::User(tdlib_rs::types::MessageSenderUser { user_id: 2 });
+        chats.set_action(42, &chardy, &typing);
+        let buf = render_in(&mut sample(), &chats, false, &mut images());
+        let title: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(title.contains(" Chardy · typing… "), "{title}");
     }
 
     #[test]
