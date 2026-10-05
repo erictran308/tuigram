@@ -16,6 +16,7 @@ use crate::config;
 use crate::messages::{OpenChat, Replied, Sender};
 use crate::notify::Notifications;
 use crate::search;
+use crate::settings::Settings;
 use crate::theme::{Colors, Theme};
 
 /// The composer grows with its text up to this many rows, then scrolls.
@@ -351,7 +352,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         draw_confirm(frame, chat_area, confirm, colors);
     }
     if let Some(menu) = &mut app.settings_menu {
-        draw_settings(frame, menu, app.settings.notifications, colors);
+        draw_settings(frame, menu, &app.settings, colors);
     }
     if let Some(toast) = &app.toast {
         draw_toast(frame, toast, colors);
@@ -444,12 +445,7 @@ fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors
 
 /// The `?` popup, centered on the screen: a tab with every shortcut, and one
 /// with the settings (only the theme for now).
-fn draw_settings(
-    frame: &mut Frame,
-    menu: &mut SettingsMenu,
-    notifications: Notifications,
-    colors: &Colors,
-) {
+fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, settings: &Settings, colors: &Colors) {
     let area = frame.area();
     // Both tabs get the same size, so the tabs don't move when switching.
     let width = 72.min(area.width.saturating_sub(2));
@@ -471,7 +467,7 @@ fn draw_settings(
     ]);
     let keys = match menu.tab {
         HelpTab::Shortcuts => " j/k scroll · Tab settings · Esc close ",
-        HelpTab::Settings if menu.selected == SettingsMenu::NOTIFICATIONS => {
+        HelpTab::Settings if menu.selected >= SettingsMenu::NOTIFICATIONS => {
             " Space on/off · Enter save · Tab shortcuts · Esc cancel "
         }
         HelpTab::Settings => " j/k preview · Enter save · Tab shortcuts · Esc cancel ",
@@ -510,17 +506,20 @@ fn draw_settings(
         };
         lines.push(row(i, mark, theme.label()));
     }
+    let check = |on: bool| if on { " [✓] " } else { " [ ] " };
     lines.push(Line::default());
     lines.push(heading(" Notifications"));
-    let check = if notifications == Notifications::Off {
-        " [ ] "
-    } else {
-        " [✓] "
-    };
     lines.push(row(
         SettingsMenu::NOTIFICATIONS,
-        check,
+        check(settings.notifications != Notifications::Off),
         "New messages, while tuigram is in the background",
+    ));
+    lines.push(Line::default());
+    lines.push(heading(" Composer"));
+    lines.push(row(
+        SettingsMenu::AFTER_SEND,
+        check(settings.normal_after_send),
+        "Back to Normal mode after sending a message",
     ));
     for (line, y) in lines.into_iter().zip(inner.y..inner.bottom()) {
         frame.render_widget(
@@ -941,12 +940,13 @@ mod tests {
             selected: 3,
             saved: Theme::Mocha,
             saved_notifications: Notifications::Auto,
+            saved_normal_after_send: false,
         };
         // Too short for the whole list.
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         let mut draw = |menu: &mut SettingsMenu| {
             terminal
-                .draw(|f| draw_settings(f, menu, Notifications::Auto, &colors))
+                .draw(|f| draw_settings(f, menu, &Settings::default(), &colors))
                 .unwrap();
             buffer_rows(terminal.backend().buffer())
         };
@@ -1395,11 +1395,12 @@ mod tests {
             selected: 0,
             saved: Theme::Mocha,
             saved_notifications: Notifications::Auto,
+            saved_normal_after_send: false,
         };
         let colors = Theme::Latte.colors();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         terminal
-            .draw(|f| draw_settings(f, &mut menu, Notifications::Auto, &colors))
+            .draw(|f| draw_settings(f, &mut menu, &Settings::default(), &colors))
             .unwrap();
         let buf = terminal.backend().buffer();
         let rows: Vec<String> = (0..buf.area.height)
@@ -1431,11 +1432,16 @@ mod tests {
             selected: SettingsMenu::NOTIFICATIONS,
             saved: Theme::Mocha,
             saved_notifications: Notifications::Auto,
+            saved_normal_after_send: false,
         };
         let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
         let mut draw = |notifications| {
+            let settings = Settings {
+                notifications,
+                ..Settings::default()
+            };
             terminal
-                .draw(|f| draw_settings(f, &mut menu, notifications, &colors))
+                .draw(|f| draw_settings(f, &mut menu, &settings, &colors))
                 .unwrap();
             buffer_rows(terminal.backend().buffer())
         };
@@ -1453,5 +1459,40 @@ mod tests {
 
         let rows = draw(Notifications::Off);
         assert!(row(&rows, "New messages").contains("▌ [ ] New messages"));
+    }
+
+    #[test]
+    fn normal_mode_after_sending_is_a_checkbox_under_notifications() {
+        let colors = Theme::Mocha.colors();
+        let mut menu = SettingsMenu {
+            tab: HelpTab::Settings,
+            scroll: 0,
+            selected: SettingsMenu::AFTER_SEND,
+            saved: Theme::Mocha,
+            saved_notifications: Notifications::Auto,
+            saved_normal_after_send: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
+        let mut draw = |normal_after_send| {
+            let settings = Settings {
+                normal_after_send,
+                ..Settings::default()
+            };
+            terminal
+                .draw(|f| draw_settings(f, &mut menu, &settings, &colors))
+                .unwrap();
+            buffer_rows(terminal.backend().buffer())
+        };
+        let row = |rows: &[String], needle: &str| {
+            rows.iter().find(|r| r.contains(needle)).unwrap().clone()
+        };
+
+        let rows = draw(false);
+        assert!(row(&rows, "Composer").contains("Composer"));
+        assert!(row(&rows, "Back to Normal").contains("▌ [ ] Back to Normal mode after sending"));
+        assert!(row(&rows, "Space on/off").contains("Esc cancel"));
+
+        let rows = draw(true);
+        assert!(row(&rows, "Back to Normal").contains("▌ [✓] Back to Normal mode"));
     }
 }

@@ -19,6 +19,9 @@ pub struct Settings {
     /// How new messages are announced: "auto" picks what the terminal
     /// supports; also "off", "bell", "osc9", "osc777" or "osc99".
     pub notifications: Notifications,
+    /// After sending a message, go back to Normal mode instead of staying in
+    /// Insert mode to write the next one.
+    pub normal_after_send: bool,
     /// Telegram API credentials entered on the login screen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<ApiKeys>,
@@ -61,12 +64,13 @@ mod tests {
             theme: Theme::Latte,
             highlighted_chats: vec![-1001234567890, 42],
             notifications: Notifications::Off,
+            normal_after_send: true,
             api_keys: None,
         };
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\""
+            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
 

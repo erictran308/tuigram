@@ -117,7 +117,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `Ctrl-d` / `Ctrl-u` | Half a page down / up |
 | `Enter` / `l` | Open a chat, or the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens) |
 | `h` / `Esc` | Back to the chat list |
-| `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line |
+| `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
 | `y` | Copy the selected message: its text, a link, or the photo or file |
 | `r` | Reply to the selected message (`Esc` twice cancels the reply) |
 | `gd` / `Ctrl-o` | Go to the message a reply answers / back to the reply |

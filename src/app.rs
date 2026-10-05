@@ -255,21 +255,26 @@ pub enum HelpTab {
 }
 
 /// The `?` popup: every keyboard shortcut, and the settings. On the settings
-/// tab, moving the cursor previews a theme and Space turns notifications on
-/// or off; Enter saves, Esc puts the saved settings back.
+/// tab, moving the cursor previews a theme and Space ticks a checkbox
+/// (notifications, Normal mode after sending); Enter saves, Esc puts the
+/// saved settings back.
 pub struct SettingsMenu {
     pub tab: HelpTab,
     /// First row shown on the shortcuts tab. Drawing keeps it in range.
     pub scroll: usize,
-    /// Row on the settings tab: a theme, or [`SettingsMenu::NOTIFICATIONS`].
+    /// Row on the settings tab: a theme, [`SettingsMenu::NOTIFICATIONS`] or
+    /// [`SettingsMenu::AFTER_SEND`].
     pub selected: usize,
     pub saved: Theme,
     pub saved_notifications: Notifications,
+    pub saved_normal_after_send: bool,
 }
 
 impl SettingsMenu {
     /// The notifications row, after the themes.
     pub const NOTIFICATIONS: usize = Theme::ALL.len();
+    /// The "Normal mode after sending" row, the last one.
+    pub const AFTER_SEND: usize = Self::NOTIFICATIONS + 1;
 }
 
 /// What the status bar prompt is for: a `/` search through chat titles or the
@@ -1013,6 +1018,7 @@ impl App {
                     selected: Theme::ALL.iter().position(|&t| t == saved).unwrap_or(0),
                     saved,
                     saved_notifications: self.settings.notifications,
+                    saved_normal_after_send: self.settings.normal_after_send,
                 });
             }
             (_, KeyCode::Char(':')) => self.open_prompt(PromptKind::Command),
@@ -1124,6 +1130,9 @@ impl App {
         self.composer = new_composer();
         // The message arriving ends the typing status for everyone.
         self.typing = None;
+        if self.settings.normal_after_send {
+            self.focus = Focus::Messages;
+        }
         // Jump to the bottom to watch it arrive.
         self.jump_to_newest();
     }
@@ -1831,6 +1840,7 @@ impl App {
             }
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
                 self.settings.theme = menu.saved;
+                self.settings.normal_after_send = menu.saved_normal_after_send;
                 let saved = menu.saved_notifications;
                 self.settings_menu = None;
                 self.set_notifications(saved);
@@ -1851,6 +1861,12 @@ impl App {
                 });
                 return;
             }
+            KeyCode::Char(' ')
+                if menu.tab == HelpTab::Settings && menu.selected == SettingsMenu::AFTER_SEND =>
+            {
+                self.settings.normal_after_send = !self.settings.normal_after_send;
+                return;
+            }
             _ => {}
         }
         let delta = match key.code {
@@ -1866,7 +1882,7 @@ impl App {
             // Drawing stops it at the end of the list.
             HelpTab::Shortcuts => menu.scroll = menu.scroll.saturating_add_signed(delta),
             HelpTab::Settings => {
-                let last = SettingsMenu::NOTIFICATIONS;
+                let last = SettingsMenu::AFTER_SEND;
                 menu.selected = menu.selected.saturating_add_signed(delta).min(last);
                 // Preview: the whole app redraws in the theme under the cursor.
                 if let Some(&theme) = Theme::ALL.get(menu.selected) {
