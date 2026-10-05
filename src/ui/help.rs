@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Colors;
 
@@ -81,14 +82,19 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
-/// The shortcuts as lines: a heading per group, then each key and what it does.
-fn lines(colors: &Colors) -> Vec<Line<'static>> {
-    let key_width = SHORTCUTS
+/// The longest key, which sets where the descriptions start.
+fn key_width() -> usize {
+    SHORTCUTS
         .iter()
         .flat_map(|(_, keys)| keys.iter())
-        .map(|(key, _)| key.len())
+        .map(|(key, _)| key.width())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// The shortcuts as lines: a heading per group, then each key and what it does.
+fn lines(colors: &Colors) -> Vec<Line<'static>> {
+    let key_width = key_width();
     let mut lines = Vec::new();
     for (i, (group, keys)) in SHORTCUTS.iter().enumerate() {
         if i > 0 {
@@ -103,6 +109,19 @@ fn lines(colors: &Colors) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+/// Columns the widest line takes, plus one for the scrollbar, for sizing the
+/// popup.
+pub fn width() -> usize {
+    let what = SHORTCUTS
+        .iter()
+        .flat_map(|(_, keys)| keys.iter())
+        .map(|(_, what)| what.width())
+        .max()
+        .unwrap_or(0);
+    // Indent, the keys, a gap, then the descriptions.
+    3 + key_width() + 2 + what + 1
 }
 
 /// Rows the list takes, for sizing the popup.
@@ -143,5 +162,15 @@ mod tests {
     #[test]
     fn height_counts_every_line() {
         assert_eq!(height(), lines(&Theme::Mocha.colors()).len());
+    }
+
+    #[test]
+    fn width_leaves_room_for_every_line_and_the_scrollbar() {
+        let widest = lines(&Theme::Mocha.colors())
+            .iter()
+            .map(Line::width)
+            .max()
+            .unwrap();
+        assert_eq!(width(), widest + 1);
     }
 }

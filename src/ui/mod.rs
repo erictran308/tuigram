@@ -2,7 +2,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+};
 use unicode_width::UnicodeWidthStr;
 
 use ratatui_textarea::TextArea;
@@ -448,7 +450,7 @@ fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors
 fn draw_settings(frame: &mut Frame, menu: &mut SettingsMenu, settings: &Settings, colors: &Colors) {
     let area = frame.area();
     // Both tabs get the same size, so the tabs don't move when switching.
-    let width = 72.min(area.width.saturating_sub(2));
+    let width = (help::width() as u16 + 2).min(area.width.saturating_sub(2));
     let height = (help::height() as u16 + 2).min(area.height.saturating_sub(2));
     let popup = center(area, width, height);
     let tab = |label: &'static str, active: bool| {
@@ -642,7 +644,10 @@ fn draw_composer(
     insert: bool,
     colors: &Colors,
 ) {
-    let block = Block::bordered().border_style(border(insert, colors));
+    // Text starts a column in, in line with the message bubbles above.
+    let block = Block::bordered()
+        .border_style(border(insert, colors))
+        .padding(Padding::horizontal(1));
     let mut text = block.inner(area);
     frame.render_widget(block, area);
     if let Some(reply) = reply {
