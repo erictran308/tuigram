@@ -3,7 +3,8 @@ use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+    Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -18,6 +19,7 @@ use crate::chats::Chat;
 use crate::config;
 use crate::messages::{Editing, OpenChat, Replied, Sender};
 use crate::notify::Notifications;
+use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search;
 use crate::settings::Settings;
 use crate::text;
@@ -363,6 +365,22 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     if let Some(menu) = &app.delete_menu {
         draw_delete(frame, chat_area, menu, colors);
     }
+    if let Some(menu) = &mut app.react_menu {
+        let msg = app
+            .open
+            .as_ref()
+            .and_then(|o| o.messages.get(&menu.message_id));
+        let yours: Vec<&str> = msg
+            .iter()
+            .flat_map(|m| &m.reactions)
+            .filter(|r| r.chosen)
+            .filter_map(|r| match &r.kind {
+                ReactionKind::Emoji(emoji) => Some(emoji.as_str()),
+                _ => None,
+            })
+            .collect();
+        draw_react(frame, chat_area, menu, &yours, colors);
+    }
     if let Some(confirm) = &app.confirm {
         draw_confirm(frame, chat_area, confirm, colors);
     }
@@ -456,6 +474,156 @@ fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors
         list,
         &mut ListState::default().with_selected(Some(menu.selected)),
     );
+}
+
+/// Rows of emoji the `R` popup shows at once; more scroll.
+const REACT_ROWS: usize = 6;
+/// Width of the `R` popup, with room for its key hints and most emoji names.
+const REACT_WIDTH: u16 = 44;
+
+/// The `R` popup over the message pane: the message (or the search), a grid
+/// of emoji with yours filled in, and the name of the one under the cursor.
+fn draw_react(
+    frame: &mut Frame,
+    area: Rect,
+    menu: &mut ReactMenu,
+    yours: &[&str],
+    colors: &Colors,
+) {
+    // Owned, since drawing moves `menu.scroll`.
+    let shown: Vec<String> = menu.shown().into_iter().map(String::from).collect();
+    let current = shown.get(menu.selected).map(String::as_str);
+    let columns = reactions::COLUMNS;
+    let rows = shown.len().div_ceil(columns).max(1);
+    // With reactions of yours, and not searching (where X is typed), a row
+    // says X takes them back, so it's known outside the popup too.
+    let hint = !yours.is_empty() && menu.query.is_none();
+    // Borders, the message or search and a gap, the grid, a gap and the name.
+    let fixed = 6 + usize::from(hint);
+    let visible = rows
+        .min(REACT_ROWS)
+        .min(usize::from(area.height).saturating_sub(fixed).max(1));
+    let popup = center(area, REACT_WIDTH.min(area.width), (visible + fixed) as u16);
+    let enter = match current {
+        Some(e) if yours.contains(&e) => "Enter take back",
+        _ => "Enter react",
+    };
+    let keys = match menu.query {
+        Some(_) => format!(" {enter} · Esc back "),
+        None => format!(" / search · {enter} · Esc close "),
+    };
+    let block = popup_block(" React ", &keys, colors);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let [top, _, grid, _, name, hint_row] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(visible as u16),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(u16::from(hint)),
+    ])
+    .areas(inner);
+    if hint {
+        let line = Line::from(vec![
+            Span::from(" X").fg(colors.accent).bold(),
+            Span::from(" removes all yours, also in the chat").fg(colors.muted),
+        ]);
+        frame.render_widget(line, hint_row);
+    }
+    let text_width = (inner.width as usize).saturating_sub(4);
+    let top_line = match &menu.query {
+        Some(query) => Line::from(vec![
+            Span::from(" / ").fg(colors.search).bold(),
+            Span::from(truncate(query, text_width)),
+            Span::from(" ").reversed(),
+        ]),
+        None => Line::from(vec![
+            Span::from(" ▎ ").fg(colors.accent),
+            Span::from(truncate(&menu.snippet, text_width)),
+        ]),
+    };
+    frame.render_widget(top_line, top);
+
+    if menu.choices.is_none() {
+        frame.render_widget(Line::from(" Loading…").fg(colors.muted), grid);
+        return;
+    }
+    let Some(current) = current else {
+        frame.render_widget(Line::from(" No emoji by that name").fg(colors.muted), grid);
+        return;
+    };
+    // Each emoji takes four columns: itself and the cursor's brackets. One
+    // more on the right for the scroll bar.
+    let [grid] = Layout::horizontal([Constraint::Length((columns * 4 + 1) as u16)])
+        .flex(Flex::Center)
+        .areas(grid);
+    let row = menu.selected / columns;
+    // Scroll just far enough to keep the cursor's row in view.
+    let max_scroll = rows.saturating_sub(visible);
+    menu.scroll = menu
+        .scroll
+        .clamp(row.saturating_sub(visible - 1), row)
+        .min(max_scroll);
+    let lines: Vec<Line> = shown
+        .chunks(columns)
+        .enumerate()
+        .skip(menu.scroll)
+        .take(visible)
+        .map(|(r, emoji)| {
+            let mut spans = Vec::new();
+            for (c, e) in emoji.iter().enumerate() {
+                let at = r * columns + c;
+                let mut style = Style::new();
+                if yours.contains(&e.as_str()) {
+                    style = style.bg(colors.your_reaction);
+                } else if at == menu.selected {
+                    style = style.bg(colors.selection);
+                }
+                let (open, close) = if at == menu.selected {
+                    ("[", "]")
+                } else {
+                    (" ", " ")
+                };
+                let bracket = style.fg(colors.accent).bold();
+                let shown = reactions::shown(e);
+                let pad = " ".repeat(2usize.saturating_sub(shown.width()));
+                spans.push(Span::styled(open, bracket));
+                spans.push(Span::styled(shown + &pad, style));
+                spans.push(Span::styled(close, bracket));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), grid);
+    if max_scroll > 0 {
+        let mut state = ScrollbarState::new(max_scroll).position(menu.scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(colors.accent)
+                .track_style(colors.border),
+            grid,
+            &mut state,
+        );
+    }
+
+    // What the emoji under the cursor is called, to search for it next time.
+    if let Some(found) = reactions::about(current) {
+        let code = found
+            .shortcode()
+            .map_or(String::new(), |c| format!("  :{c}:"));
+        let width = usize::from(name.width).saturating_sub(1);
+        let line = Line::from(vec![
+            Span::from(" "),
+            Span::from(truncate(found.name(), width)),
+            Span::from(code).fg(colors.muted),
+        ]);
+        frame.render_widget(line, name);
+    }
 }
 
 /// The `?` popup, centered on the screen: a tab with every shortcut, and one
@@ -1013,6 +1181,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             "  j/k preview theme · Enter save · Tab shortcuts · Esc cancel",
         ),
         _ if app.delete_menu.is_some() => (normal, "  j/k choose · Enter delete · Esc cancel"),
+        _ if app.react_menu.as_ref().is_some_and(|m| m.query.is_some()) => (
+            normal,
+            "  type a name, like heart or +1 · arrows choose · Enter react · Esc back",
+        ),
+        _ if app.react_menu.is_some() => (
+            normal,
+            "  h/j/k/l choose · Enter react, or take yours back · X take all yours back · / search · Esc close",
+        ),
         Focus::Chats if !app.chats.filter().is_empty() => (
             normal,
             "  j/k move · Enter open · Esc clear search · / search again · i write · q quit",
@@ -1039,7 +1215,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages => (
             normal,
-            "  j/k newer/older · y copy · r reply · e edit · d delete · Enter open media · i write · a attach · p paste · / search · gg/G oldest/newest · h back · : commands · ? help · q quit",
+            "  j/k newer/older · y copy · r reply · R react · X unreact · e edit · d delete · Enter open media · i write · a attach · p paste · / search · gg/G oldest/newest · h back · : commands · ? help · q quit",
         ),
         Focus::Input if editing => (
             insert,
@@ -1062,7 +1238,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             "  Enter send · Alt-Enter or Ctrl-j new line · Ctrl-v paste photo or file · Esc normal mode",
         ),
     };
-    let popup = app.settings_menu.is_some() || app.delete_menu.is_some() || app.confirm.is_some();
+    let popup = app.settings_menu.is_some()
+        || app.delete_menu.is_some()
+        || app.react_menu.is_some()
+        || app.confirm.is_some();
     let mut context = match &app.open {
         Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open),
         _ => Vec::new(),
@@ -1533,6 +1712,58 @@ mod tests {
     }
 
     #[test]
+    fn the_reaction_popup_marks_the_cursor_and_yours_and_searches_by_name() {
+        let colors = Theme::Mocha.colors();
+        let mut menu = ReactMenu::new(5, "see you at 7".into());
+        let render = |menu: &mut ReactMenu| {
+            let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+            terminal
+                .draw(|f| draw_react(f, f.area(), menu, &["❤"], &colors))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let has = |rows: &[String], needle: &str| rows.iter().any(|r| r.contains(needle));
+
+        let rows = buffer_rows(&render(&mut menu));
+        assert!(has(&rows, " React "));
+        assert!(has(&rows, "▎ see you at 7"), "says which message");
+        assert!(has(&rows, "Loading…"), "until TDLib answers");
+        assert!(
+            has(&rows, " X removes all yours, also in the chat"),
+            "you have ❤"
+        );
+
+        let emoji = ["👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "💔", "😍"];
+        menu.set_choices(emoji.map(String::from).to_vec(), &[]);
+        menu.move_by(3);
+        let buf = render(&mut menu);
+        let rows = buffer_rows(&buf);
+        assert!(has(&rows, "[🔥"), "the cursor is in brackets");
+        assert!(has(&rows, " fire  :fire:"), "and named under the grid");
+        let (x, y) = (0..buf.area.height)
+            .find_map(|y| {
+                let x = (0..buf.area.width).find(|&x| buf[(x, y)].symbol() == "❤\u{FE0F}")?;
+                Some((x, y))
+            })
+            .expect("❤ drawn two columns wide");
+        assert_eq!(buf[(x, y)].bg, colors.your_reaction, "yours is filled in");
+
+        menu.edit_query(|q| q.push_str("heart"));
+        let rows = buffer_rows(&render(&mut menu));
+        assert!(has(&rows, " / heart"));
+        assert!(!has(&rows, " X removes"), "X is typed while searching");
+        assert!(has(&rows, " red heart  :heart:"));
+        assert!(has(&rows, "Enter take back · Esc back"), "it's yours");
+        assert!(!has(&rows, "👍"), "{rows:#?}");
+
+        menu.edit_query(|q| q.push('z'));
+        assert!(has(
+            &buffer_rows(&render(&mut menu)),
+            "No emoji by that name"
+        ));
+    }
+
+    #[test]
     fn jump_keys_are_hinted_only_where_they_work() {
         use crate::messages::{Msg, ReplyTo, SendState, Sender};
         let msg = |reply_to| Msg {
@@ -1551,6 +1782,7 @@ mod tests {
             formatted: false,
             edited: false,
             album: 0,
+            reactions: Vec::new(),
         };
         let mut open = OpenChat::new(1);
         open.messages.insert(1, msg(None));

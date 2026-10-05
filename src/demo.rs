@@ -4,7 +4,7 @@
 //! The photos are drawn here and written to a temporary folder, removed on
 //! exit.
 //!
-//! Keys: 1–5 or Tab / Shift-Tab switch scenes, t / T change the theme, q
+//! Keys: 1–6 or Tab / Shift-Tab switch scenes, t / T change the theme, q
 //! quits.
 
 use std::path::Path;
@@ -26,6 +26,7 @@ use crate::images::Images;
 use crate::messages::{
     Editable, Link, Msg, OpenChat, Preview, Replied, ReplyTo, SendState, Sender,
 };
+use crate::reactions::{ReactMenu, Reaction, ReactionKind};
 use crate::search::MessageSearch;
 use crate::settings::Settings;
 use crate::tg::Tg;
@@ -61,6 +62,7 @@ const MOM_PHOTO: i32 = 5;
 const SUNRISE_SIZE: (u32, u32) = (1280, 853);
 
 // Messages in the open chat, by id.
+const SUNNY: i64 = 1;
 const DRIVE: i64 = 5;
 const PICK_UP: i64 = 7;
 const TRAILHEAD: i64 = 6;
@@ -72,6 +74,8 @@ enum Scene {
     Reading,
     /// Insert mode, answering a message.
     Replying,
+    /// The `R` popup, picking a reaction.
+    Reacting,
     /// A `/` search through the chat, matches highlighted.
     Searching,
     /// The `?` popup on its settings tab.
@@ -80,9 +84,10 @@ enum Scene {
     Shortcuts,
 }
 
-const SCENES: [Scene; 5] = [
+const SCENES: [Scene; 6] = [
     Scene::Reading,
     Scene::Replying,
+    Scene::Reacting,
     Scene::Searching,
     Scene::Settings,
     Scene::Shortcuts,
@@ -183,7 +188,7 @@ fn on_key(app: &mut App, scene: &mut usize, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return false,
         KeyCode::Char('c') if ctrl => return false,
-        KeyCode::Char(c @ '1'..='5') => *scene = c as usize - '1' as usize,
+        KeyCode::Char(c @ '1'..='6') => *scene = c as usize - '1' as usize,
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => *scene = next(*scene, 1),
         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => *scene = next(*scene, -1),
         KeyCode::Char('t') => change_theme(app, 1),
@@ -211,6 +216,7 @@ fn show_scene(app: &mut App, scene: Scene) {
         Scene::Shortcuts => Some(help(app, HelpTab::Shortcuts)),
         _ => None,
     };
+    app.react_menu = None;
     let Some(open) = app.open.as_mut() else {
         return;
     };
@@ -226,6 +232,15 @@ fn show_scene(app: &mut App, scene: Scene) {
                 .map(|msg| Replied::new(PICK_UP, msg));
             app.focus = Focus::Input;
             app.composer.insert_str("Yes! I'll be outside at 6:55");
+        }
+        Scene::Reacting => {
+            open.selected = Some(SUNNY);
+            let mut menu =
+                ReactMenu::new(SUNNY, "Sunny all weekend! Eagle Ridge on Saturday?".into());
+            let emoji = TELEGRAM_REACTIONS.iter().map(|e| e.to_string()).collect();
+            menu.set_choices(emoji, &["👍".into()]);
+            menu.selected = 3;
+            app.react_menu = Some(menu);
         }
         Scene::Searching => {
             let mut search = MessageSearch::new("trail".into());
@@ -362,6 +377,94 @@ fn fill_chats(chats: &mut Chats) {
     chats.refresh();
 }
 
+/// The reactions Telegram offers in most chats, in its order.
+const TELEGRAM_REACTIONS: &[&str] = &[
+    "👍",
+    "👎",
+    "❤",
+    "🔥",
+    "🥰",
+    "👏",
+    "😁",
+    "🤔",
+    "🤯",
+    "😱",
+    "🤬",
+    "😢",
+    "🎉",
+    "🤩",
+    "🤮",
+    "💩",
+    "🙏",
+    "👌",
+    "🕊",
+    "🤡",
+    "🥱",
+    "🥴",
+    "😍",
+    "🐳",
+    "❤‍🔥",
+    "🌚",
+    "🌭",
+    "💯",
+    "🤣",
+    "⚡",
+    "🍌",
+    "🏆",
+    "💔",
+    "🤨",
+    "😐",
+    "🍓",
+    "🍾",
+    "💋",
+    "🖕",
+    "😈",
+    "😴",
+    "😭",
+    "🤓",
+    "👻",
+    "👨‍💻",
+    "👀",
+    "🎃",
+    "🙈",
+    "😇",
+    "😨",
+    "🤝",
+    "✍",
+    "🤗",
+    "🫡",
+    "🎅",
+    "🎄",
+    "☃",
+    "💅",
+    "🤪",
+    "🗿",
+    "🆒",
+    "💘",
+    "🙉",
+    "🦄",
+    "😘",
+    "💊",
+    "🙊",
+    "😎",
+    "👾",
+    "🤷‍♂",
+    "🤷",
+    "🤷‍♀",
+    "😡",
+];
+
+/// Reactions on a demo message: (emoji, count, added by you).
+fn reactions(list: &[(&str, i32, bool)]) -> Vec<Reaction> {
+    list.iter()
+        .map(|&(emoji, count, chosen)| Reaction {
+            kind: ReactionKind::Emoji(emoji.into()),
+            count,
+            chosen,
+        })
+        .collect()
+}
+
 /// The open chat: planning a hike over two days.
 fn hike() -> OpenChat {
     let at = |day, hour, min| {
@@ -386,6 +489,7 @@ fn hike() -> OpenChat {
         formatted: false,
         edited: false,
         album: 0,
+        reactions: Vec::new(),
     };
     let url = "https://trails.example.com/eagle-ridge";
     let link = msg(LEO, at(2, 19, 5), &format!("Here's the trail: {url}"));
@@ -403,6 +507,7 @@ fn hike() -> OpenChat {
             thumbnail: None,
             sticker: false,
         }),
+        reactions: reactions(&[("❤", 3, true), ("😍", 1, false)]),
         ..msg(PRIYA, at(3, 7, 48), "Sunrise at the trailhead last year")
     };
     let pick_up = Msg {
@@ -415,15 +520,20 @@ fn hike() -> OpenChat {
 
     let mut open = OpenChat::new(HIKE);
     open.all_loaded = true;
+    let sunny = Msg {
+        reactions: reactions(&[("👍", 3, true), ("🔥", 2, false)]),
+        ..msg(
+            MAYA,
+            at(2, 19, 2),
+            "Sunny all weekend! Eagle Ridge on Saturday?",
+        )
+    };
+    let snacks = Msg {
+        reactions: reactions(&[("🙏", 2, false)]),
+        ..msg(LEO, at(3, 7, 53), "Bringing snacks and the good coffee")
+    };
     open.messages.extend([
-        (
-            1,
-            msg(
-                MAYA,
-                at(2, 19, 2),
-                "Sunny all weekend! Eagle Ridge on Saturday?",
-            ),
-        ),
+        (SUNNY, sunny),
         (2, msg(LEO, at(2, 19, 4), "I'm in")),
         (TRAIL_LINK, link),
         (4, msg(ME, at(2, 19, 11), "Count me in too")),
@@ -433,10 +543,7 @@ fn hike() -> OpenChat {
         ),
         (TRAILHEAD, sunrise),
         (PICK_UP, pick_up),
-        (
-            8,
-            msg(LEO, at(3, 7, 53), "Bringing snacks and the good coffee"),
-        ),
+        (8, snacks),
         (9, msg(ME, at(3, 7, 55), "On my way!")),
     ]);
     open
@@ -574,6 +681,11 @@ mod tests {
         let screen = rows(&mut app);
         assert!(has(&screen, "INSERT"));
         assert!(has(&screen, "I'll be outside at 6:55"));
+
+        show_scene(&mut app, Scene::Reacting);
+        let screen = rows(&mut app);
+        assert!(has(&screen, " React "));
+        assert!(has(&screen, "fire  :fire:"));
 
         show_scene(&mut app, Scene::Searching);
         assert!(has(&rows(&mut app), "/trail 1 of 2"));

@@ -7,6 +7,7 @@ mod demo;
 mod images;
 mod messages;
 mod notify;
+mod reactions;
 mod search;
 mod settings;
 mod text;

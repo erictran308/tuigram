@@ -39,6 +39,7 @@ impl Theme {
         // Own bubbles are the background tinted blue, like Telegram's. Less
         // tint on the light flavor keeps dark text readable on it.
         let tint = if p.dark { 0.3 } else { 0.2 };
+        let own_bubble = mix(p.base, p.blue, tint);
         Colors {
             bg: p.base,
             fg: p.text,
@@ -60,10 +61,15 @@ impl Theme {
             edit: p.peach,
             attach: p.blue,
             success: p.green,
-            own_bubble: mix(p.base, p.blue, tint),
+            own_bubble,
             own_meta: mix(p.text, p.blue, 0.5),
             other_bubble: p.surface0,
             other_meta: p.subtext0,
+            // Reactions are pills a shade off their bubble; yours are filled
+            // in, as in Telegram.
+            own_reaction: mix(own_bubble, p.text, 0.15),
+            other_reaction: mix(p.surface0, p.text, 0.15),
+            your_reaction: p.blue,
             // Telegram's seven name colors, in Catppuccin's shades.
             names: [p.red, p.peach, p.mauve, p.green, p.teal, p.blue, p.pink],
             // Dark on light in every flavor: not every scanner reads an
@@ -118,6 +124,11 @@ pub struct Colors {
     pub own_meta: Color,
     pub other_bubble: Color,
     pub other_meta: Color,
+    /// Behind a reaction on own bubbles, and on others'.
+    pub own_reaction: Color,
+    pub other_reaction: Color,
+    /// Behind a reaction you added, and the emoji you added in the `R` popup.
+    pub your_reaction: Color,
     /// Sender names in groups, picked by sender id, and the squares standing
     /// in for missing chat photos, by Telegram's accent color id (0 red … 6 pink).
     pub names: [Color; 7],

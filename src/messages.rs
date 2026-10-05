@@ -13,6 +13,7 @@ use tdlib_rs::types::{self, Message};
 use crate::attach::{Attachment, Dropped};
 use crate::chats::content_text;
 use crate::images::Thumbnail;
+use crate::reactions::{self, Reaction, ReactionKind};
 use crate::search::MessageSearch;
 use crate::text;
 use crate::tg::Page;
@@ -161,6 +162,8 @@ pub struct Msg {
     pub edited: bool,
     /// Messages sent together as an album share this id; 0 for the rest.
     pub album: i64,
+    /// Reactions people added, most added first.
+    pub reactions: Vec<Reaction>,
 }
 
 /// What `e` can change in a message, which decides how TDLib is asked.
@@ -562,6 +565,7 @@ impl From<Message> for Msg {
             formatted: body.formatted,
             edited: message.edit_date != 0,
             album: message.media_album_id,
+            reactions: reactions::from_info(message.interaction_info.as_ref()),
         }
     }
 }
@@ -718,6 +722,68 @@ impl OpenChat {
                 Some("This message has no text to edit")
             }
             SendState::Sent => None,
+        }
+    }
+
+    /// The messages drawn as one bubble with message `id`: its album of
+    /// photos or videos, or just itself. Albums of files show each file as
+    /// its own message.
+    fn bubble(&self, id: i64) -> Vec<(i64, &Msg)> {
+        let Some(msg) = self.messages.get(&id) else {
+            return Vec::new();
+        };
+        if msg.album != 0 {
+            let photos: Vec<(i64, &Msg)> = self
+                .messages
+                .iter()
+                .filter(|(_, m)| m.album == msg.album)
+                .map(|(&id, m)| (id, m))
+                .collect();
+            if photos
+                .iter()
+                .all(|(_, m)| m.preview.as_ref().is_some_and(|p| !p.sticker))
+            {
+                return photos;
+            }
+        }
+        vec![(id, msg)]
+    }
+
+    /// What `R` reacts to: the message under the cursor. An album of photos
+    /// or videos is drawn as one bubble, so its reactions go where it
+    /// already has some, else on its first photo, as in Telegram's apps.
+    pub fn react_target(&self) -> Option<i64> {
+        let bubble = self.bubble(self.cursor_id()?);
+        bubble
+            .iter()
+            .find(|(_, m)| !m.reactions.is_empty())
+            .or(bubble.first())
+            .map(|&(id, _)| id)
+    }
+
+    /// What `X` takes back: your reactions on the message under the cursor,
+    /// or on any photo of its album, with the message each is on. Not the
+    /// paid one, which can't be taken back.
+    pub fn your_reactions(&self) -> Vec<(i64, ReactionKind)> {
+        let Some(id) = self.cursor_id() else {
+            return Vec::new();
+        };
+        self.bubble(id)
+            .into_iter()
+            .flat_map(|(id, m)| {
+                m.reactions
+                    .iter()
+                    .filter(|r| r.chosen && r.kind != ReactionKind::Paid)
+                    .map(move |r| (id, r.kind.clone()))
+            })
+            .collect()
+    }
+
+    /// TDLib's `updateMessageInteractionInfo`: someone reacted, or took a
+    /// reaction back.
+    pub fn set_reactions(&mut self, message_id: i64, info: Option<&types::MessageInteractionInfo>) {
+        if let Some(msg) = self.messages.get_mut(&message_id) {
+            msg.reactions = reactions::from_info(info);
         }
     }
 
@@ -1202,6 +1268,7 @@ mod tests {
                     formatted: false,
                     edited: false,
                     album: 0,
+                    reactions: Vec::new(),
                 };
                 (id, msg)
             })
@@ -1350,6 +1417,68 @@ mod tests {
         open.messages.get_mut(&2).unwrap().source_text = "second caption".into();
         open.selected = Some(3);
         assert_eq!(open.edit_target(), Some(3), "with two captions, its own");
+    }
+
+    #[test]
+    fn r_in_an_album_reacts_where_it_already_has_reactions_else_on_its_first_photo() {
+        let mut open = OpenChat::new(1);
+        open.messages = page([1, 2, 3, 4]).into_iter().collect();
+        for id in [1, 2, 3] {
+            let msg = open.messages.get_mut(&id).unwrap();
+            msg.album = 9;
+            msg.preview = Some(Preview {
+                file_id: id as i32,
+                width: 10,
+                height: 10,
+                thumbnail: None,
+                sticker: false,
+            });
+        }
+        open.selected = Some(3);
+        assert_eq!(open.react_target(), Some(1));
+        let heart = Reaction {
+            kind: ReactionKind::Emoji("❤".into()),
+            count: 1,
+            chosen: false,
+        };
+        open.messages.get_mut(&2).unwrap().reactions = vec![heart];
+        assert_eq!(open.react_target(), Some(2));
+        open.selected = Some(4);
+        assert_eq!(open.react_target(), Some(4), "not in the album");
+
+        // X takes back yours from any photo of the album, not others'.
+        let mine = |emoji: &str| Reaction {
+            kind: ReactionKind::Emoji(emoji.into()),
+            count: 2,
+            chosen: true,
+        };
+        open.messages.get_mut(&1).unwrap().reactions = vec![mine("👍")];
+        open.messages.get_mut(&3).unwrap().reactions = vec![
+            mine("🔥"),
+            Reaction {
+                kind: ReactionKind::Paid,
+                count: 1,
+                chosen: true,
+            },
+        ];
+        assert!(open.your_reactions().is_empty(), "nothing of yours on 4");
+        open.selected = Some(2);
+        assert_eq!(
+            open.your_reactions(),
+            [
+                (1, ReactionKind::Emoji("👍".into())),
+                (3, ReactionKind::Emoji("🔥".into())),
+            ]
+        );
+
+        let info = types::MessageInteractionInfo {
+            view_count: 0,
+            forward_count: 0,
+            reply_info: None,
+            reactions: None,
+        };
+        open.set_reactions(2, Some(&info));
+        assert!(open.messages[&2].reactions.is_empty());
     }
 
     #[test]

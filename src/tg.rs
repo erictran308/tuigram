@@ -16,6 +16,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::error::SendError;
 
 use crate::config::{ApiKeys, Config};
+use crate::reactions::{self, Available, ReactionKind};
 
 pub enum TgEvent {
     Update(Box<enums::Update>),
@@ -56,6 +57,12 @@ pub enum TgEvent {
         chat_id: i64,
         message_id: i64,
         editable: Option<bool>,
+    },
+    /// What reactions a message can get; `None` if TDLib couldn't say.
+    Reactions {
+        chat_id: i64,
+        message_id: i64,
+        available: Option<Available>,
     },
     /// A download finished; `path` is `None` if it failed.
     Downloaded {
@@ -429,6 +436,56 @@ impl Tg {
                 deletable,
             });
         });
+    }
+
+    /// Asks what reactions a message can get: the chat decides which, and
+    /// some can't be added without Telegram Premium.
+    pub fn available_reactions(&self, chat_id: i64, message_id: i64) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let row = reactions::COLUMNS as i32;
+            let result =
+                functions::get_message_available_reactions(chat_id, message_id, row, client_id)
+                    .await;
+            let available = match result {
+                Ok(enums::AvailableReactions::AvailableReactions(r)) => Some(Available::from(r)),
+                Err(e) => {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    None
+                }
+            };
+            let _ = tx.send(TgEvent::Reactions {
+                chat_id,
+                message_id,
+                available,
+            });
+        });
+    }
+
+    /// Adds your reaction to a message, or takes it back. TDLib shows the
+    /// change at once with `updateMessageInteractionInfo`.
+    pub fn react(&self, chat_id: i64, message_id: i64, kind: &ReactionKind, add: bool) {
+        let Some(reaction) = kind.to_tdlib() else {
+            return;
+        };
+        if add {
+            self.spawn(functions::add_message_reaction(
+                chat_id,
+                message_id,
+                reaction,
+                false,
+                true,
+                self.client_id,
+            ));
+        } else {
+            self.spawn(functions::remove_message_reaction(
+                chat_id,
+                message_id,
+                reaction,
+                self.client_id,
+            ));
+        }
     }
 
     /// Asks whether a message can be edited: TDLib knows whose it is, and

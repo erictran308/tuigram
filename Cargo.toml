@@ -42,6 +42,7 @@ chrono = "0.4.45"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 dirs = "6.0.0"
 dotenvy = "0.15.7"
+emojis = "0.9.0"
 futures = "0.3.34"
 image = "0.25"
 open = { version = "5.4.4", features = ["shellexecute-on-windows"] }

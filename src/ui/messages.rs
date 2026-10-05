@@ -19,6 +19,7 @@ use crate::images::Images;
 use crate::messages::{
     Fetched, Msg, OpenChat, Preview, Replied, ReplyTo, ScrollAnchor, SendState, Sender,
 };
+use crate::reactions::{self, Reaction};
 use crate::search;
 use crate::settings::Settings;
 use crate::theme::Colors;
@@ -33,6 +34,8 @@ const MAX_STICKER_COLS: usize = 20;
 const MAX_STICKER_ROWS: usize = 10;
 /// Least space between a message's last line and the time beside it.
 const META_GAP: usize = 3;
+/// Space between two reactions under a bubble.
+const CHIP_GAP: usize = 1;
 
 /// Resolves message senders to display names.
 pub struct Names<'a> {
@@ -412,7 +415,20 @@ fn layout(
         };
         let photo = msg.preview.as_ref().map(|p| photo_cells(p, max_text, font));
         let matches = caption.map_or(Vec::new(), |c| search::find(&c.text, query));
-        let bubble = Bubble::new(msg, caption, header, photo, meta, matches, max_text);
+        // An album's reactions go under it, where its time is, whichever
+        // photos they're on.
+        let reactions = match album {
+            Some(a) if a.last => reactions::merge(
+                open.messages
+                    .values()
+                    .filter(|m| m.album == msg.album)
+                    .map(|m| m.reactions.as_slice()),
+            ),
+            Some(_) => Vec::new(),
+            None => msg.reactions.clone(),
+        };
+        let chips = chip_rows(&reactions, max_text);
+        let bubble = Bubble::new(msg, caption, header, photo, meta, chips, matches, max_text);
         // Messages in a row from one sender form a block, with no gap between
         // them. Not in channels, where every post has the same sender, and
         // not for stickers, which have no bubble to join up.
@@ -570,6 +586,65 @@ fn quote(open: &OpenChat, id: i64, reply: &ReplyTo, names: &Names, colors: &Colo
     }
 }
 
+/// A reaction under a bubble: the emoji and how many added it.
+struct Chip {
+    label: String,
+    /// You added it.
+    chosen: bool,
+}
+
+impl Chip {
+    /// Columns it takes, with a space of padding each side.
+    fn width(&self) -> usize {
+        self.label.width() + 2
+    }
+}
+
+/// Columns a row of reactions takes.
+fn chips_width(row: &[Chip]) -> usize {
+    let gaps = row.len().saturating_sub(1) * CHIP_GAP;
+    row.iter().map(Chip::width).sum::<usize>() + gaps
+}
+
+/// Reactions in rows that fit in `max` columns.
+fn chip_rows(reactions: &[Reaction], max: usize) -> Vec<Vec<Chip>> {
+    let mut rows: Vec<Vec<Chip>> = Vec::new();
+    let mut used = 0;
+    for reaction in reactions {
+        let chip = Chip {
+            label: format!(
+                "{} {}",
+                reaction.kind.label(),
+                reactions::count_label(reaction.count)
+            ),
+            chosen: reaction.chosen,
+        };
+        let w = chip.width();
+        match rows.last_mut() {
+            Some(row) if used + CHIP_GAP + w <= max => {
+                used += CHIP_GAP + w;
+                row.push(chip);
+            }
+            _ => {
+                used = w;
+                rows.push(vec![chip]);
+            }
+        }
+    }
+    rows
+}
+
+/// Where a bubble's time goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetaAt {
+    /// After the last line of text.
+    Text,
+    /// After the last row of reactions.
+    Reactions,
+    /// On a row of its own.
+    Own,
+}
+
 /// One message's bubble, measured but not yet drawn, so the bubbles in a
 /// block can all be drawn as wide as the widest.
 struct Bubble<'a> {
@@ -582,12 +657,13 @@ struct Bubble<'a> {
     /// The time, or the send status. `None` inside an album, which has one
     /// time at the bottom.
     meta: Option<String>,
+    /// Reactions, in rows, under the text.
+    chips: Vec<Vec<Chip>>,
     /// Byte ranges of the text to highlight for a search.
     matches: Vec<Range<usize>>,
     /// Wrapped lines, each with the byte offset where it starts in the text.
     text: Vec<(String, usize)>,
-    /// Whether there's a `meta` and it fits on the last text line.
-    meta_inline: bool,
+    meta_at: MetaAt,
     /// Columns the contents need, inside the padding.
     width: usize,
 }
@@ -596,33 +672,46 @@ impl<'a> Bubble<'a> {
     /// Wraps the text of `caption` (usually `msg` itself, but an album's
     /// caption goes with its last photo) and shortens the header to fit
     /// `max_text` columns.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         msg: &'a Msg,
         caption: Option<&'a Msg>,
         header: Header,
         photo: Option<(u16, u16)>,
         meta: Option<String>,
+        chips: Vec<Vec<Chip>>,
         matches: Vec<Range<usize>>,
         max_text: usize,
     ) -> Self {
         let source = caption.map_or("", |c| c.text.as_str());
-        // A photo inside an album has no row under it at all.
-        let text = if source.is_empty() && meta.is_none() {
+        // A photo inside an album has no row under it at all, and one with
+        // reactions has its time beside them.
+        let text = if source.is_empty() && (meta.is_none() || !chips.is_empty()) {
             Vec::new()
         } else {
             wrap(source, max_text)
         };
         let meta_w = meta.as_ref().map_or(0, |m| m.width());
-        let last_w = text.last().map_or(0, |(l, _)| l.width());
-        let meta_inline = meta.is_some() && last_w + META_GAP + meta_w <= max_text;
+        // The time goes beside the last row of reactions, else the last line
+        // of text, if it fits.
+        let last_w = match chips.last() {
+            Some(row) => chips_width(row),
+            None => text.last().map_or(0, |(l, _)| l.width()),
+        };
+        let meta_at = match () {
+            _ if meta.is_none() || last_w + META_GAP + meta_w > max_text => MetaAt::Own,
+            _ if chips.is_empty() => MetaAt::Text,
+            _ => MetaAt::Reactions,
+        };
 
         let mut width = text
             .iter()
             .map(|(l, _)| l.width())
+            .chain(chips.iter().map(|row| chips_width(row)))
             .max()
             .unwrap_or(0)
             .max(meta_w);
-        if meta_inline {
+        if meta_at != MetaAt::Own {
             width = width.max(last_w + META_GAP + meta_w);
         }
         let name = header
@@ -650,9 +739,10 @@ impl<'a> Bubble<'a> {
             header: Header { name, quote },
             photo,
             meta,
+            chips,
             matches,
             text,
-            meta_inline,
+            meta_at,
             width,
         }
     }
@@ -676,9 +766,9 @@ impl<'a> Bubble<'a> {
     }
 
     /// The message as padded, colored lines, `inner` columns wide inside the
-    /// padding (at least its own `width`). `meta` sits at the bottom right, on
-    /// the last text line if it fits. A photo gets blank rows right under the
-    /// header, for [`draw_photos`] to fill.
+    /// padding (at least its own `width`). Reactions go under the text, and
+    /// `meta` at the bottom right, beside the last row if it fits. A photo
+    /// gets blank rows right under the header, for [`draw_photos`] to fill.
     fn rows(self, inner: usize, colors: &Colors) -> Vec<Line<'static>> {
         let sticker = self.sticker();
         let Bubble {
@@ -687,9 +777,10 @@ impl<'a> Bubble<'a> {
             header,
             photo,
             meta,
+            chips,
             matches,
             text,
-            meta_inline,
+            meta_at,
             width,
         } = self;
         let inner = inner.max(width);
@@ -750,7 +841,7 @@ impl<'a> Bubble<'a> {
             let w = line.width();
             let mut line_spans = spans(&line, start);
             if i + 1 == count
-                && meta_inline
+                && meta_at == MetaAt::Text
                 && let Some(meta) = &meta
             {
                 line_spans.push(Span::styled(" ".repeat(inner - w - meta_w), style));
@@ -760,7 +851,42 @@ impl<'a> Bubble<'a> {
                 out.push(row(line_spans, w));
             }
         }
-        if !meta_inline && let Some(meta) = meta {
+        let chip_style = |chosen| {
+            if chosen {
+                Style::new().fg(colors.bg).bg(colors.your_reaction)
+            } else if msg.outgoing {
+                Style::new().fg(colors.fg).bg(colors.own_reaction)
+            } else {
+                Style::new().fg(colors.fg).bg(colors.other_reaction)
+            }
+        };
+        let count = chips.len();
+        for (i, chips) in chips.into_iter().enumerate() {
+            let w = chips_width(&chips);
+            let mut spans = Vec::new();
+            for (j, chip) in chips.into_iter().enumerate() {
+                if j > 0 {
+                    spans.push(Span::styled(" ".repeat(CHIP_GAP), style));
+                }
+                spans.push(Span::styled(
+                    format!(" {} ", chip.label),
+                    chip_style(chip.chosen),
+                ));
+            }
+            if i + 1 == count
+                && meta_at == MetaAt::Reactions
+                && let Some(meta) = &meta
+            {
+                spans.push(Span::styled(" ".repeat(inner - w - meta_w), style));
+                spans.push(Span::styled(meta.clone(), meta_style));
+                out.push(row(spans, inner));
+            } else {
+                out.push(row(spans, w));
+            }
+        }
+        if meta_at == MetaAt::Own
+            && let Some(meta) = meta
+        {
             out.push(row(
                 vec![
                     Span::styled(" ".repeat(inner - meta_w), style),
@@ -886,6 +1012,7 @@ mod tests {
             formatted: false,
             edited: false,
             album: 0,
+            reactions: Vec::new(),
         }
     }
 
@@ -1559,6 +1686,78 @@ mod tests {
         assert!(row.contains("edited "), "{row}");
         let left = &buf[(1, y)];
         assert_eq!((left.symbol(), left.fg), ("▌", colors.edit));
+    }
+
+    fn reaction(emoji: &str, count: i32, chosen: bool) -> Reaction {
+        Reaction {
+            kind: crate::reactions::ReactionKind::Emoji(emoji.into()),
+            count,
+            chosen,
+        }
+    }
+
+    #[test]
+    fn reactions_sit_under_the_text_with_the_time_beside_them_and_yours_filled_in() {
+        let mut open = sample();
+        open.messages.get_mut(&1).unwrap().reactions =
+            vec![reaction("👍", 3, true), reaction("❤", 1, false)];
+        let buf = render_buffer(&mut open, false, &mut images());
+        let colors = Theme::default().colors();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let text = rows.iter().position(|r| r.contains("hi there")).unwrap();
+        let time = Local
+            .timestamp_opt(1_790_000_000, 0)
+            .unwrap()
+            .format("%H:%M")
+            .to_string();
+        let chips = &rows[text + 1];
+        assert!(!rows[text].contains(&time), "{}", rows[text]);
+        assert!(chips.contains('👍') && chips.contains(&time), "{chips}");
+
+        let y = (text + 1) as u16;
+        let at = |symbol: &str| (0..buf.area.width).find(|&x| buf[(x, y)].symbol() == symbol);
+        let thumbs = at("👍").unwrap();
+        assert_eq!(buf[(thumbs, y)].bg, colors.your_reaction);
+        let heart = at("❤\u{FE0F}").expect("❤ drawn two columns wide");
+        assert_eq!(buf[(heart, y)].bg, colors.other_reaction);
+        assert_eq!(buf[(heart + 3, y)].symbol(), "1");
+    }
+
+    #[test]
+    fn reactions_wrap_onto_more_rows_when_they_dont_fit() {
+        // Each takes " 👍 12 ", seven columns, and two fit with the gap.
+        let list = [
+            reaction("👍", 12, false),
+            reaction("🔥", 12, false),
+            reaction("🎉", 12, false),
+        ];
+        let rows = chip_rows(&list, 15);
+        assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1]);
+    }
+
+    #[test]
+    fn an_album_shows_the_reactions_of_all_its_photos_once_under_the_last() {
+        let mut open = OpenChat::new(42);
+        for id in [1, 2] {
+            let mut photo = msg(false, 1_790_000_000, "");
+            photo.album = 7;
+            photo.preview = Some(Preview {
+                file_id: id as i32,
+                width: 100,
+                height: 100,
+                thumbnail: None,
+                sticker: false,
+            });
+            photo.reactions = vec![reaction("🔥", 1, false)];
+            open.messages.insert(id, photo);
+        }
+        let rows = render(&mut open, false);
+        let fire: Vec<&String> = rows.iter().filter(|r| r.contains('🔥')).collect();
+        assert_eq!(fire.len(), 1, "{rows:#?}");
+        let words: Vec<&str> = fire[0].split_whitespace().collect();
+        assert!(words.windows(2).any(|w| w == ["🔥", "2"]), "{}", fire[0]);
     }
 
     #[test]

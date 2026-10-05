@@ -44,6 +44,11 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("y", "Copy the text, a link, or the photo or file"),
             ("r", "Reply"),
             ("e", "Edit your message"),
+            (
+                "R",
+                "React, or take your reaction back (/ finds an emoji by name)",
+            ),
+            ("X", "Take back all your reactions"),
             ("d", "Delete"),
             ("gd", "Go to the message a reply answers"),
             ("Ctrl-o", "Back to the reply"),

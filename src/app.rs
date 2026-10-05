@@ -25,6 +25,7 @@ use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
 use crate::messages::{Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState};
 use crate::notify::{self, Note, Notifications, Notifier};
+use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search::MessageSearch;
 use crate::settings::Settings;
 use crate::text;
@@ -385,6 +386,7 @@ pub struct App {
     /// Shown over everything when Enter or `y` finds several things.
     pub menu: Option<PickMenu>,
     pub delete_menu: Option<DeleteMenu>,
+    pub react_menu: Option<ReactMenu>,
     pub confirm: Option<Confirm>,
     pub settings: Settings,
     settings_path: PathBuf,
@@ -468,6 +470,7 @@ impl App {
             toast: None,
             menu: None,
             delete_menu: None,
+            react_menu: None,
             confirm: None,
             settings,
             settings_path,
@@ -656,6 +659,11 @@ impl App {
                 message_id,
                 editable,
             } => self.on_editable(chat_id, message_id, editable),
+            TgEvent::Reactions {
+                chat_id,
+                message_id,
+                available,
+            } => self.on_available_reactions(chat_id, message_id, available),
             TgEvent::Downloaded { file_id, path } => {
                 if self.opening.remove(&file_id) {
                     match &path {
@@ -801,6 +809,11 @@ impl App {
                     open.set_edited(u.message_id);
                 }
             }
+            Update::MessageInteractionInfo(u) => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
+                    open.set_reactions(u.message_id, u.interaction_info.as_ref());
+                }
+            }
             Update::DeleteMessages(u) if u.is_permanent => {
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
                     open.remove(&u.message_ids);
@@ -891,6 +904,7 @@ impl App {
             Screen::Main if self.confirm.is_some() => self.on_confirm_key(key),
             Screen::Main if self.settings_menu.is_some() => self.on_settings_key(key, ctrl),
             Screen::Main if self.delete_menu.is_some() => self.on_delete_key(key),
+            Screen::Main if self.react_menu.is_some() => self.on_react_key(key, ctrl),
             Screen::Main if self.menu.is_some() => self.on_menu_key(key),
             Screen::Main if self.prompt.is_some() => self.on_prompt_key(key, ctrl),
             Screen::Main if self.focus == Focus::Input => self.on_insert_key(key, ctrl),
@@ -1111,6 +1125,8 @@ impl App {
             (Focus::Messages, KeyCode::Char('t')) if ctrl => self.toggle_as_files(),
             (Focus::Messages, KeyCode::Char('d')) if pending_g => self.go_to_replied(),
             (Focus::Messages, KeyCode::Char('d')) => self.open_delete_menu(),
+            (Focus::Messages, KeyCode::Char('R')) => self.open_react_menu(),
+            (Focus::Messages, KeyCode::Char('X')) => self.remove_reactions(),
             (Focus::Messages, KeyCode::Char('o')) if ctrl => self.jump_back(),
             (Focus::Chats, KeyCode::Enter | KeyCode::Char('l')) => self.open_selected_chat(),
             (Focus::Chats, KeyCode::Char('i')) => {
@@ -1469,6 +1485,7 @@ impl App {
         self.copying.clear();
         self.menu = None;
         self.delete_menu = None;
+        self.react_menu = None;
         self.confirm = None;
         self.settings_menu = None;
         self.prompt = None;
@@ -1824,6 +1841,151 @@ impl App {
         if let Some(open) = &self.open {
             let revoke = choice == DeleteChoice::Everyone;
             self.tg.delete_message(open.chat_id, message_id, revoke);
+        }
+    }
+
+    /// `R`: the emoji to react to the message under the cursor with. The
+    /// popup opens at once and fills in when TDLib says which the chat allows.
+    fn open_react_menu(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let Some((&message_id, msg)) = open
+            .react_target()
+            .and_then(|id| open.messages.get_key_value(&id))
+        else {
+            return;
+        };
+        match msg.state {
+            SendState::Pending => self.status = Some("Wait until it's sent".into()),
+            SendState::Failed => self.status = Some("This message wasn't sent".into()),
+            SendState::Sent => {
+                self.react_menu = Some(ReactMenu::new(message_id, msg.snippet()));
+                self.tg.available_reactions(open.chat_id, message_id);
+            }
+        }
+    }
+
+    /// The emoji you put on a message.
+    fn your_reactions(&self, message_id: i64) -> Vec<String> {
+        let Some(msg) = self.open.as_ref().and_then(|o| o.messages.get(&message_id)) else {
+            return Vec::new();
+        };
+        msg.reactions
+            .iter()
+            .filter(|r| r.chosen)
+            .filter_map(|r| match &r.kind {
+                ReactionKind::Emoji(emoji) => Some(emoji.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn on_available_reactions(
+        &mut self,
+        chat_id: i64,
+        message_id: i64,
+        available: Option<reactions::Available>,
+    ) {
+        // Drop answers for a popup that closed, or a chat that changed.
+        if self.open.as_ref().is_none_or(|o| o.chat_id != chat_id)
+            || self
+                .react_menu
+                .as_ref()
+                .is_none_or(|m| m.message_id != message_id)
+        {
+            return;
+        }
+        // On an error, TDLib's message is already in the status bar.
+        let Some(available) = available else {
+            self.react_menu = None;
+            return;
+        };
+        if available.emoji.is_empty() {
+            self.react_menu = None;
+            let reason = available.reason.unwrap_or("Reactions are off in this chat");
+            self.status = Some(reason.into());
+            return;
+        }
+        let yours = self.your_reactions(message_id);
+        if let Some(menu) = self.react_menu.as_mut() {
+            menu.set_choices(available.emoji, &yours);
+        }
+    }
+
+    /// The reaction popup takes all keys while it's up. In the grid, `h/j/k/l`
+    /// move; after `/`, keys type the search and the arrows move.
+    fn on_react_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let Some(menu) = self.react_menu.as_mut() else {
+            return;
+        };
+        let row = reactions::COLUMNS as isize;
+        let searching = menu.query.is_some();
+        match key.code {
+            KeyCode::Enter => self.react_with_selected(),
+            KeyCode::Left => menu.move_by(-1),
+            KeyCode::Right | KeyCode::Tab => menu.move_by(1),
+            KeyCode::BackTab => menu.move_by(-1),
+            KeyCode::Up => menu.move_by(-row),
+            KeyCode::Down => menu.move_by(row),
+            KeyCode::Char('n') if ctrl => menu.move_by(1),
+            KeyCode::Char('p') if ctrl => menu.move_by(-1),
+            // Esc, or Backspace on an empty search, leaves the search first.
+            KeyCode::Esc if searching => menu.leave_search(),
+            KeyCode::Backspace if menu.query.as_ref().is_some_and(|q| q.is_empty()) => {
+                menu.leave_search();
+            }
+            KeyCode::Backspace if searching => menu.edit_query(|q| {
+                q.pop();
+            }),
+            KeyCode::Char('u' | 'w') if ctrl && searching => menu.edit_query(String::clear),
+            KeyCode::Char(c) if searching && !ctrl => menu.edit_query(|q| q.push(c)),
+            KeyCode::Char('h') => menu.move_by(-1),
+            KeyCode::Char('l') => menu.move_by(1),
+            KeyCode::Char('k') => menu.move_by(-row),
+            KeyCode::Char('j') => menu.move_by(row),
+            KeyCode::Char('/') => menu.edit_query(|_| {}),
+            KeyCode::Char('X') => {
+                self.react_menu = None;
+                self.remove_reactions();
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'R') => self.react_menu = None,
+            _ => {}
+        }
+    }
+
+    /// Enter in the reaction popup: adds the emoji under the cursor, or takes
+    /// it back if it's already yours, and closes the popup.
+    fn react_with_selected(&mut self) {
+        // Nothing to pick while TDLib hasn't answered or nothing matches.
+        let Some((message_id, emoji)) = self
+            .react_menu
+            .as_ref()
+            .and_then(|m| Some((m.message_id, m.current()?.to_string())))
+        else {
+            return;
+        };
+        self.react_menu = None;
+        let add = !self.your_reactions(message_id).contains(&emoji);
+        if let Some(open) = &self.open {
+            let kind = ReactionKind::Emoji(emoji);
+            self.tg.react(open.chat_id, message_id, &kind, add);
+        }
+    }
+
+    /// `X`: takes back all your reactions on the message under the cursor,
+    /// without the popup.
+    fn remove_reactions(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let yours = open.your_reactions();
+        if yours.is_empty() {
+            self.status = Some("You haven't reacted to this message".into());
+            return;
+        }
+        for (message_id, kind) in yours {
+            self.tg.react(open.chat_id, message_id, &kind, false);
         }
     }
 
