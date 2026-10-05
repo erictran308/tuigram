@@ -320,26 +320,20 @@ fn layout(
         .min(width)
         .saturating_sub(2)
         .max(1);
-    let mut lines = Vec::new();
-    let mut placed = Vec::new();
-    let mut photos = Vec::new();
-    let mut prev_day = None;
-    let mut prev_sender = None;
     let query = open.search.as_ref().map_or("", |s| s.query.as_str());
 
+    // Measure every bubble first, so the ones in a block can share a width.
+    let mut measured = Vec::with_capacity(open.messages.len());
+    let mut prev_day = None;
+    let mut prev_sender = None;
+    let mut prev_sticker = false;
     for (&id, msg) in &open.messages {
-        let start = lines.len();
         let time = Local.timestamp_opt(i64::from(msg.date), 0).single();
         let day = time.map(|t| t.date_naive());
-        if day != prev_day {
-            if !lines.is_empty() {
-                lines.push(Line::default());
-            }
-            let label = time.map_or(String::new(), |t| t.format(" %a %-d %b %Y ").to_string());
-            lines.push(Line::from(label).fg(colors.muted).centered());
+        let separator = (day != prev_day).then(|| {
             prev_sender = None;
-        }
-        lines.push(Line::default());
+            time.map_or(String::new(), |t| t.format(" %a %-d %b %Y ").to_string())
+        });
 
         // Like Telegram: name only on the first of several messages in a row.
         let name = (show_names && prev_sender != Some(msg.sender)).then(|| {
@@ -360,12 +354,49 @@ fn layout(
             SendState::Pending => "sending…".into(),
             SendState::Failed => "not sent".into(),
         };
-        let bubble_start = lines.len();
-        let photo_size = msg.preview.as_ref().map(|p| photo_cells(p, max_text, font));
-        let header_rows = header.rows();
+        let photo = msg.preview.as_ref().map(|p| photo_cells(p, max_text, font));
         let matches = search::find(&msg.text, query);
-        let (rows, inner) = bubble(msg, header, photo_size, &meta, &matches, max_text, colors);
-        if let (Some(photo), Some((cols, photo_rows))) = (&msg.preview, photo_size) {
+        let bubble = Bubble::new(msg, header, photo, meta, matches, max_text);
+        // Messages in a row from one sender form a block, with no gap between
+        // them. Not in channels, where every post has the same sender, and
+        // not for stickers, which have no bubble to join up.
+        let sticker = bubble.sticker();
+        let joined = show_names && prev_sender == Some(msg.sender) && !sticker && !prev_sticker;
+        measured.push(Measured {
+            id,
+            separator,
+            joined,
+            bubble,
+        });
+        prev_day = day;
+        prev_sender = Some(msg.sender);
+        prev_sticker = sticker;
+    }
+
+    // Every bubble in a block is as wide as the widest, so they line up.
+    let mut widths = Vec::with_capacity(measured.len());
+    for block in measured.chunk_by(|_, next| next.joined) {
+        let widest = block.iter().map(|m| m.bubble.width).max().unwrap_or(0);
+        widths.extend(std::iter::repeat_n(widest, block.len()));
+    }
+
+    let mut lines = Vec::new();
+    let mut placed = Vec::new();
+    let mut photos = Vec::new();
+    for (m, inner) in measured.into_iter().zip(widths) {
+        let start = lines.len();
+        if let Some(label) = m.separator {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.push(Line::from(label).fg(colors.muted).centered());
+        }
+        if !m.joined {
+            lines.push(Line::default());
+        }
+        let bubble_start = lines.len();
+        let msg = m.bubble.msg;
+        if let (Some(photo), Some((cols, photo_rows))) = (&msg.preview, m.bubble.photo) {
             // Rows are right-aligned for own messages, so measure from the right.
             let bubble_x = if msg.outgoing {
                 width.saturating_sub(inner + 2)
@@ -373,24 +404,32 @@ fn layout(
                 0
             };
             photos.push(PhotoSlot {
-                line: bubble_start + header_rows,
+                line: bubble_start + m.bubble.header.rows(),
                 x: (bubble_x + 1) as u16,
                 cols,
                 rows: photo_rows,
                 photo: photo.clone(),
             });
         }
-        lines.extend(rows);
+        lines.extend(m.bubble.rows(inner, colors));
         placed.push(Placed {
-            id,
+            id: m.id,
             start,
             bubble_start,
             end: lines.len(),
         });
-        prev_day = day;
-        prev_sender = Some(msg.sender);
     }
     (lines, placed, photos)
+}
+
+/// A message measured in the first pass of [`layout`].
+struct Measured<'a> {
+    id: i64,
+    /// The date to show above it, when it's the first message of a day.
+    separator: Option<String>,
+    /// Whether it continues the block above, with no gap between.
+    joined: bool,
+    bubble: Bubble<'a>,
 }
 
 /// Each sender keeps one of the theme's name colors.
@@ -430,132 +469,182 @@ fn quote(open: &OpenChat, id: i64, reply: &ReplyTo, names: &Names, colors: &Colo
     }
 }
 
-/// One message as padded, colored lines. `meta` (the time, or the send status)
-/// sits at the bottom right, on the last text line if it fits. `matches` are
-/// byte ranges of the text to highlight for a search.
-/// Returns the rows and the bubble's inner width. A photo gets `rows` blank
-/// rows of `cols` width right under the header, for [`draw_photos`] to fill.
-fn bubble(
-    msg: &Msg,
+/// One message's bubble, measured but not yet drawn, so the bubbles in a
+/// block can all be drawn as wide as the widest.
+struct Bubble<'a> {
+    msg: &'a Msg,
     header: Header,
+    /// Columns and rows of the photo.
     photo: Option<(u16, u16)>,
-    meta: &str,
-    matches: &[Range<usize>],
-    max_text: usize,
-    colors: &Colors,
-) -> (Vec<Line<'static>>, usize) {
-    let (bg, meta_fg) = if msg.outgoing {
-        (colors.own_bubble, colors.own_meta)
-    } else {
-        (colors.other_bubble, colors.other_meta)
-    };
-    // Stickers float on the pane, without a bubble behind them.
-    let sticker = msg.preview.as_ref().is_some_and(|p| p.sticker);
-    let style = if sticker {
-        Style::new()
-    } else {
-        Style::new().fg(colors.fg).bg(bg)
-    };
-    // Secondary text that still reads on the bubble.
-    let faded = if sticker { colors.muted } else { meta_fg };
-    let meta_color = match msg.state {
-        SendState::Failed => colors.error,
-        _ => faded,
-    };
-    let meta_style = style.fg(meta_color);
-    let text = wrap(&msg.text, max_text);
-    let meta_w = meta.width();
-    let last_w = text.last().map_or(0, |(l, _)| l.width());
-    let meta_inline = last_w + 1 + meta_w <= max_text;
-    let found = style.patch(super::match_style(colors));
-    let spans =
-        |line: &str, start: usize| line_spans(line, start, &msg.link_ranges, matches, style, found);
+    /// The time, or the send status.
+    meta: String,
+    /// Byte ranges of the text to highlight for a search.
+    matches: Vec<Range<usize>>,
+    /// Wrapped lines, each with the byte offset where it starts in the text.
+    text: Vec<(String, usize)>,
+    /// Whether `meta` fits on the last text line.
+    meta_inline: bool,
+    /// Columns the contents need, inside the padding.
+    width: usize,
+}
 
-    let mut inner = text
-        .iter()
-        .map(|(l, _)| l.width())
-        .max()
-        .unwrap_or(0)
-        .max(meta_w);
-    if meta_inline {
-        inner = inner.max(last_w + 1 + meta_w);
-    }
-    let name = header
-        .name
-        .map(|(n, color)| (truncate(&n, max_text), color));
-    if let Some((n, _)) = &name {
-        inner = inner.max(n.width());
-    }
-    // The quote's bar takes two columns.
-    let quote = header.quote.map(|q| Quote {
-        name: truncate(&q.name, max_text.saturating_sub(2)),
-        text: q.text.map(|t| truncate(&t, max_text.saturating_sub(2))),
-        ..q
-    });
-    if let Some(q) = &quote {
-        let text_w = q.text.as_ref().map_or(0, |t| t.width());
-        inner = inner.max(2 + q.name.width().max(text_w));
-    }
-    if let Some((cols, _)) = photo {
-        inner = inner.max(usize::from(cols));
+impl<'a> Bubble<'a> {
+    /// Wraps the text and shortens the header to fit `max_text` columns.
+    fn new(
+        msg: &'a Msg,
+        header: Header,
+        photo: Option<(u16, u16)>,
+        meta: String,
+        matches: Vec<Range<usize>>,
+        max_text: usize,
+    ) -> Self {
+        let text = wrap(&msg.text, max_text);
+        let meta_w = meta.width();
+        let last_w = text.last().map_or(0, |(l, _)| l.width());
+        let meta_inline = last_w + 1 + meta_w <= max_text;
+
+        let mut width = text
+            .iter()
+            .map(|(l, _)| l.width())
+            .max()
+            .unwrap_or(0)
+            .max(meta_w);
+        if meta_inline {
+            width = width.max(last_w + 1 + meta_w);
+        }
+        let name = header
+            .name
+            .map(|(n, color)| (truncate(&n, max_text), color));
+        if let Some((n, _)) = &name {
+            width = width.max(n.width());
+        }
+        // The quote's bar takes two columns.
+        let quote = header.quote.map(|q| Quote {
+            name: truncate(&q.name, max_text.saturating_sub(2)),
+            text: q.text.map(|t| truncate(&t, max_text.saturating_sub(2))),
+            ..q
+        });
+        if let Some(q) = &quote {
+            let text_w = q.text.as_ref().map_or(0, |t| t.width());
+            width = width.max(2 + q.name.width().max(text_w));
+        }
+        if let Some((cols, _)) = photo {
+            width = width.max(usize::from(cols));
+        }
+        Bubble {
+            msg,
+            header: Header { name, quote },
+            photo,
+            meta,
+            matches,
+            text,
+            meta_inline,
+            width,
+        }
     }
 
-    // Pads a row to the bubble width (one column of padding each side) and
-    // puts own messages on the right.
-    let row = |mut spans: Vec<Span<'static>>, used: usize| {
-        spans.insert(0, Span::styled(" ", style));
-        spans.push(Span::styled(" ".repeat(inner - used + 1), style));
-        let line = Line::from(spans);
-        if msg.outgoing {
-            line.right_aligned()
+    /// Stickers float on the pane, without a bubble behind them.
+    fn sticker(&self) -> bool {
+        self.msg.preview.as_ref().is_some_and(|p| p.sticker)
+    }
+
+    /// The message as padded, colored lines, `inner` columns wide inside the
+    /// padding (at least its own `width`). `meta` sits at the bottom right, on
+    /// the last text line if it fits. A photo gets blank rows right under the
+    /// header, for [`draw_photos`] to fill.
+    fn rows(self, inner: usize, colors: &Colors) -> Vec<Line<'static>> {
+        let sticker = self.sticker();
+        let Bubble {
+            msg,
+            header,
+            photo,
+            meta,
+            matches,
+            text,
+            meta_inline,
+            width,
+        } = self;
+        let inner = inner.max(width);
+        let (bg, meta_fg) = if msg.outgoing {
+            (colors.own_bubble, colors.own_meta)
         } else {
-            line
-        }
-    };
-
-    let mut out = Vec::new();
-    if let Some((n, color)) = name {
-        let w = n.width();
-        out.push(row(vec![Span::styled(n, style.fg(color).bold())], w));
-    }
-    if let Some(q) = quote {
-        let accent = style.fg(q.color.unwrap_or(faded));
-        let bar = || Span::styled("▎ ", accent);
-        let w = q.name.width();
-        out.push(row(vec![bar(), Span::styled(q.name, accent.bold())], 2 + w));
-        if let Some(text) = q.text {
-            let w = text.width();
-            out.push(row(vec![bar(), Span::styled(text, style.fg(faded))], 2 + w));
-        }
-    }
-    if let Some((cols, rows)) = photo {
-        for _ in 0..rows {
-            let blank = " ".repeat(usize::from(cols));
-            out.push(row(vec![Span::styled(blank, style)], usize::from(cols)));
-        }
-    }
-    let count = text.len();
-    for (i, (line, start)) in text.into_iter().enumerate() {
-        let w = line.width();
-        let mut line_spans = spans(&line, start);
-        if i + 1 == count && meta_inline {
-            line_spans.push(Span::styled(" ".repeat(inner - w - meta_w), style));
-            line_spans.push(Span::styled(meta.to_string(), meta_style));
-            out.push(row(line_spans, inner));
+            (colors.other_bubble, colors.other_meta)
+        };
+        let style = if sticker {
+            Style::new()
         } else {
-            out.push(row(line_spans, w));
+            Style::new().fg(colors.fg).bg(bg)
+        };
+        // Secondary text that still reads on the bubble.
+        let faded = if sticker { colors.muted } else { meta_fg };
+        let meta_color = match msg.state {
+            SendState::Failed => colors.error,
+            _ => faded,
+        };
+        let meta_style = style.fg(meta_color);
+        let meta_w = meta.width();
+        let found = style.patch(super::match_style(colors));
+        let spans = |line: &str, start: usize| {
+            line_spans(line, start, &msg.link_ranges, &matches, style, found)
+        };
+
+        // Pads a row to the bubble width (one column of padding each side) and
+        // puts own messages on the right.
+        let row = |mut spans: Vec<Span<'static>>, used: usize| {
+            spans.insert(0, Span::styled(" ", style));
+            spans.push(Span::styled(" ".repeat(inner - used + 1), style));
+            let line = Line::from(spans);
+            if msg.outgoing {
+                line.right_aligned()
+            } else {
+                line
+            }
+        };
+
+        let mut out = Vec::new();
+        if let Some((n, color)) = header.name {
+            let w = n.width();
+            out.push(row(vec![Span::styled(n, style.fg(color).bold())], w));
         }
+        if let Some(q) = header.quote {
+            let accent = style.fg(q.color.unwrap_or(faded));
+            let bar = || Span::styled("▎ ", accent);
+            let w = q.name.width();
+            out.push(row(vec![bar(), Span::styled(q.name, accent.bold())], 2 + w));
+            if let Some(text) = q.text {
+                let w = text.width();
+                out.push(row(vec![bar(), Span::styled(text, style.fg(faded))], 2 + w));
+            }
+        }
+        if let Some((cols, rows)) = photo {
+            for _ in 0..rows {
+                let blank = " ".repeat(usize::from(cols));
+                out.push(row(vec![Span::styled(blank, style)], usize::from(cols)));
+            }
+        }
+        let count = text.len();
+        for (i, (line, start)) in text.into_iter().enumerate() {
+            let w = line.width();
+            let mut line_spans = spans(&line, start);
+            if i + 1 == count && meta_inline {
+                line_spans.push(Span::styled(" ".repeat(inner - w - meta_w), style));
+                line_spans.push(Span::styled(meta.clone(), meta_style));
+                out.push(row(line_spans, inner));
+            } else {
+                out.push(row(line_spans, w));
+            }
+        }
+        if !meta_inline {
+            out.push(row(
+                vec![
+                    Span::styled(" ".repeat(inner - meta_w), style),
+                    Span::styled(meta, meta_style),
+                ],
+                inner,
+            ));
+        }
+        out
     }
-    if !meta_inline {
-        out.push(row(
-            vec![
-                Span::styled(" ".repeat(inner - meta_w), style),
-                Span::styled(meta.to_string(), meta_style),
-            ],
-            inner,
-        ));
-    }
-    (out, inner)
 }
 
 /// Word-wraps text to `width` columns, keeping the message's own line breaks.
@@ -808,6 +897,50 @@ mod tests {
             !channel
                 .iter()
                 .any(|l| l.contains("Chardy") || l.contains("Eric"))
+        );
+    }
+
+    #[test]
+    fn messages_in_a_row_from_one_sender_form_one_even_block() {
+        let mut open = OpenChat::new(42);
+        let day = 1_790_000_000;
+        open.messages.insert(1, msg(false, day, "short"));
+        open.messages
+            .insert(2, msg(false, day + 60, "a somewhat longer message"));
+        open.messages
+            .insert(3, msg(true, day + 120, "a longer one of mine"));
+        open.messages.insert(4, msg(true, day + 180, "ok"));
+        let colors = Theme::default().colors();
+        let buf = render_buffer(&mut open, false, &mut images());
+        let row = |needle: &str| {
+            (0..buf.area.height)
+                .find(|&y| {
+                    let text: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                    text.contains(needle)
+                })
+                .unwrap()
+        };
+        // Columns painted with a bubble's background on row `y`.
+        let painted = |y: u16, bg: Color| -> Vec<u16> {
+            (0..buf.area.width)
+                .filter(|&x| buf[(x, y)].bg == bg)
+                .collect()
+        };
+
+        let (short, longer) = (row("short"), row("somewhat"));
+        assert_eq!(longer, short + 1, "no gap inside a block");
+        assert_eq!(
+            painted(short, colors.other_bubble),
+            painted(longer, colors.other_bubble),
+            "as wide as the widest"
+        );
+
+        let (mine, ok) = (row("one of mine"), row("ok "));
+        assert!(mine > longer + 1, "a gap between blocks");
+        assert_eq!(ok, mine + 1);
+        assert_eq!(
+            painted(mine, colors.own_bubble),
+            painted(ok, colors.own_bubble)
         );
     }
 
