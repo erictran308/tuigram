@@ -94,6 +94,25 @@ impl Preview {
         })
     }
 
+    /// A sticker small, as the sticker panel shows it: its thumbnail, a
+    /// fraction of the download, else the sticker itself if it's a still
+    /// image.
+    pub fn sticker_thumbnail(sticker: &types::Sticker) -> Option<Self> {
+        let thumbnail = sticker.thumbnail.as_ref().filter(|t| decodable(&t.format));
+        let file_id = match (thumbnail, &sticker.format) {
+            (Some(thumbnail), _) => thumbnail.file.id,
+            (None, StickerFormat::Webp) => sticker.sticker.id,
+            (None, _) => return None,
+        };
+        Some(Self {
+            file_id,
+            width: sticker.width.max(1) as u32,
+            height: sticker.height.max(1) as u32,
+            thumbnail: None,
+            sticker: true,
+        })
+    }
+
     /// A video's still thumbnail, if it's in a format we can decode
     /// (some are tiny MPEG-4 clips).
     fn from_video(video: &types::Video) -> Option<Self> {
@@ -1183,6 +1202,24 @@ mod tests {
         let unknown = body(&sticker(StickerFormat::Tgs, Some(ThumbnailFormat::Tgs)));
         assert!(unknown.preview.is_none());
         assert_eq!(unknown.text, "[Sticker 😀]");
+    }
+
+    #[test]
+    fn the_sticker_panel_shows_a_thumbnail_or_the_still_sticker_itself() {
+        let shown = |format, thumbnail| {
+            let MessageContent::MessageSticker(m) = sticker(format, thumbnail) else {
+                unreachable!();
+            };
+            Preview::sticker_thumbnail(&m.sticker).map(|p| p.file_id)
+        };
+        let webp = Some(ThumbnailFormat::Webp);
+        assert_eq!(
+            shown(StickerFormat::Webp, webp),
+            Some(7),
+            "the smaller file"
+        );
+        assert_eq!(shown(StickerFormat::Webp, None), Some(8));
+        assert_eq!(shown(StickerFormat::Tgs, Some(ThumbnailFormat::Tgs)), None);
     }
 
     #[test]

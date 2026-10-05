@@ -28,6 +28,7 @@ use crate::notify::{self, Note, Notifications, Notifier};
 use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search::MessageSearch;
 use crate::settings::Settings;
+use crate::stickers::{self, Source, StickerPanel};
 use crate::text;
 use crate::tg::{Deletable, Found, Page, Tagged, Tg, TgEvent};
 use crate::theme::Theme;
@@ -387,9 +388,13 @@ pub struct App {
     pub menu: Option<PickMenu>,
     pub delete_menu: Option<DeleteMenu>,
     pub react_menu: Option<ReactMenu>,
+    /// Opened with Tab while writing; only open in Insert mode.
+    pub stickers: Option<StickerPanel>,
     pub confirm: Option<Confirm>,
     pub settings: Settings,
     settings_path: PathBuf,
+    /// You have Telegram Premium, so Premium stickers can be sent.
+    premium: bool,
     /// API credentials from the environment, which win over saved ones.
     env_keys: Option<ApiKeys>,
     /// The key TDLib has; `None` until it gets one.
@@ -471,9 +476,11 @@ impl App {
             menu: None,
             delete_menu: None,
             react_menu: None,
+            stickers: None,
             confirm: None,
             settings,
             settings_path,
+            premium: false,
             env_keys,
             keys_source: None,
             built_in_rejected: false,
@@ -664,6 +671,21 @@ impl App {
                 message_id,
                 available,
             } => self.on_available_reactions(chat_id, message_id, available),
+            TgEvent::Stickers { source, stickers } => self.on_stickers(source, stickers),
+            TgEvent::StickerSets(sets) => {
+                if let Some(panel) = self.stickers.as_mut() {
+                    panel.set_sets(sets.unwrap_or_default());
+                    self.load_sticker_set();
+                }
+            }
+            TgEvent::StickersFound { query, stickers } => {
+                let premium = self.premium;
+                if let Some(panel) = self.stickers.as_mut() {
+                    // After an error, TDLib's message is in the status bar.
+                    let found = stickers::convert(&stickers.unwrap_or_default(), premium);
+                    panel.set_found(&query, found);
+                }
+            }
             TgEvent::Downloaded { file_id, path } => {
                 if self.opening.remove(&file_id) {
                     match &path {
@@ -756,6 +778,11 @@ impl App {
             Update::ChatAccentColors(u) => self.chats.set_accent(u.chat_id, u.accent_color_id),
             Update::AccentColors(u) => self.chats.set_accent_colors(&u.colors),
             Update::ChatReadInbox(u) => self.chats.set_unread(u.chat_id, u.unread_count),
+            // TDLib drops the option, rather than setting it false, when
+            // Premium ends.
+            Update::Option(u) if u.name == "is_premium" => {
+                self.premium = matches!(u.value, OptionValue::Boolean(v) if v.value);
+            }
             Update::Option(u) if u.name == "my_id" => {
                 if let OptionValue::Integer(v) = u.value {
                     self.chats.set_my_id(v.value);
@@ -907,8 +934,15 @@ impl App {
             Screen::Main if self.react_menu.is_some() => self.on_react_key(key, ctrl),
             Screen::Main if self.menu.is_some() => self.on_menu_key(key),
             Screen::Main if self.prompt.is_some() => self.on_prompt_key(key, ctrl),
+            Screen::Main if self.focus == Focus::Input && self.stickers.is_some() => {
+                self.on_sticker_key(key, ctrl)
+            }
             Screen::Main if self.focus == Focus::Input => self.on_insert_key(key, ctrl),
             Screen::Main => self.on_normal_key(key, ctrl),
+        }
+        // The sticker panel is part of Insert mode, and closes with it.
+        if self.focus != Focus::Input {
+            self.stickers = None;
         }
     }
 
@@ -1166,6 +1200,7 @@ impl App {
             KeyCode::Char('v') if ctrl => self.paste_clipboard(),
             KeyCode::Char('z') if ctrl => self.undo_drop(),
             KeyCode::Char('t') if ctrl => self.toggle_as_files(),
+            KeyCode::Tab => self.open_stickers(),
             _ => {
                 if self.composer.input(key) {
                     self.on_composer_edit();
@@ -1486,6 +1521,9 @@ impl App {
         self.menu = None;
         self.delete_menu = None;
         self.react_menu = None;
+        self.stickers = None;
+        // The next account says if it has Premium; one without may not.
+        self.premium = false;
         self.confirm = None;
         self.settings_menu = None;
         self.prompt = None;
@@ -1989,6 +2027,121 @@ impl App {
         }
     }
 
+    /// Tab while writing: the sticker panel. It opens at once and fills in
+    /// as TDLib sends your recent and favorite stickers and your sets.
+    fn open_stickers(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        if open.editing.is_some() {
+            self.status = Some("An edit can't change a message into a sticker".into());
+            return;
+        }
+        self.stickers = Some(StickerPanel::new(open.chat_id));
+        self.tg.stickers(Source::Recent);
+        self.tg.stickers(Source::Favorites);
+        self.tg.sticker_sets();
+    }
+
+    /// The sticker panel takes the keys while it's open. In the grid,
+    /// `h/j/k/l` move and `H/L` switch tabs; after `/`, keys type the search
+    /// and the arrows move.
+    fn on_sticker_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let Some(panel) = self.stickers.as_mut() else {
+            return;
+        };
+        let searching = panel.query.is_some();
+        let before = panel.search_query();
+        match key.code {
+            KeyCode::Enter => self.send_sticker(),
+            KeyCode::Char('c') if ctrl => self.leave_insert(),
+            KeyCode::Left => panel.move_by(-1),
+            KeyCode::Right => panel.move_by(1),
+            KeyCode::Up => panel.move_rows(-1),
+            KeyCode::Down => panel.move_rows(1),
+            KeyCode::Char('n') if ctrl => panel.move_by(1),
+            KeyCode::Char('p') if ctrl => panel.move_by(-1),
+            // Esc, or Backspace on an empty search, leaves the search first.
+            KeyCode::Esc if searching => panel.leave_search(),
+            KeyCode::Backspace if panel.query.as_ref().is_some_and(|q| q.is_empty()) => {
+                panel.leave_search();
+            }
+            KeyCode::Backspace if searching => panel.edit_query(|q| {
+                q.pop();
+            }),
+            KeyCode::Char('u' | 'w') if ctrl && searching => panel.edit_query(String::clear),
+            KeyCode::Char(c) if searching && !ctrl => panel.edit_query(|q| q.push(c)),
+            KeyCode::Char('h') => panel.move_by(-1),
+            KeyCode::Char('l') => panel.move_by(1),
+            KeyCode::Char('k') => panel.move_rows(-1),
+            KeyCode::Char('j') => panel.move_rows(1),
+            KeyCode::Char('H') => panel.switch(-1),
+            KeyCode::Char('L') => panel.switch(1),
+            KeyCode::Char('/') => panel.edit_query(|_| {}),
+            // Back to writing.
+            KeyCode::Esc | KeyCode::Tab | KeyCode::Char('i' | 'q') => self.stickers = None,
+            _ => {}
+        }
+        self.find_stickers(before);
+        self.load_sticker_set();
+    }
+
+    /// Asks TDLib for what the panel's search finds, if it's changed from
+    /// `before`.
+    fn find_stickers(&mut self, before: Option<String>) {
+        if let Some(panel) = &self.stickers
+            && let Some(query) = panel.search_query()
+            && Some(&query) != before.as_ref()
+        {
+            self.tg.find_stickers(panel.chat_id, query);
+        }
+    }
+
+    /// Asks for the stickers of the set the panel shows, the first time.
+    fn load_sticker_set(&mut self) {
+        if let Some(set_id) = self.stickers.as_mut().and_then(StickerPanel::pending_set) {
+            self.tg.stickers(Source::Set(set_id));
+        }
+    }
+
+    fn on_stickers(&mut self, source: Source, stickers: Option<Vec<tdlib_rs::types::Sticker>>) {
+        let premium = self.premium;
+        let Some(panel) = self.stickers.as_mut() else {
+            return;
+        };
+        // After an error, TDLib's message is in the status bar, and the tab
+        // shows no stickers.
+        let stickers = stickers::convert(&stickers.unwrap_or_default(), premium);
+        panel.set_stickers(source, stickers);
+        // An empty Recent going away can show a set.
+        self.load_sticker_set();
+    }
+
+    /// Enter in the sticker panel: sends the sticker under the cursor, as the
+    /// reply if one is being written, and closes the panel. What's written
+    /// in the composer stays there.
+    fn send_sticker(&mut self) {
+        let Some(panel) = &self.stickers else {
+            return;
+        };
+        // Nothing to send while it's loading or nothing was found.
+        let Some(sticker) = panel.current().cloned() else {
+            return;
+        };
+        let Some(open) = self.open.as_mut().filter(|o| o.chat_id == panel.chat_id) else {
+            return;
+        };
+        let reply_to = open.reply.take().map(|r| r.id);
+        self.tg.send_sticker(open.chat_id, &sticker, reply_to);
+        self.stickers = None;
+        // The message arriving ends the typing status for everyone.
+        self.typing = None;
+        if self.settings.normal_after_send {
+            self.focus = Focus::Messages;
+        }
+        self.jump_to_newest();
+    }
+
     /// `gd`: from a reply to the message it answers, loading the history
     /// around it if needed. Ctrl-o comes back.
     fn go_to_replied(&mut self) {
@@ -2206,6 +2359,20 @@ impl App {
         let editing = self.open.as_ref().is_some_and(|o| o.editing.is_some());
         if !editing && let Some(paths) = attach::pasted_paths(&text) {
             self.attach(paths, Some(text));
+            return;
+        }
+        if self.focus == Focus::Input
+            && let Some(panel) = self.stickers.as_mut()
+        {
+            // Into the sticker search: pasting an emoji is a quick way to
+            // find stickers for it.
+            let before = panel.search_query();
+            let line = text::clean(&text)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            panel.edit_query(|q| q.push_str(&line));
+            self.find_stickers(before);
             return;
         }
         if self.focus == Focus::Input {

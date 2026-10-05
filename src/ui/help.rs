@@ -82,7 +82,18 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Ctrl-t",
                 "Send attached photos as files, uncompressed, or back",
             ),
+            ("Tab", "Stickers"),
             ("Esc / Ctrl-c", "Back to Normal mode"),
+        ],
+    ),
+    (
+        "Stickers",
+        &[
+            ("h / j / k / l", "Move"),
+            ("H / L", "Previous / next tab: Recent, Favorites, your sets"),
+            ("Enter", "Send the sticker, or the reply"),
+            ("/", "Find stickers by emoji or word"),
+            ("Tab / Esc", "Back to writing"),
         ],
     ),
     (

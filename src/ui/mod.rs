@@ -38,6 +38,7 @@ mod chat_list;
 mod help;
 mod messages;
 mod qr;
+mod stickers;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let colors = app.settings.theme.colors();
@@ -316,9 +317,17 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 rows += BAR_ROWS;
             }
             rows += attachment_rows(&open.attachments);
-            let [history, composer] =
-                Layout::vertical([Constraint::Fill(1), Constraint::Length(rows + 2)])
-                    .areas(chat_area);
+            let panel = app.stickers.as_mut().filter(|_| app.focus == Focus::Input);
+            let panel_rows = match panel {
+                Some(_) => stickers::height(chat_area.height.saturating_sub(rows + 2)),
+                None => 0,
+            };
+            let [history, panel_area, composer] = Layout::vertical([
+                Constraint::Fill(1),
+                Constraint::Length(panel_rows),
+                Constraint::Length(rows + 2),
+            ])
+            .areas(chat_area);
             messages::draw(
                 frame,
                 history,
@@ -328,6 +337,10 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 app.focus == Focus::Messages,
                 &app.settings,
             );
+            if let Some(panel) = panel {
+                stickers::draw(frame, panel_area, panel, &mut app.images, colors);
+            }
+            // While the sticker panel is open, keys go there, not to the text.
             draw_composer(
                 frame,
                 &mut app.composer,
@@ -336,7 +349,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 open.as_files,
                 &names,
                 composer,
-                app.focus == Focus::Input,
+                app.focus == Focus::Input && panel_rows == 0,
                 colors,
             );
         }
@@ -1164,6 +1177,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     let attaching = app.open.as_ref().is_some_and(|o| !o.attachments.is_empty());
     let dropped = app.open.as_ref().is_some_and(|o| o.dropped.is_some());
     let insert = Span::from(" INSERT ").fg(colors.bg).bg(colors.insert);
+    let sticker = Span::from(" STICKERS ").fg(colors.bg).bg(colors.insert);
+    let picking = app.focus == Focus::Input && app.stickers.is_some();
     let (mode, hints) = match app.focus {
         _ if app
             .confirm
@@ -1217,6 +1232,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             normal,
             "  j/k newer/older · y copy · r reply · R react · X unreact · e edit · d delete · Enter open media · i write · a attach · p paste · / search · gg/G oldest/newest · h back · : commands · ? help · q quit",
         ),
+        _ if picking && app.stickers.as_ref().is_some_and(|p| p.query.is_some()) => (
+            sticker,
+            "  type an emoji or a word, like cat · arrows choose · Enter send · Esc back",
+        ),
+        _ if picking => (
+            sticker,
+            "  h/j/k/l choose · H/L previous/next tab · Enter send · / search · Tab or Esc back to writing",
+        ),
         Focus::Input if editing => (
             insert,
             "  Enter save · Alt-Enter or Ctrl-j new line · Esc normal mode · Esc Esc cancel edit",
@@ -1231,11 +1254,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Input if replying => (
             insert,
-            "  Enter send reply · Alt-Enter or Ctrl-j new line · Esc normal mode · Esc Esc cancel reply",
+            "  Enter send reply · Alt-Enter or Ctrl-j new line · Tab stickers · Esc normal mode · Esc Esc cancel reply",
         ),
         Focus::Input => (
             insert,
-            "  Enter send · Alt-Enter or Ctrl-j new line · Ctrl-v paste photo or file · Esc normal mode",
+            "  Enter send · Alt-Enter or Ctrl-j new line · Tab stickers · Ctrl-v paste photo or file · Esc normal mode",
         ),
     };
     let popup = app.settings_menu.is_some()

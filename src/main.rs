@@ -10,6 +10,7 @@ mod notify;
 mod reactions;
 mod search;
 mod settings;
+mod stickers;
 mod text;
 mod tg;
 mod theme;

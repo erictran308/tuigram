@@ -26,6 +26,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Vim all the way.** Normal mode to move around (`j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u`), `i` to write, `Esc` to stop. Your hands never leave the keyboard.
 - **Photos and stickers, inline.** Real images in kitty, Ghostty, WezTerm and iTerm2, and block-character previews in any other terminal.
 - **React with emoji.** `R` opens the emoji the chat allows, and `/` finds one by name (`heart`, `fire`, `+1`). `X` takes yours back.
+- **Send stickers.** `Tab` while writing opens your recent and favorite stickers and the sets you added, and `/` finds more by emoji or word.
 - **Search everything.** `/` in the chat list filters chats as you type. `/` inside a chat searches its entire history, and `n`/`N` jump between matches, highlighted where they appear.
 - **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, reactions under them, date separators, "typing…" while someone writes to you, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app.
@@ -133,6 +134,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `Enter` / `l` | Open a chat, or the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens) |
 | `h` / `Esc` | Back to the chat list |
 | `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
+| `Tab` | While writing: stickers. `h/j/k/l` pick one, `H` / `L` switch between Recent, Favorites and your sets, `/` finds stickers by emoji or word, `Enter` sends |
 | `y` | Copy the selected message: its text, a link, or the photo or file |
 | `r` | Reply to the selected message (`Esc` twice cancels the reply) |
 | `e` | Edit your message: `Enter` saves, `Esc` twice cancels |

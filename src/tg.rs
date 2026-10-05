@@ -17,6 +17,7 @@ use tokio::sync::mpsc::error::SendError;
 
 use crate::config::{ApiKeys, Config};
 use crate::reactions::{self, Available, ReactionKind};
+use crate::stickers::{Source, Sticker};
 
 pub enum TgEvent {
     Update(Box<enums::Update>),
@@ -64,6 +65,19 @@ pub enum TgEvent {
         message_id: i64,
         available: Option<Available>,
     },
+    /// Stickers for a tab of the sticker panel; `None` if TDLib couldn't
+    /// send them.
+    Stickers {
+        source: Source,
+        stickers: Option<Vec<types::Sticker>>,
+    },
+    /// Your sticker sets, by id and title; `None` if TDLib couldn't say.
+    StickerSets(Option<Vec<(i64, String)>>),
+    /// Stickers found for a search in the sticker panel.
+    StickersFound {
+        query: String,
+        stickers: Option<Vec<types::Sticker>>,
+    },
     /// A download finished; `path` is `None` if it failed.
     Downloaded {
         file_id: i32,
@@ -108,6 +122,9 @@ const QUIET_DOWNLOAD_PRIORITY: i32 = 8;
 /// Chats with notifications at once. Only new ones are announced, so a few
 /// is plenty; TDLib allows up to 25.
 const NOTIFICATION_GROUPS: i64 = 5;
+
+/// Stickers a search in the sticker panel asks for.
+const STICKER_SEARCH_LIMIT: i32 = 100;
 
 unsafe extern "C" {
     /// TDLib's synchronous entry point, for the few requests that need no
@@ -567,6 +584,100 @@ impl Tg {
             content,
             self.client_id,
         ));
+    }
+
+    /// Sends a sticker, as a reply to message `reply_to` if given.
+    pub fn send_sticker(&self, chat_id: i64, sticker: &Sticker, reply_to: Option<i64>) {
+        let content = enums::InputMessageContent::InputMessageSticker(types::InputMessageSticker {
+            sticker: enums::InputFile::Id(types::InputFileId {
+                id: sticker.file_id,
+            }),
+            thumbnail: None,
+            width: sticker.width,
+            height: sticker.height,
+            emoji: sticker.emoji.clone(),
+        });
+        let reply_to = reply_to.map(reply_to_message);
+        self.spawn(functions::send_message(
+            chat_id,
+            None,
+            reply_to,
+            None,
+            content,
+            self.client_id,
+        ));
+    }
+
+    /// Asks for the stickers of a tab of the sticker panel.
+    pub fn stickers(&self, source: Source) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let result = match source {
+                Source::Recent => functions::get_recent_stickers(false, client_id)
+                    .await
+                    .map(|enums::Stickers::Stickers(s)| s.stickers),
+                Source::Favorites => functions::get_favorite_stickers(client_id)
+                    .await
+                    .map(|enums::Stickers::Stickers(s)| s.stickers),
+                Source::Set(id) => functions::get_sticker_set(id, client_id)
+                    .await
+                    .map(|enums::StickerSet::StickerSet(s)| s.stickers),
+            };
+            let stickers = match result {
+                Ok(stickers) => Some(stickers),
+                Err(e) => {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    None
+                }
+            };
+            let _ = tx.send(TgEvent::Stickers { source, stickers });
+        });
+    }
+
+    /// Asks for the sticker sets you added, for the sticker panel's tabs.
+    pub fn sticker_sets(&self) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let result =
+                functions::get_installed_sticker_sets(enums::StickerType::Regular, client_id).await;
+            let sets = match result {
+                Ok(enums::StickerSets::StickerSets(s)) => {
+                    Some(s.sets.into_iter().map(|set| (set.id, set.title)).collect())
+                }
+                Err(e) => {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    None
+                }
+            };
+            let _ = tx.send(TgEvent::StickerSets(sets));
+        });
+    }
+
+    /// Finds stickers by emoji, or by a word their emoji or set are known
+    /// by: your own first, then others Telegram suggests.
+    pub fn find_stickers(&self, chat_id: i64, query: String) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let result = functions::get_stickers(
+                enums::StickerType::Regular,
+                query.clone(),
+                STICKER_SEARCH_LIMIT,
+                chat_id,
+                client_id,
+            )
+            .await;
+            let stickers = match result {
+                Ok(enums::Stickers::Stickers(s)) => Some(s.stickers),
+                Err(e) => {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    None
+                }
+            };
+            let _ = tx.send(TgEvent::StickersFound { query, stickers });
+        });
     }
 
     /// Sends files in order, one album per group (a group of one is a plain
