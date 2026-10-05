@@ -10,6 +10,7 @@ use tdlib_rs::enums::{
 };
 use tdlib_rs::types::{self, Message};
 
+use crate::attach::{Attachment, Dropped};
 use crate::chats::content_text;
 use crate::images::Thumbnail;
 use crate::search::MessageSearch;
@@ -158,6 +159,8 @@ pub struct Msg {
     pub formatted: bool,
     /// Changed after it was sent.
     pub edited: bool,
+    /// Messages sent together as an album share this id; 0 for the rest.
+    pub album: i64,
 }
 
 /// What `e` can change in a message, which decides how TDLib is asked.
@@ -182,6 +185,8 @@ pub struct Editing {
     /// cancelled.
     pub draft: String,
     pub reply: Option<Replied>,
+    /// Files waiting to be sent, put back too: an edit can't add any.
+    pub attachments: Vec<Attachment>,
 }
 
 impl Msg {
@@ -556,6 +561,7 @@ impl From<Message> for Msg {
             editable: body.editable,
             formatted: body.formatted,
             edited: message.edit_date != 0,
+            album: message.media_album_id,
         }
     }
 }
@@ -600,6 +606,17 @@ pub struct OpenChat {
     pub reply: Option<Replied>,
     /// Set with `e`; Enter saves the composer's text into this message.
     pub editing: Option<Editing>,
+    /// Files the next message sends, with the composer's text as caption.
+    pub attachments: Vec<Attachment>,
+    /// The paste that added the last attachments, while Ctrl-z can turn
+    /// them back into text.
+    pub dropped: Option<Dropped>,
+    /// Ctrl-t: the attached photos go as files, uncompressed. Ends with the
+    /// message it was for.
+    pub as_files: bool,
+    /// How far files on their way to Telegram are, in percent, by TDLib
+    /// file id.
+    pub uploads: HashMap<i32, u8>,
     /// What replies answer when it isn't among the loaded messages, by the
     /// id of the reply.
     pub replied: HashMap<i64, Fetched>,
@@ -621,8 +638,67 @@ impl OpenChat {
             search: None,
             reply: None,
             editing: None,
+            attachments: Vec::new(),
+            dropped: None,
+            as_files: false,
+            uploads: HashMap::new(),
             replied: HashMap::new(),
             jumps: Vec::new(),
+        }
+    }
+
+    /// Ctrl-z after a paste of file paths: takes back the files it
+    /// attached, and gives the text that was pasted.
+    pub fn undo_drop(&mut self) -> Option<String> {
+        let dropped = self.dropped.take()?;
+        let kept = self.attachments.len().saturating_sub(dropped.count);
+        self.attachments.truncate(kept);
+        Some(dropped.text)
+    }
+
+    /// Keeps up with an upload from TDLib's `updateFile`, which also comes
+    /// for downloads and everything else about files.
+    pub fn set_upload(&mut self, file: &types::File) {
+        let total = if file.size > 0 {
+            file.size
+        } else {
+            file.expected_size
+        };
+        if file.remote.is_uploading_active && total > 0 {
+            // 100% only once the message is sent.
+            let done = file.remote.uploaded_size.clamp(0, total) * 100 / total;
+            self.uploads.insert(file.id, done.min(99) as u8);
+        } else {
+            self.uploads.remove(&file.id);
+        }
+    }
+
+    /// How far the upload of a message's file is, while it's on its way.
+    pub fn upload_progress(&self, msg: &Msg) -> Option<u8> {
+        let photo = msg.preview.as_ref().map(|p| p.file_id);
+        [msg.file.as_ref().map(|f| f.id), photo]
+            .into_iter()
+            .flatten()
+            .find_map(|id| self.uploads.get(&id).copied())
+    }
+
+    /// What `e` edits: the message under the cursor, or in an album, the
+    /// one photo sent with the caption, since the caption shows under the
+    /// last photo wherever the cursor is.
+    pub fn edit_target(&self) -> Option<i64> {
+        let id = self.cursor_id()?;
+        let album = self.messages.get(&id)?.album;
+        if album == 0 {
+            return Some(id);
+        }
+        let mut captioned = self
+            .messages
+            .iter()
+            .filter(|(_, m)| m.album == album && !m.source_text.is_empty())
+            .map(|(&id, _)| id);
+        match (captioned.next(), captioned.next()) {
+            (Some(holder), None) => Some(holder),
+            _ => Some(id),
         }
     }
 
@@ -1125,6 +1201,7 @@ mod tests {
                     editable: Editable::Text,
                     formatted: false,
                     edited: false,
+                    album: 0,
                 };
                 (id, msg)
             })
@@ -1227,6 +1304,72 @@ mod tests {
             photo: true,
         });
         assert_eq!(msg.snippet(), "Photo", "a photo without a caption");
+    }
+
+    #[test]
+    fn uploads_count_up_to_99_percent_until_the_message_is_sent() {
+        let mut open = OpenChat::new(1);
+        let mut msg = page([1]).remove(0).1;
+        msg.file = Some(MediaFile {
+            id: 5,
+            label: "File: map.pdf".into(),
+            photo: false,
+        });
+        let mut file = types::File {
+            id: 5,
+            size: 2000,
+            ..Default::default()
+        };
+        file.remote.is_uploading_active = true;
+        file.remote.uploaded_size = 500;
+        open.set_upload(&file);
+        assert_eq!(open.upload_progress(&msg), Some(25));
+        file.remote.uploaded_size = 2000;
+        open.set_upload(&file);
+        assert_eq!(open.upload_progress(&msg), Some(99));
+        file.remote.is_uploading_active = false;
+        file.remote.is_uploading_completed = true;
+        open.set_upload(&file);
+        assert_eq!(open.upload_progress(&msg), None);
+    }
+
+    #[test]
+    fn e_in_an_album_edits_the_photo_with_the_caption() {
+        let mut open = OpenChat::new(1);
+        open.messages = page([1, 2, 3, 4]).into_iter().collect();
+        for (id, caption) in [(1, "the view"), (2, ""), (3, "")] {
+            let msg = open.messages.get_mut(&id).unwrap();
+            msg.album = 9;
+            msg.source_text = caption.into();
+        }
+        open.messages.get_mut(&4).unwrap().source_text = "after".into();
+        open.selected = Some(3);
+        assert_eq!(open.edit_target(), Some(1));
+        open.selected = Some(4);
+        assert_eq!(open.edit_target(), Some(4), "not in the album");
+        open.messages.get_mut(&2).unwrap().source_text = "second caption".into();
+        open.selected = Some(3);
+        assert_eq!(open.edit_target(), Some(3), "with two captions, its own");
+    }
+
+    #[test]
+    fn ctrl_z_takes_back_only_the_files_the_paste_attached() {
+        let file = |name: &str| Attachment {
+            path: name.into(),
+            name: name.into(),
+            size: 1,
+            kind: crate::attach::Kind::File,
+        };
+        let mut open = OpenChat::new(1);
+        open.attachments = vec![file("chosen.pdf"), file("a.txt"), file("b.txt")];
+        open.dropped = Some(Dropped {
+            text: "/tmp/a.txt /tmp/b.txt".into(),
+            count: 2,
+        });
+        assert_eq!(open.undo_drop().as_deref(), Some("/tmp/a.txt /tmp/b.txt"));
+        let names: Vec<&str> = open.attachments.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["chosen.pdf"], "the file attached before stays");
+        assert_eq!(open.undo_drop(), None, "only once");
     }
 
     #[test]

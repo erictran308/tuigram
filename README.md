@@ -28,6 +28,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Search everything.** `/` in the chat list filters chats as you type. `/` inside a chat searches its entire history, and `n`/`N` jump between matches, highlighted where they appear.
 - **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, date separators, "typing…" while someone writes to you, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app.
+- **Send photos and files.** Drop them on the window, paste a screenshot with `p`, or type a path with `a` (Tab completes it). What you write goes with them as the caption, and several photos go as one album.
 - **Notifications.** New messages pop up as system notifications while you're in another window, and the window title counts your unread chats. Telegram's mute settings apply.
 - **Make it yours.** Four Catppuccin themes with live preview, and highlights that make your important chats stand out.
 - **Private by design.** tuigram talks only to Telegram. No telemetry, no accounts and no servers in between. Your session stays on your machine, and read receipts go out only for messages you've actually had in front of you.

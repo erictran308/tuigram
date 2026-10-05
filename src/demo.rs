@@ -144,13 +144,14 @@ async fn show(dir: &Path) -> Result<()> {
 
 /// The app with the made-up chats, on the main screen.
 fn demo_app(tg: Tg, images: Images, dir: &Path) -> App {
-    let (decoded_tx, _) = unbounded_channel();
+    let (clipboard_tx, _) = unbounded_channel();
     let settings = Settings::default();
     // Settings are never saved: the demo's popup has no Enter.
     let mut app = App::new(
         tg,
         images,
-        Clipboard::new(decoded_tx),
+        // The demo never pastes, so nothing is saved there.
+        Clipboard::new(clipboard_tx, dir.join("outbox")),
         settings,
         dir.join("settings.toml"),
         None,
@@ -384,6 +385,7 @@ fn hike() -> OpenChat {
         editable: Editable::Text,
         formatted: false,
         edited: false,
+        album: 0,
     };
     let url = "https://trails.example.com/eagle-ridge";
     let link = msg(LEO, at(2, 19, 5), &format!("Here's the trail: {url}"));

@@ -48,11 +48,13 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("gd", "Go to the message a reply answers"),
             ("Ctrl-o", "Back to the reply"),
             ("i", "Write a message"),
+            ("a", "Attach a file by its path (Tab completes it)"),
+            ("p", "Paste a photo, files or text from the clipboard"),
             ("/", "Search the whole chat"),
             ("n / N", "Next older / newer match"),
             (
                 "Esc",
-                "End the search, cancel the edit or reply, or go back",
+                "End the search, cancel the edit, remove the files, cancel the reply, or go back",
             ),
             ("h", "Back to the chat list"),
         ],
@@ -62,6 +64,19 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Enter", "Send, or save the edit"),
             ("Alt-Enter / Ctrl-j", "New line"),
+            ("Ctrl-v", "Paste a photo, files or text from the clipboard"),
+            (
+                "Drop a file",
+                "Attach it; the text you write is its caption",
+            ),
+            (
+                "Ctrl-z",
+                "Turn files just pasted back into their path as text",
+            ),
+            (
+                "Ctrl-t",
+                "Send attached photos as files, uncompressed, or back",
+            ),
             ("Esc / Ctrl-c", "Back to Normal mode"),
         ],
     ),
@@ -69,6 +84,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         "Search and command prompts",
         &[
             ("Enter", "Search, keep the chat filter, or run the command"),
+            ("Tab", "Complete the path of a file to attach"),
             ("Esc / Ctrl-c", "Cancel"),
         ],
     ),

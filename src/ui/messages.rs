@@ -349,7 +349,9 @@ fn layout(
     let mut prev_day = None;
     let mut prev_sender = None;
     let mut prev_sticker = false;
-    for (&id, msg) in &open.messages {
+    let messages: Vec<(i64, &Msg)> = open.messages.iter().map(|(&id, m)| (id, m)).collect();
+    let albums = albums(&messages);
+    for ((id, msg), album) in messages.into_iter().zip(albums) {
         let time = Local.timestamp_opt(i64::from(msg.date), 0).single();
         let day = time.map(|t| t.date_naive());
         let separator = (day != prev_day).then(|| {
@@ -366,26 +368,51 @@ fn layout(
         });
         let header = Header {
             name,
+            // Every photo of an album answers the same message; it's said once.
             quote: msg
                 .reply_to
                 .as_ref()
+                .filter(|_| album.is_none_or(|a| a.first))
                 .map(|reply| quote(open, id, reply, names, colors)),
         };
+        // An album's caption goes under its last photo, as in Telegram,
+        // though it belongs to the photo that was sent with it.
+        let caption = match album {
+            Some(InAlbum {
+                caption: Some((holder_id, holder)),
+                last,
+                ..
+            }) => {
+                if last {
+                    Some(holder)
+                } else {
+                    (holder_id != id).then_some(msg)
+                }
+            }
+            _ => Some(msg),
+        };
+        let edited = msg.edited || caption.is_some_and(|c| c.edited);
+        // An album has one time, at the bottom; a photo still on its way, or
+        // that didn't make it, says so under itself.
         let meta = match msg.state {
-            SendState::Sent => time.map_or(String::new(), |t| {
+            _ if msg.state == SendState::Sent && album.is_some_and(|a| !a.last) => None,
+            SendState::Sent => Some(time.map_or(String::new(), |t| {
                 let time = t.format("%H:%M");
-                if msg.edited {
+                if edited {
                     format!("edited {time}")
                 } else {
                     time.to_string()
                 }
+            })),
+            SendState::Pending => Some(match open.upload_progress(msg) {
+                Some(done) => format!("sending {done}%"),
+                None => "sending…".into(),
             }),
-            SendState::Pending => "sending…".into(),
-            SendState::Failed => "not sent".into(),
+            SendState::Failed => Some("not sent".into()),
         };
         let photo = msg.preview.as_ref().map(|p| photo_cells(p, max_text, font));
-        let matches = search::find(&msg.text, query);
-        let bubble = Bubble::new(msg, header, photo, meta, matches, max_text);
+        let matches = caption.map_or(Vec::new(), |c| search::find(&c.text, query));
+        let bubble = Bubble::new(msg, caption, header, photo, meta, matches, max_text);
         // Messages in a row from one sender form a block, with no gap between
         // them. Not in channels, where every post has the same sender, and
         // not for stickers, which have no bubble to join up.
@@ -455,6 +482,47 @@ fn layout(
     (lines, placed, photos)
 }
 
+/// Where a message sits in an album, which is drawn as one bubble: the
+/// photos in order, then the caption and the time.
+#[derive(Clone, Copy)]
+struct InAlbum<'a> {
+    first: bool,
+    last: bool,
+    /// The one photo sent with a caption, and its id. `None` if none or
+    /// several were, which then show under their own photos.
+    caption: Option<(i64, &'a Msg)>,
+}
+
+/// For each message, where it sits in an album of photos or videos, or
+/// `None`. Albums of files show each file's caption under it, like Telegram.
+fn albums<'a>(messages: &[(i64, &'a Msg)]) -> Vec<Option<InAlbum<'a>>> {
+    let mut out = Vec::with_capacity(messages.len());
+    for run in messages.chunk_by(|(_, a), (_, b)| a.album != 0 && a.album == b.album) {
+        let media = run.len() > 1
+            && run
+                .iter()
+                .all(|(_, m)| m.preview.as_ref().is_some_and(|p| !p.sticker));
+        if !media {
+            out.extend(run.iter().map(|_| None));
+            continue;
+        }
+        // The caption as sent, not a video's length.
+        let mut captioned = run.iter().filter(|(_, m)| !m.source_text.is_empty());
+        let caption = match (captioned.next(), captioned.next()) {
+            (Some(&(id, msg)), None) => Some((id, msg)),
+            _ => None,
+        };
+        out.extend((0..run.len()).map(|i| {
+            Some(InAlbum {
+                first: i == 0,
+                last: i + 1 == run.len(),
+                caption,
+            })
+        }));
+    }
+    out
+}
+
 /// A message measured in the first pass of [`layout`].
 struct Measured<'a> {
     id: i64,
@@ -506,35 +574,47 @@ fn quote(open: &OpenChat, id: i64, reply: &ReplyTo, names: &Names, colors: &Colo
 /// block can all be drawn as wide as the widest.
 struct Bubble<'a> {
     msg: &'a Msg,
+    /// Byte ranges of the text that are links.
+    links: &'a [Range<usize>],
     header: Header,
     /// Columns and rows of the photo.
     photo: Option<(u16, u16)>,
-    /// The time, or the send status.
-    meta: String,
+    /// The time, or the send status. `None` inside an album, which has one
+    /// time at the bottom.
+    meta: Option<String>,
     /// Byte ranges of the text to highlight for a search.
     matches: Vec<Range<usize>>,
     /// Wrapped lines, each with the byte offset where it starts in the text.
     text: Vec<(String, usize)>,
-    /// Whether `meta` fits on the last text line.
+    /// Whether there's a `meta` and it fits on the last text line.
     meta_inline: bool,
     /// Columns the contents need, inside the padding.
     width: usize,
 }
 
 impl<'a> Bubble<'a> {
-    /// Wraps the text and shortens the header to fit `max_text` columns.
+    /// Wraps the text of `caption` (usually `msg` itself, but an album's
+    /// caption goes with its last photo) and shortens the header to fit
+    /// `max_text` columns.
     fn new(
         msg: &'a Msg,
+        caption: Option<&'a Msg>,
         header: Header,
         photo: Option<(u16, u16)>,
-        meta: String,
+        meta: Option<String>,
         matches: Vec<Range<usize>>,
         max_text: usize,
     ) -> Self {
-        let text = wrap(&msg.text, max_text);
-        let meta_w = meta.width();
+        let source = caption.map_or("", |c| c.text.as_str());
+        // A photo inside an album has no row under it at all.
+        let text = if source.is_empty() && meta.is_none() {
+            Vec::new()
+        } else {
+            wrap(source, max_text)
+        };
+        let meta_w = meta.as_ref().map_or(0, |m| m.width());
         let last_w = text.last().map_or(0, |(l, _)| l.width());
-        let meta_inline = last_w + META_GAP + meta_w <= max_text;
+        let meta_inline = meta.is_some() && last_w + META_GAP + meta_w <= max_text;
 
         let mut width = text
             .iter()
@@ -566,6 +646,7 @@ impl<'a> Bubble<'a> {
         }
         Bubble {
             msg,
+            links: caption.map_or(&[], |c| c.link_ranges.as_slice()),
             header: Header { name, quote },
             photo,
             meta,
@@ -602,6 +683,7 @@ impl<'a> Bubble<'a> {
         let sticker = self.sticker();
         let Bubble {
             msg,
+            links,
             header,
             photo,
             meta,
@@ -624,11 +706,10 @@ impl<'a> Bubble<'a> {
             _ => faded,
         };
         let meta_style = style.fg(meta_color);
-        let meta_w = meta.width();
+        let meta_w = meta.as_ref().map_or(0, |m| m.width());
         let found = style.patch(super::match_style(colors));
-        let spans = |line: &str, start: usize| {
-            line_spans(line, start, &msg.link_ranges, &matches, style, found)
-        };
+        let spans =
+            |line: &str, start: usize| line_spans(line, start, links, &matches, style, found);
 
         // Pads a row to the bubble width (one column of padding each side) and
         // puts own messages on the right.
@@ -668,7 +749,10 @@ impl<'a> Bubble<'a> {
         for (i, (line, start)) in text.into_iter().enumerate() {
             let w = line.width();
             let mut line_spans = spans(&line, start);
-            if i + 1 == count && meta_inline {
+            if i + 1 == count
+                && meta_inline
+                && let Some(meta) = &meta
+            {
                 line_spans.push(Span::styled(" ".repeat(inner - w - meta_w), style));
                 line_spans.push(Span::styled(meta.clone(), meta_style));
                 out.push(row(line_spans, inner));
@@ -676,7 +760,7 @@ impl<'a> Bubble<'a> {
                 out.push(row(line_spans, w));
             }
         }
-        if !meta_inline {
+        if !meta_inline && let Some(meta) = meta {
             out.push(row(
                 vec![
                     Span::styled(" ".repeat(inner - meta_w), style),
@@ -801,6 +885,7 @@ mod tests {
             editable: Editable::Text,
             formatted: false,
             edited: false,
+            album: 0,
         }
     }
 
@@ -1064,6 +1149,75 @@ mod tests {
         open.messages.insert(2, msg(false, 1_790_000_060, "two"));
         let rows = |gaps| layout(&open, &names, true, gaps, 58, font, &colors).0.len();
         assert_eq!(rows(true), rows(false) + 1);
+    }
+
+    #[test]
+    fn an_album_is_one_bubble_with_the_caption_and_time_under_the_last_photo() {
+        let users = HashMap::new();
+        let chats = Chats::default();
+        let names = Names {
+            users: &users,
+            chats: &chats,
+        };
+        let font = FontSize {
+            width: 10,
+            height: 20,
+        };
+        let colors = Theme::default().colors();
+        let photo = |file_id, caption: &str| Msg {
+            preview: Some(Preview {
+                file_id,
+                width: 800,
+                height: 600,
+                thumbnail: None,
+                sticker: false,
+            }),
+            album: 5,
+            ..msg(true, 1_790_000_000, caption)
+        };
+        let mut open = OpenChat::new(42);
+        open.messages.insert(1, photo(7, "Sunrise at the top"));
+        open.messages.insert(2, photo(8, ""));
+        open.messages.insert(3, photo(9, ""));
+        open.messages
+            .insert(4, msg(true, 1_790_000_000, "and a text after"));
+        let (lines, placed, photos) = layout(&open, &names, true, true, 58, font, &colors);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let time = Local
+            .timestamp_opt(1_790_000_000, 0)
+            .unwrap()
+            .format("%H:%M")
+            .to_string();
+
+        assert_eq!(photos.len(), 3);
+        let caption = text.iter().position(|l| l.contains("Sunrise")).unwrap();
+        let last = &photos[2];
+        assert_eq!(
+            caption,
+            last.line + usize::from(last.rows),
+            "right under the last photo"
+        );
+        assert!(
+            placed[2].start <= caption && caption < placed[2].end,
+            "drawn with the last photo"
+        );
+        assert_eq!(
+            placed[0].end,
+            photos[0].line + usize::from(photos[0].rows),
+            "nothing under the first"
+        );
+        assert!(
+            text[caption].contains(&time),
+            "the time once, after the caption"
+        );
+        assert_eq!(
+            text.iter().filter(|l| l.contains(&time)).count(),
+            2,
+            "and once for the text after"
+        );
     }
 
     #[test]
@@ -1391,6 +1545,7 @@ mod tests {
             editable: Editable::Text,
             draft: String::new(),
             reply: None,
+            attachments: Vec::new(),
         });
         let buf = render_buffer(&mut open, false, &mut images());
         let colors = Theme::default().colors();

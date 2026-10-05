@@ -1,12 +1,22 @@
-//! Copying to the system clipboard: text, files, and photos as images.
+//! The system clipboard: copying text, files, and photos as images, and
+//! pasting photos and files to send.
 
 use std::borrow::Cow;
 use std::io::{Write, stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use image::RgbaImage;
+use image::codecs::jpeg::JpegEncoder;
+use image::{DynamicImage, RgbaImage};
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Telegram takes photos up to 10 MB. A pasted image saved bigger than this
+/// as PNG is saved as a JPEG instead.
+const PNG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// Pasted images are kept this long: TDLib uploads from the file, and
+/// carries on with an upload after a restart.
+const OUTBOX_KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// How text got to the clipboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +28,12 @@ pub enum Copied {
     Terminal,
 }
 
+/// Work done off the UI thread, back for the app.
+pub enum ClipboardEvent {
+    Decoded(Decoded),
+    Pasted(Pasted),
+}
+
 /// A photo decoded off the UI thread, back to be put on the clipboard.
 pub struct Decoded {
     /// What the toast calls it.
@@ -25,16 +41,36 @@ pub struct Decoded {
     pub image: Result<RgbaImage, String>,
 }
 
+/// What the clipboard held when `p` asked, for the chat that was open then.
+pub struct Pasted {
+    pub chat_id: i64,
+    pub content: Result<Paste, String>,
+}
+
+pub enum Paste {
+    /// Files copied in a file manager.
+    Files(Vec<PathBuf>),
+    /// An image (a screenshot, one copied from a browser…), saved to a file.
+    Image(PathBuf),
+    Text(String),
+}
+
 pub struct Clipboard {
     /// Kept for the whole run: on Linux, what was copied stays on the
     /// clipboard only while the program that copied it holds on to it.
     system: Option<arboard::Clipboard>,
-    tx: UnboundedSender<Decoded>,
+    tx: UnboundedSender<ClipboardEvent>,
+    /// Where pasted images are saved for TDLib to upload.
+    outbox: PathBuf,
 }
 
 impl Clipboard {
-    pub fn new(tx: UnboundedSender<Decoded>) -> Self {
-        Self { system: None, tx }
+    pub fn new(tx: UnboundedSender<ClipboardEvent>, outbox: PathBuf) -> Self {
+        Self {
+            system: None,
+            tx,
+            outbox,
+        }
     }
 
     fn system(&mut self) -> Result<&mut arboard::Clipboard, arboard::Error> {
@@ -71,7 +107,20 @@ impl Clipboard {
             let image = crate::images::open_image(&path)
                 .map(|i| i.to_rgba8())
                 .map_err(|e| e.to_string());
-            let _ = tx.send(Decoded { label, image });
+            let _ = tx.send(ClipboardEvent::Decoded(Decoded { label, image }));
+        });
+    }
+
+    /// Reads the clipboard on a blocking thread, since an image takes a
+    /// moment to convert and save. It comes back as a [`Pasted`] for
+    /// `chat_id`: files first, as a file manager copies an icon image along
+    /// with them, then an image, then text.
+    pub fn paste(&self, chat_id: i64) {
+        let tx = self.tx.clone();
+        let outbox = self.outbox.clone();
+        tokio::task::spawn_blocking(move || {
+            let content = read(&outbox);
+            let _ = tx.send(ClipboardEvent::Pasted(Pasted { chat_id, content }));
         });
     }
 
@@ -82,6 +131,71 @@ impl Clipboard {
             height: height as usize,
             bytes: Cow::Owned(image.into_raw()),
         })
+    }
+}
+
+fn read(outbox: &Path) -> Result<Paste, String> {
+    // A clipboard of its own, as this runs on another thread.
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("Can't reach the clipboard: {e}"))?;
+    if let Ok(files) = clipboard.get().file_list()
+        && !files.is_empty()
+    {
+        return Ok(Paste::Files(files));
+    }
+    if let Ok(image) = clipboard.get_image() {
+        let image = RgbaImage::from_raw(
+            image.width as u32,
+            image.height as u32,
+            image.bytes.into_owned(),
+        )
+        .ok_or("The image on the clipboard is broken")?;
+        return save_image(image, outbox)
+            .map(Paste::Image)
+            .map_err(|e| format!("Can't save the image: {e}"));
+    }
+    match clipboard.get_text() {
+        Ok(text) if !text.is_empty() => Ok(Paste::Text(text)),
+        _ => Err("Nothing to paste: the clipboard is empty".into()),
+    }
+}
+
+/// Saves a pasted image in `outbox` as PNG, or as JPEG when the PNG would
+/// be too big for Telegram to take as a photo.
+fn save_image(image: RgbaImage, outbox: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(outbox)?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let png = outbox.join(format!("pasted-{stamp}.png"));
+    image.save(&png)?;
+    if std::fs::metadata(&png)?.len() <= PNG_MAX_BYTES {
+        return Ok(png);
+    }
+    std::fs::remove_file(&png)?;
+    let jpeg = outbox.join(format!("pasted-{stamp}.jpg"));
+    let file = std::io::BufWriter::new(std::fs::File::create(&jpeg)?);
+    // JPEG has no transparency.
+    DynamicImage::ImageRgba8(image)
+        .to_rgb8()
+        .write_with_encoder(JpegEncoder::new_with_quality(file, 90))?;
+    Ok(jpeg)
+}
+
+/// Removes pasted images older than [`OUTBOX_KEEP`]. Errors don't matter:
+/// it's tried again on the next start.
+pub fn clean_outbox(outbox: &Path) {
+    let Ok(entries) = std::fs::read_dir(outbox) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > OUTBOX_KEEP);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -100,5 +214,17 @@ mod tests {
     #[test]
     fn the_terminal_gets_the_text_in_base64() {
         assert_eq!(osc52("hi ✓"), "\x1b]52;c;aGkg4pyT\x07");
+    }
+
+    #[test]
+    fn pasted_images_are_saved_as_png() {
+        let outbox =
+            std::env::temp_dir().join(format!("tuigram-test-outbox-{}", std::process::id()));
+        let path = save_image(RgbaImage::new(30, 20), &outbox).unwrap();
+        assert_eq!(path.extension().unwrap(), "png");
+        assert_eq!(image::image_dimensions(&path).unwrap(), (30, 20));
+        clean_outbox(&outbox);
+        assert!(path.exists(), "new ones are kept");
+        let _ = std::fs::remove_dir_all(&outbox);
     }
 }

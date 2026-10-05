@@ -1,4 +1,5 @@
 mod app;
+mod attach;
 mod chats;
 mod clipboard;
 mod config;
@@ -44,6 +45,8 @@ async fn main() -> Result<()> {
     let settings = settings::Settings::load(&settings_path)?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let env_keys = config.api_keys.clone();
+    let outbox = config.data_dir.join("outbox");
+    clipboard::clean_outbox(&outbox);
     let tg = tg::Tg::start(config, tx).await?;
 
     let mut terminal = ratatui::init();
@@ -87,10 +90,10 @@ async fn main() -> Result<()> {
 
     let (image_tx, image_rx) = tokio::sync::mpsc::unbounded_channel();
     let images = images::Images::new(picker, image_tx);
-    let (decoded_tx, decoded_rx) = tokio::sync::mpsc::unbounded_channel();
-    let clipboard = clipboard::Clipboard::new(decoded_tx);
+    let (clipboard_tx, clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
+    let clipboard = clipboard::Clipboard::new(clipboard_tx, outbox);
     let result = app::App::new(tg, images, clipboard, settings, settings_path, env_keys)
-        .run(&mut terminal, rx, image_rx, decoded_rx)
+        .run(&mut terminal, rx, image_rx, clipboard_rx)
         .await;
 
     if enhanced {

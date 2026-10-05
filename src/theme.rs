@@ -58,6 +58,7 @@ impl Theme {
             reply: p.teal,
             activity: p.blue,
             edit: p.peach,
+            attach: p.blue,
             success: p.green,
             own_bubble: mix(p.base, p.blue, tint),
             own_meta: mix(p.text, p.blue, 0.5),
@@ -108,6 +109,8 @@ pub struct Colors {
     /// The "Edit message" bar over the composer, and the marker on the
     /// message being edited.
     pub edit: Color,
+    /// Files waiting in the composer to be sent, and the ATTACH label.
+    pub attach: Color,
     /// Toasts saying something worked.
     pub success: Color,
     pub own_bubble: Color,

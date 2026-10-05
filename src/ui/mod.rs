@@ -13,12 +13,14 @@ use crate::app::{
     App, Command, Confirm, Confirmed, DeleteMenu, Focus, HelpTab, Login, LoginStep, MenuAction,
     PickMenu, PromptKind, Screen, SettingsMenu, Target, Toast,
 };
+use crate::attach::{self, Attachment, Kind};
 use crate::chats::Chat;
 use crate::config;
 use crate::messages::{Editing, OpenChat, Replied, Sender};
 use crate::notify::Notifications;
 use crate::search;
 use crate::settings::Settings;
+use crate::text;
 use crate::theme::{Colors, Theme};
 
 /// The composer grows with its text up to this many rows, then scrolls.
@@ -26,6 +28,9 @@ const MAX_COMPOSER_ROWS: usize = 6;
 /// The bar at the top of the composer while replying or editing: what it's
 /// about, then a line of the message.
 const BAR_ROWS: u16 = 2;
+/// Files waiting to be sent get a row each in the composer, up to this
+/// many; the last row then counts the rest.
+const MAX_ATTACHMENT_ROWS: usize = 3;
 
 mod chat_list;
 mod help;
@@ -294,7 +299,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             || app
                 .prompt
                 .as_ref()
-                .is_some_and(|p| p.kind == PromptKind::Command),
+                .is_some_and(|p| p.kind == PromptKind::Command || !p.completions.is_empty()),
         gaps: app.settings.chat_gaps,
     };
     chat_list::draw(frame, list_area, &list, &mut app.images, colors);
@@ -308,6 +313,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             if ComposerBar::of(open).is_some() {
                 rows += BAR_ROWS;
             }
+            rows += attachment_rows(&open.attachments);
             let [history, composer] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(rows + 2)])
                     .areas(chat_area);
@@ -324,6 +330,8 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 frame,
                 &mut app.composer,
                 ComposerBar::of(open),
+                &open.attachments,
+                open.as_files,
                 &names,
                 composer,
                 app.focus == Focus::Input,
@@ -345,6 +353,9 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         .filter(|p| p.kind == PromptKind::Command)
     {
         draw_commands(frame, body, &prompt.query(), colors);
+    }
+    if let Some(prompt) = app.prompt.as_ref().filter(|p| !p.completions.is_empty()) {
+        draw_completions(frame, body, &prompt.completions, colors);
     }
     if let Some(menu) = &app.menu {
         draw_menu(frame, chat_area, menu, colors);
@@ -650,11 +661,14 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
 }
 
 /// The box messages are written in. While replying, a bar at its top says
-/// which message the reply answers.
+/// which message the reply answers, and files to send are listed under it.
+#[allow(clippy::too_many_arguments)]
 fn draw_composer(
     frame: &mut Frame,
     composer: &mut TextArea<'static>,
     bar: Option<ComposerBar>,
+    attachments: &[Attachment],
+    as_files: bool,
     names: &messages::Names,
     area: Rect,
     insert: bool,
@@ -672,22 +686,83 @@ fn draw_composer(
         draw_bar(frame, bar, names, top, colors);
         text = rest;
     }
+    if !attachments.is_empty() {
+        let [files, rest] = Layout::vertical([
+            Constraint::Length(attachment_rows(attachments)),
+            Constraint::Fill(1),
+        ])
+        .areas(text);
+        let lines = attachment_lines(attachments, as_files, files.width as usize, colors);
+        frame.render_widget(Paragraph::new(lines), files);
+        text = rest;
+    }
     // The cursor only shows in Insert mode, so it's obvious where keys go.
     composer.set_cursor_style(if insert {
         Style::new().reversed()
     } else {
         Style::new()
     });
+    let caption = !attachments.is_empty();
     composer.set_placeholder_text(match (insert, &bar) {
         (true, Some(ComposerBar::Edit(_))) => "Write the new text…",
+        (true, _) if caption => "Add a caption…",
         (true, Some(ComposerBar::Reply(_))) => "Write a reply…",
         (true, None) => "Write a message…",
         (false, Some(ComposerBar::Edit(_))) => "Press i to edit",
+        (false, _) if caption => "Press i to add a caption",
         (false, Some(ComposerBar::Reply(_))) => "Press i to write your reply",
         (false, None) => "Press i to write a message",
     });
     composer.set_placeholder_style(Style::new().fg(colors.muted));
     frame.render_widget(&*composer, text);
+}
+
+fn attachment_rows(attachments: &[Attachment]) -> u16 {
+    attachments.len().min(MAX_ATTACHMENT_ROWS) as u16
+}
+
+/// A row per file waiting to be sent: its name, how it goes, and its size.
+fn attachment_lines(
+    attachments: &[Attachment],
+    as_files: bool,
+    width: usize,
+    colors: &Colors,
+) -> Vec<Line<'static>> {
+    let shown = if attachments.len() > MAX_ATTACHMENT_ROWS {
+        MAX_ATTACHMENT_ROWS - 1
+    } else {
+        attachments.len()
+    };
+    let line = |name: &str, details: String| {
+        let clip = "📎 ";
+        let name = truncate(name, width.saturating_sub(clip.width() + details.width()));
+        Line::from(vec![
+            Span::from(clip).fg(colors.attach),
+            Span::from(name).fg(colors.attach).bold(),
+            Span::from(details).fg(colors.subtle),
+        ])
+    };
+    let mut lines: Vec<Line> = attachments[..shown]
+        .iter()
+        .map(|a| {
+            let kind = match a.sent_as(as_files) {
+                Kind::Photo { .. } => "Photo",
+                Kind::File if a.kind.is_photo() => "File, uncompressed",
+                Kind::File => "File",
+            };
+            line(
+                &a.name,
+                format!(" · {kind} · {}", attach::size_label(a.size)),
+            )
+        })
+        .collect();
+    let rest = &attachments[shown..];
+    if !rest.is_empty() {
+        let size = rest.iter().map(|a| a.size).sum();
+        let count = format!("{} more files", rest.len());
+        lines.push(line(&count, format!(" · {}", attach::size_label(size))));
+    }
+    lines
 }
 
 /// What sits over the composer's text, with a bar down the side like a
@@ -767,6 +842,12 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             " :",
             "  Enter run · Esc cancel ",
         ),
+        PromptKind::Attach => (
+            " ATTACH ",
+            colors.attach,
+            " ",
+            "  Tab complete · Enter attach · Esc cancel ",
+        ),
     };
     let [mode, slash, input, keys] = Layout::horizontal([
         Constraint::Length(label.width() as u16),
@@ -832,6 +913,60 @@ fn draw_commands(frame: &mut Frame, area: Rect, typed: &str, colors: &Colors) {
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+/// Names in the folder that the attach prompt's last Tab matched, over the
+/// bottom left corner like the command list.
+fn draw_completions(frame: &mut Frame, area: Rect, names: &[String], colors: &Colors) {
+    const MAX_SHOWN: usize = 12;
+    let max = (area.width as usize).saturating_sub(4);
+    let mut lines: Vec<Line> = names
+        .iter()
+        .take(MAX_SHOWN)
+        .map(|name| {
+            let style = if name.ends_with('/') {
+                Style::new().fg(colors.primary)
+            } else {
+                Style::new()
+            };
+            Line::from(format!(" {}", truncate(&text::clean(name), max))).style(style)
+        })
+        .collect();
+    if names.len() > MAX_SHOWN {
+        lines.push(Line::from(format!(" … {} more", names.len() - MAX_SHOWN)).fg(colors.muted));
+    }
+    let title = " Matches · type more, then Tab ";
+    let longest = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .max(title.width());
+    let width = (longest as u16 + 3).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x,
+        y: area.bottom().saturating_sub(height),
+        width,
+        height,
+    };
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::new().fg(colors.accent))
+        .style(Style::new().bg(colors.popup_bg));
+    // Clear first: the popup must cover text and photos underneath.
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Ctrl-t's hint while photos are attached: what it switches them to.
+fn as_files_hint(open: &OpenChat) -> Option<&'static str> {
+    let photos = open.attachments.iter().any(|a| a.kind.is_photo());
+    photos.then_some(if open.as_files {
+        "Ctrl-t send as photos"
+    } else {
+        "Ctrl-t send as files"
+    })
+}
+
 /// Hints for keys that depend on the cursor: `gd` on a reply, and Ctrl-o
 /// after a `gd`.
 fn jump_hints(open: &OpenChat) -> Vec<&'static str> {
@@ -858,6 +993,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     let searching = app.open.as_ref().is_some_and(|o| o.search.is_some());
     let replying = app.open.as_ref().is_some_and(|o| o.reply.is_some());
     let editing = app.open.as_ref().is_some_and(|o| o.editing.is_some());
+    let attaching = app.open.as_ref().is_some_and(|o| !o.attachments.is_empty());
+    let dropped = app.open.as_ref().is_some_and(|o| o.dropped.is_some());
     let insert = Span::from(" INSERT ").fg(colors.bg).bg(colors.insert);
     let (mode, hints) = match app.focus {
         _ if app
@@ -892,17 +1029,29 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             normal,
             "  i edit · Esc cancel edit · e edit selected instead · j/k newer/older · h back",
         ),
+        Focus::Messages if attaching => (
+            normal,
+            "  i add caption · Esc remove files · a attach more · p paste more · r reply · j/k newer/older · h back",
+        ),
         Focus::Messages if replying => (
             normal,
             "  i write reply · Esc cancel reply · r reply to selected instead · j/k newer/older · Enter open media · h back",
         ),
         Focus::Messages => (
             normal,
-            "  j/k newer/older · y copy · r reply · e edit · d delete · Enter open media · i write · / search · gg/G oldest/newest · h back · : commands · ? help · q quit",
+            "  j/k newer/older · y copy · r reply · e edit · d delete · Enter open media · i write · a attach · p paste · / search · gg/G oldest/newest · h back · : commands · ? help · q quit",
         ),
         Focus::Input if editing => (
             insert,
             "  Enter save · Alt-Enter or Ctrl-j new line · Esc normal mode · Esc Esc cancel edit",
+        ),
+        Focus::Input if dropped => (
+            insert,
+            "  Enter send · Ctrl-z paste as text instead · Alt-Enter or Ctrl-j new line · Esc normal mode · Esc Esc remove files",
+        ),
+        Focus::Input if attaching => (
+            insert,
+            "  Enter send · Ctrl-v paste more · Alt-Enter or Ctrl-j new line · Esc normal mode · Esc Esc remove files",
         ),
         Focus::Input if replying => (
             insert,
@@ -910,19 +1059,21 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Input => (
             insert,
-            "  Enter send · Alt-Enter or Ctrl-j new line · Esc normal mode",
+            "  Enter send · Alt-Enter or Ctrl-j new line · Ctrl-v paste photo or file · Esc normal mode",
         ),
     };
-    let context = match &app.open {
-        Some(open)
-            if app.focus == Focus::Messages
-                && app.settings_menu.is_none()
-                && app.delete_menu.is_none() =>
-        {
-            jump_hints(open)
-        }
+    let popup = app.settings_menu.is_some() || app.delete_menu.is_some() || app.confirm.is_some();
+    let mut context = match &app.open {
+        Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open),
         _ => Vec::new(),
     };
+    if let Some(open) = &app.open
+        && app.focus != Focus::Chats
+        && !popup
+        && let Some(hint) = as_files_hint(open)
+    {
+        context.insert(0, hint);
+    }
     let mut spans = vec![mode.bold()];
     if context.is_empty() {
         spans.push(Span::from(hints).fg(colors.muted));
@@ -937,6 +1088,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         spans.push(Span::from("  Downloading… opens when done").fg(colors.warning));
     } else if !app.copying.is_empty() {
         spans.push(Span::from("  Downloading… copies when done").fg(colors.warning));
+    } else if app.pasting {
+        spans.push(Span::from("  Reading the clipboard…").fg(colors.warning));
     } else if let Some(message) = &app.status {
         spans.push(Span::from(format!("  {message}")).fg(colors.error));
     }
@@ -1141,6 +1294,7 @@ mod tests {
             editable: Editable::Text,
             draft: String::new(),
             reply: None,
+            attachments: Vec::new(),
         };
         let mut composer = TextArea::default();
         let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
@@ -1148,7 +1302,17 @@ mod tests {
             .draw(|f| {
                 let area = f.area();
                 let bar = Some(ComposerBar::Edit(&editing));
-                draw_composer(f, &mut composer, bar, &names, area, true, &colors);
+                draw_composer(
+                    f,
+                    &mut composer,
+                    bar,
+                    &[],
+                    false,
+                    &names,
+                    area,
+                    true,
+                    &colors,
+                );
             })
             .unwrap();
         let rows = buffer_rows(terminal.backend().buffer());
@@ -1187,6 +1351,8 @@ mod tests {
                     f,
                     &mut composer,
                     Some(ComposerBar::Reply(&reply)),
+                    &[],
+                    false,
                     &names,
                     area,
                     true,
@@ -1207,6 +1373,116 @@ mod tests {
             .find(|&x| buf[(x, 1)].symbol() == "▎")
             .unwrap();
         assert_eq!(buf[(bar, 1)].fg, colors.reply);
+    }
+
+    #[test]
+    fn files_to_send_are_listed_under_the_reply_and_the_text_is_their_caption() {
+        let colors = Theme::Mocha.colors();
+        let users = std::collections::HashMap::new();
+        let chats = crate::chats::Chats::default();
+        let names = messages::Names {
+            users: &users,
+            chats: &chats,
+        };
+        let reply = Replied {
+            id: 7,
+            sender: crate::messages::Sender::User(2),
+            outgoing: true,
+            snippet: "the trail map".into(),
+        };
+        let file = |name: &str, size, kind| Attachment {
+            path: std::path::PathBuf::new(),
+            name: name.into(),
+            size,
+            kind,
+        };
+        let photo = Kind::Photo {
+            width: 4,
+            height: 3,
+        };
+        let mut attachments = vec![
+            file("sunrise.jpg", 2_200_000, photo),
+            file("route.gpx", 340 * 1024, Kind::File),
+        ];
+        let draw = |attachments: &[Attachment], as_files| {
+            let mut composer = TextArea::default();
+            let rows = 2 + BAR_ROWS + attachment_rows(attachments) + 1;
+            let mut terminal = Terminal::new(TestBackend::new(48, rows)).unwrap();
+            terminal
+                .draw(|f| {
+                    let bar = Some(ComposerBar::Reply(&reply));
+                    let area = f.area();
+                    draw_composer(
+                        f,
+                        &mut composer,
+                        bar,
+                        attachments,
+                        as_files,
+                        &names,
+                        area,
+                        true,
+                        &colors,
+                    );
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (buffer_rows(&buf), buf)
+        };
+
+        let (rows, buf) = draw(&attachments, false);
+        assert!(rows[1].contains("↩ Reply to"), "{}", rows[1]);
+        // The clip is two columns wide, so its second cell reads as a space.
+        assert!(
+            rows[3].contains("📎  sunrise.jpg · Photo · 2.1 MB"),
+            "{}",
+            rows[3]
+        );
+        assert!(
+            rows[4].contains("📎  route.gpx · File · 340 KB"),
+            "{}",
+            rows[4]
+        );
+        assert!(rows[5].contains("Add a caption…"), "{}", rows[5]);
+        let clip = column(&rows[3], "📎");
+        assert_eq!(buf[(clip, 3)].fg, colors.attach);
+
+        // Ctrl-t: photos go as files.
+        let (rows, _) = draw(&attachments, true);
+        assert!(
+            rows[3].contains("sunrise.jpg · File, uncompressed"),
+            "{}",
+            rows[3]
+        );
+        assert!(rows[4].contains("route.gpx · File · 340 KB"), "{}", rows[4]);
+
+        attachments.extend((0..3).map(|i| file(&format!("{i}.png"), 1024, photo)));
+        let (rows, _) = draw(&attachments, false);
+        assert!(rows[4].contains("route.gpx"), "{}", rows[4]);
+        assert!(rows[5].contains("📎  3 more files · 3.0 KB"), "{}", rows[5]);
+    }
+
+    #[test]
+    fn tab_in_the_attach_prompt_lists_what_matched() {
+        let colors = Theme::Mocha.colors();
+        let names: Vec<String> = (0..14).map(|i| format!("photo-{i:02}.jpg")).collect();
+        let mut names = names;
+        names.insert(0, "photos/".into());
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|f| draw_completions(f, f.area(), &names, &colors))
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+        // Twelve names and a count of the rest, at the bottom.
+        assert!(rows[5].contains("Matches"), "{}", rows[5]);
+        assert!(rows[6].contains("photos/"), "{}", rows[6]);
+        assert!(rows[17].contains("photo-10.jpg"), "{}", rows[17]);
+        assert!(rows[18].contains("… 3 more"), "{}", rows[18]);
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf[(column(&rows[6], "photos/"), 6)].fg,
+            colors.primary,
+            "folders stand out"
+        );
     }
 
     #[test]
@@ -1274,6 +1550,7 @@ mod tests {
             editable: Editable::Text,
             formatted: false,
             edited: false,
+            album: 0,
         };
         let mut open = OpenChat::new(1);
         open.messages.insert(1, msg(None));

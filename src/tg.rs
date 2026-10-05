@@ -501,13 +501,7 @@ impl Tg {
             link_preview_options: None,
             clear_draft: true,
         });
-        let reply_to = reply_to.map(|message_id| {
-            enums::InputMessageReplyTo::Message(types::InputMessageReplyToMessage {
-                message_id,
-                quote: None,
-                checklist_task_id: 0,
-            })
-        });
+        let reply_to = reply_to.map(reply_to_message);
         self.spawn(functions::send_message(
             chat_id,
             None,
@@ -516,6 +510,50 @@ impl Tg {
             content,
             self.client_id,
         ));
+    }
+
+    /// Sends files in order, one album per group (a group of one is a plain
+    /// message), each request waiting for the one before so they arrive in
+    /// that order. The caption goes under the first file, and the first
+    /// group answers message `reply_to` if given. Uploads continue after
+    /// TDLib reports the messages, like a text message's sending.
+    pub fn send_files(
+        &self,
+        chat_id: i64,
+        groups: Vec<Vec<Upload>>,
+        caption: String,
+        reply_to: Option<i64>,
+    ) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let mut caption = (!caption.is_empty()).then(|| plain(caption));
+            let mut reply_to = reply_to.map(reply_to_message);
+            for group in groups {
+                let mut contents: Vec<_> = group
+                    .into_iter()
+                    .map(|upload| upload.content(caption.take()))
+                    .collect();
+                let reply_to = reply_to.take();
+                let result = if contents.len() == 1 {
+                    let content = contents.remove(0);
+                    functions::send_message(chat_id, None, reply_to, None, content, client_id)
+                        .await
+                        .map(drop)
+                } else {
+                    functions::send_message_album(
+                        chat_id, None, reply_to, None, contents, client_id,
+                    )
+                    .await
+                    .map(drop)
+                };
+                // What failed once (no right to send media, say) fails again.
+                if let Err(e) = result {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    break;
+                }
+            }
+        });
     }
 
     /// Tells the chat you're typing, or that you stopped. Others see it for
@@ -637,6 +675,59 @@ impl Tg {
             }
         });
     }
+}
+
+/// A file to send, and how Telegram shows it.
+pub enum Upload {
+    /// Compressed and shown in the chat. The size is the image's, for TDLib
+    /// to lay it out before the upload is done.
+    Photo {
+        path: String,
+        width: i32,
+        height: i32,
+    },
+    /// As it is, with its name.
+    File { path: String },
+}
+
+impl Upload {
+    fn content(self, caption: Option<types::FormattedText>) -> enums::InputMessageContent {
+        let local = |path| enums::InputFile::Local(types::InputFileLocal { path });
+        match self {
+            Upload::Photo {
+                path,
+                width,
+                height,
+            } => enums::InputMessageContent::InputMessagePhoto(types::InputMessagePhoto {
+                photo: local(path),
+                thumbnail: None,
+                added_sticker_file_ids: Vec::new(),
+                width,
+                height,
+                caption,
+                show_caption_above_media: false,
+                self_destruct_type: None,
+                has_spoiler: false,
+            }),
+            Upload::File { path } => {
+                enums::InputMessageContent::InputMessageDocument(types::InputMessageDocument {
+                    document: local(path),
+                    thumbnail: None,
+                    // Telegram may then show a song or video as one.
+                    disable_content_type_detection: false,
+                    caption,
+                })
+            }
+        }
+    }
+}
+
+fn reply_to_message(message_id: i64) -> enums::InputMessageReplyTo {
+    enums::InputMessageReplyTo::Message(types::InputMessageReplyToMessage {
+        message_id,
+        quote: None,
+        checklist_task_id: 0,
+    })
 }
 
 /// Text without formatting. Telegram still finds links, mentions and the

@@ -18,8 +18,9 @@ use tdlib_rs::types::{Message, UpdateNotificationGroup};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Instant, sleep_until};
 
+use crate::attach::{self, Attachment, Dropped};
 use crate::chats::Chats;
-use crate::clipboard::{Clipboard, Copied, Decoded};
+use crate::clipboard::{Clipboard, ClipboardEvent, Copied, Decoded, Paste, Pasted};
 use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
 use crate::messages::{Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState};
@@ -297,12 +298,13 @@ impl SettingsMenu {
 }
 
 /// What the status bar prompt is for: a `/` search through chat titles or the
-/// open chat's messages, or a `:` command.
+/// open chat's messages, a `:` command, or the path of a file to attach (`a`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     Chats,
     Messages,
     Command,
+    Attach,
 }
 
 /// The prompt in the status bar. Searching chats filters the list as you
@@ -310,6 +312,9 @@ pub enum PromptKind {
 pub struct Prompt {
     pub kind: PromptKind,
     pub input: TextArea<'static>,
+    /// What the last Tab found in the attach prompt, when it was more than
+    /// one name. Typing clears it.
+    pub completions: Vec<String>,
     /// The chat filter and cursor from before, which Esc puts back.
     previous_filter: String,
     previous_selected: Option<i64>,
@@ -374,6 +379,8 @@ pub struct App {
     clipboard: Clipboard,
     /// Files being downloaded to copy when done, by file id.
     pub copying: HashMap<i32, MediaFile>,
+    /// The clipboard is being read for `p`.
+    pub pasting: bool,
     pub toast: Option<Toast>,
     /// Shown over everything when Enter or `y` finds several things.
     pub menu: Option<PickMenu>,
@@ -457,6 +464,7 @@ impl App {
             opening: HashSet::new(),
             clipboard,
             copying: HashMap::new(),
+            pasting: false,
             toast: None,
             menu: None,
             delete_menu: None,
@@ -494,7 +502,7 @@ impl App {
         terminal: &mut DefaultTerminal,
         mut events: UnboundedReceiver<Tagged>,
         mut image_events: UnboundedReceiver<ImageEvent>,
-        mut decoded: UnboundedReceiver<Decoded>,
+        mut clipboard: UnboundedReceiver<ClipboardEvent>,
     ) -> Result<()> {
         let mut keys = EventStream::new();
         while !self.exit {
@@ -544,7 +552,7 @@ impl App {
                     }
                 }
                 Some(event) = image_events.recv() => self.images.on_built(event),
-                Some(decoded) = decoded.recv() => self.on_decoded(decoded),
+                Some(event) = clipboard.recv() => self.on_clipboard(event),
                 Some(event) = keys.next() => self.on_terminal_event(event?),
                 _ = sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => break,
                 _ = sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {}
@@ -583,9 +591,8 @@ impl App {
                 }
                 self.on_prompt_edit();
             }
-            Event::Paste(text) if self.focus == Focus::Input => {
-                self.composer.insert_str(text.replace('\r', ""));
-                self.on_composer_edit();
+            Event::Paste(text) if matches!(self.focus, Focus::Input | Focus::Messages) => {
+                self.on_paste(text)
             }
             _ => {}
         }
@@ -777,6 +784,11 @@ impl App {
                     .filter(|o| o.chat_id == u.message.chat_id)
                 {
                     open.replace(u.old_message_id, u.message);
+                }
+            }
+            Update::File(u) => {
+                if let Some(open) = self.open.as_mut() {
+                    open.set_upload(&u.file);
                 }
             }
             Update::MessageContent(u) => {
@@ -1057,8 +1069,8 @@ impl App {
             (Focus::Messages, KeyCode::Char('/')) => self.open_prompt(PromptKind::Messages),
             (Focus::Messages, KeyCode::Char('n')) => self.next_match(1),
             (Focus::Messages, KeyCode::Char('N')) => self.next_match(-1),
-            // Esc ends a search, then an edit, then a reply, before it leaves
-            // the pane.
+            // Esc ends a search, then an edit, then removes the files, then
+            // ends a reply, before it leaves the pane.
             (Focus::Chats, KeyCode::Esc) => self.chats.set_filter(""),
             (Focus::Messages, KeyCode::Esc)
                 if self.open.as_ref().is_some_and(|o| o.search.is_some()) =>
@@ -1073,6 +1085,18 @@ impl App {
                 self.end_edit();
             }
             (Focus::Messages, KeyCode::Esc)
+                if self
+                    .open
+                    .as_ref()
+                    .is_some_and(|o| !o.attachments.is_empty()) =>
+            {
+                if let Some(open) = self.open.as_mut() {
+                    open.attachments.clear();
+                    open.dropped = None;
+                    open.as_files = false;
+                }
+            }
+            (Focus::Messages, KeyCode::Esc)
                 if self.open.as_ref().is_some_and(|o| o.reply.is_some()) =>
             {
                 if let Some(open) = self.open.as_mut() {
@@ -1082,6 +1106,9 @@ impl App {
             (Focus::Messages, KeyCode::Char('r')) => self.reply_to_selected(),
             (Focus::Messages, KeyCode::Char('e')) => self.edit_selected(),
             (Focus::Messages, KeyCode::Char('y')) => self.copy_selected(),
+            (Focus::Messages, KeyCode::Char('a')) => self.open_prompt(PromptKind::Attach),
+            (Focus::Messages, KeyCode::Char('p')) => self.paste_clipboard(),
+            (Focus::Messages, KeyCode::Char('t')) if ctrl => self.toggle_as_files(),
             (Focus::Messages, KeyCode::Char('d')) if pending_g => self.go_to_replied(),
             (Focus::Messages, KeyCode::Char('d')) => self.open_delete_menu(),
             (Focus::Messages, KeyCode::Char('o')) if ctrl => self.jump_back(),
@@ -1118,6 +1145,11 @@ impl App {
                 self.on_composer_edit();
             }
             KeyCode::Enter => self.send(),
+            // Ctrl-v pages down in the text area, which a composer this
+            // small doesn't need.
+            KeyCode::Char('v') if ctrl => self.paste_clipboard(),
+            KeyCode::Char('z') if ctrl => self.undo_drop(),
+            KeyCode::Char('t') if ctrl => self.toggle_as_files(),
             _ => {
                 if self.composer.input(key) {
                     self.on_composer_edit();
@@ -1165,12 +1197,24 @@ impl App {
             return;
         };
         let text = self.composer.lines().join("\n");
-        let text = text.trim();
-        if text.is_empty() {
+        let text = text.trim().to_string();
+        if text.is_empty() && open.attachments.is_empty() {
             return;
         }
         let reply_to = open.reply.take().map(|r| r.id);
-        self.tg.send_text(open.chat_id, text.to_string(), reply_to);
+        if open.attachments.is_empty() {
+            self.tg.send_text(open.chat_id, text, reply_to);
+        } else {
+            let as_files = open.as_files;
+            let groups = attach::albums(&open.attachments, as_files)
+                .into_iter()
+                .map(|album| album.iter().map(|a| a.upload(as_files)).collect())
+                .collect();
+            self.tg.send_files(open.chat_id, groups, text, reply_to);
+            open.attachments.clear();
+            open.dropped = None;
+            open.as_files = false;
+        }
         self.composer = new_composer();
         // The message arriving ends the typing status for everyone.
         self.typing = None;
@@ -1182,12 +1226,15 @@ impl App {
     }
 
     fn open_prompt(&mut self, kind: PromptKind) {
-        let mut input = TextArea::default();
-        input.set_cursor_line_style(Style::default());
-        input.set_cursor_style(Style::default().reversed());
+        let input = prompt_input("");
+        // Files go into a chat, so one has to be open.
+        if kind == PromptKind::Attach && !self.can_attach() {
+            return;
+        }
         self.prompt = Some(Prompt {
             kind,
             input,
+            completions: Vec::new(),
             previous_filter: self.chats.filter().to_string(),
             previous_selected: self.selected,
         });
@@ -1206,8 +1253,14 @@ impl App {
             KeyCode::Char('m' | 'j') if ctrl => self.close_prompt(true),
             // Like vim, backspace on an empty prompt closes it.
             KeyCode::Backspace if prompt.query().is_empty() => self.close_prompt(false),
+            KeyCode::Tab if prompt.kind == PromptKind::Attach => {
+                let completion = attach::complete(&prompt.query());
+                prompt.input = prompt_input(&completion.text);
+                prompt.completions = completion.matches;
+            }
             _ => {
                 prompt.input.input(key);
+                prompt.completions.clear();
                 self.on_prompt_edit();
             }
         }
@@ -1248,6 +1301,16 @@ impl App {
                 };
                 open.search = Some(MessageSearch::new(query));
                 self.go_to_match(0);
+            }
+            PromptKind::Attach if !submit || query.is_empty() => {}
+            PromptKind::Attach => {
+                let path = attach::expand_home(&query);
+                // A file dropped on the prompt comes quoted.
+                let paths = match attach::pasted_paths(&query) {
+                    Some(paths) if !path.exists() => paths,
+                    _ => vec![path],
+                };
+                self.attach(paths, None);
             }
             PromptKind::Command if !submit || query.is_empty() => {}
             PromptKind::Command => match Command::parse(&query) {
@@ -1573,7 +1636,7 @@ impl App {
         let Some(open) = &self.open else {
             return;
         };
-        let Some(id) = open.cursor_id() else {
+        let Some(id) = open.edit_target() else {
             return;
         };
         match open.cant_edit(id) {
@@ -1588,7 +1651,7 @@ impl App {
         let Some(open) = self
             .open
             .as_ref()
-            .filter(|o| o.chat_id == chat_id && o.cursor_id() == Some(message_id))
+            .filter(|o| o.chat_id == chat_id && o.edit_target() == Some(message_id))
         else {
             return;
         };
@@ -1630,7 +1693,9 @@ impl App {
             editable: msg.editable,
             draft: self.composer.lines().join("\n"),
             reply: open.reply.take(),
+            attachments: std::mem::take(&mut open.attachments),
         });
+        open.dropped = None;
         self.set_typing(false);
         self.composer = new_composer();
         self.composer.insert_str(text);
@@ -1646,6 +1711,7 @@ impl App {
         self.composer.insert_str(editing.draft);
         if let Some(open) = self.open.as_mut() {
             open.reply = editing.reply;
+            open.attachments = editing.attachments;
         }
     }
 
@@ -1921,6 +1987,129 @@ impl App {
             Ok(()) => self.show_toast("Copied", &file.label),
             Err(e) => self.status = Some(format!("Couldn't copy: {e}")),
         }
+    }
+
+    fn on_clipboard(&mut self, event: ClipboardEvent) {
+        match event {
+            ClipboardEvent::Decoded(decoded) => self.on_decoded(decoded),
+            ClipboardEvent::Pasted(pasted) => self.on_pasted(pasted),
+        }
+    }
+
+    /// Whether files can go with the next message: a chat is open, and its
+    /// composer isn't editing a message, which can't take any. Says why not
+    /// in the status bar.
+    fn can_attach(&mut self) -> bool {
+        match &self.open {
+            None => false,
+            Some(open) if open.editing.is_some() => {
+                self.status = Some("Files can't be added to an edit".into());
+                false
+            }
+            Some(_) => true,
+        }
+    }
+
+    /// Adds files to the next message and goes to Insert mode for the
+    /// caption. `pasted` is the paste they came from, for Ctrl-z. Files that
+    /// can't be sent are left out, and the status bar says why.
+    fn attach(&mut self, paths: Vec<PathBuf>, pasted: Option<String>) {
+        if !self.can_attach() {
+            return;
+        }
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let mut added = 0;
+        for path in paths {
+            match Attachment::new(&path) {
+                Ok(attachment) => {
+                    open.attachments.push(attachment);
+                    added += 1;
+                }
+                Err(e) => self.status = Some(e),
+            }
+        }
+        if added == 0 {
+            return;
+        }
+        open.dropped = pasted.map(|text| Dropped { text, count: added });
+        self.focus = Focus::Input;
+    }
+
+    /// A paste into the chat (Cmd-V, or files dropped on the window). Paths
+    /// to files are attached, which Ctrl-z undoes; other text is typed in
+    /// Insert mode. While editing, it's all text.
+    fn on_paste(&mut self, text: String) {
+        let editing = self.open.as_ref().is_some_and(|o| o.editing.is_some());
+        if !editing && let Some(paths) = attach::pasted_paths(&text) {
+            self.attach(paths, Some(text));
+            return;
+        }
+        if self.focus == Focus::Input {
+            self.composer.insert_str(text.replace('\r', ""));
+            self.on_composer_edit();
+        }
+    }
+
+    /// `p` and Ctrl-v: what's on the system clipboard goes in the message,
+    /// once it's been read off the UI thread (`on_pasted`).
+    fn paste_clipboard(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        self.clipboard.paste(open.chat_id);
+        self.pasting = true;
+    }
+
+    fn on_pasted(&mut self, pasted: Pasted) {
+        self.pasting = false;
+        // Not into another chat than the one it was meant for.
+        if self
+            .open
+            .as_ref()
+            .is_none_or(|o| o.chat_id != pasted.chat_id)
+        {
+            return;
+        }
+        match pasted.content {
+            Ok(Paste::Files(paths)) => self.attach(paths, None),
+            Ok(Paste::Image(path)) => {
+                self.attach(vec![path], None);
+                // Not the made-up name it was saved under.
+                if let Some(last) = self.open.as_mut().and_then(|o| o.attachments.last_mut()) {
+                    last.name = "Pasted image".into();
+                }
+            }
+            Ok(Paste::Text(text)) => {
+                self.focus = Focus::Input;
+                self.on_paste(text);
+            }
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// Ctrl-t: the attached photos go as files, uncompressed and with their
+    /// names, or back to photos.
+    fn toggle_as_files(&mut self) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if open.attachments.iter().any(|a| a.kind.is_photo()) {
+            open.as_files = !open.as_files;
+        } else if !open.attachments.is_empty() {
+            self.status = Some("These go as files already: only photos can go either way".into());
+        }
+    }
+
+    /// Ctrl-z: files a paste just attached go back to being the text that
+    /// was pasted, for a path that was meant to be sent as words.
+    fn undo_drop(&mut self) {
+        let Some(text) = self.open.as_mut().and_then(OpenChat::undo_drop) else {
+            return;
+        };
+        self.composer.insert_str(text.replace('\r', ""));
+        self.on_composer_edit();
     }
 
     fn on_decoded(&mut self, decoded: Decoded) {
@@ -2222,6 +2411,15 @@ fn mark_downloaded(path: &str) {
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     let _ = path;
+}
+
+/// A one-line prompt input holding `text`, with the cursor at its end.
+fn prompt_input(text: &str) -> TextArea<'static> {
+    let mut input = TextArea::new(vec![text.to_string()]);
+    input.set_cursor_line_style(Style::default());
+    input.set_cursor_style(Style::default().reversed());
+    input.move_cursor(ratatui_textarea::CursorMove::End);
+    input
 }
 
 fn login_screen(step: LoginStep) -> Screen {
