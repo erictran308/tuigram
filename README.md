@@ -4,7 +4,7 @@
 
 **Telegram at the speed of your keyboard.**
 
-A Telegram client for the terminal with vim keys, inline photos and search across your whole history.<br>
+A terminal Telegram client (TUI) with vim keys, inline photos, reactions and search across your whole history.<br>
 Written in Rust on [TDLib](https://github.com/tdlib/td), the library behind Telegram's own apps.
 
 [![Release](https://img.shields.io/github/v/release/erictran308/tuigram)](https://github.com/erictran308/tuigram/releases/latest)
@@ -25,6 +25,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Your real account, not a bot.** Log in by scanning a QR code with Telegram on your phone, or with your phone number and the code Telegram sends, plus your two-step password if you have one, just like the official apps.
 - **Vim all the way.** Normal mode to move around (`j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u`), `i` to write, `Esc` to stop. Your hands never leave the keyboard.
 - **Photos and stickers, inline.** Real images in kitty, Ghostty, WezTerm and iTerm2, and block-character previews in any other terminal.
+- **React with emoji.** `R` opens the emoji the chat allows, and `/` finds one by name (`heart`, `fire`, `+1`). `X` takes yours back.
 - **Search everything.** `/` in the chat list filters chats as you type. `/` inside a chat searches its entire history, and `n`/`N` jump between matches, highlighted where they appear.
 - **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, reactions under them, date separators, "typing…" while someone writes to you, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app.
