@@ -28,7 +28,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **React with emoji.** `R` opens the emoji the chat allows, and `/` finds one by name (`heart`, `fire`, `+1`). `X` takes yours back.
 - **Send stickers.** `Tab` while writing opens your recent and favorite stickers and the sets you added, and `/` finds more by emoji or word.
 - **Search everything.** `/` in the chat list filters chats as you type. `/` inside a chat searches its entire history, and `n`/`N` jump between matches, highlighted where they appear.
-- **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, reactions under them, date separators, "typing…" while someone writes to you, and unread chats on top.
+- **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, reactions under them, ✓ / ✓✓ when yours are sent and read, date separators, "typing…" while someone writes to you, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app.
 - **Send photos and files.** Drop them on the window, paste a screenshot with `p`, or type a path with `a` (Tab completes it). What you write goes with them as the caption, and several photos go as one album.
 - **Notifications.** New messages pop up as system notifications while you're in another window, and the window title counts your unread chats. Telegram's mute settings apply.

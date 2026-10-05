@@ -295,13 +295,15 @@ fn photo(file_id: i32) -> Option<ChatPhoto> {
 /// The chat list, newest first. Unread chats move to the top.
 fn fill_chats(chats: &mut Chats) {
     chats.set_my_id(ME);
+    // Everyone has read up to the snacks; "On my way!" was just sent.
     add(
         chats,
         HIKE,
         "Weekend Hike",
         photo(HIKE_PHOTO),
         "You: On my way!",
-    );
+    )
+    .read_outbox = 8;
     let alex = add(
         chats,
         ALEX,

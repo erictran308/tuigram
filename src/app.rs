@@ -778,6 +778,10 @@ impl App {
             Update::ChatAccentColors(u) => self.chats.set_accent(u.chat_id, u.accent_color_id),
             Update::AccentColors(u) => self.chats.set_accent_colors(&u.colors),
             Update::ChatReadInbox(u) => self.chats.set_unread(u.chat_id, u.unread_count),
+            Update::ChatReadOutbox(u) => {
+                self.chats
+                    .set_read_outbox(u.chat_id, u.last_read_outbox_message_id);
+            }
             // TDLib drops the option, rather than setting it false, when
             // Premium ends.
             Update::Option(u) if u.name == "is_premium" => {

@@ -346,6 +346,13 @@ fn layout(
         .saturating_sub(2)
         .max(1);
     let query = open.search.as_ref().map_or("", |s| s.query.as_str());
+    // How far your messages have been read, for their ticks. None in
+    // channels and Saved Messages, where nobody reads them.
+    let read_outbox = names
+        .chats
+        .get(open.chat_id)
+        .filter(|c| !c.is_channel && !names.chats.is_saved(open.chat_id))
+        .map(|c| c.read_outbox);
 
     // Measure every bubble first, so the ones in a block can share a width.
     let mut measured = Vec::with_capacity(open.messages.len());
@@ -401,11 +408,18 @@ fn layout(
             _ if msg.state == SendState::Sent && album.is_some_and(|a| !a.last) => None,
             SendState::Sent => Some(time.map_or(String::new(), |t| {
                 let time = t.format("%H:%M");
-                if edited {
+                let mut meta = if edited {
                     format!("edited {time}")
                 } else {
                     time.to_string()
+                };
+                // One tick once it's sent, two once it's been read.
+                if msg.outgoing
+                    && let Some(read) = read_outbox
+                {
+                    meta.push_str(if id <= read { " ✓✓" } else { " ✓" });
                 }
+                meta
             })),
             SendState::Pending => Some(match open.upload_progress(msg) {
                 Some(done) => format!("sending {done}%"),
@@ -1191,6 +1205,37 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("Chardy") || l.contains("Eric"))
         );
+    }
+
+    #[test]
+    fn your_messages_get_one_tick_when_sent_and_two_once_read() {
+        let mut open = OpenChat::new(1);
+        open.messages.insert(1, msg(true, 1_790_000_000, "seen it"));
+        open.messages.insert(2, msg(false, 1_790_000_060, "answer"));
+        open.messages.insert(3, msg(true, 1_790_000_120, "not yet"));
+        let render = |chats: &Chats, open: &mut OpenChat| -> Vec<String> {
+            let buf = render_in(open, chats, false, &mut images());
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+                .collect()
+        };
+        let row =
+            |rows: &[String], text: &str| rows.iter().find(|r| r.contains(text)).cloned().unwrap();
+
+        let mut chats = Chats::default();
+        chats.add_local(1, "Chardy", None).read_outbox = 2;
+        let rows = render(&chats, &mut open);
+        assert!(row(&rows, "seen it").contains(" ✓✓"), "{rows:#?}");
+        let unread = row(&rows, "not yet");
+        assert!(unread.contains(" ✓") && !unread.contains("✓✓"), "{unread}");
+        assert!(!row(&rows, "answer").contains('✓'), "not on theirs");
+
+        chats.add_local(1, "News", None).is_channel = true;
+        assert!(!render(&chats, &mut open).iter().any(|r| r.contains('✓')));
+        let mut saved = Chats::default();
+        saved.add_local(1, "Saved Messages", None);
+        saved.set_my_id(1);
+        assert!(!render(&saved, &mut open).iter().any(|r| r.contains('✓')));
     }
 
     #[test]

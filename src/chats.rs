@@ -22,6 +22,9 @@ pub struct Chat {
     /// A one-on-one chat, where only the other person can be typing.
     pub is_private: bool,
     pub unread: i32,
+    /// Your messages up to this id have been read: by the other person, or
+    /// by anyone in a group.
+    pub read_outbox: i64,
     /// One-line summary of the last message, e.g. "You: see you at 5".
     pub preview: String,
     /// Position in the main list; 0 means the chat isn't in it (e.g. archived).
@@ -91,6 +94,7 @@ impl Chats {
             is_channel,
             is_private,
             unread: chat.unread_count,
+            read_outbox: chat.last_read_outbox_message_id,
             preview: chat.last_message.as_ref().map(preview).unwrap_or_default(),
             order: main_order(&chat.positions).unwrap_or(0),
             photo: chat.photo.as_ref().map(ChatPhoto::new),
@@ -156,6 +160,12 @@ impl Chats {
         if let Some(chat) = self.by_id.get_mut(&chat_id) {
             chat.unread = unread;
             self.dirty = true;
+        }
+    }
+
+    pub fn set_read_outbox(&mut self, chat_id: i64, message_id: i64) {
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            chat.read_outbox = message_id;
         }
     }
 
@@ -300,6 +310,7 @@ impl Chats {
                 is_channel: false,
                 is_private: false,
                 unread: 0,
+                read_outbox: 0,
                 preview: String::new(),
                 order,
                 photo,
@@ -391,6 +402,7 @@ mod tests {
                     is_channel: false,
                     is_private: false,
                     unread,
+                    read_outbox: 0,
                     preview: String::new(),
                     order,
                     photo: None,
@@ -475,6 +487,7 @@ mod tests {
                 is_channel: false,
                 is_private: true,
                 unread: 0,
+                read_outbox: 0,
                 preview: String::new(),
                 order: 10,
                 photo: None,
