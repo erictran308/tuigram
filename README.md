@@ -140,7 +140,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `y` | Copy the selected message: its text, a link, or the photo or file |
 | `r` | Reply to the selected message (`Esc` twice cancels the reply) |
 | `f` | Forward the selected message, or its whole album: type part of a chat's name, `Enter` sends it there |
-| `e` | Edit your message: `Enter` saves, `Esc` twice cancels |
+| `e` | Edit your message, its formatting written as Markdown: `Enter` saves, `Esc` twice cancels |
 | `R` | React to the selected message: pick an emoji, or type `/` and its name (`heart`, `+1`); `Enter` on one of yours takes it back |
 | `X` | Take back all your reactions to the selected message, without the popup |
 | `gd` / `Ctrl-o` | Go to the message a reply answers / back to the reply |
@@ -153,6 +153,22 @@ The status bar always shows the keys for where you are. The essentials:
 | `:` | Run a command, typed in full: `:logout` logs out of Telegram on this computer |
 | `?` | Every shortcut, plus settings and themes |
 | `q` | Quit |
+
+### Formatting
+
+Write Markdown the way Telegram Desktop takes it, and the message goes out formatted:
+
+| You write | It shows |
+| --- | --- |
+| `**bold**` | **bold** |
+| `__italic__` | *italic* |
+| `~~strikethrough~~` | ~~strikethrough~~ |
+| `\|\|spoiler\|\|` | hidden until tapped (or `Enter` in tuigram) |
+| `` `code` `` | `code` |
+| ` ```code block``` ` | a block of code |
+| `[words](https://example.com)` | a link behind the words |
+
+Markup that isn't closed stays as you typed it, so `2*3*4` or `snake_case` are left alone. Captions work the same, and `e` puts a message back in Markdown to edit it.
 
 ## Notifications
 

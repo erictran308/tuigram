@@ -56,11 +56,13 @@ pub enum TgEvent {
         message_id: i64,
         deletable: Option<Deletable>,
     },
-    /// Whether a message can be edited; `None` if TDLib couldn't say.
+    /// Whether a message can be edited; `None` if TDLib couldn't say. If it
+    /// can, its words as Markdown, unless they couldn't be had.
     Editable {
         chat_id: i64,
         message_id: i64,
         editable: Option<bool>,
+        text: Option<EditText>,
     },
     /// What reactions a message can get; `None` if TDLib couldn't say.
     Reactions {
@@ -243,23 +245,94 @@ fn log_to_file(path: &Path) -> Result<()> {
         json!({ "@type": "setLogVerbosityLevel", "new_verbosity_level": 2 }),
     ];
     for request in requests {
-        let request = CString::new(request.to_string())?;
-        // SAFETY: `request` is a NUL-terminated string that outlives the call.
-        // TDLib returns a NUL-terminated answer (or null) that stays valid
-        // until the next `td_execute` call, and it's copied out before then.
-        let response = unsafe {
-            let response = td_execute(request.as_ptr());
-            if response.is_null() {
-                String::new()
-            } else {
-                CStr::from_ptr(response).to_string_lossy().into_owned()
-            }
-        };
+        let response = execute(&request)?;
         if !response.contains(r#""@type":"ok""#) {
             bail!("TDLib log setup failed: {response}");
         }
     }
     Ok(())
+}
+
+/// Runs one of the TDLib requests that need no client, and returns its JSON
+/// answer.
+fn execute(request: &serde_json::Value) -> Result<String> {
+    let request = CString::new(request.to_string())?;
+    // SAFETY: `request` is a NUL-terminated string that outlives the call.
+    // TDLib returns a NUL-terminated answer (or null) that stays valid until
+    // the next `td_execute` call on this thread, and it's copied out before
+    // then.
+    let response = unsafe {
+        let response = td_execute(request.as_ptr());
+        if response.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(response).to_string_lossy().into_owned()
+        }
+    };
+    Ok(response)
+}
+
+/// A formatted text from a TDLib request that needs no client, or `None` if
+/// it failed.
+fn execute_text(request: &serde_json::Value) -> Option<types::FormattedText> {
+    let response = execute(request).ok()?;
+    match serde_json::from_str(&response) {
+        Ok(enums::FormattedText::FormattedText(text)) => Some(text),
+        Err(_) => None,
+    }
+}
+
+/// What's written in the composer, with Telegram's Markdown turned into
+/// formatting, as Telegram Desktop does: `**bold**`, `__italic__`,
+/// `~~strikethrough~~`, `||spoiler||`, `` `code` ``, ` ```code block``` `
+/// and `[text](https://…)`. Markup that isn't closed stays as typed, so a
+/// lone `*` or `_` is just a character. It runs at once rather than as a
+/// request, so messages still go out in the order they were sent.
+pub fn markdown(text: String) -> types::FormattedText {
+    let request = json!({
+        "@type": "parseMarkdown",
+        "text": { "@type": "formattedText", "text": text, "entities": [] },
+    });
+    execute_text(&request).unwrap_or_else(|| plain(text))
+}
+
+/// What `e` puts in the composer: your message as Markdown, so saving it
+/// keeps its formatting.
+pub struct EditText {
+    pub markdown: String,
+    /// Some formatting has no Markdown (underline, custom emoji, a mention
+    /// of someone without a username…), so an edit would lose it.
+    pub loses: bool,
+}
+
+/// A message's text or caption as Markdown, for editing it.
+pub fn to_markdown(text: &types::FormattedText) -> Option<EditText> {
+    let request = json!({ "@type": "getMarkdownText", "text": text });
+    let written = execute_text(&request)?;
+    // What Markdown couldn't write is left as entities.
+    let loses = written
+        .entities
+        .iter()
+        .any(|e| !crate::messages::found_by_telegram(&e.r#type));
+    Some(EditText {
+        markdown: crate::text::clean(&written.text),
+        loses,
+    })
+}
+
+/// The words of a message that `e` can change: a text, or a caption.
+fn editable_text(content: &enums::MessageContent) -> Option<&types::FormattedText> {
+    use enums::MessageContent as C;
+    match content {
+        C::MessageText(m) => Some(&m.text),
+        C::MessagePhoto(m) => Some(&m.caption),
+        C::MessageVideo(m) => Some(&m.caption),
+        C::MessageAnimation(m) => Some(&m.caption),
+        C::MessageDocument(m) => Some(&m.caption),
+        C::MessageAudio(m) => Some(&m.caption),
+        C::MessageVoiceNote(m) => Some(&m.caption),
+        _ => None,
+    }
 }
 
 /// Events go to the app tagged with the client they came from, so it can
@@ -601,8 +674,8 @@ impl Tg {
         }
     }
 
-    /// Asks whether a message can be edited: TDLib knows whose it is, and
-    /// how long the chat allows edits for.
+    /// Asks whether a message can be edited (TDLib knows whose it is, and
+    /// how long the chat allows edits for), and for its words as Markdown.
     pub fn check_editable(&self, chat_id: i64, message_id: i64) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
@@ -615,19 +688,27 @@ impl Tg {
                     None
                 }
             };
+            let mut text = None;
+            if editable == Some(true)
+                && let Ok(enums::Message::Message(message)) =
+                    functions::get_message(chat_id, message_id, client_id).await
+            {
+                text = editable_text(&message.content).and_then(to_markdown);
+            }
             let _ = tx.send(TgEvent::Editable {
                 chat_id,
                 message_id,
                 editable,
+                text,
             });
         });
     }
 
-    /// Replaces a text message's text. TDLib then sends
-    /// `updateMessageContent` and `updateMessageEdited`.
+    /// Replaces a text message's text, with its Markdown made formatting.
+    /// TDLib then sends `updateMessageContent` and `updateMessageEdited`.
     pub fn edit_text(&self, chat_id: i64, message_id: i64, text: String) {
         let content = enums::InputMessageContent::InputMessageText(types::InputMessageText {
-            text: plain(text),
+            text: markdown(text),
             link_preview_options: None,
             clear_draft: false,
         });
@@ -645,7 +726,7 @@ impl Tg {
         self.spawn(functions::edit_message_caption(
             chat_id,
             message_id,
-            Some(plain(text)),
+            Some(markdown(text)),
             above,
             self.client_id,
         ));
@@ -662,12 +743,13 @@ impl Tg {
         ));
     }
 
-    /// Sends a plain-text message, as a reply to message `reply_to` if given.
-    /// TDLib first reports it with a temporary id (`updateNewMessage`), then
-    /// `updateMessageSendSucceeded` or `…Failed`.
+    /// Sends a message, its Markdown made formatting (see [`markdown`]), as
+    /// a reply to message `reply_to` if given. TDLib first reports it with a
+    /// temporary id (`updateNewMessage`), then `updateMessageSendSucceeded`
+    /// or `…Failed`.
     pub fn send_text(&self, chat_id: i64, text: String, reply_to: Option<i64>) {
         let content = enums::InputMessageContent::InputMessageText(types::InputMessageText {
-            text: plain(text),
+            text: markdown(text),
             link_preview_options: None,
             clear_draft: true,
         });
@@ -790,8 +872,8 @@ impl Tg {
     ) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
+        let mut caption = (!caption.is_empty()).then(|| markdown(caption));
         tokio::spawn(async move {
-            let mut caption = (!caption.is_empty()).then(|| plain(caption));
             let mut reply_to = reply_to.map(reply_to_message);
             for group in groups {
                 let mut contents: Vec<_> = group
@@ -1169,7 +1251,7 @@ fn reply_to_message(message_id: i64) -> enums::InputMessageReplyTo {
 
 /// Text without formatting. Telegram still finds links, mentions and the
 /// like in it by itself.
-fn plain(text: String) -> types::FormattedText {
+pub fn plain(text: String) -> types::FormattedText {
     types::FormattedText {
         text,
         entities: Vec::new(),
@@ -1178,6 +1260,83 @@ fn plain(text: String) -> types::FormattedText {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Without `log_to_file`, TDLib prints every request it runs here.
+    fn quiet() {
+        let request = json!({ "@type": "setLogVerbosityLevel", "new_verbosity_level": 1 });
+        execute(&request).unwrap();
+    }
+
+    fn entities(text: &types::FormattedText) -> Vec<(i32, i32, String)> {
+        text.entities
+            .iter()
+            .map(|e| {
+                let kind = format!("{:?}", e.r#type);
+                (e.offset, e.length, kind)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn markdown_in_the_composer_is_sent_as_formatting() {
+        quiet();
+        let sent =
+            markdown("**bold** __it__ ~~gone~~ ||secret|| `code` [site](https://x.dev)".into());
+        assert_eq!(sent.text, "bold it gone secret code site");
+        assert_eq!(
+            entities(&sent),
+            [
+                (0, 4, "Bold".into()),
+                (5, 2, "Italic".into()),
+                (8, 4, "Strikethrough".into()),
+                (13, 6, "Spoiler".into()),
+                (20, 4, "Code".into()),
+                (
+                    25,
+                    4,
+                    "TextUrl(TextEntityTypeTextUrl { url: \"https://x.dev/\" })".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_stars_and_underscores_stay_as_typed() {
+        quiet();
+        let sent = markdown("2*3*4 = 24, snake_case_name, a ** b".into());
+        assert_eq!(sent.text, "2*3*4 = 24, snake_case_name, a ** b");
+        assert!(sent.entities.is_empty(), "{:?}", sent.entities);
+    }
+
+    #[test]
+    fn edits_start_from_the_message_as_markdown() {
+        quiet();
+        let entity = |offset, length, r#type| types::TextEntity {
+            offset,
+            length,
+            r#type,
+        };
+        let bold = types::FormattedText {
+            text: "bold and plain".into(),
+            entities: vec![entity(0, 4, enums::TextEntityType::Bold)],
+        };
+        let edit = to_markdown(&bold).unwrap();
+        assert_eq!(edit.markdown, "**bold** and plain");
+        assert!(!edit.loses);
+        // Saving it gives the same message back.
+        assert_eq!(markdown(edit.markdown), bold);
+
+        let underlined = types::FormattedText {
+            text: "under".into(),
+            entities: vec![entity(0, 5, enums::TextEntityType::Underline)],
+        };
+        assert!(
+            to_markdown(&underlined).unwrap().loses,
+            "Markdown has no underline"
+        );
+    }
+
     #[test]
     fn openssl_is_told_not_to_read_a_config_file() {
         super::no_openssl_config().unwrap();

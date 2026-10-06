@@ -2162,6 +2162,7 @@ mod tests {
         open.editing = Some(crate::messages::Editing {
             id: 2,
             snippet: "hello from me".into(),
+            original: "hello from me".into(),
             editable: Editable::Text,
             draft: String::new(),
             reply: None,

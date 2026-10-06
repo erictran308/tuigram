@@ -213,6 +213,9 @@ pub struct Editing {
     pub id: i64,
     /// What it said, for the bar over the composer.
     pub snippet: String,
+    /// What the composer started with: the message as Markdown. Enter
+    /// sends nothing if it's still that.
+    pub original: String,
     pub editable: Editable,
     /// What the composer held before, put back once the edit is saved or
     /// cancelled.
@@ -642,7 +645,7 @@ fn body(content: &MessageContent) -> Body {
 
 /// Entities Telegram finds in plain text by itself, so an edit sent as
 /// plain text gets them back. Any other kind is formatting the sender chose.
-fn found_by_telegram(kind: &TextEntityType) -> bool {
+pub fn found_by_telegram(kind: &TextEntityType) -> bool {
     use TextEntityType as T;
     matches!(
         kind,

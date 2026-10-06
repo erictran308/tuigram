@@ -1559,7 +1559,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         _ if app
             .confirm
             .as_ref()
-            .is_some_and(|c| matches!(c.action, Confirmed::Edit(_))) =>
+            .is_some_and(|c| matches!(c.action, Confirmed::Edit { .. })) =>
         {
             (normal, "  `y` edit · `n` or `Esc` cancel")
         }
@@ -1934,6 +1934,7 @@ mod tests {
         let editing = Editing {
             id: 7,
             snippet: "see you at 7".into(),
+            original: "see you at 7".into(),
             editable: Editable::Text,
             draft: String::new(),
             reply: None,

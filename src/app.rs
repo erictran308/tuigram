@@ -33,7 +33,7 @@ use crate::search::MessageSearch;
 use crate::settings::{self, Settings, Side};
 use crate::stickers::{self, Source, StickerPanel};
 use crate::text;
-use crate::tg::{Deletable, Found, Invite, Page, Tagged, Tg, TgEvent};
+use crate::tg::{Deletable, EditText, Found, Invite, Page, Tagged, Tg, TgEvent};
 use crate::theme::{Colors, Themes};
 use crate::ui;
 
@@ -192,8 +192,12 @@ impl Confirm {
 pub enum Confirmed {
     OpenFile(String),
     OpenLink(String),
-    /// Edit this message, losing its formatting.
-    Edit(i64),
+    /// Edit this message, starting from this text, losing the formatting
+    /// Markdown can't write.
+    Edit {
+        id: i64,
+        text: String,
+    },
     /// Join this public group or channel, to write in it.
     Join(i64),
     /// Join the chat this invite link leads to, then open it.
@@ -208,7 +212,7 @@ impl Confirmed {
     pub fn verb(&self) -> &'static str {
         match self {
             Confirmed::OpenFile(_) | Confirmed::OpenLink(_) => "open",
-            Confirmed::Edit(_) => "edit",
+            Confirmed::Edit { .. } => "edit",
             Confirmed::Join(_) | Confirmed::JoinLink { .. } => "join",
         }
     }
@@ -807,7 +811,8 @@ impl App {
                 chat_id,
                 message_id,
                 editable,
-            } => self.on_editable(chat_id, message_id, editable),
+                text,
+            } => self.on_editable(chat_id, message_id, editable, text),
             TgEvent::Reactions {
                 chat_id,
                 message_id,
@@ -2019,7 +2024,13 @@ impl App {
         }
     }
 
-    fn on_editable(&mut self, chat_id: i64, message_id: i64, editable: Option<bool>) {
+    fn on_editable(
+        &mut self,
+        chat_id: i64,
+        message_id: i64,
+        editable: Option<bool>,
+        text: Option<EditText>,
+    ) {
         // Only while the cursor is still on it, so a late answer can't take
         // over the composer.
         let Some(open) = self
@@ -2032,27 +2043,36 @@ impl App {
         let Some(msg) = open.messages.get(&message_id) else {
             return;
         };
+        // Without it as Markdown, it's edited as plain text, which loses
+        // any formatting.
+        let (text, loses) = match text {
+            Some(text) => (text.markdown, text.loses),
+            None => (msg.source_text.clone(), msg.formatted),
+        };
         // On an error, TDLib's message is already in the status bar.
         match editable {
             None => {}
             Some(false) => self.status = Some("You can't edit this message".into()),
-            Some(true) if msg.formatted => {
+            Some(true) if loses => {
                 self.confirm = Some(Confirm::new(
-                    "Edit without formatting?",
+                    "Edit and lose some formatting?",
                     vec![
-                        "tuigram edits plain text, so this message would lose".into(),
-                        "its bold, italics, links behind words and the like.".into(),
+                        "Some of its formatting can't be written in Markdown".into(),
+                        "(underline, custom emoji…), so an edit would lose it.".into(),
                     ],
-                    Confirmed::Edit(message_id),
+                    Confirmed::Edit {
+                        id: message_id,
+                        text,
+                    },
                 ));
             }
-            Some(true) => self.start_edit(message_id),
+            Some(true) => self.start_edit(message_id, text),
         }
     }
 
-    /// Puts the message's text in the composer, keeping what was there to
-    /// give back when the edit is done.
-    fn start_edit(&mut self, id: i64) {
+    /// Puts the message's text, as Markdown, in the composer, keeping what
+    /// was there to give back when the edit is done.
+    fn start_edit(&mut self, id: i64, text: String) {
         self.end_edit();
         let Some(open) = self.open.as_mut() else {
             return;
@@ -2060,10 +2080,10 @@ impl App {
         let Some(msg) = open.messages.get(&id) else {
             return;
         };
-        let text = msg.source_text.clone();
         open.editing = Some(Editing {
             id,
             snippet: msg.snippet(),
+            original: text.clone(),
             editable: msg.editable,
             draft: self.composer.lines().join("\n"),
             reply: open.reply.take(),
@@ -2103,11 +2123,7 @@ impl App {
             self.status = Some("A message can't be empty (d deletes it)".into());
             return;
         }
-        let changed = open
-            .messages
-            .get(&editing.id)
-            .is_none_or(|m| m.source_text != text);
-        if changed {
+        if text != editing.original.trim() {
             let (chat_id, id, text) = (open.chat_id, editing.id, text.to_string());
             match editing.editable {
                 Editable::Text => self.tg.edit_text(chat_id, id, text),
@@ -2745,7 +2761,7 @@ impl App {
                         Confirmed::OpenFile(target) | Confirmed::OpenLink(target) => {
                             self.open_externally(&target)
                         }
-                        Confirmed::Edit(id) => self.start_edit(id),
+                        Confirmed::Edit { id, text } => self.start_edit(id, text),
                         Confirmed::Join(chat_id) => self.tg.join_chat(chat_id),
                         Confirmed::JoinLink { link, request } => {
                             self.finding = Some(request.clone());
@@ -3751,6 +3767,34 @@ mod tests {
     }
 
     #[test]
+    fn e_edits_your_message_as_markdown_and_an_untouched_edit_sends_nothing() {
+        let mut app = test_app("edit-markdown");
+        app.focus = Focus::Messages;
+        let open = app.open.as_ref().unwrap();
+        let (chat_id, id) = (open.chat_id, open.edit_target().unwrap());
+        let text = EditText {
+            markdown: "On my **way**!".into(),
+            loses: false,
+        };
+        app.on_editable(chat_id, id, Some(true), Some(text));
+        assert!(app.focus == Focus::Input);
+        assert_eq!(app.composer.lines(), ["On my **way**!"]);
+        // Unchanged, so Enter only ends the edit: no request.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.open.as_ref().unwrap().editing.is_none());
+
+        // Formatting Markdown can't write asks first.
+        app.focus = Focus::Messages;
+        let text = EditText {
+            markdown: "On my way!".into(),
+            loses: true,
+        };
+        app.on_editable(chat_id, id, Some(true), Some(text));
+        let confirm = app.confirm.as_ref().expect("asks");
+        assert!(matches!(&confirm.action, Confirmed::Edit { text, .. } if text == "On my way!"));
+    }
+
+    #[test]
     fn i_in_a_public_group_you_are_not_in_asks_to_join_first() {
         let mut app = test_app("join");
         let chat_id = app.open.as_ref().unwrap().chat_id;
@@ -3771,7 +3815,11 @@ mod tests {
     #[test]
     fn a_y_typed_just_before_a_warning_came_up_does_not_answer_it() {
         let mut app = test_app("grace");
-        app.confirm = Some(Confirm::new("Edit?", vec![], Confirmed::Edit(-1)));
+        let edit = Confirmed::Edit {
+            id: -1,
+            text: String::new(),
+        };
+        app.confirm = Some(Confirm::new("Edit?", vec![], edit));
         press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
         assert!(app.confirm.is_some(), "too soon to count");
         let confirm = app.confirm.as_mut().unwrap();
