@@ -26,6 +26,10 @@ const PHOTO_ROWS: u16 = 2;
 /// Narrower than this inside its border, the list leaves photos out to keep
 /// room for titles.
 const MIN_WIDTH_FOR_PHOTOS: u16 = 24;
+/// After a muted chat's name.
+const MUTED: &str = " 🔕";
+/// On the right of a pinned chat with nothing unread.
+const PINNED: &str = "📌";
 
 /// What the list shows, from the app's state.
 pub struct ChatList<'a> {
@@ -94,24 +98,37 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
                 Span::from(" ")
             };
             let gap = Span::from(" ".repeat(indent.into()));
+            let muted = chats.muted(id);
+            // The unread count, grey for a muted chat as in Telegram; else
+            // a pin for a pinned one.
             let badge = if chat.unread > 0 {
-                format!(" {} ", chat.unread)
+                let bg = if muted { colors.muted } else { colors.primary };
+                Span::from(format!(" {} ", chat.unread))
+                    .fg(colors.bg)
+                    .bg(bg)
+            } else if chat.pinned {
+                Span::from(PINNED)
             } else {
-                String::new()
+                Span::from("")
             };
             let title = chats.title(id).unwrap_or_default();
             let mark = chats.badge(id);
             let mark_w = mark.map_or(0, |m| m.mark().width());
-            let title = truncate(title, width.saturating_sub(badge.width() + mark_w + 1));
-            let pad = width.saturating_sub(title.width() + mark_w + badge.width());
+            let mute_w = if muted { MUTED.width() } else { 0 };
+            let badge_w = badge.content.width();
+            let title = truncate(title, width.saturating_sub(badge_w + mark_w + mute_w + 1));
+            let pad = width.saturating_sub(title.width() + mark_w + mute_w + badge_w);
             let style = title_style(chats, id, colors).bold();
             let mut first = vec![bar.clone(), gap.clone()];
             first.extend(highlight(&title, filter, style, colors));
             if let Some(mark) = mark {
                 first.push(super::badge_span(mark, colors));
             }
+            if muted {
+                first.push(Span::from(MUTED).fg(colors.muted));
+            }
             first.push(Span::from(" ".repeat(pad)));
-            first.push(Span::from(badge).fg(colors.bg).bg(colors.primary));
+            first.push(badge);
             // Highlighted by hand too, so the blank row below stays blank.
             let row_style = if is_selected {
                 Style::new().bg(colors.selection)
@@ -285,6 +302,39 @@ mod tests {
             rows.iter().any(|r| r.contains("Telegram SCAM")),
             "{rows:#?}"
         );
+    }
+
+    #[test]
+    fn pinned_chats_show_a_pin_and_muted_ones_a_bell_and_a_grey_count() {
+        use tdlib_rs::types::ChatNotificationSettings;
+        let mut chats = Chats::default();
+        chats.add_local(1, "Pinned", None).pinned = true;
+        chats.add_local(2, "Quiet", None).unread = 4;
+        chats.set_notifications(
+            2,
+            ChatNotificationSettings {
+                mute_for: 3600,
+                ..ChatNotificationSettings::default()
+            },
+        );
+        chats.refresh();
+        let colors = Colors::default();
+        let buf = render(
+            &list(&chats, None),
+            &mut images(ProtocolType::Halfblocks),
+            40,
+            10,
+        );
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let pinned = rows.iter().position(|r| r.contains("Pinned")).unwrap();
+        let quiet = rows.iter().position(|r| r.contains("Quiet")).unwrap();
+        assert!(pinned < quiet, "pinned first, even before unread chats");
+        assert!(rows[pinned].contains('📌'), "{rows:#?}");
+        assert!(rows[quiet].contains("Quiet 🔕"), "{rows:#?}");
+        let x = rows[quiet].chars().position(|c| c == '4').unwrap() as u16;
+        assert_eq!(buf[(x, quiet as u16)].bg, colors.muted, "a grey count");
     }
 
     fn render(list: &ChatList, images: &mut Images, width: u16, height: u16) -> Buffer {

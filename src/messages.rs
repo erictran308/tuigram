@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::attach::{Attachment, Dropped};
 use crate::chats::content_text_as_sent;
+use crate::complete::Commands;
 use crate::images::Thumbnail;
 use crate::poll::Poll;
 use crate::reactions::{self, Reaction, ReactionKind};
@@ -980,6 +981,8 @@ pub struct OpenChat {
     pub replied: HashMap<i64, Fetched>,
     /// Replies `gd` jumped away from, latest last, for Ctrl-o to go back to.
     pub jumps: Vec<i64>,
+    /// The commands of the chat's bots, for `/` completion.
+    pub commands: Commands,
 }
 
 impl OpenChat {
@@ -1002,6 +1005,7 @@ impl OpenChat {
             uploads: HashMap::new(),
             replied: HashMap::new(),
             jumps: Vec::new(),
+            commands: Commands::NotAsked,
         }
     }
 

@@ -31,7 +31,8 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Find anyone.** `s` finds a chat by name, or anyone on Telegram by `@username` or `t.me` link: your contacts, public groups and channels, invite links (it asks before joining) and links to a message.
 - **Forward.** `f` sends the selected message, or a whole album, to another chat, with "Forwarded from" as in Telegram.
 - **Polls and link previews.** Polls show their answers, and how people voted once you have; `Enter` votes. Links show the page's title and a few lines of it, under the site they really go to, beside a small picture where the terminal shows images.
-- **Write faster.** `@` and a few letters suggests people in the group, `:` and a few letters suggests emoji (`:tada` 🎉); `Tab` puts one in.
+- **Write faster.** `@` and a few letters suggests people in the group, `:` and a few letters suggests emoji (`:tada` 🎉), and `/` starting a message lists the bots' commands; `Tab` puts one in.
+- **Pin and mute.** `p` pins a chat to the top and `m` mutes it, on Telegram, so your other devices follow.
 - **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, **bold**, *italic*, `code` and spoilers (hidden until `Enter`), reactions under them, ✓ / ✓✓ when yours are sent and read, date separators, "typing…" while someone writes to you, when they were last seen, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app. Telegram links (`t.me/…`) open right in tuigram: the chat, the message, or an invite, which asks before joining.
 - **Send photos and files.** Drop them on the window, paste a screenshot with `p`, or type a path with `a` (Tab completes it). What you write goes with them as the caption, and several photos go as one album.
@@ -137,7 +138,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `Ctrl-d` / `Ctrl-u` | Half a page down / up |
 | `Enter` / `l` | Open a chat, or the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens). On a message with spoilers, `Enter` shows them first; on a poll, it votes; a `t.me` link opens in tuigram |
 | `h` / `Esc` | Back to the chat list. To have the list on the right, tick **On the right side of the window** in `?` > **Settings**; `h` and `l` then swap, to follow the screen |
-| `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line. `@name` or `:emoji` shows suggestions, and `Tab` puts one in. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
+| `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line. `@name` or `:emoji` shows suggestions, and so does `/` starting a message (the bots' commands); `Tab` puts one in. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
 | `Tab` | While writing: stickers. `h/j/k/l` pick one, `H` / `L` switch between Recent, Favorites and your sets, `/` finds stickers by emoji or word, `Enter` sends |
 | `y` | Copy the selected message: its text, a link, or the photo or file |
 | `r` | Reply to the selected message (`Esc` twice cancels the reply) |
@@ -150,6 +151,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `/` | Search chat names, or messages in the open chat |
 | `n` / `N` | Next older / newer match |
 | `H` | Highlight a chat |
+| `p` / `m` | Pin the selected chat to the top, or mute it, on Telegram, so your phone shows the same; again to undo. Pinned chats show 📌, muted ones 🔕 and a grey unread count |
 | `s` | Find a chat or person: type a name, an `@username` or a `t.me` link, then `Enter` opens it. In a public group or channel you're not in, `i` asks to join |
 | `Ctrl-r` | Resize the panes: `h` / `l` move the line between them left / right, `=` puts it back as at first, `Enter` keeps it (also next time), `Esc` cancels |
 | `:` | Run a command, typed in full: `:leave` leaves the group or channel (asks first), `:logout` logs out of Telegram on this computer |

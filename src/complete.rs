@@ -1,6 +1,7 @@
 //! Completing the word being typed in the composer: `@` and a name mentions
 //! someone in the group, `:` and a few letters puts in an emoji by its
-//! shortcode. Tab takes the suggestion under the cursor.
+//! shortcode, and `/` starting a message lists the commands of the chat's
+//! bots. Tab takes the suggestion under the cursor.
 
 use std::time::Duration;
 
@@ -19,6 +20,8 @@ pub enum Kind {
     Mention,
     /// `:shortcode`.
     Emoji,
+    /// `/command`, for a bot.
+    Command,
 }
 
 /// The word before the cursor that can be completed.
@@ -53,6 +56,15 @@ pub fn word_at(line: &str, col: usize) -> Option<Word> {
         return Some(Word {
             kind: Kind::Mention,
             query: query.to_string(),
+            chars,
+        });
+    }
+    if let Some(query) = word.strip_prefix('/')
+        && query.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Some(Word {
+            kind: Kind::Command,
+            query: query.to_ascii_lowercase(),
             chars,
         });
     }
@@ -138,6 +150,62 @@ pub fn mention(user_id: i64, name: &str, username: Option<&str>) -> Suggestion {
             ),
         },
     }
+}
+
+/// A command a bot in the chat takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Command {
+    pub bot: i64,
+    pub name: String,
+    pub description: String,
+}
+
+/// The chat's bot commands, asked of TDLib the first time `/` is typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Commands {
+    NotAsked,
+    Asked,
+    Known(Vec<Command>),
+}
+
+/// Commands starting with the query, then ones with it elsewhere. With
+/// several bots in the chat, each goes to its own bot (`/start@name_bot`),
+/// as in Telegram.
+pub fn commands(
+    list: &[Command],
+    query: &str,
+    username: impl Fn(i64) -> Option<String>,
+) -> Vec<Suggestion> {
+    let mut bots: Vec<i64> = list.iter().map(|c| c.bot).collect();
+    bots.sort_unstable();
+    bots.dedup();
+    let mut found: Vec<(bool, &Command)> = list
+        .iter()
+        .filter(|c| c.name.contains(query))
+        .map(|c| (!c.name.starts_with(query), c))
+        .collect();
+    found.sort_by_key(|&(later, _)| later);
+    found
+        .into_iter()
+        .take(MAX_SUGGESTIONS)
+        .map(|(_, command)| {
+            let to = match username(command.bot) {
+                Some(name) if bots.len() > 1 => format!("@{name}"),
+                _ => String::new(),
+            };
+            // Which bot it goes to shows before it's put in, too.
+            let detail = if to.is_empty() {
+                command.description.clone()
+            } else {
+                format!("{to} · {}", command.description)
+            };
+            Suggestion {
+                label: format!("/{}", command.name),
+                detail,
+                insert: format!("/{}{to} ", command.name),
+            }
+        })
+        .collect()
 }
 
 /// Suggestions for the word being typed.
@@ -247,6 +315,42 @@ mod tests {
         assert_eq!(word("at 10:30"), None);
         assert_eq!(word("so :30"), None);
         assert_eq!(word("so :)"), None);
+    }
+
+    #[test]
+    fn bot_commands_go_to_their_bot_when_the_chat_has_several() {
+        let command = |bot, name: &str| Command {
+            bot,
+            name: name.into(),
+            description: format!("{name} it"),
+        };
+        let one = [
+            command(1, "start"),
+            command(1, "help"),
+            command(1, "restart"),
+        ];
+        let names = |s: Vec<Suggestion>| s.into_iter().map(|s| s.insert).collect::<Vec<_>>();
+        let username = |bot: i64| Some(format!("bot{bot}"));
+        assert_eq!(
+            names(commands(&one, "st", username)),
+            ["/start ", "/restart "],
+            "starting with it first"
+        );
+        let two = [command(1, "start"), command(2, "start")];
+        assert_eq!(
+            names(commands(&two, "", username)),
+            ["/start@bot1 ", "/start@bot2 "]
+        );
+        assert_eq!(commands(&two, "", username)[1].detail, "@bot2 · start it");
+        assert_eq!(
+            word_at("/sta", 4),
+            Some(Word {
+                kind: Kind::Command,
+                query: "sta".into(),
+                chars: 4,
+            })
+        );
+        assert_eq!(word_at("/usr/bin", 8), None);
     }
 
     #[test]

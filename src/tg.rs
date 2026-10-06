@@ -17,7 +17,7 @@ use tdlib_rs::{enums, functions, types};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::error::SendError;
 
-use crate::chats::Badge;
+use crate::chats::{Badge, Peer};
 use crate::config::{ApiKeys, Config};
 use crate::reactions::{self, Available, ReactionKind};
 use crate::stickers::{Source, Sticker};
@@ -108,6 +108,12 @@ pub enum TgEvent {
         chat_id: i64,
         query: String,
         user_ids: Vec<i64>,
+    },
+    /// The commands of a chat's bots, for `/` completion. Failures find
+    /// none.
+    Commands {
+        chat_id: i64,
+        commands: Vec<crate::complete::Command>,
     },
     /// Telegram took messages to forward to this chat.
     Forwarded {
@@ -1143,6 +1149,83 @@ impl Tg {
                 user_ids,
             });
         });
+    }
+
+    /// Asks what commands the bots of a chat take: the bot a private chat is
+    /// with, or the bots in a group.
+    pub fn bot_commands(&self, chat_id: i64, peer: Peer) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let by_bot: Vec<(i64, Vec<types::BotCommand>)> = match peer {
+                Peer::User(id) => match functions::get_user_full_info(id, client_id).await {
+                    Ok(enums::UserFullInfo::UserFullInfo(info)) => info
+                        .bot_info
+                        .map(|b| vec![(id, b.commands)])
+                        .unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                },
+                Peer::BasicGroup(id) => {
+                    match functions::get_basic_group_full_info(id, client_id).await {
+                        Ok(enums::BasicGroupFullInfo::BasicGroupFullInfo(info)) => info
+                            .bot_commands
+                            .into_iter()
+                            .map(|b| (b.bot_user_id, b.commands))
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                Peer::Supergroup(id) => {
+                    match functions::get_supergroup_full_info(id, client_id).await {
+                        Ok(enums::SupergroupFullInfo::SupergroupFullInfo(info)) => info
+                            .bot_commands
+                            .into_iter()
+                            .map(|b| (b.bot_user_id, b.commands))
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    }
+                }
+            };
+            // A bot writes these, so they're cleaned like any message.
+            let line = |text: &str| {
+                crate::text::clean(text)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let commands = by_bot
+                .into_iter()
+                .flat_map(|(bot, commands)| {
+                    commands.into_iter().map(move |c| crate::complete::Command {
+                        bot,
+                        name: line(&c.command),
+                        description: line(&c.description),
+                    })
+                })
+                .collect();
+            let _ = tx.send(TgEvent::Commands { chat_id, commands });
+        });
+    }
+
+    /// Pins a chat to the top of the main list, or unpins it. TDLib then
+    /// sends `updateChatPosition`; past Telegram's limit it's an error.
+    pub fn pin_chat(&self, chat_id: i64, pinned: bool) {
+        self.spawn(functions::toggle_chat_is_pinned(
+            enums::ChatList::Main,
+            chat_id,
+            pinned,
+            self.client_id,
+        ));
+    }
+
+    /// Changes how a chat notifies (`m` mutes it). TDLib then sends
+    /// `updateChatNotificationSettings`.
+    pub fn set_notifications(&self, chat_id: i64, settings: types::ChatNotificationSettings) {
+        self.spawn(functions::set_chat_notification_settings(
+            chat_id,
+            settings,
+            self.client_id,
+        ));
     }
 
     /// Votes in a poll for these answers, by index; none takes your vote

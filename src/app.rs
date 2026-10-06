@@ -21,7 +21,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::attach::{self, Attachment, Dropped};
 use crate::chats::{Badge, Chats, Peer, Presence};
 use crate::clipboard::{Clipboard, ClipboardEvent, Copied, Decoded, Paste, Pasted};
-use crate::complete::{self, Completion, Kind, Suggestion};
+use crate::complete::{self, Commands, Completion, Kind, Suggestion};
 use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
 use crate::messages::{
@@ -913,6 +913,23 @@ impl App {
                     }
                 }
             }
+            TgEvent::Commands { chat_id, commands } => {
+                let Some(open) = self.open.as_mut().filter(|o| o.chat_id == chat_id) else {
+                    return;
+                };
+                open.commands = Commands::Known(commands);
+                let query = self
+                    .completion
+                    .as_ref()
+                    .filter(|c| c.word.kind == Kind::Command)
+                    .map(|c| c.word.query.clone());
+                if let Some(query) = query {
+                    let items = self.command_items(&query);
+                    if let Some(completion) = self.completion.as_mut() {
+                        completion.set_items(items);
+                    }
+                }
+            }
             TgEvent::ChatsFound {
                 query,
                 chat_ids,
@@ -1042,6 +1059,12 @@ impl App {
                     .set_last_message(u.chat_id, u.last_message.as_ref(), &u.positions)
             }
             Update::ChatTitle(u) => self.chats.set_title(u.chat_id, u.title),
+            Update::ChatNotificationSettings(u) => self
+                .chats
+                .set_notifications(u.chat_id, u.notification_settings),
+            Update::ScopeNotificationSettings(u) => self
+                .chats
+                .set_default_mute(&u.scope, u.notification_settings.mute_for),
             Update::ChatAction(u) => self.chats.set_action(u.chat_id, &u.sender_id, &u.action),
             Update::NotificationGroup(u) => self.on_notifications(u),
             Update::UnreadChatCount(u) if matches!(u.chat_list, ChatList::Main) => {
@@ -1436,6 +1459,8 @@ impl App {
             // reply, before it leaves the pane.
             (_, KeyCode::Esc) if self.finding.is_some() => self.finding = None,
             (Focus::Chats, KeyCode::Esc) => self.chats.set_filter(""),
+            (Focus::Chats, KeyCode::Char('p')) if !ctrl => self.toggle_pin(),
+            (Focus::Chats, KeyCode::Char('m')) if !ctrl => self.toggle_mute(),
             (Focus::Messages, KeyCode::Esc)
                 if self.open.as_ref().is_some_and(|o| o.search.is_some()) =>
             {
@@ -1565,16 +1590,24 @@ impl App {
             .lines()
             .get(row)
             .and_then(|line| complete::word_at(line, col));
-        // Nobody to mention in a chat with one person.
+        // Nobody to mention in a chat with one person, and a command only
+        // starts a message.
         let group = self
             .open
             .as_ref()
             .and_then(|o| self.chats.get(o.chat_id))
             .is_some_and(|c| !c.is_private);
-        let Some(word) = word.filter(|w| w.kind == Kind::Emoji || group) else {
+        let Some(word) = word.filter(|w| match w.kind {
+            Kind::Emoji => true,
+            Kind::Mention => group,
+            Kind::Command => row == 0 && col == w.chars,
+        }) else {
             self.completion = None;
             return;
         };
+        if word.kind == Kind::Command {
+            self.ask_bot_commands();
+        }
         if self.completion.as_ref().is_some_and(|c| c.word == word) {
             return;
         }
@@ -1588,10 +1621,43 @@ impl App {
                 let found = completion.found.clone();
                 self.mention_items(&word.query, &found)
             }
+            Kind::Command => self.command_items(&word.query),
         };
         if let Some(completion) = self.completion.as_mut() {
             completion.set_items(items);
         }
+    }
+
+    /// Asks once per open chat for the commands of its bots: the bot of a
+    /// chat with one, or the bots in a group.
+    fn ask_bot_commands(&mut self) {
+        let Some(open) = self
+            .open
+            .as_mut()
+            .filter(|o| o.commands == Commands::NotAsked)
+        else {
+            return;
+        };
+        let peer = self.chats.get(open.chat_id).and_then(|c| c.peer);
+        open.commands = match peer {
+            // A person takes no commands.
+            Some(Peer::User(id)) if !self.chats.is_bot(id) => Commands::Known(Vec::new()),
+            Some(peer) => {
+                self.tg.bot_commands(open.chat_id, peer);
+                Commands::Asked
+            }
+            None => Commands::Known(Vec::new()),
+        };
+    }
+
+    /// The commands of the open chat's bots that have `query` in them.
+    fn command_items(&self, query: &str) -> Vec<Suggestion> {
+        let Some(Commands::Known(list)) = self.open.as_ref().map(|o| &o.commands) else {
+            return Vec::new();
+        };
+        complete::commands(list, query, |bot| {
+            self.chats.user_username(bot).map(String::from)
+        })
     }
 
     /// People in the open group whose name or username has `query` in it:
@@ -3533,6 +3599,28 @@ impl App {
         self.tg.load_chats(CHAT_PAGE);
     }
 
+    /// `p` in the list: pins the selected chat to the top, or unpins it, on
+    /// Telegram, so your other devices show it too.
+    fn toggle_pin(&mut self) {
+        let Some(chat_id) = self.selected else {
+            return;
+        };
+        let pinned = self.chats.get(chat_id).is_some_and(|c| c.pinned);
+        self.tg.pin_chat(chat_id, !pinned);
+    }
+
+    /// `m` in the list: mutes the selected chat for good, or unmutes it, on
+    /// Telegram.
+    fn toggle_mute(&mut self) {
+        let Some(chat_id) = self.selected else {
+            return;
+        };
+        let mute = !self.chats.muted(chat_id);
+        if let Some(settings) = self.chats.with_mute(chat_id, mute) {
+            self.tg.set_notifications(chat_id, settings);
+        }
+    }
+
     /// `H`: marks the selected chat so it's easy to find, or unmarks it.
     fn toggle_highlight(&mut self) {
         let Some(chat_id) = self.selected else {
@@ -4141,6 +4229,33 @@ mod tests {
             app.completion.as_ref().is_none_or(|c| c.items.is_empty()),
             "not yourself"
         );
+    }
+
+    #[test]
+    fn slash_starting_a_message_suggests_the_bots_commands() {
+        let mut app = test_app("commands");
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        app.focus = Focus::Input;
+        app.typing = Some((chat_id, Instant::now()));
+        let command = |name: &str| complete::Command {
+            bot: 9,
+            name: name.into(),
+            description: format!("{name} the bot"),
+        };
+        app.open.as_mut().unwrap().commands =
+            Commands::Known(vec![command("start"), command("help")]);
+
+        app.composer.insert_str("/he");
+        app.update_completion();
+        let completion = app.completion.as_ref().expect("suggestions");
+        assert_eq!(completion.items[0].label, "/help");
+        assert_eq!(completion.items[0].detail, "help the bot");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.composer.lines(), ["/help "]);
+
+        app.composer.insert_str("see /st");
+        app.update_completion();
+        assert!(app.completion.is_none(), "only at the start of a message");
     }
 
     #[test]

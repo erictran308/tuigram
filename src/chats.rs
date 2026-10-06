@@ -7,8 +7,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tdlib_rs::enums::{ChatAction, ChatList, ChatType, MessageContent, MessageSender, UserStatus};
-use tdlib_rs::types::{self, AccentColor, ChatPhotoInfo, ChatPosition, FormattedText, Message};
+use tdlib_rs::enums::{
+    ChatAction, ChatList, ChatType, MessageContent, MessageSender, NotificationSettingsScope,
+    UserStatus,
+};
+use tdlib_rs::types::{
+    self, AccentColor, ChatNotificationSettings, ChatPhotoInfo, ChatPosition, FormattedText,
+    Message,
+};
 
 use crate::images::Thumbnail;
 use crate::messages::{Sender, decode_minithumbnail, without_spoilers};
@@ -38,12 +44,17 @@ pub struct Chat {
     pub activity: Vec<(Sender, &'static str)>,
     /// The person or group the chat is with, for its [`Badge`].
     pub peer: Option<Peer>,
+    /// Pinned to the top of the main list.
+    pub pinned: bool,
+    /// How the chat notifies, which `m` changes the mute of.
+    notifications: ChatNotificationSettings,
 }
 
 /// Whom a chat is with: a person, or a group or channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Peer {
     User(i64),
+    BasicGroup(i64),
     Supergroup(i64),
 }
 
@@ -130,6 +141,9 @@ pub struct Chats {
     usernames: HashMap<Peer, String>,
     /// Groups and channels you're not in: public ones opened with `s`.
     left: HashSet<i64>,
+    /// How long chats of each kind are muted for unless they say
+    /// otherwise: private chats, groups, channels.
+    default_mute: [i32; 3],
     /// When people were last on Telegram, by user id.
     presence: HashMap<i64, Presence>,
     /// User ids of bots, which have no last seen.
@@ -179,8 +193,9 @@ impl Chats {
             ChatType::Private(p) => Some(Peer::User(p.user_id)),
             ChatType::Secret(s) => Some(Peer::User(s.user_id)),
             ChatType::Supergroup(s) => Some(Peer::Supergroup(s.supergroup_id)),
-            ChatType::BasicGroup(_) => None,
+            ChatType::BasicGroup(b) => Some(Peer::BasicGroup(b.basic_group_id)),
         };
+        let main = main_position(&chat.positions);
         let entry = Chat {
             title: text::clean(&chat.title),
             is_channel,
@@ -188,11 +203,13 @@ impl Chats {
             unread: chat.unread_count,
             read_outbox: chat.last_read_outbox_message_id,
             preview: chat.last_message.as_ref().map(preview).unwrap_or_default(),
-            order: main_order(&chat.positions).unwrap_or(0),
+            order: main.map_or(0, |p| p.order),
             photo: chat.photo.as_ref().map(ChatPhoto::new),
             accent: chat.accent_color_id,
             activity: Vec::new(),
             peer,
+            pinned: main.is_some_and(|p| p.is_pinned),
+            notifications: chat.notification_settings,
         };
         self.by_id.insert(chat.id, entry);
         self.dirty = true;
@@ -203,6 +220,7 @@ impl Chats {
             && let Some(chat) = self.by_id.get_mut(&chat_id)
         {
             chat.order = position.order;
+            chat.pinned = position.is_pinned;
             self.dirty = true;
         }
     }
@@ -215,8 +233,9 @@ impl Chats {
     ) {
         if let Some(chat) = self.by_id.get_mut(&chat_id) {
             chat.preview = message.map(preview).unwrap_or_default();
-            if let Some(order) = main_order(positions) {
-                chat.order = order;
+            if let Some(main) = main_position(positions) {
+                chat.order = main.order;
+                chat.pinned = main.is_pinned;
                 self.dirty = true;
             }
         }
@@ -319,10 +338,12 @@ impl Chats {
             });
             self.sorted = sorted;
         }
+        // Pinned chats stay on top, as you put them; unread ones come next.
         let (by_id, held) = (&self.by_id, self.held);
         self.sorted.sort_unstable_by_key(|&id| {
-            let unread = by_id[&id].unread > 0 || held == Some(id);
-            std::cmp::Reverse((unread, by_id[&id].order, id))
+            let chat = &by_id[&id];
+            let unread = chat.unread > 0 || held == Some(id);
+            std::cmp::Reverse((chat.pinned, unread, chat.order, id))
         });
         self.dirty = false;
     }
@@ -410,6 +431,49 @@ impl Chats {
         self.usernames.get(&Peer::User(user_id)).map(String::as_str)
     }
 
+    pub fn set_notifications(&mut self, chat_id: i64, settings: ChatNotificationSettings) {
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            chat.notifications = settings;
+        }
+    }
+
+    /// How long chats of a kind are muted for by default, from
+    /// `updateScopeNotificationSettings`.
+    pub fn set_default_mute(&mut self, scope: &NotificationSettingsScope, mute_for: i32) {
+        self.default_mute[scope_index(scope)] = mute_for;
+    }
+
+    /// The chat's notifications are off, by its own setting or the default
+    /// for its kind.
+    pub fn muted(&self, chat_id: i64) -> bool {
+        let Some(chat) = self.by_id.get(&chat_id) else {
+            return false;
+        };
+        let mute_for = if chat.notifications.use_default_mute_for {
+            let scope = match () {
+                _ if chat.is_private => NotificationSettingsScope::PrivateChats,
+                _ if chat.is_channel => NotificationSettingsScope::ChannelChats,
+                _ => NotificationSettingsScope::GroupChats,
+            };
+            self.default_mute[scope_index(&scope)]
+        } else {
+            chat.notifications.mute_for
+        };
+        mute_for > 0
+    }
+
+    /// The chat's notification settings with it muted for good, or not at
+    /// all, everything else as it was.
+    pub fn with_mute(&self, chat_id: i64, mute: bool) -> Option<ChatNotificationSettings> {
+        let chat = self.by_id.get(&chat_id)?;
+        Some(ChatNotificationSettings {
+            use_default_mute_for: false,
+            // TDLib takes anything past a year as forever.
+            mute_for: if mute { i32::MAX } else { 0 },
+            ..chat.notifications.clone()
+        })
+    }
+
     /// When someone was last on Telegram, from `updateUser` and
     /// `updateUserStatus`.
     pub fn set_presence(&mut self, user_id: i64, presence: Presence) {
@@ -422,6 +486,10 @@ impl Chats {
         } else {
             self.bots.remove(&user_id);
         }
+    }
+
+    pub fn is_bot(&self, user_id: i64) -> bool {
+        self.bots.contains(&user_id)
     }
 
     /// What to say about the person a one-on-one chat is with; `None` for
@@ -523,8 +591,18 @@ impl Chats {
                 accent: 0,
                 activity: Vec::new(),
                 peer: None,
+                pinned: false,
+                notifications: ChatNotificationSettings::default(),
             })
             .into_mut()
+    }
+}
+
+fn scope_index(scope: &NotificationSettingsScope) -> usize {
+    match scope {
+        NotificationSettingsScope::PrivateChats => 0,
+        NotificationSettingsScope::GroupChats => 1,
+        NotificationSettingsScope::ChannelChats => 2,
     }
 }
 
@@ -550,11 +628,8 @@ fn activity(action: &ChatAction) -> Option<&'static str> {
     })
 }
 
-fn main_order(positions: &[ChatPosition]) -> Option<i64> {
-    positions
-        .iter()
-        .find(|p| matches!(p.list, ChatList::Main))
-        .map(|p| p.order)
+fn main_position(positions: &[ChatPosition]) -> Option<&ChatPosition> {
+    positions.iter().find(|p| matches!(p.list, ChatList::Main))
 }
 
 /// How much of the last message a chat list row keeps.
@@ -633,6 +708,8 @@ mod tests {
                     accent: 0,
                     activity: Vec::new(),
                     peer: None,
+                    pinned: false,
+                    notifications: ChatNotificationSettings::default(),
                 },
             );
         }
@@ -686,6 +763,38 @@ mod tests {
     }
 
     #[test]
+    fn pinned_chats_stay_on_top_then_unread_ones() {
+        let mut list = chats(&[(1, 50, 0), (2, 40, 3), (3, 30, 0)]);
+        list.by_id.get_mut(&3).unwrap().pinned = true;
+        list.dirty = true;
+        list.refresh();
+        assert_eq!(list.ids(), [3, 2, 1]);
+    }
+
+    #[test]
+    fn a_chat_is_muted_by_its_own_setting_or_its_kinds_default() {
+        let mut list = chats(&[(1, 50, 0), (2, 40, 0)]);
+        let own = |mute_for| ChatNotificationSettings {
+            mute_for,
+            ..ChatNotificationSettings::default()
+        };
+        let default = || ChatNotificationSettings {
+            use_default_mute_for: true,
+            ..ChatNotificationSettings::default()
+        };
+        list.set_notifications(1, own(3600));
+        list.set_notifications(2, default());
+        assert!(list.muted(1));
+        assert!(!list.muted(2));
+        list.set_default_mute(&NotificationSettingsScope::GroupChats, i32::MAX);
+        assert!(list.muted(2), "groups are muted by default now");
+
+        let unmute = list.with_mute(1, false).unwrap();
+        assert!(!unmute.use_default_mute_for && unmute.mute_for == 0);
+        assert_eq!(list.with_mute(2, true).unwrap().mute_for, i32::MAX);
+    }
+
+    #[test]
     fn an_opened_chat_keeps_its_place_until_another_is_opened() {
         let mut list = chats(&[(1, 50, 0), (2, 40, 3), (3, 30, 1)]);
         list.opened(3);
@@ -719,6 +828,8 @@ mod tests {
                 accent: 0,
                 activity: Vec::new(),
                 peer: None,
+                pinned: false,
+                notifications: ChatNotificationSettings::default(),
             },
         );
 

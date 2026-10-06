@@ -39,6 +39,8 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ),
             ("i", "Open the chat and write"),
             ("/", "Filter chats by name"),
+            ("p", "Pin or unpin the chat (on all your devices)"),
+            ("m", "Mute or unmute the chat"),
             ("Esc", "Clear the filter"),
         ],
     ),
@@ -89,6 +91,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "@name / :smile",
                 "Suggests people in the group, or emoji; Tab puts one in",
             ),
+            ("/command", "Starting a message: the bots' commands"),
             ("Ctrl-v", "Paste a photo, files or text from the clipboard"),
             (
                 "Drop a file",
