@@ -8,10 +8,10 @@
 use std::collections::{HashMap, HashSet};
 
 use tdlib_rs::enums::{ChatAction, ChatList, ChatType, MessageContent, MessageSender};
-use tdlib_rs::types::{self, AccentColor, ChatPhotoInfo, ChatPosition, Message};
+use tdlib_rs::types::{self, AccentColor, ChatPhotoInfo, ChatPosition, FormattedText, Message};
 
 use crate::images::Thumbnail;
-use crate::messages::{Sender, decode_minithumbnail};
+use crate::messages::{Sender, decode_minithumbnail, without_spoilers};
 use crate::search;
 use crate::text;
 
@@ -126,6 +126,10 @@ pub struct Chats {
     accent_colors: HashMap<i32, i32>,
     /// What Telegram says about the people and groups chats are with.
     badges: HashMap<Peer, Badge>,
+    /// The @username of people and groups that have one.
+    usernames: HashMap<Peer, String>,
+    /// Groups and channels you're not in: public ones opened with `s`.
+    left: HashSet<i64>,
 }
 
 impl Chats {
@@ -345,6 +349,75 @@ impl Chats {
         self.badges.get(&peer).copied()
     }
 
+    /// A person's or group's first active username, from `updateUser` or
+    /// `updateSupergroup`.
+    pub fn set_username(&mut self, peer: Peer, usernames: Option<&types::Usernames>) {
+        let first = usernames.and_then(|u| u.active_usernames.first());
+        match first {
+            Some(name) => self.usernames.insert(peer, text::clean(name)),
+            None => self.usernames.remove(&peer),
+        };
+    }
+
+    /// The @username of a chat, without the @.
+    pub fn username(&self, chat_id: i64) -> Option<&str> {
+        let peer = self.by_id.get(&chat_id)?.peer?;
+        self.usernames.get(&peer).map(String::as_str)
+    }
+
+    /// The @username of a person, without the @, whether or not you have a
+    /// chat with them.
+    pub fn user_username(&self, user_id: i64) -> Option<&str> {
+        self.usernames.get(&Peer::User(user_id)).map(String::as_str)
+    }
+
+    /// Whether you're in a group or channel, from `updateSupergroup`.
+    pub fn set_member(&mut self, supergroup_id: i64, member: bool) {
+        if member {
+            self.left.remove(&supergroup_id);
+        } else {
+            self.left.insert(supergroup_id);
+        }
+    }
+
+    /// You're in the chat: always for private chats and basic groups, which
+    /// can't be read from outside.
+    pub fn joined(&self, chat_id: i64) -> bool {
+        match self.by_id.get(&chat_id).and_then(|c| c.peer) {
+            Some(Peer::Supergroup(id)) => !self.left.contains(&id),
+            _ => true,
+        }
+    }
+
+    /// The chat is in the main list, not e.g. a public channel found with `s`.
+    pub fn listed(&self, chat_id: i64) -> bool {
+        self.by_id.get(&chat_id).is_some_and(|c| c.order != 0)
+    }
+
+    /// Chats in the main list whose name or username contains `query`, in
+    /// Telegram's order (pinned, then by the last message), for the chat
+    /// picker. Unread chats don't go first, unlike in the list. An empty
+    /// query matches them all.
+    pub fn matching(&self, query: &str) -> Vec<i64> {
+        let query = query.trim();
+        let username = query.strip_prefix('@').unwrap_or(query);
+        let mut ids: Vec<i64> = self
+            .by_id
+            .iter()
+            .filter(|(_, chat)| chat.order != 0)
+            .map(|(&id, _)| id)
+            .filter(|&id| {
+                username.is_empty()
+                    || !search::find(self.title(id).unwrap_or_default(), query).is_empty()
+                    || self
+                        .username(id)
+                        .is_some_and(|name| !search::find(name, username).is_empty())
+            })
+            .collect();
+        ids.sort_unstable_by_key(|&id| std::cmp::Reverse((self.by_id[&id].order, id)));
+        ids
+    }
+
     pub fn title(&self, chat_id: i64) -> Option<&str> {
         if self.is_saved(chat_id) {
             return Some(SAVED_MESSAGES);
@@ -431,8 +504,20 @@ fn preview(message: &Message) -> String {
 }
 
 /// Plain-text rendering of a message body; media becomes a `[Label]`.
+/// Spoilers are blotted out, as in Telegram's chat list.
 pub fn content_text(content: &MessageContent) -> String {
-    let labeled = |label: &str, caption: &str| {
+    labeled_text(content, without_spoilers)
+}
+
+/// [`content_text`] with spoilers as they were sent, for the message's own
+/// bubble, which hides them itself.
+pub fn content_text_as_sent(content: &MessageContent) -> String {
+    labeled_text(content, |text| text.text.clone())
+}
+
+fn labeled_text(content: &MessageContent, text: impl Fn(&FormattedText) -> String) -> String {
+    let labeled = |label: &str, caption: &FormattedText| {
+        let caption = text(caption);
         if caption.is_empty() {
             format!("[{label}]")
         } else {
@@ -440,15 +525,15 @@ pub fn content_text(content: &MessageContent) -> String {
         }
     };
     match content {
-        MessageContent::MessageText(m) => m.text.text.clone(),
-        MessageContent::MessagePhoto(m) => labeled("Photo", &m.caption.text),
-        MessageContent::MessageVideo(m) => labeled("Video", &m.caption.text),
-        MessageContent::MessageAnimation(m) => labeled("GIF", &m.caption.text),
+        MessageContent::MessageText(m) => text(&m.text),
+        MessageContent::MessagePhoto(m) => labeled("Photo", &m.caption),
+        MessageContent::MessageVideo(m) => labeled("Video", &m.caption),
+        MessageContent::MessageAnimation(m) => labeled("GIF", &m.caption),
         MessageContent::MessageDocument(m) => {
-            labeled(&format!("File: {}", m.document.file_name), &m.caption.text)
+            labeled(&format!("File: {}", m.document.file_name), &m.caption)
         }
-        MessageContent::MessageAudio(m) => labeled("Audio", &m.caption.text),
-        MessageContent::MessageVoiceNote(m) => labeled("Voice message", &m.caption.text),
+        MessageContent::MessageAudio(m) => labeled("Audio", &m.caption),
+        MessageContent::MessageVoiceNote(m) => labeled("Voice message", &m.caption),
         MessageContent::MessageVideoNote(_) => "[Video message]".into(),
         MessageContent::MessageSticker(m) => format!("[Sticker {}]", m.sticker.emoji),
         MessageContent::MessagePoll(_) => "[Poll]".into(),

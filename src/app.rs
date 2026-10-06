@@ -11,8 +11,8 @@ use ratatui::style::Style;
 use ratatui::widgets::Block;
 use ratatui_textarea::TextArea;
 use tdlib_rs::enums::{
-    AuthenticationCodeType, AuthorizationState, ChatList, MessageSender, NotificationType,
-    OptionValue, Update,
+    AuthenticationCodeType, AuthorizationState, ChatList, ChatMemberStatus, MessageSender,
+    NotificationType, OptionValue, Update,
 };
 use tdlib_rs::types::{Message, UpdateNotificationGroup};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -27,12 +27,13 @@ use crate::messages::{
     Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState, link_host,
 };
 use crate::notify::{self, Note, Notifications, Notifier};
+use crate::picker::{ChatPicker, Choice, Purpose};
 use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search::MessageSearch;
 use crate::settings::{self, Settings, Side};
 use crate::stickers::{self, Source, StickerPanel};
 use crate::text;
-use crate::tg::{Deletable, Found, Page, Tagged, Tg, TgEvent};
+use crate::tg::{Deletable, Found, Invite, Page, Tagged, Tg, TgEvent};
 use crate::theme::{Colors, Themes};
 use crate::ui;
 
@@ -165,6 +166,9 @@ pub struct Confirm {
     /// For a link: the site it goes to, on a line of its own. A site's name
     /// is at the end of its host, so a long one is cut from the left.
     pub site: Option<String>,
+    /// For a chat to join: what Telegram says about it, on a line of its
+    /// own at the top.
+    pub badge: Option<Badge>,
     pub action: Confirmed,
     /// When it came up. A `y` in the first moments was typed for whatever
     /// was on screen before, so it doesn't count.
@@ -177,6 +181,7 @@ impl Confirm {
             title: title.into(),
             lines,
             site: None,
+            badge: None,
             action,
             shown: Instant::now(),
         }
@@ -189,6 +194,13 @@ pub enum Confirmed {
     OpenLink(String),
     /// Edit this message, losing its formatting.
     Edit(i64),
+    /// Join this public group or channel, to write in it.
+    Join(i64),
+    /// Join the chat this invite link leads to, then open it.
+    JoinLink {
+        link: String,
+        request: String,
+    },
 }
 
 impl Confirmed {
@@ -197,6 +209,7 @@ impl Confirmed {
         match self {
             Confirmed::OpenFile(_) | Confirmed::OpenLink(_) => "open",
             Confirmed::Edit(_) => "edit",
+            Confirmed::Join(_) | Confirmed::JoinLink { .. } => "join",
         }
     }
 }
@@ -431,6 +444,11 @@ pub struct App {
     pub menu: Option<PickMenu>,
     pub delete_menu: Option<DeleteMenu>,
     pub react_menu: Option<ReactMenu>,
+    /// `f` to forward a message, or `s` to find a chat to open.
+    pub picker: Option<ChatPicker>,
+    /// What's being looked up to open (a username, a link or a contact),
+    /// for the status bar. Opening another chat meanwhile drops the answer.
+    pub finding: Option<String>,
     /// Opened with Tab while writing; only open in Insert mode.
     pub stickers: Option<StickerPanel>,
     /// In resize mode (Ctrl-r): the chat list's width before, which Esc
@@ -529,6 +547,8 @@ impl App {
             menu: None,
             delete_menu: None,
             react_menu: None,
+            picker: None,
+            finding: None,
             stickers: None,
             resizing: None,
             confirm: None,
@@ -612,6 +632,13 @@ impl App {
             self.mark_seen();
             self.update_online();
             self.send_notification();
+            if let Some(query) = self
+                .picker
+                .as_mut()
+                .and_then(|p| p.due_search(Instant::now()))
+            {
+                self.tg.find_chats(query);
+            }
             if failed.is_none()
                 && let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut self))
             {
@@ -627,12 +654,14 @@ impl App {
             }
 
             let deadline = self.quit_deadline;
-            // Wakes up to take the toast down, to go offline when idle, and
-            // to send notifications that had to wait.
+            // Wakes up to take the toast down, to go offline when idle, to
+            // send notifications that had to wait, and to search Telegram
+            // once typing in the `s` picker pauses.
             let wake = [
                 self.toast.as_ref().map(|t| t.until),
                 self.online.then_some(self.last_input + IDLE_AFTER),
                 self.notifier.next_at(),
+                self.picker.as_ref().and_then(ChatPicker::search_at),
             ]
             .into_iter()
             .flatten()
@@ -699,6 +728,13 @@ impl App {
                     && login.takes_input()
                 {
                     login.input.insert_str(text.trim());
+                }
+            }
+            Event::Paste(text) if self.picker.is_some() => {
+                // A pasted link or name goes into the search, on one line.
+                let text = text::clean(&text).replace(['\n', '\t'], " ");
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.edit_query(|q| q.push_str(text.trim()), Instant::now());
                 }
             }
             Event::Paste(text) if self.prompt.is_some() => {
@@ -812,6 +848,58 @@ impl App {
                 }
                 self.images.on_downloaded(file_id, path);
             }
+            TgEvent::ChatsFound {
+                query,
+                chat_ids,
+                user_ids,
+            } => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.set_found(&query, chat_ids, user_ids);
+                }
+            }
+            TgEvent::ChatFound { request, found } => {
+                // Dropped if another chat was opened meanwhile.
+                if self.finding.as_ref() != Some(&request) {
+                    return;
+                }
+                self.finding = None;
+                // Not while the keys go somewhere (writing, a popup): what
+                // was typed would land in the other chat, or a popup act
+                // on it.
+                if self.busy() {
+                    if found.is_ok() {
+                        self.status = Some(format!("Found {request}: press s to open it"));
+                    }
+                    return;
+                }
+                match found {
+                    Ok((chat_id, message_id)) => {
+                        self.open_chat(chat_id);
+                        if let Some(id) = message_id {
+                            self.jump_to_message(id);
+                        }
+                    }
+                    Err(why) if why.is_empty() => {}
+                    Err(why) => self.status = Some(why),
+                }
+            }
+            TgEvent::Forwarded { chat_id } => {
+                let title = self.chats.title(chat_id).unwrap_or_default().to_string();
+                self.show_toast("Forwarded", &format!("to {title}"));
+            }
+            TgEvent::Joined { chat_id } => {
+                let title = self.chats.title(chat_id).unwrap_or_default().to_string();
+                self.show_toast("Joined", &title);
+            }
+            TgEvent::Invite {
+                request,
+                link,
+                invite,
+            } => {
+                if self.finding.as_ref() == Some(&request) && !self.busy() {
+                    self.confirm_invite(link, request, invite);
+                }
+            }
         }
     }
 
@@ -908,11 +996,17 @@ impl App {
                 self.users.insert(u.user.id, text::clean(name.trim()));
                 let badge = Badge::of(u.user.verification_status.as_ref(), u.user.is_support);
                 self.chats.set_badge(Peer::User(u.user.id), badge);
+                self.chats
+                    .set_username(Peer::User(u.user.id), u.user.usernames.as_ref());
             }
             Update::Supergroup(u) => {
-                let badge = Badge::of(u.supergroup.verification_status.as_ref(), false);
+                let group = &u.supergroup;
+                let badge = Badge::of(group.verification_status.as_ref(), false);
+                self.chats.set_badge(Peer::Supergroup(group.id), badge);
                 self.chats
-                    .set_badge(Peer::Supergroup(u.supergroup.id), badge);
+                    .set_username(Peer::Supergroup(group.id), group.usernames.as_ref());
+                let member = !matches!(group.status, ChatMemberStatus::Left);
+                self.chats.set_member(group.id, member);
             }
             Update::NewMessage(u) => {
                 // While older messages are shown, new ones load with the rest.
@@ -1039,10 +1133,12 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Not while typing: in Insert mode, the prompt, or the picker's search.
         if ctrl
             && key.code == KeyCode::Char('c')
             && self.focus != Focus::Input
             && self.prompt.is_none()
+            && self.picker.is_none()
         {
             self.quit();
             return;
@@ -1055,6 +1151,7 @@ impl App {
             Screen::Main if self.delete_menu.is_some() => self.on_delete_key(key),
             Screen::Main if self.react_menu.is_some() => self.on_react_key(key, ctrl),
             Screen::Main if self.menu.is_some() => self.on_menu_key(key),
+            Screen::Main if self.picker.is_some() => self.on_picker_key(key, ctrl),
             Screen::Main if self.resizing.is_some() => self.on_resize_key(key, ctrl),
             Screen::Main if self.prompt.is_some() => self.on_prompt_key(key, ctrl),
             Screen::Main if self.focus == Focus::Input && self.stickers.is_some() => {
@@ -1066,6 +1163,11 @@ impl App {
         // The sticker panel is part of Insert mode, and closes with it.
         if self.focus != Focus::Input {
             self.stickers = None;
+        }
+        // Writing or a popup means you moved on: a chat still being looked
+        // up won't open over it.
+        if self.busy() {
+            self.finding = None;
         }
     }
 
@@ -1240,12 +1342,15 @@ impl App {
                 self.settings_menu = Some(SettingsMenu::new(HelpTab::Shortcuts, &self.settings));
             }
             (_, KeyCode::Char(':')) => self.open_prompt(PromptKind::Command),
+            (_, KeyCode::Char('s')) => self.picker = Some(ChatPicker::new(Purpose::Open)),
             (Focus::Chats, KeyCode::Char('/')) => self.open_prompt(PromptKind::Chats),
             (Focus::Messages, KeyCode::Char('/')) => self.open_prompt(PromptKind::Messages),
             (Focus::Messages, KeyCode::Char('n')) => self.next_match(1),
             (Focus::Messages, KeyCode::Char('N')) => self.next_match(-1),
-            // Esc ends a search, then an edit, then removes the files, then
-            // ends a reply, before it leaves the pane.
+            // Esc stops a lookup with `s`. In the chat pane it then ends a
+            // search, then an edit, then removes the files, then ends a
+            // reply, before it leaves the pane.
+            (_, KeyCode::Esc) if self.finding.is_some() => self.finding = None,
             (Focus::Chats, KeyCode::Esc) => self.chats.set_filter(""),
             (Focus::Messages, KeyCode::Esc)
                 if self.open.as_ref().is_some_and(|o| o.search.is_some()) =>
@@ -1288,16 +1393,15 @@ impl App {
             (Focus::Messages, KeyCode::Char('d')) => self.open_delete_menu(),
             (Focus::Messages, KeyCode::Char('R')) => self.open_react_menu(),
             (Focus::Messages, KeyCode::Char('X')) => self.remove_reactions(),
+            (Focus::Messages, KeyCode::Char('f')) => self.forward_selected(),
             (Focus::Messages, KeyCode::Char('o')) if ctrl => self.jump_back(),
             (Focus::Chats, KeyCode::Enter) => self.open_selected_chat(),
             (Focus::Chats, KeyCode::Char(c)) if c == to_chat => self.open_selected_chat(),
             (Focus::Chats, KeyCode::Char('i')) => {
                 self.open_selected_chat();
-                if self.open.is_some() {
-                    self.focus = Focus::Input;
-                }
+                self.start_writing();
             }
-            (Focus::Messages, KeyCode::Char('i')) => self.focus = Focus::Input,
+            (Focus::Messages, KeyCode::Char('i')) => self.start_writing(),
             (Focus::Messages, KeyCode::Enter) => self.open_selected_message(),
             (Focus::Messages, KeyCode::Esc) => self.focus = Focus::Chats,
             (Focus::Messages, KeyCode::Char(c)) if c == to_list => self.focus = Focus::Chats,
@@ -1336,6 +1440,39 @@ impl App {
                 }
             }
         }
+    }
+
+    /// `i`: Insert mode, in a chat you can write in. In a public group or
+    /// channel you're not in, it asks to join first.
+    fn start_writing(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        if self.chats.joined(open.chat_id) {
+            self.focus = Focus::Input;
+            return;
+        }
+        let title = self.chats.title(open.chat_id).unwrap_or("this chat");
+        // Only a channel's admins write in it; joining one is following it.
+        let channel = self.chats.get(open.chat_id).is_some_and(|c| c.is_channel);
+        let (ask, why) = if channel {
+            (
+                "Join this channel?",
+                "Join it to have it in your chat list.",
+            )
+        } else {
+            (
+                "Join to write here?",
+                "Join it to write, and to have it in your chat list.",
+            )
+        };
+        let mut confirm = Confirm::new(
+            ask,
+            vec![format!("You're not in {title}."), why.into()],
+            Confirmed::Join(open.chat_id),
+        );
+        confirm.badge = self.chats.badge(open.chat_id);
+        self.confirm = Some(confirm);
     }
 
     fn leave_insert(&mut self) {
@@ -1677,6 +1814,8 @@ impl App {
         self.menu = None;
         self.delete_menu = None;
         self.react_menu = None;
+        self.picker = None;
+        self.finding = None;
         self.stickers = None;
         // The next account says if it has Premium; one without may not.
         self.premium = false;
@@ -1775,9 +1914,27 @@ impl App {
     }
 
     fn open_selected_chat(&mut self) {
-        let Some(chat_id) = self.selected else {
-            return;
-        };
+        if let Some(chat_id) = self.selected {
+            self.open_chat(chat_id);
+        }
+    }
+
+    /// Opens a chat, in the list or not: one found with `s` may be a
+    /// public group you're not in.
+    fn open_chat(&mut self, chat_id: i64) {
+        // A lookup still on its way would open another chat over this one.
+        self.finding = None;
+        // Popups about a message of the chat before are no use in this one.
+        self.menu = None;
+        self.delete_menu = None;
+        self.react_menu = None;
+        if self.chats.listed(chat_id) && self.selected != Some(chat_id) {
+            // The list's cursor goes to it, even if the filter hid it.
+            if !self.chats.ids().contains(&chat_id) {
+                self.chats.set_filter("");
+            }
+            self.selected = Some(chat_id);
+        }
         self.focus = Focus::Messages;
         if self.open.as_ref().is_some_and(|o| o.chat_id == chat_id) {
             return;
@@ -1795,12 +1952,18 @@ impl App {
         self.load_older_messages();
     }
 
-    /// Enter on a message: opens its file or link right away, or shows a menu
-    /// when there's more than one.
+    /// Enter on a message: shows its spoilers first, as a tap does in
+    /// Telegram; then opens its file or link right away, or shows a menu when
+    /// there's more than one.
     fn open_selected_message(&mut self) {
-        let Some(open) = &self.open else {
+        let Some(open) = self.open.as_mut() else {
             return;
         };
+        if let Some(id) = open.cursor_id()
+            && open.reveal_spoilers(id)
+        {
+            return;
+        }
         let Some(msg) = open.cursor_id().and_then(|id| open.messages.get(&id)) else {
             return;
         };
@@ -2166,6 +2329,127 @@ impl App {
         }
     }
 
+    /// `f`: forwards the message under the cursor, or its whole album, to a
+    /// chat picked from your list.
+    fn forward_selected(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let Some((&id, msg)) = open
+            .cursor_id()
+            .and_then(|id| open.messages.get_key_value(&id))
+        else {
+            return;
+        };
+        match msg.state {
+            SendState::Pending => self.status = Some("Wait until it's sent".into()),
+            SendState::Failed => self.status = Some("This message wasn't sent".into()),
+            SendState::Sent => {
+                self.picker = Some(ChatPicker::new(Purpose::Forward {
+                    from: open.chat_id,
+                    message_ids: open.forward_ids(id),
+                    snippet: msg.snippet(),
+                }));
+            }
+        }
+    }
+
+    /// The picker takes all keys while it's up: they type the search, and
+    /// the arrows (or Ctrl-n / Ctrl-p, Tab) move.
+    fn on_picker_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let choices = self
+            .picker
+            .as_ref()
+            .map_or(Vec::new(), |p| p.choices(&self.chats));
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        match key.code {
+            KeyCode::Enter => self.pick_chat(),
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Char('c') if ctrl => self.picker = None,
+            KeyCode::Up | KeyCode::BackTab => picker.move_by(-1, &choices),
+            KeyCode::Down | KeyCode::Tab => picker.move_by(1, &choices),
+            KeyCode::Char('p') if ctrl => picker.move_by(-1, &choices),
+            KeyCode::Char('n') if ctrl => picker.move_by(1, &choices),
+            KeyCode::PageUp => picker.move_by(-HALF_PAGE, &choices),
+            KeyCode::PageDown => picker.move_by(HALF_PAGE, &choices),
+            KeyCode::Backspace => picker.edit_query(
+                |q| {
+                    q.pop();
+                },
+                now,
+            ),
+            KeyCode::Char('u' | 'w') if ctrl => picker.edit_query(String::clear, now),
+            KeyCode::Char(c) if !ctrl => picker.edit_query(|q| q.push(c), now),
+            _ => {}
+        }
+    }
+
+    /// Enter in the picker: forwards there, or opens it, looking it up
+    /// first if it's a username, a link or a contact with no chat yet.
+    fn pick_chat(&mut self) {
+        let Some(picker) = self.picker.as_ref() else {
+            return;
+        };
+        let Some(choice) = picker.current(&picker.choices(&self.chats)) else {
+            return;
+        };
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        match (picker.purpose, choice) {
+            (
+                Purpose::Forward {
+                    from, message_ids, ..
+                },
+                Choice::Chat(to),
+            ) => self.tg.forward(to, from, message_ids),
+            (Purpose::Forward { .. }, _) => {}
+            (Purpose::Open, Choice::Chat(id)) => self.open_chat(id),
+            (Purpose::Open, Choice::User(user_id)) => {
+                let name = self
+                    .users
+                    .get(&user_id)
+                    .cloned()
+                    .unwrap_or_else(|| "your contact".into());
+                self.finding = Some(name.clone());
+                self.tg.find_private_chat(user_id, name);
+            }
+            (Purpose::Open, Choice::Username(name)) => {
+                let request = format!("@{name}");
+                self.finding = Some(request.clone());
+                self.tg.find_username(name, request);
+            }
+            (Purpose::Open, Choice::Link(link)) => {
+                self.finding = Some(link.clone());
+                self.tg.find_link(link.clone(), link);
+            }
+        }
+    }
+
+    /// Asks before joining the chat an invite link leads to, saying what it
+    /// is and what Telegram thinks of it.
+    fn confirm_invite(&mut self, link: String, request: String, invite: Invite) {
+        let kind = if invite.channel { "channel" } else { "group" };
+        let mut lines = vec![
+            invite.title,
+            format!("A {kind} with {} members.", invite.members),
+        ];
+        if invite.by_request {
+            lines.push("An admin has to let you in.".into());
+        }
+        let title = if invite.by_request {
+            format!("Ask to join this {kind}?")
+        } else {
+            format!("Join this {kind}?")
+        };
+        let mut confirm = Confirm::new(title, lines, Confirmed::JoinLink { link, request });
+        confirm.badge = invite.badge;
+        self.confirm = Some(confirm);
+    }
+
     /// `X`: takes back all your reactions on the message under the cursor,
     /// without the popup.
     fn remove_reactions(&mut self) {
@@ -2434,6 +2718,7 @@ impl App {
             || self.delete_menu.is_some()
             || self.react_menu.is_some()
             || self.menu.is_some()
+            || self.picker.is_some()
             || self.resizing.is_some()
             || self.prompt.is_some()
             || self.focus == Focus::Input
@@ -2461,6 +2746,11 @@ impl App {
                             self.open_externally(&target)
                         }
                         Confirmed::Edit(id) => self.start_edit(id),
+                        Confirmed::Join(chat_id) => self.tg.join_chat(chat_id),
+                        Confirmed::JoinLink { link, request } => {
+                            self.finding = Some(request.clone());
+                            self.tg.join_by_link(link, request);
+                        }
                     }
                 }
             }
@@ -3338,6 +3628,144 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
         crate::demo::demo_app(Tg::detached(unbounded_channel().0), images, &dir)
+    }
+
+    #[test]
+    fn f_opens_a_list_of_your_chats_to_forward_to_saved_messages_first() {
+        let mut app = test_app("forward");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        press(&mut app, KeyCode::Char('f'), none);
+        let picker = app.picker.as_ref().expect("the picker is open");
+        let Purpose::Forward {
+            from, message_ids, ..
+        } = &picker.purpose
+        else {
+            panic!("forwarding");
+        };
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(*from, open.chat_id);
+        assert_eq!(message_ids, &[open.cursor_id().unwrap()]);
+        assert!(
+            matches!(picker.choices(&app.chats)[0], Choice::Chat(id) if app.chats.is_saved(id)),
+            "Saved Messages first"
+        );
+        let rows = screen(&mut app);
+        assert!(rows.iter().any(|r| r.contains("Forward to")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("Saved Messages")));
+
+        // Letters type the search, even j and k.
+        for c in "tokyo".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        let picker = app.picker.as_ref().unwrap();
+        assert_eq!(picker.query, "tokyo");
+        let titles: Vec<&str> = picker
+            .choices(&app.chats)
+            .iter()
+            .map(|c| match c {
+                Choice::Chat(id) => app.chats.title(*id).unwrap(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(titles, ["Tokyo Trip"]);
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn s_finds_a_chat_by_username_or_link_and_pastes_go_into_its_search() {
+        let mut app = test_app("find");
+        let none = KeyModifiers::NONE;
+        press(&mut app, KeyCode::Char('s'), none);
+        assert!(app.picker.as_ref().is_some_and(|p| !p.forwarding()));
+        for c in "@durov".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        let rows = screen(&mut app);
+        assert!(rows.iter().any(|r| r.contains("Open @durov")), "{rows:#?}");
+
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        app.on_terminal_event(Event::Paste("t.me/+AbCdEf\n".into()));
+        let picker = app.picker.as_ref().unwrap();
+        assert_eq!(picker.query, "t.me/+AbCdEf", "not attached as a file");
+        assert_eq!(
+            picker.choices(&app.chats)[0],
+            Choice::Link("https://t.me/+AbCdEf".into())
+        );
+        assert!(picker.search_at().is_none(), "links aren't searched for");
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.picker.is_none(), "Ctrl-c closes it");
+        assert!(app.quit_deadline.is_none(), "without quitting");
+    }
+
+    #[test]
+    fn a_chat_found_while_you_write_does_not_open_over_what_you_type() {
+        let mut app = test_app("late-find");
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        app.focus = Focus::Input;
+        app.composer.insert_str("see you at 5");
+        app.finding = Some("@bob".into());
+        app.on_tg(TgEvent::ChatFound {
+            request: "@bob".into(),
+            found: Ok((999, None)),
+        });
+        assert_eq!(app.open.as_ref().unwrap().chat_id, chat_id);
+        assert!(app.focus == Focus::Input);
+        assert_eq!(app.composer.lines(), ["see you at 5"]);
+        assert!(app.finding.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Found @bob: press s to open it")
+        );
+
+        // Nor does an invite ask to join over the composer.
+        app.finding = Some("https://t.me/+x".into());
+        let invite = Invite {
+            title: "Group".into(),
+            members: 3,
+            channel: false,
+            badge: None,
+            by_request: false,
+        };
+        app.on_tg(TgEvent::Invite {
+            request: "https://t.me/+x".into(),
+            link: "https://t.me/+x".into(),
+            invite,
+        });
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn writing_a_popup_or_esc_stops_a_lookup() {
+        let mut app = test_app("stop-find");
+        app.focus = Focus::Messages;
+        app.finding = Some("@bob".into());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.finding.is_none());
+        assert!(app.focus == Focus::Messages, "only the lookup stopped");
+
+        app.finding = Some("@bob".into());
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(app.finding.is_none(), "writing in this chat instead");
+    }
+
+    #[test]
+    fn i_in_a_public_group_you_are_not_in_asks_to_join_first() {
+        let mut app = test_app("join");
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        app.chats.add_local(chat_id, "Weekend Hike", None).peer = Some(Peer::Supergroup(77));
+        app.chats.set_member(77, false);
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(app.focus == Focus::Messages, "not writing yet");
+        let confirm = app.confirm.as_ref().expect("asks");
+        assert!(matches!(confirm.action, Confirmed::Join(id) if id == chat_id));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        app.chats.set_member(77, true);
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(app.focus == Focus::Input, "once you're in");
     }
 
     #[test]

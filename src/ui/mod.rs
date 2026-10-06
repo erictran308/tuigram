@@ -19,6 +19,7 @@ use crate::chats::{Badge, Chat};
 use crate::config;
 use crate::messages::{Editing, OpenChat, Replied, Sender};
 use crate::notify::Notifications;
+use crate::picker::{ChatPicker, Choice, Purpose};
 use crate::reactions::{self, ReactMenu};
 use crate::search;
 use crate::settings::{Settings, Side};
@@ -342,6 +343,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     let popup_over_chat = app.menu.is_some()
         || app.delete_menu.is_some()
         || app.react_menu.is_some()
+        || app.picker.is_some()
         || app.confirm.is_some()
         || app.settings_menu.is_some()
         || app
@@ -431,6 +433,13 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             .collect();
         let yours: Vec<&str> = yours.iter().map(String::as_str).collect();
         draw_react(frame, chat_area, menu, &yours, colors);
+    }
+    if let Some(picker) = &mut app.picker {
+        let names = messages::Names {
+            users: &app.users,
+            chats: &app.chats,
+        };
+        draw_picker(frame, chat_area, picker, &names, colors);
     }
     if let Some(confirm) = &app.confirm {
         draw_confirm(frame, chat_area, confirm, colors);
@@ -529,6 +538,184 @@ fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors
         list,
         &mut ListState::default().with_selected(Some(menu.selected)),
     );
+}
+
+/// Chats the `f` and `s` popup lists at once; more scroll.
+const PICKER_ROWS: usize = 10;
+/// Width of the `f` and `s` popup.
+const PICKER_WIDTH: u16 = 56;
+
+/// The `f` (forward) and `s` (find a chat) popup over the message pane: what's
+/// forwarded, the search, and the chats it finds.
+fn draw_picker(
+    frame: &mut Frame,
+    area: Rect,
+    picker: &mut ChatPicker,
+    names: &messages::Names,
+    colors: &Colors,
+) {
+    let chats = names.chats;
+    let choices = picker.choices(chats);
+    let forwarding = picker.forwarding();
+    // Borders, what's forwarded, the search and a gap, then the list.
+    let fixed = 4 + usize::from(forwarding);
+    let visible = choices
+        .len()
+        .clamp(1, PICKER_ROWS)
+        .min(usize::from(area.height).saturating_sub(fixed).max(1));
+    let popup = center(area, PICKER_WIDTH.min(area.width), (visible + fixed) as u16);
+    let (title, keys, placeholder) = match &picker.purpose {
+        Purpose::Forward { .. } => (
+            " Forward to ",
+            " `Enter` forward · `Esc` cancel ",
+            "type to find a chat",
+        ),
+        Purpose::Open => (
+            " Find a chat or person ",
+            " `Enter` open · `Esc` cancel ",
+            "a name, @username or t.me link",
+        ),
+    };
+    let mut title = vec![Span::from(title)];
+    if picker.searching {
+        title.push(Span::from("· searching… ").fg(colors.muted));
+    }
+    let block = popup_block(Line::from(title), keys, colors);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let [about, search, _, list] = Layout::vertical([
+        Constraint::Length(u16::from(forwarding)),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    let text_width = (inner.width as usize).saturating_sub(4);
+    if let Purpose::Forward { snippet, .. } = &picker.purpose {
+        let line = Line::from(vec![
+            Span::from(" ▎ ").fg(colors.accent),
+            Span::from(truncate(snippet, text_width)),
+        ]);
+        frame.render_widget(line, about);
+    }
+    let mut query = vec![Span::from(" / ").fg(colors.search).bold()];
+    if picker.query.is_empty() {
+        query.push(Span::from(" ").reversed());
+        query.push(Span::from(placeholder).fg(colors.muted));
+    } else {
+        query.push(Span::from(truncate_start(&picker.query, text_width)));
+        query.push(Span::from(" ").reversed());
+    }
+    frame.render_widget(Line::from(query), search);
+
+    if choices.is_empty() {
+        let empty = match () {
+            _ if picker.searching => " Searching Telegram…",
+            _ if picker.query.trim().is_empty() => " No chats yet",
+            _ => " Nothing found",
+        };
+        frame.render_widget(Line::from(empty).fg(colors.muted), list);
+        return;
+    }
+    let cursor = picker.selected(&choices);
+    // Scroll just far enough to keep the cursor in view.
+    let max_scroll = choices.len().saturating_sub(visible);
+    picker.scroll = picker
+        .scroll
+        .clamp(cursor.saturating_sub(visible - 1), cursor)
+        .min(max_scroll);
+    let width = usize::from(list.width).saturating_sub(2);
+    let lines: Vec<Line> = choices
+        .iter()
+        .enumerate()
+        .skip(picker.scroll)
+        .take(visible)
+        .map(|(i, choice)| {
+            let selected = i == cursor;
+            let (title, style, badge, detail) = match choice {
+                Choice::Chat(id) => {
+                    let detail = match chats.username(*id) {
+                        Some(name) => format!("@{name}"),
+                        None if !chats.listed(*id) => "public".into(),
+                        None => String::new(),
+                    };
+                    (
+                        chats.title(*id).unwrap_or("Unknown").to_string(),
+                        title_style(chats, *id, colors),
+                        chats.badge(*id),
+                        detail,
+                    )
+                }
+                Choice::User(id) => (
+                    names.get(Sender::User(*id)),
+                    Style::new(),
+                    None,
+                    chats
+                        .user_username(*id)
+                        .map_or("contact".into(), |name| format!("@{name}")),
+                ),
+                Choice::Username(name) => (
+                    format!("Open @{name}"),
+                    Style::new().fg(colors.accent),
+                    None,
+                    String::new(),
+                ),
+                Choice::Link(link) => (
+                    format!("Open {link}"),
+                    Style::new().fg(colors.accent),
+                    None,
+                    String::new(),
+                ),
+            };
+            let badge = badge.map(|b| badge_span(b, colors));
+            let badge_w = badge.as_ref().map_or(0, |b| b.content.width());
+            // The detail takes up to half the row, the title what's left.
+            let room = width.saturating_sub(badge_w);
+            let detail = truncate(&detail, room / 2);
+            let detail_w = if detail.is_empty() {
+                0
+            } else {
+                detail.width() + 2
+            };
+            let title = truncate(&title, room.saturating_sub(detail_w));
+            let used = title.width() + badge_w;
+            let mut spans = vec![
+                if selected {
+                    Span::from("▌").fg(colors.accent)
+                } else {
+                    Span::from(" ")
+                },
+                Span::styled(title, style),
+            ];
+            spans.extend(badge);
+            if !detail.is_empty() {
+                let gap = width.saturating_sub(used + detail.width()).max(2);
+                spans.push(Span::from(" ".repeat(gap)));
+                spans.push(Span::from(detail).fg(colors.muted));
+            }
+            let line = Line::from(spans);
+            if selected {
+                line.bg(colors.selection)
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), list);
+    if max_scroll > 0 {
+        let mut state = ScrollbarState::new(max_scroll).position(picker.scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(colors.accent)
+                .track_style(colors.border),
+            list,
+            &mut state,
+        );
+    }
 }
 
 /// Rows of emoji the `R` popup shows at once; more scroll.
@@ -865,18 +1052,34 @@ fn short_path(path: &std::path::Path) -> String {
 fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Colors) {
     const SITE: &str = "It goes to:    ";
     let title = format!(" {} ", confirm.title);
+    let verdict = confirm.badge.map(|badge| match badge {
+        Badge::Scam => "Telegram marks it as a SCAM",
+        Badge::Fake => "Telegram marks it as FAKE: it poses as someone else",
+        Badge::Official => "Verified by Telegram ✓",
+    });
     let site_width = confirm
         .site
         .as_ref()
         .map_or(0, |s| SITE.width() + s.width());
-    let longest = confirm.lines.iter().map(|l| l.width()).max().unwrap_or(0);
+    let longest = confirm
+        .lines
+        .iter()
+        .map(|l| l.width())
+        .chain(verdict.map(|v| v.width()))
+        .max()
+        .unwrap_or(0);
     let width = (longest.max(title.width()).max(site_width) as u16 + 4)
         .min(area.width)
         .max(40.min(area.width));
-    let height = confirm.lines.len() + usize::from(confirm.site.is_some());
+    let height =
+        confirm.lines.len() + usize::from(confirm.site.is_some()) + usize::from(verdict.is_some());
     let popup = center(area, width, height as u16 + 2);
     let keys = format!(" `y` {} · `Esc` cancel ", confirm.action.verb());
-    let block = popup_block(title, &keys, colors).border_style(Style::new().fg(colors.warning));
+    let border = match confirm.badge {
+        Some(Badge::Scam | Badge::Fake) => colors.error,
+        _ => colors.warning,
+    };
+    let block = popup_block(title, &keys, colors).border_style(Style::new().fg(border));
     let room = (block.inner(popup).width as usize).saturating_sub(2);
     let mut lines: Vec<Line> = confirm
         .lines
@@ -888,6 +1091,18 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
     if let Some(site) = &confirm.site {
         let host = truncate_start(site, room.saturating_sub(SITE.width()));
         lines.insert(lines.len().min(1), Line::from(format!(" {SITE}{host}")));
+    }
+    // What Telegram says about the chat goes first, on a line of its own,
+    // so a long name can't push it out of sight or pose as it.
+    if let (Some(verdict), Some(badge)) = (verdict, confirm.badge) {
+        let style = match badge {
+            Badge::Scam | Badge::Fake => Style::new().fg(colors.error).bold(),
+            Badge::Official => Style::new().fg(colors.accent),
+        };
+        lines.insert(
+            0,
+            Line::styled(format!(" {}", truncate(verdict, room)), style),
+        );
     }
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
@@ -1295,10 +1510,13 @@ fn as_files_hint(open: &OpenChat) -> Option<&'static str> {
     })
 }
 
-/// Hints for keys that depend on the cursor: `gd` on a reply, and Ctrl-o
-/// after a `gd`.
+/// Hints for keys that depend on the cursor: Enter on hidden spoilers, `gd`
+/// on a reply, and Ctrl-o after a `gd`.
 fn jump_hints(open: &OpenChat) -> Vec<&'static str> {
     let mut hints = Vec::new();
+    if open.cursor_id().is_some_and(|id| open.hides_spoilers(id)) {
+        hints.push("`Enter` show spoiler");
+    }
     let on_reply = open
         .cursor_id()
         .and_then(|id| open.messages.get(&id))
@@ -1345,6 +1563,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         {
             (normal, "  `y` edit · `n` or `Esc` cancel")
         }
+        _ if app
+            .confirm
+            .as_ref()
+            .is_some_and(|c| c.action.verb() == "join") =>
+        {
+            (normal, "  `y` join · `n` or `Esc` cancel")
+        }
         _ if app.confirm.is_some() => (normal, "  `y` open · `n` or `Esc` cancel"),
         _ if app.settings_menu.as_ref().map(|m| m.tab) == Some(HelpTab::Shortcuts) => {
             (normal, "  `j/k` scroll · `Tab` settings · `Esc` close")
@@ -1364,13 +1589,21 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             normal,
             "  `h/j/k/l` choose · `Enter` react, or take yours back · `X` take all yours back · `/` search · `Esc` close",
         ),
+        _ if app.picker.as_ref().is_some_and(ChatPicker::forwarding) => (
+            normal,
+            "  type a chat's name · `arrows` choose · `Enter` forward · `Esc` cancel",
+        ),
+        _ if app.picker.is_some() => (
+            normal,
+            "  type a name, @username or t.me link · `arrows` choose · `Enter` open · `Esc` cancel",
+        ),
         Focus::Chats if !app.chats.filter().is_empty() => (
             normal,
             "  `j/k` move · `Enter` open · `Esc` clear search · `/` search again · `i` write · `q` quit",
         ),
         Focus::Chats => (
             normal,
-            "  `j/k` move · `Enter` open · `i` write · `/` search · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            "  `j/k` move · `Enter` open · `i` write · `/` search · `s` find anyone · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         Focus::Messages if searching => (
             normal,
@@ -1390,7 +1623,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages => (
             normal,
-            "  `j/k` newer/older · `y` copy · `r` reply · `R` react · `X` unreact · `e` edit · `d` delete · `Enter` open media · `i` write · `a` attach · `p` paste · `/` search · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            "  `j/k` newer/older · `y` copy · `r` reply · `f` forward · `R` react · `X` unreact · `e` edit · `d` delete · `Enter` open media · `i` write · `a` attach · `p` paste · `/` search · `s` find anyone · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         _ if picking && app.stickers.as_ref().is_some_and(|p| p.query.is_some()) => (
             sticker,
@@ -1430,6 +1663,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         || app.resizing.is_some()
         || app.delete_menu.is_some()
         || app.react_menu.is_some()
+        || app.picker.is_some()
         || app.confirm.is_some();
     let mut context = match &app.open {
         Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open),
@@ -1464,6 +1698,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         spans.push(Span::from("  Downloading… copies when done").fg(colors.warning));
     } else if app.pasting {
         spans.push(Span::from("  Reading the clipboard…").fg(colors.warning));
+    } else if let Some(what) = &app.finding {
+        let what = truncate(what, 60);
+        let looking = format!("  Looking for {what}… (Esc stops)");
+        spans.push(Span::from(looking).fg(colors.warning));
     } else if let Some(message) = &app.status {
         spans.push(Span::from(format!("  {message}")).fg(colors.error));
     }
@@ -2016,6 +2254,9 @@ mod tests {
             file: None,
             links: Vec::new(),
             link_ranges: Vec::new(),
+            styles: Vec::new(),
+            revealed: false,
+            forwarded: None,
             state: SendState::Sent,
             reply_to,
             editable: Editable::Text,
@@ -2315,6 +2556,41 @@ mod tests {
             colors.warning,
             "warning border"
         );
+    }
+
+    #[test]
+    fn telegrams_verdict_on_a_chat_to_join_cant_be_pushed_out_by_a_long_name() {
+        let colors = Colors::default();
+        let padded = format!("Official Support{} ✓", "\u{2800}".repeat(120));
+        let mut confirm = Confirm::new(
+            "Join this group?",
+            vec![padded, "A group with 5000 members.".into()],
+            crate::app::Confirmed::JoinLink {
+                link: "https://t.me/+x".into(),
+                request: "https://t.me/+x".into(),
+            },
+        );
+        confirm.badge = Some(Badge::Scam);
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal
+            .draw(|f| draw_confirm(f, f.area(), &confirm, &colors))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows = buffer_rows(buf);
+        let verdict = rows
+            .iter()
+            .position(|r| r.contains("Telegram marks it as a SCAM"))
+            .expect("its own line");
+        let name = rows
+            .iter()
+            .position(|r| r.contains("Official Support"))
+            .unwrap();
+        assert!(verdict < name, "before the name: {rows:#?}");
+        let x = column(&rows[verdict], "SCAM");
+        assert_eq!(buf[(x, verdict as u16)].fg, colors.error);
+        let keys = rows.iter().position(|r| r.contains("y join")).unwrap();
+        let x = column(&rows[keys], "y join");
+        assert_eq!(buf[(x - 2, keys as u16)].fg, colors.error, "red border");
     }
 
     #[test]

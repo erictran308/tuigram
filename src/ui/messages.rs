@@ -17,7 +17,8 @@ use super::truncate;
 use crate::chats::Chats;
 use crate::images::Images;
 use crate::messages::{
-    Fetched, Msg, OpenChat, Preview, Replied, ReplyTo, ScrollAnchor, SendState, Sender,
+    Fetched, Format, Msg, OpenChat, Origin, Preview, Replied, ReplyTo, SPOILER, ScrollAnchor,
+    SendState, Sender, Styled,
 };
 use crate::reactions::{self, Reaction};
 use crate::search;
@@ -51,6 +52,23 @@ impl Names<'_> {
         name.unwrap_or_else(|| "Unknown".into())
     }
 
+    /// Who a forwarded message first came from: "Alice", or "News (Bob)"
+    /// for a channel post Bob signed.
+    pub(super) fn origin(&self, origin: &Origin) -> String {
+        match origin {
+            Origin::User(id) => self.get(Sender::User(*id)),
+            Origin::Hidden(name) => name.clone(),
+            Origin::Chat { chat_id, signature } => {
+                let title = self.get(Sender::Chat(*chat_id));
+                if signature.is_empty() {
+                    title
+                } else {
+                    format!("{title} ({signature})")
+                }
+            }
+        }
+    }
+
     /// Who sent a message, with "(me)" on your own.
     pub(super) fn author(&self, sender: Sender, outgoing: bool) -> String {
         let mut name = self.get(sender);
@@ -73,6 +91,8 @@ struct Quote {
 /// What sits above a message's photo and text.
 struct Header {
     name: Option<(String, Color)>,
+    /// "Forwarded from Alice".
+    forward: Option<String>,
     quote: Option<Quote>,
 }
 
@@ -82,7 +102,7 @@ impl Header {
             .quote
             .as_ref()
             .map_or(0, |q| 1 + usize::from(q.text.is_some()));
-        usize::from(self.name.is_some()) + quote
+        usize::from(self.name.is_some()) + usize::from(self.forward.is_some()) + quote
     }
 }
 
@@ -392,9 +412,15 @@ fn measure<'a>(
                 name_color(msg.sender, colors),
             )
         });
+        // Every photo of an album was forwarded from, and answers, the same
+        // place; it's said once.
         let header = Header {
             name,
-            // Every photo of an album answers the same message; it's said once.
+            forward: msg
+                .forwarded
+                .as_ref()
+                .filter(|_| album.is_none_or(|a| a.first))
+                .map(|origin| format!("Forwarded from {}", names.origin(origin))),
             quote: msg
                 .reply_to
                 .as_ref()
@@ -741,6 +767,10 @@ struct Bubble<'a> {
     msg: &'a Msg,
     /// Byte ranges of the text that are links.
     links: &'a [Range<usize>],
+    /// The text's formatting.
+    styles: &'a [Styled],
+    /// Enter showed the text's spoilers.
+    revealed: bool,
     header: Header,
     /// Columns and rows of the photo.
     photo: Option<(u16, u16)>,
@@ -810,6 +840,10 @@ impl<'a> Bubble<'a> {
         if let Some((n, _)) = &name {
             width = width.max(n.width());
         }
+        let forward = header.forward.map(|f| truncate(&f, max_text));
+        if let Some(f) = &forward {
+            width = width.max(f.width());
+        }
         // The quote's bar takes two columns.
         let quote = header.quote.map(|q| Quote {
             name: truncate(&q.name, max_text.saturating_sub(2)),
@@ -826,7 +860,13 @@ impl<'a> Bubble<'a> {
         Bubble {
             msg,
             links: caption.map_or(&[], |c| c.link_ranges.as_slice()),
-            header: Header { name, quote },
+            styles: caption.map_or(&[], |c| c.styles.as_slice()),
+            revealed: caption.is_some_and(|c| c.revealed),
+            header: Header {
+                name,
+                forward,
+                quote,
+            },
             photo,
             meta,
             chips,
@@ -873,6 +913,8 @@ impl<'a> Bubble<'a> {
         let Bubble {
             msg,
             links,
+            styles,
+            revealed,
             header,
             photo,
             meta,
@@ -897,9 +939,17 @@ impl<'a> Bubble<'a> {
         };
         let meta_style = style.fg(meta_color);
         let meta_w = meta.as_ref().map_or(0, |m| m.width());
-        let found = style.patch(super::match_style(colors));
-        let spans =
-            |line: &str, start: usize| line_spans(line, start, links, &matches, style, found);
+        let paint = Paint {
+            links,
+            matches: &matches,
+            styles,
+            revealed,
+            style,
+            found: super::match_style(colors),
+            code: colors.code,
+            faded,
+        };
+        let spans = |line: &str, start: usize| line_spans(line, start, &paint);
 
         // Pads a row to the bubble width (one column of padding each side) and
         // puts own messages on the right.
@@ -918,6 +968,13 @@ impl<'a> Bubble<'a> {
         if let Some((n, color)) = header.name {
             let w = n.width();
             out.push(row(vec![Span::styled(n, style.fg(color).bold())], w));
+        }
+        if let Some(forward) = header.forward {
+            let w = forward.width();
+            out.push(row(
+                vec![Span::styled(forward, style.fg(faded).italic())],
+                w,
+            ));
         }
         if let Some(q) = header.quote {
             let accent = style.fg(q.color.unwrap_or(faded));
@@ -1034,25 +1091,69 @@ fn wrap(text: &str, width: usize) -> Vec<(String, usize)> {
     out
 }
 
-/// Splits one wrapped line into spans: `links` underlined, search `matches`
-/// in `found`. Both are byte ranges of the whole text; the line starts at
-/// byte `start`.
-fn line_spans(
-    line: &str,
-    start: usize,
-    links: &[Range<usize>],
-    matches: &[Range<usize>],
+/// What decides how each part of a bubble's text looks. Ranges are byte
+/// ranges of the whole text.
+struct Paint<'a> {
+    /// Underlined.
+    links: &'a [Range<usize>],
+    /// Search matches, in `found`.
+    matches: &'a [Range<usize>],
+    /// The formatting the sender picked.
+    styles: &'a [Styled],
+    /// Spoilers are shown, not blotted out.
+    revealed: bool,
+    /// The bubble's text.
     style: Style,
+    /// Laid over a search match.
     found: Style,
-) -> Vec<Span<'static>> {
+    /// Code.
+    code: Color,
+    /// What's quieter than the text on the bubble: quotes, hidden spoilers.
+    faded: Color,
+}
+
+impl Paint<'_> {
+    /// `style` with the sender's formatting.
+    fn format(&self, style: Style, format: Format) -> Style {
+        let mut style = style;
+        if format.bold {
+            style = style.bold();
+        }
+        if format.italic || format.quote {
+            style = style.italic();
+        }
+        if format.underline {
+            style = style.underlined();
+        }
+        if format.strike {
+            style = style.crossed_out();
+        }
+        if format.code {
+            style = style.fg(self.code);
+        }
+        if format.quote || (format.spoiler && !self.revealed) {
+            style = style.fg(self.faded);
+        }
+        style
+    }
+}
+
+/// Splits one wrapped line, which starts at byte `start` of the text, into
+/// spans painted as `paint` says.
+fn line_spans(line: &str, start: usize, paint: &Paint) -> Vec<Span<'static>> {
     let end = start + line.len();
     // Only the ranges on this line: a message can have thousands, and each
     // of its lines is drawn on every frame.
-    let links = overlapping(links, start, end);
-    let matches = overlapping(matches, start, end);
+    let links = overlapping(paint.links, start, end, |r| r);
+    let matches = overlapping(paint.matches, start, end, |r| r);
+    let styles = overlapping(paint.styles, start, end, |s| &s.range);
     // Every offset in the line where the style can change.
     let mut cuts = vec![0, line.len()];
-    for range in links.iter().chain(matches) {
+    let edges = links
+        .iter()
+        .chain(matches)
+        .chain(styles.iter().map(|s| &s.range));
+    for range in edges {
         for at in [range.start, range.end] {
             if at > start && at < end {
                 cuts.push(at - start);
@@ -1066,25 +1167,41 @@ fn line_spans(
         .windows(2)
         .map(|w| {
             let at = start + w[0];
-            let mut s = if inside(matches, at) { found } else { style };
+            let mut text = line[w[0]..w[1]].to_string();
+            let mut s = paint.style;
+            if let Some(styled) = styles.iter().find(|s| s.range.contains(&at)) {
+                s = paint.format(s, styled.format);
+                // As wide as the words it hides, so revealing them moves nothing.
+                if styled.format.spoiler && !paint.revealed {
+                    text = SPOILER.repeat(text.width());
+                }
+            }
             if inside(links, at) {
                 s = s.underlined();
             }
-            Span::styled(line[w[0]..w[1]].to_string(), s)
+            if inside(matches, at) {
+                s = s.patch(paint.found);
+            }
+            Span::styled(text, s)
         })
         .collect();
     if spans.is_empty() {
-        spans.push(Span::styled(String::new(), style));
+        spans.push(Span::styled(String::new(), paint.style));
     }
     spans
 }
 
-/// The ranges that overlap `start..end`, out of ranges in order that don't
-/// overlap each other (links, and search matches, are).
-fn overlapping(ranges: &[Range<usize>], start: usize, end: usize) -> &[Range<usize>] {
-    let first = ranges.partition_point(|r| r.end <= start);
-    let count = ranges[first..].partition_point(|r| r.start < end);
-    &ranges[first..first + count]
+/// The items whose ranges overlap `start..end`, out of items in order whose
+/// ranges don't overlap each other (links, search matches and formatting).
+fn overlapping<T>(
+    items: &[T],
+    start: usize,
+    end: usize,
+    range: impl Fn(&T) -> &Range<usize>,
+) -> &[T] {
+    let first = items.partition_point(|i| range(i).end <= start);
+    let count = items[first..].partition_point(|i| range(i).start < end);
+    &items[first..first + count]
 }
 
 #[cfg(test)]
@@ -1117,6 +1234,9 @@ mod tests {
             file: None,
             links: Vec::new(),
             link_ranges: Vec::new(),
+            styles: Vec::new(),
+            revealed: false,
+            forwarded: None,
             state: SendState::Sent,
             reply_to: None,
             editable: Editable::Text,
@@ -1658,6 +1778,24 @@ mod tests {
         }
     }
 
+    /// Plain text with these links, search matches (on yellow) and formatting.
+    fn paint<'a>(
+        links: &'a [Range<usize>],
+        matches: &'a [Range<usize>],
+        styles: &'a [Styled],
+    ) -> Paint<'a> {
+        Paint {
+            links,
+            matches,
+            styles,
+            revealed: false,
+            style: Style::new(),
+            found: Style::new().bg(Color::Yellow),
+            code: Color::Green,
+            faded: Color::Gray,
+        }
+    }
+
     #[test]
     fn links_are_underlined_even_across_a_wrap() {
         let text = "see https://example.com/a/long/path ok";
@@ -1665,7 +1803,7 @@ mod tests {
         let mut underlined = String::new();
         for (line, start) in wrap(text, 20) {
             let links = std::slice::from_ref(&link);
-            for span in line_spans(&line, start, links, &[], Style::new(), Style::new()) {
+            for span in line_spans(&line, start, &paint(links, &[], &[])) {
                 if span
                     .style
                     .add_modifier
@@ -1676,6 +1814,111 @@ mod tests {
             }
         }
         assert_eq!(underlined, "https://example.com/a/long/path");
+    }
+
+    #[test]
+    fn formatting_shows_in_the_bubble_and_spoilers_only_once_revealed() {
+        let mut open = OpenChat::new(42);
+        let mut m = msg(false, 1_790_000_000, "bold code secret");
+        let styled = |range, format| Styled { range, format };
+        m.styles = vec![
+            styled(
+                0..4,
+                Format {
+                    bold: true,
+                    ..Format::default()
+                },
+            ),
+            styled(
+                5..9,
+                Format {
+                    code: true,
+                    ..Format::default()
+                },
+            ),
+            styled(
+                10..16,
+                Format {
+                    spoiler: true,
+                    ..Format::default()
+                },
+            ),
+        ];
+        open.messages.insert(1, m);
+        let rows = |buf: &ratatui::buffer::Buffer| -> Vec<String> {
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+                .collect()
+        };
+        let buf = render_buffer(&mut open, false, &mut images());
+        assert!(
+            rows(&buf).iter().any(|r| r.contains("bold code ⠿⠿⠿⠿⠿⠿")),
+            "{:#?}",
+            rows(&buf)
+        );
+        assert!(!rows(&buf).iter().any(|r| r.contains("secret")));
+        let cell = |buf: &ratatui::buffer::Buffer, symbol: &str| {
+            buf.content()
+                .iter()
+                .find(|c| c.symbol() == symbol)
+                .cloned()
+                .unwrap()
+        };
+        assert!(
+            cell(&buf, "b")
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(cell(&buf, "c").fg, Colors::default().code);
+
+        open.messages.get_mut(&1).unwrap().revealed = true;
+        let buf = render_buffer(&mut open, false, &mut images());
+        assert!(
+            rows(&buf).iter().any(|r| r.contains("bold code secret")),
+            "the same width, so nothing moves"
+        );
+    }
+
+    #[test]
+    fn forwarded_messages_say_where_from_once_per_album() {
+        let mut open = OpenChat::new(42);
+        let mut m = msg(true, 1_790_000_000, "look at this");
+        m.forwarded = Some(Origin::Hidden("Bob".into()));
+        open.messages.insert(1, m);
+        let mut post = msg(false, 1_790_000_100, "news");
+        post.forwarded = Some(Origin::Chat {
+            chat_id: 5,
+            signature: "Ann".into(),
+        });
+        open.messages.insert(2, post);
+        let rows = render(&mut open, false);
+        assert!(
+            rows.iter().any(|r| r.contains("Forwarded from Bob")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("Forwarded from Unknown (Ann)")),
+            "a signed post from a chat that isn't loaded"
+        );
+
+        let mut album = OpenChat::new(42);
+        for id in 1..=2 {
+            let mut photo = msg(false, 1_790_000_000, "");
+            photo.album = 9;
+            photo.forwarded = Some(Origin::Hidden("Bob".into()));
+            photo.preview = Some(Preview {
+                file_id: id as i32,
+                width: 100,
+                height: 100,
+                thumbnail: None,
+                sticker: false,
+            });
+            album.messages.insert(id, photo);
+        }
+        let rows = render(&mut album, false);
+        let said = rows.iter().filter(|r| r.contains("Forwarded from")).count();
+        assert_eq!(said, 1, "{rows:#?}");
     }
 
     #[test]
@@ -1707,7 +1950,7 @@ mod tests {
         let started = std::time::Instant::now();
         let mut underlined = 0;
         for (line, start) in wrap(&text, 71) {
-            for span in line_spans(&line, start, &links, &[], Style::new(), Style::new()) {
+            for span in line_spans(&line, start, &paint(&links, &[], &[])) {
                 if span
                     .style
                     .add_modifier
@@ -1750,9 +1993,8 @@ mod tests {
     fn a_match_inside_a_link_is_both_highlighted_and_underlined() {
         let text = "see https://hello.dev now";
         let link = 4..text.find(" now").unwrap();
-        let found = Style::new().bg(Color::Yellow);
         let matches = crate::search::find(text, "hello");
-        let spans = line_spans(text, 0, &[link], &matches, Style::new(), found);
+        let spans = line_spans(text, 0, &paint(&[link], &matches, &[]));
         let parts: Vec<(&str, bool, bool)> = spans
             .iter()
             .map(|s| {

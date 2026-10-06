@@ -17,6 +17,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("?", "This help, and settings"),
             (":", "Type a command, like logout"),
+            ("s", "Find a chat or person: a name, @username or t.me link"),
             ("H", "Highlight or unhighlight the selected chat"),
             (
                 "Ctrl-r",
@@ -47,9 +48,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("j / k", "Newer / older message"),
             ("gg / G", "Oldest / newest message"),
             ("Ctrl-d / Ctrl-u", "Half a page newer / older"),
-            ("Enter", "Open the photo, file or link"),
+            ("Enter", "Show spoilers, or open the photo, file or link"),
             ("y", "Copy the text, a link, or the photo or file"),
             ("r", "Reply"),
+            ("f", "Forward to another chat (an album goes whole)"),
             ("e", "Edit your message"),
             (
                 "R",
@@ -112,6 +114,15 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Forward and find popups",
+        &[
+            ("Type", "Search chats by name, or @username"),
+            ("Up / Down", "Move (also Ctrl-p / Ctrl-n, Tab)"),
+            ("Enter", "Forward there, or open it"),
+            ("Esc", "Cancel"),
+        ],
+    ),
+    (
         "Menus and popups",
         &[
             ("j / k", "Move"),
@@ -123,7 +134,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ),
             ("Esc / q", "Close"),
             ("Tab / h / l", "Switch tabs in this popup"),
-            ("y / n", "Open or not, when asked about a file or link"),
+            (
+                "y / n",
+                "Go ahead or not, when asked about a file, a link or joining",
+            ),
         ],
     ),
 ];

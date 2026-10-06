@@ -5,13 +5,14 @@ use std::ops::Range;
 
 use base64::Engine;
 use tdlib_rs::enums::{
-    MessageContent, MessageReplyTo, MessageSender, MessageSendingState, StickerFormat,
-    TextEntityType, ThumbnailFormat,
+    MessageContent, MessageOrigin, MessageReplyTo, MessageSender, MessageSendingState,
+    StickerFormat, TextEntityType, ThumbnailFormat,
 };
 use tdlib_rs::types::{self, Message};
+use unicode_width::UnicodeWidthStr;
 
 use crate::attach::{Attachment, Dropped};
-use crate::chats::content_text;
+use crate::chats::content_text_as_sent;
 use crate::images::Thumbnail;
 use crate::reactions::{self, Reaction, ReactionKind};
 use crate::search::MessageSearch;
@@ -172,6 +173,13 @@ pub struct Msg {
     pub links: Vec<Link>,
     /// Byte ranges of `text` that are links, to underline.
     pub link_ranges: Vec<Range<usize>>,
+    /// Formatting the sender picked (bold, code, spoilers…), by byte range
+    /// of `text`, in order and not overlapping.
+    pub styles: Vec<Styled>,
+    /// Enter showed its spoilers.
+    pub revealed: bool,
+    /// Who it was forwarded from, if it was.
+    pub forwarded: Option<Origin>,
     pub state: SendState,
     /// Set when this message is a reply.
     pub reply_to: Option<ReplyTo>,
@@ -216,12 +224,191 @@ pub struct Editing {
 
 impl Msg {
     /// The message on one line: its text, or else what it holds ("Photo").
+    /// Spoilers stay hidden.
     pub fn snippet(&self) -> String {
-        let text = one_line(&self.text);
+        let text = one_line(&hide_spoilers(&self.text, &self.styles));
         match &self.file {
             _ if !text.is_empty() => text,
             Some(file) => file.label.clone(),
             None => "Message".into(),
+        }
+    }
+
+    /// It has spoilers that Enter hasn't shown yet.
+    pub fn hides_spoilers(&self) -> bool {
+        !self.revealed && self.styles.iter().any(|s| s.format.spoiler)
+    }
+}
+
+/// How part of a message's text looks, from the formatting its sender picked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Format {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    /// Inline code or a code block.
+    pub code: bool,
+    /// Hidden until Enter shows it.
+    pub spoiler: bool,
+    /// A block quote.
+    pub quote: bool,
+}
+
+/// A stretch of text with one [`Format`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Styled {
+    pub range: Range<usize>,
+    pub format: Format,
+}
+
+/// The kinds of formatting a [`Format`] has, for counting how many entities
+/// of each cover a spot.
+#[derive(Clone, Copy)]
+enum Mark {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Code,
+    Spoiler,
+    Quote,
+}
+
+const MARKS: usize = 7;
+
+impl Mark {
+    fn of(kind: &TextEntityType) -> Option<Self> {
+        use TextEntityType as T;
+        Some(match kind {
+            T::Bold => Mark::Bold,
+            T::Italic => Mark::Italic,
+            T::Underline => Mark::Underline,
+            T::Strikethrough => Mark::Strike,
+            T::Code | T::Pre | T::PreCode(_) => Mark::Code,
+            T::Spoiler => Mark::Spoiler,
+            T::BlockQuote | T::ExpandableBlockQuote => Mark::Quote,
+            _ => return None,
+        })
+    }
+}
+
+impl Format {
+    /// The formatting where `open[mark]` entities of each kind are open.
+    fn of(open: &[u32; MARKS]) -> Self {
+        let on = |mark: Mark| open[mark as usize] > 0;
+        Format {
+            bold: on(Mark::Bold),
+            italic: on(Mark::Italic),
+            underline: on(Mark::Underline),
+            strike: on(Mark::Strike),
+            code: on(Mark::Code),
+            spoiler: on(Mark::Spoiler),
+            quote: on(Mark::Quote),
+        }
+    }
+}
+
+/// The formatting in a text, as byte ranges. Entities can nest (bold inside
+/// italic) and overlap, so they're cut into stretches that each look one way.
+fn styles(text: &types::FormattedText) -> Vec<Styled> {
+    // Where each entity starts (+1) and ends (-1).
+    let mut edges = Vec::new();
+    for entity in &text.entities {
+        let Some(mark) = Mark::of(&entity.r#type) else {
+            continue;
+        };
+        // Entity offsets count UTF-16 code units, not bytes or chars.
+        let start = byte_offset(&text.text, entity.offset);
+        let end = byte_offset(&text.text, entity.offset.saturating_add(entity.length));
+        if start < end {
+            edges.push((start, true, mark));
+            edges.push((end, false, mark));
+        }
+    }
+    edges.sort_by_key(|&(at, _, _)| at);
+    let mut open = [0u32; MARKS];
+    let mut out: Vec<Styled> = Vec::new();
+    let mut from = 0;
+    for (at, starts, mark) in edges {
+        if at > from {
+            let format = Format::of(&open);
+            if format != Format::default() {
+                match out.last_mut() {
+                    Some(last) if last.range.end == from && last.format == format => {
+                        last.range.end = at;
+                    }
+                    _ => out.push(Styled {
+                        range: from..at,
+                        format,
+                    }),
+                }
+            }
+            from = at;
+        }
+        let count = &mut open[mark as usize];
+        *count = if starts {
+            count.saturating_add(1)
+        } else {
+            count.saturating_sub(1)
+        };
+    }
+    out
+}
+
+/// What a spoiler shows until it's revealed: one of these per column, so the
+/// text keeps its width.
+pub const SPOILER: &str = "⠿";
+
+/// `text` with its spoilers blotted out, for places that never reveal them:
+/// snippets, chat previews, notifications.
+fn hide_spoilers(text: &str, styles: &[Styled]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut done = 0;
+    for styled in styles.iter().filter(|s| s.format.spoiler) {
+        let Some(hidden) = text.get(styled.range.clone()) else {
+            continue;
+        };
+        out.push_str(&text[done..styled.range.start]);
+        out.push_str(&SPOILER.repeat(hidden.width()));
+        done = styled.range.end;
+    }
+    out.push_str(&text[done..]);
+    out
+}
+
+/// A text or caption as plain text, spoilers blotted out.
+pub fn without_spoilers(text: &types::FormattedText) -> String {
+    hide_spoilers(&text.text, &styles(text))
+}
+
+/// Who a forwarded message first came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    User(i64),
+    /// Someone whose privacy settings hide their account: only the name.
+    Hidden(String),
+    /// A channel, or a group's anonymous admin, with the author's name if
+    /// the post was signed.
+    Chat {
+        chat_id: i64,
+        signature: String,
+    },
+}
+
+impl From<&MessageOrigin> for Origin {
+    fn from(origin: &MessageOrigin) -> Self {
+        match origin {
+            MessageOrigin::User(o) => Origin::User(o.sender_user_id),
+            MessageOrigin::HiddenUser(o) => Origin::Hidden(text::clean(&o.sender_name)),
+            MessageOrigin::Chat(o) => Origin::Chat {
+                chat_id: o.sender_chat_id,
+                signature: text::clean(&o.author_signature),
+            },
+            MessageOrigin::Channel(o) => Origin::Chat {
+                chat_id: o.chat_id,
+                signature: text::clean(&o.author_signature),
+            },
         }
     }
 }
@@ -307,6 +494,7 @@ struct Body {
     file: Option<MediaFile>,
     links: Vec<Link>,
     link_ranges: Vec<Range<usize>>,
+    styles: Vec<Styled>,
     editable: Editable,
     formatted: bool,
 }
@@ -314,12 +502,13 @@ struct Body {
 fn body(content: &MessageContent) -> Body {
     use MessageContent as C;
     let mut body = Body {
-        text: content_text(content),
+        text: content_text_as_sent(content),
         source_text: String::new(),
         preview: None,
         file: None,
         links: Vec::new(),
         link_ranges: Vec::new(),
+        styles: Vec::new(),
         editable: Editable::No,
         formatted: false,
     };
@@ -414,7 +603,7 @@ fn body(content: &MessageContent) -> Body {
             .any(|e| !found_by_telegram(&e.r#type));
         let found = links(source);
         // The caption ends the shown text (after e.g. "[File] " or a video's
-        // length), so its link ranges shift by whatever comes before it.
+        // length), so its ranges shift by whatever comes before it.
         if body.text.ends_with(&source.text) {
             let shift = body.text.len() - source.text.len();
             body.link_ranges = found
@@ -423,6 +612,10 @@ fn body(content: &MessageContent) -> Body {
                 .collect();
             // Drawing looks ranges up by position.
             body.link_ranges.sort_by_key(|r| r.start);
+            body.styles = styles(source);
+            for styled in &mut body.styles {
+                styled.range = styled.range.start + shift..styled.range.end + shift;
+            }
         }
         for (link, _) in found {
             match body.links.iter_mut().find(|l| l.url == link.url) {
@@ -437,7 +630,13 @@ fn body(content: &MessageContent) -> Body {
             }
         }
     }
-    body.text = normalize(&body.text, &mut body.link_ranges);
+    let ranges = body
+        .link_ranges
+        .iter_mut()
+        .chain(body.styles.iter_mut().map(|s| &mut s.range));
+    body.text = normalize(&body.text, ranges);
+    // Formatting on nothing but hidden characters is gone with them.
+    body.styles.retain(|s| !s.range.is_empty());
     body
 }
 
@@ -460,9 +659,9 @@ fn found_by_telegram(kind: &TextEntityType) -> bool {
 }
 
 /// Tabs become spaces and hidden characters ([`text::is_hidden`], `\r`
-/// among them) go, so terminal widths add up. Link ranges move along with
-/// the text.
-fn normalize(text: &str, ranges: &mut [Range<usize>]) -> String {
+/// among them) go, so terminal widths add up. Link and formatting ranges
+/// move along with the text.
+fn normalize<'a>(text: &str, ranges: impl IntoIterator<Item = &'a mut Range<usize>>) -> String {
     if !text.contains(|c| c == '\t' || text::is_hidden(c)) {
         return text.to_string();
     }
@@ -607,7 +806,7 @@ impl From<Message> for Msg {
         let reply_to = match message.reply_to {
             Some(MessageReplyTo::Message(r)) => Some(ReplyTo {
                 message_id: (r.chat_id == message.chat_id).then_some(r.message_id),
-                quote: r.quote.map(|q| one_line(&q.text.text)),
+                quote: r.quote.map(|q| one_line(&without_spoilers(&q.text))),
             }),
             _ => None,
         };
@@ -622,6 +821,9 @@ impl From<Message> for Msg {
             file: body.file,
             links: body.links,
             link_ranges: body.link_ranges,
+            styles: body.styles,
+            revealed: false,
+            forwarded: message.forward_info.map(|f| Origin::from(&f.origin)),
             state,
             reply_to,
             editable: body.editable,
@@ -807,6 +1009,38 @@ impl OpenChat {
             }
         }
         vec![(id, msg)]
+    }
+
+    /// What `f` forwards: message `id`, or its whole album, as far as it
+    /// was sent.
+    pub fn forward_ids(&self, id: i64) -> Vec<i64> {
+        self.bubble(id)
+            .into_iter()
+            .filter(|(_, m)| m.state == SendState::Sent)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// The bubble with message `id` has spoilers Enter hasn't shown.
+    pub fn hides_spoilers(&self, id: i64) -> bool {
+        self.bubble(id).iter().any(|(_, m)| m.hides_spoilers())
+    }
+
+    /// Shows the spoilers in the bubble with message `id`: an album's
+    /// caption can be on another of its photos. Returns whether it had any.
+    pub fn reveal_spoilers(&mut self, id: i64) -> bool {
+        let hiding: Vec<i64> = self
+            .bubble(id)
+            .into_iter()
+            .filter(|(_, m)| m.hides_spoilers())
+            .map(|(id, _)| id)
+            .collect();
+        for id in &hiding {
+            if let Some(msg) = self.messages.get_mut(id) {
+                msg.revealed = true;
+            }
+        }
+        !hiding.is_empty()
     }
 
     /// What `R` reacts to: the message under the cursor. An album of photos
@@ -1033,6 +1267,8 @@ impl OpenChat {
             msg.source_text = body.source_text;
             (msg.links, msg.link_ranges) = (body.links, body.link_ranges);
             (msg.editable, msg.formatted) = (body.editable, body.formatted);
+            // New spoilers stay hidden until asked for again.
+            (msg.styles, msg.revealed) = (body.styles, false);
             if let Some(reply) = self.reply.as_mut().filter(|r| r.id == message_id) {
                 reply.snippet = msg.snippet();
             }
@@ -1429,6 +1665,147 @@ mod tests {
         assert_eq!(&body.text[range], "x.dev");
     }
 
+    fn text_message(text: &str, entities: Vec<types::TextEntity>) -> MessageContent {
+        MessageContent::MessageText(types::MessageText {
+            text: types::FormattedText {
+                text: text.into(),
+                entities,
+            },
+            link_preview: None,
+            link_preview_options: None,
+        })
+    }
+
+    /// The formatted parts of a body's text, with what each looks like.
+    fn styled(body: &Body) -> Vec<(&str, Format)> {
+        body.styles
+            .iter()
+            .map(|s| (&body.text[s.range.clone()], s.format))
+            .collect()
+    }
+
+    #[test]
+    fn nested_and_overlapping_formatting_is_cut_into_stretches() {
+        use TextEntityType as T;
+        // "🎉" is 2 UTF-16 units: "bold" starts at offset 3.
+        let content = text_message(
+            "🎉 bold both italic code",
+            vec![
+                entity(3, 9, T::Bold),
+                entity(8, 11, T::Italic),
+                entity(20, 4, T::Code),
+                entity(0, 0, T::Strikethrough),
+                entity(50, 4, T::Underline),
+            ],
+        );
+        let body = body(&content);
+        let bold = Format {
+            bold: true,
+            ..Format::default()
+        };
+        let italic = Format {
+            italic: true,
+            ..Format::default()
+        };
+        let code = Format {
+            code: true,
+            ..Format::default()
+        };
+        let both = Format {
+            bold: true,
+            italic: true,
+            ..Format::default()
+        };
+        assert_eq!(
+            styled(&body),
+            [
+                ("bold ", bold),
+                ("both", both),
+                (" italic", italic),
+                ("code", code),
+            ],
+            "empty and out-of-range entities are skipped"
+        );
+        assert!(body.formatted);
+    }
+
+    #[test]
+    fn caption_formatting_lines_up_after_a_label_and_expanded_tabs() {
+        let caption = types::FormattedText {
+            text: "a\tb bold".into(),
+            entities: vec![entity(4, 4, TextEntityType::Bold)],
+        };
+        let content = MessageContent::MessageDocument(types::MessageDocument {
+            document: types::Document {
+                file_name: "a.pdf".into(),
+                mime_type: "application/pdf".into(),
+                minithumbnail: None,
+                thumbnail: None,
+                document: types::File::default(),
+            },
+            caption,
+        });
+        let body = body(&content);
+        assert_eq!(body.text, "[File: a.pdf] a    b bold");
+        assert_eq!(styled(&body)[0].0, "bold");
+    }
+
+    #[test]
+    fn spoilers_stay_hidden_everywhere_but_the_bubble() {
+        let content = text_message(
+            "the butler did it",
+            vec![entity(4, 6, TextEntityType::Spoiler)],
+        );
+        assert_eq!(crate::chats::content_text(&content), "the ⠿⠿⠿⠿⠿⠿ did it");
+        let body = body(&content);
+        assert_eq!(
+            body.text, "the butler did it",
+            "the bubble blots it out itself"
+        );
+
+        let mut msg = page([1]).remove(0).1;
+        (msg.text, msg.styles) = (body.text, body.styles);
+        assert_eq!(msg.snippet(), "the ⠿⠿⠿⠿⠿⠿ did it");
+        assert!(msg.hides_spoilers());
+        msg.revealed = true;
+        assert!(!msg.hides_spoilers());
+        assert_eq!(msg.snippet(), "the ⠿⠿⠿⠿⠿⠿ did it", "snippets never reveal");
+
+        // As wide as what it hides.
+        let wide = text_message("答えは東京", vec![entity(3, 2, TextEntityType::Spoiler)]);
+        assert_eq!(crate::chats::content_text(&wide), "答えは⠿⠿⠿⠿");
+    }
+
+    #[test]
+    fn enter_shows_the_spoilers_of_the_whole_album() {
+        let mut open = OpenChat::new(1);
+        let mut msgs = page([1, 2, 3]);
+        for (_, msg) in &mut msgs[..2] {
+            msg.album = 7;
+            msg.preview = Some(Preview {
+                file_id: 1,
+                width: 10,
+                height: 10,
+                thumbnail: None,
+                sticker: false,
+            });
+        }
+        // The caption, with its spoiler, is on the first photo.
+        msgs[0].1.styles = vec![Styled {
+            range: 0..7,
+            format: Format {
+                spoiler: true,
+                ..Format::default()
+            },
+        }];
+        open.messages.extend(msgs);
+        assert!(open.hides_spoilers(2));
+        assert!(!open.hides_spoilers(3));
+        assert!(open.reveal_spoilers(2), "from the other photo");
+        assert!(open.messages[&1].revealed);
+        assert!(!open.reveal_spoilers(2), "nothing left to show");
+    }
+
     /// A page of plain messages with these ids.
     fn page(ids: impl IntoIterator<Item = i64>) -> Vec<(i64, Msg)> {
         ids.into_iter()
@@ -1443,6 +1820,9 @@ mod tests {
                     file: None,
                     links: Vec::new(),
                     link_ranges: Vec::new(),
+                    styles: Vec::new(),
+                    revealed: false,
+                    forwarded: None,
                     state: SendState::Sent,
                     reply_to: None,
                     editable: Editable::Text,

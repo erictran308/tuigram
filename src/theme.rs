@@ -309,6 +309,7 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
         activity: role("activity", p("blue"))?,
         edit: role("edit", p("orange"))?,
         attach: role("attach", p("blue"))?,
+        code: role("code", p("green"))?,
         success: role("success", p("green"))?,
         own_bubble,
         own_meta: role("own_meta", mix(p("fg"), p("blue"), 0.5))?,
@@ -366,6 +367,8 @@ pub struct Colors {
     pub edit: Color,
     /// Files waiting in the composer to be sent, and the ATTACH label.
     pub attach: Color,
+    /// Code in messages.
+    pub code: Color,
     /// Toasts saying something worked.
     pub success: Color,
     pub own_bubble: Color,

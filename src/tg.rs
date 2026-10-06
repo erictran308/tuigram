@@ -17,6 +17,7 @@ use tdlib_rs::{enums, functions, types};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::error::SendError;
 
+use crate::chats::Badge;
 use crate::config::{ApiKeys, Config};
 use crate::reactions::{self, Available, ReactionKind};
 use crate::stickers::{Source, Sticker};
@@ -85,6 +86,44 @@ pub enum TgEvent {
         file_id: i32,
         path: Option<String>,
     },
+    /// Whom Telegram found for a search in the `s` picker: contacts by
+    /// user id, and public chats. Failures find nothing.
+    ChatsFound {
+        query: String,
+        chat_ids: Vec<i64>,
+        user_ids: Vec<i64>,
+    },
+    /// A chat looked up to open, by what was looked up (a username, a link
+    /// or a contact's name): the chat, and the message a link pointed at.
+    /// Or what to say if it can't be opened.
+    ChatFound {
+        request: String,
+        found: Result<(i64, Option<i64>), String>,
+    },
+    /// Telegram took messages to forward to this chat.
+    Forwarded {
+        chat_id: i64,
+    },
+    /// You joined this public group or channel.
+    Joined {
+        chat_id: i64,
+    },
+    /// An invite link to a chat you're not in, to ask before joining.
+    Invite {
+        request: String,
+        link: String,
+        invite: Invite,
+    },
+}
+
+/// A chat an invite link leads to, as the link describes it.
+pub struct Invite {
+    pub title: String,
+    pub members: i32,
+    pub channel: bool,
+    pub badge: Option<Badge>,
+    /// You'd ask to join, and an admin lets you in.
+    pub by_request: bool,
 }
 
 /// Which part of a chat's history to fetch.
@@ -127,6 +166,8 @@ const NOTIFICATION_GROUPS: i64 = 5;
 
 /// Stickers a search in the sticker panel asks for.
 const STICKER_SEARCH_LIMIT: i32 = 100;
+/// Contacts a search in the `s` picker asks for.
+const CONTACT_SEARCH_LIMIT: i32 = 20;
 
 /// How long [`offline_now`] gives TDLib to send it before the process ends.
 const OFFLINE_GRACE: Duration = Duration::from_millis(300);
@@ -779,6 +820,166 @@ impl Tg {
         });
     }
 
+    /// Forwards messages of chat `from_chat_id`, in order, to chat
+    /// `chat_id`. They arrive there as new messages.
+    pub fn forward(&self, chat_id: i64, from_chat_id: i64, message_ids: Vec<i64>) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let result = functions::forward_messages(
+                chat_id,
+                None,
+                from_chat_id,
+                message_ids,
+                None,
+                false, // send_copy: keep "Forwarded from"
+                false, // remove_caption
+                client_id,
+            )
+            .await;
+            let _ = match result {
+                Ok(_) => tx.send(TgEvent::Forwarded { chat_id }),
+                Err(e) => tx.send(TgEvent::Error(e.message)),
+            };
+        });
+    }
+
+    /// Searches your contacts, and Telegram's public chats, for the `s`
+    /// picker. TDLib sends the users and chats it finds as updates first.
+    pub fn find_chats(&self, query: String) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let user_ids =
+                match functions::search_contacts(query.clone(), CONTACT_SEARCH_LIMIT, client_id)
+                    .await
+                {
+                    Ok(enums::Users::Users(u)) => u.user_ids,
+                    Err(_) => Vec::new(),
+                };
+            // Too short a query, or one searched too often, is an error;
+            // either way nothing was found.
+            let chat_ids = match functions::search_public_chats(query.clone(), client_id).await {
+                Ok(enums::Chats::Chats(c)) => c.chat_ids,
+                Err(_) => Vec::new(),
+            };
+            let _ = tx.send(TgEvent::ChatsFound {
+                query,
+                chat_ids,
+                user_ids,
+            });
+        });
+    }
+
+    /// Opens a chat with one of your contacts, creating it if there's none.
+    pub fn find_private_chat(&self, user_id: i64, request: String) {
+        let client_id = self.client_id;
+        self.find(request, async move {
+            let enums::Chat::Chat(chat) = functions::create_private_chat(user_id, false, client_id)
+                .await
+                .map_err(|e| e.message)?;
+            Ok((chat.id, None))
+        });
+    }
+
+    /// Finds the chat with a username: a person, bot, group or channel.
+    pub fn find_username(&self, username: String, request: String) {
+        let client_id = self.client_id;
+        self.find(request, async move {
+            let id = public_chat(&username, client_id).await?;
+            Ok((id, None))
+        });
+    }
+
+    /// Follows a t.me link: to a chat, to a message in one, or an invite.
+    /// An invite to a chat you're not in comes back as [`TgEvent::Invite`],
+    /// to ask first.
+    pub fn find_link(&self, link: String, request: String) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        self.find(request.clone(), async move {
+            let kind = functions::get_internal_link_type(link.clone(), client_id)
+                .await
+                .map_err(|_| "That isn't a link tuigram can open".to_string())?;
+            match kind {
+                enums::InternalLinkType::PublicChat(p) => {
+                    Ok((public_chat(&p.chat_username, client_id).await?, None))
+                }
+                enums::InternalLinkType::Message(m) => {
+                    let enums::MessageLinkInfo::MessageLinkInfo(info) =
+                        functions::get_message_link_info(m.url, client_id)
+                            .await
+                            .map_err(|e| e.message)?;
+                    if info.chat_id == 0 {
+                        return Err("That message can't be found".into());
+                    }
+                    Ok((info.chat_id, info.message.map(|m| m.id)))
+                }
+                enums::InternalLinkType::ChatInvite(i) => {
+                    let enums::ChatInviteLinkInfo::ChatInviteLinkInfo(info) =
+                        functions::check_chat_invite_link(i.invite_link.clone(), client_id)
+                            .await
+                            .map_err(|e| e.message)?;
+                    // A chat you're in has an id and no time limit on reading it.
+                    if info.chat_id != 0 && info.accessible_for == 0 {
+                        return Ok((info.chat_id, None));
+                    }
+                    let invite = Invite {
+                        title: crate::text::clean(&info.title),
+                        members: info.member_count,
+                        channel: matches!(info.r#type, enums::InviteLinkChatType::Channel),
+                        badge: Badge::of(info.verification_status.as_ref(), false),
+                        by_request: info.creates_join_request,
+                    };
+                    let _ = tx.send(TgEvent::Invite {
+                        request,
+                        link: i.invite_link,
+                        invite,
+                    });
+                    Err(String::new())
+                }
+                _ => Err("tuigram can't open this kind of link yet".into()),
+            }
+        });
+    }
+
+    /// Joins a chat with an invite link, then opens it.
+    pub fn join_by_link(&self, link: String, request: String) {
+        let client_id = self.client_id;
+        self.find(request, async move {
+            let enums::Chat::Chat(chat) = functions::join_chat_by_invite_link(link, client_id)
+                .await
+                .map_err(|e| e.message)?;
+            Ok((chat.id, None))
+        });
+    }
+
+    /// Joins a public group or channel. TDLib then sends `updateSupergroup`.
+    pub fn join_chat(&self, chat_id: i64) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let _ = match functions::join_chat(chat_id, client_id).await {
+                Ok(()) => tx.send(TgEvent::Joined { chat_id }),
+                Err(e) => tx.send(TgEvent::Error(e.message)),
+            };
+        });
+    }
+
+    /// Runs a lookup of a chat to open, and reports it as
+    /// [`TgEvent::ChatFound`]. An empty error says nothing more.
+    fn find(
+        &self,
+        request: String,
+        lookup: impl Future<Output = Result<(i64, Option<i64>), String>> + Send + 'static,
+    ) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let found = lookup.await;
+            let _ = tx.send(TgEvent::ChatFound { request, found });
+        });
+    }
+
     /// Tells the chat you're typing, or that you stopped. Others see it for
     /// about 5 seconds unless it's sent again. Failing is harmless (TDLib
     /// already skips chats you can't write in), so errors aren't shown.
@@ -943,6 +1144,18 @@ impl Upload {
                 })
             }
         }
+    }
+}
+
+/// The chat with a username, or why there's none.
+async fn public_chat(username: &str, client_id: i32) -> Result<i64, String> {
+    match functions::search_public_chat(username.to_string(), client_id).await {
+        Ok(enums::Chat::Chat(chat)) => Ok(chat.id),
+        Err(e) if e.code == 400 => Err(format!(
+            "Nobody on Telegram is called @{}",
+            crate::text::clean(username)
+        )),
+        Err(e) => Err(e.message),
     }
 }
 

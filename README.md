@@ -28,7 +28,9 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **React with emoji.** `R` opens the emoji the chat allows, and `/` finds one by name (`heart`, `fire`, `+1`). `X` takes yours back.
 - **Send stickers.** `Tab` while writing opens your recent and favorite stickers and the sets you added, and `/` finds more by emoji or word.
 - **Search everything.** `/` in the chat list filters chats as you type. `/` inside a chat searches its entire history, and `n`/`N` jump between matches, highlighted where they appear.
-- **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, reactions under them, ✓ / ✓✓ when yours are sent and read, date separators, "typing…" while someone writes to you, and unread chats on top.
+- **Find anyone.** `s` finds a chat by name, or anyone on Telegram by `@username` or `t.me` link: your contacts, public groups and channels, invite links (it asks before joining) and links to a message.
+- **Forward.** `f` sends the selected message, or a whole album, to another chat, with "Forwarded from" as in Telegram.
+- **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, **bold**, *italic*, `code` and spoilers (hidden until `Enter`), reactions under them, ✓ / ✓✓ when yours are sent and read, date separators, "typing…" while someone writes to you, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app.
 - **Send photos and files.** Drop them on the window, paste a screenshot with `p`, or type a path with `a` (Tab completes it). What you write goes with them as the caption, and several photos go as one album.
 - **Notifications.** New messages pop up as system notifications while you're in another window, and the window title counts your unread chats. Telegram's mute settings apply.
@@ -131,12 +133,13 @@ The status bar always shows the keys for where you are. The essentials:
 | `j` / `k` | Move down / up |
 | `gg` / `G` | Jump to top / bottom |
 | `Ctrl-d` / `Ctrl-u` | Half a page down / up |
-| `Enter` / `l` | Open a chat, or the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens) |
+| `Enter` / `l` | Open a chat, or the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens). On a message with spoilers, `Enter` shows them first |
 | `h` / `Esc` | Back to the chat list. To have the list on the right, tick **On the right side of the window** in `?` > **Settings**; `h` and `l` then swap, to follow the screen |
 | `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
 | `Tab` | While writing: stickers. `h/j/k/l` pick one, `H` / `L` switch between Recent, Favorites and your sets, `/` finds stickers by emoji or word, `Enter` sends |
 | `y` | Copy the selected message: its text, a link, or the photo or file |
 | `r` | Reply to the selected message (`Esc` twice cancels the reply) |
+| `f` | Forward the selected message, or its whole album: type part of a chat's name, `Enter` sends it there |
 | `e` | Edit your message: `Enter` saves, `Esc` twice cancels |
 | `R` | React to the selected message: pick an emoji, or type `/` and its name (`heart`, `+1`); `Enter` on one of yours takes it back |
 | `X` | Take back all your reactions to the selected message, without the popup |
@@ -145,6 +148,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `/` | Search chat names, or messages in the open chat |
 | `n` / `N` | Next older / newer match |
 | `H` | Highlight a chat |
+| `s` | Find a chat or person: type a name, an `@username` or a `t.me` link, then `Enter` opens it. In a public group or channel you're not in, `i` asks to join |
 | `Ctrl-r` | Resize the panes: `h` / `l` move the line between them left / right, `=` puts it back as at first, `Enter` keeps it (also next time), `Esc` cancels |
 | `:` | Run a command, typed in full: `:logout` logs out of Telegram on this computer |
 | `?` | Every shortcut, plus settings and themes |
@@ -201,6 +205,7 @@ Sixteen `[palette]` colors make a whole theme: `bg`, `bg_alt`, `surface`, `overl
 | `reply`, `edit` | The bar over the composer, and the message it's about | `cyan`, `orange` |
 | `activity` | "typing…" | `blue` |
 | `attach` | Files waiting to be sent | `blue` |
+| `code` | Code in messages | `green` |
 | `own_bubble`, `other_bubble` | Your messages, and other people's | `bg` tinted `blue`, `surface` |
 | `own_meta`, `other_meta` | The time and ✓ on them | `fg` mixed with `blue`, `subtext` |
 | `own_reaction`, `other_reaction` | Reactions on them | A shade off the bubble |
