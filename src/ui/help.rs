@@ -83,6 +83,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Enter", "Send, or save the edit"),
             ("Alt-Enter / Ctrl-j", "New line"),
+            ("Ctrl-u", "Delete back to the start of the line"),
             (
                 "**bold**",
                 "Formatting: __italic__ ~~strike~~ ||spoiler|| `code` ```block``` [text](url)",

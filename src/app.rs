@@ -1570,6 +1570,13 @@ impl App {
             KeyCode::Char('v') if ctrl => self.paste_clipboard(),
             KeyCode::Char('z') if ctrl => self.undo_drop(),
             KeyCode::Char('t') if ctrl => self.toggle_as_files(),
+            // Ctrl-u deletes back to the start of the line, as in a shell,
+            // instead of the text area's undo.
+            KeyCode::Char('u') if ctrl => {
+                if self.composer.delete_line_by_head() {
+                    self.on_composer_edit();
+                }
+            }
             KeyCode::Tab => self.open_stickers(),
             _ => {
                 if self.composer.input(key) {
@@ -4111,6 +4118,26 @@ mod tests {
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.picker.is_none(), "Ctrl-c closes it");
         assert!(app.quit_deadline.is_none(), "without quitting");
+    }
+
+    #[test]
+    fn ctrl_u_deletes_back_to_the_start_of_the_line_and_then_the_line_break() {
+        let mut app = test_app("ctrl-u");
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        app.focus = Focus::Input;
+        // Typing was already told, so this test sends nothing to TDLib.
+        app.typing = Some((chat_id, Instant::now()));
+        app.composer.insert_str("first line");
+        app.composer.insert_newline();
+        app.composer.insert_str("second line");
+        app.composer
+            .move_cursor(ratatui_textarea::CursorMove::WordBack);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(app.composer.lines(), ["first line", "line"]);
+
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(app.composer.lines(), ["first lineline"]);
+        assert!(app.focus == Focus::Input);
     }
 
     #[test]
