@@ -391,6 +391,16 @@ impl Images {
         self.files.insert(file_id, state);
     }
 
+    /// The photo numbered `file_id` is a file on this computer, such as one
+    /// about to be sent: it's read from `path`, never downloaded. Called
+    /// while drawing, before [`want`](Self::want); a photo that failed to
+    /// decode stays broken.
+    pub fn local_file(&mut self, file_id: i32, path: &str) {
+        self.files
+            .entry(file_id)
+            .or_insert_with(|| FileState::Ready(path.into()));
+    }
+
     pub fn on_built(&mut self, event: ImageEvent) {
         if event.generation != self.generation {
             return;
@@ -643,6 +653,24 @@ mod tests {
         assert_eq!(images.ready.len(), MAX_READY);
         assert!(images.get(&preview(0), 4, 2).is_some());
         assert!(images.get(&preview(1), 4, 2).is_none(), "the oldest went");
+    }
+
+    #[tokio::test]
+    async fn a_photo_about_to_be_sent_is_read_from_its_file_not_downloaded() {
+        let dir = std::env::temp_dir().join(format!("tuigram-local-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cat.png");
+        std::fs::write(&path, png(80, 60)).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        let photo = preview(-1);
+        images.local_file(-1, path.to_str().unwrap());
+        images.want(&photo, 4, 2);
+        // A detached client makes no requests, so a download would never end.
+        images.fetch(&Tg::detached(tokio::sync::mpsc::unbounded_channel().0));
+        images.on_built(rx.recv().await.unwrap());
+        assert!(images.get(&photo, 4, 2).is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

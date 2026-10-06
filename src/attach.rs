@@ -4,7 +4,9 @@
 
 use std::ops::Not;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 
+use crate::messages::Preview;
 use crate::text;
 use crate::tg::Upload;
 
@@ -40,7 +42,14 @@ pub struct Attachment {
     pub kind: Kind,
     /// Which file it was when listed, to tell if it was swapped since.
     pub identity: Identity,
+    /// Numbers its picture in the composer the way TDLib numbers files:
+    /// negative, so never one of TDLib's, and new for each attachment, so a
+    /// file changed and attached again doesn't show as it was.
+    pub image_id: i32,
 }
+
+/// The next [`Attachment::image_id`].
+static NEXT_IMAGE_ID: AtomicI32 = AtomicI32::new(-1);
 
 /// What tells one file from another that took its place: on Unix its device
 /// and inode, everywhere its size and when it last changed.
@@ -111,6 +120,21 @@ impl Attachment {
             size: meta.len(),
             kind,
             identity,
+            image_id: NEXT_IMAGE_ID.fetch_sub(1, Ordering::Relaxed),
+        })
+    }
+
+    /// The picture the composer shows of a photo, read from its file.
+    pub fn preview(&self) -> Option<Preview> {
+        let Kind::Photo { width, height } = self.kind else {
+            return None;
+        };
+        Some(Preview {
+            file_id: self.image_id,
+            width,
+            height,
+            thumbnail: None,
+            sticker: false,
         })
     }
 
@@ -633,6 +657,7 @@ mod tests {
             size: 1,
             kind,
             identity: Identity::default(),
+            image_id: 0,
         };
         let photo = Kind::Photo {
             width: 1,

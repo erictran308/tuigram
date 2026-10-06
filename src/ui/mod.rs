@@ -18,6 +18,7 @@ use crate::attach::{self, Attachment, Kind};
 use crate::chats::{Badge, Chat};
 use crate::complete::Completion;
 use crate::config;
+use crate::images::Images;
 use crate::messages::{Editing, OpenChat, Replied, Sender};
 use crate::notify::Notifications;
 use crate::picker::{ChatPicker, Choice, Purpose};
@@ -368,6 +369,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             if ComposerBar::of(open).is_some() {
                 rows += BAR_ROWS;
             }
+            rows += preview_rows(&open.attachments, &app.images);
             rows += attachment_rows(&open.attachments);
             let panel = app.stickers.as_mut().filter(|_| app.focus == Focus::Input);
             let panel_rows = match panel {
@@ -405,6 +407,8 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 &names,
                 composer,
                 app.focus == Focus::Input && panel_rows == 0,
+                &mut app.images,
+                popup_over_chat,
                 colors,
             );
         }
@@ -1356,7 +1360,8 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
 }
 
 /// The box messages are written in. While replying, a bar at its top says
-/// which message the reply answers, and files to send are listed under it.
+/// which message the reply answers, and files to send are listed under it,
+/// after a picture of each photo. `covered`: a popup may be over it.
 #[allow(clippy::too_many_arguments)]
 fn draw_composer(
     frame: &mut Frame,
@@ -1367,6 +1372,8 @@ fn draw_composer(
     names: &messages::Names,
     area: Rect,
     insert: bool,
+    images: &mut Images,
+    covered: bool,
     colors: &Colors,
 ) {
     // Text starts a column in, in line with the message bubbles above.
@@ -1382,11 +1389,13 @@ fn draw_composer(
         text = rest;
     }
     if !attachments.is_empty() {
-        let [files, rest] = Layout::vertical([
+        let [photos, files, rest] = Layout::vertical([
+            Constraint::Length(preview_rows(attachments, images)),
             Constraint::Length(attachment_rows(attachments)),
             Constraint::Fill(1),
         ])
         .areas(text);
+        draw_previews(frame, attachments, photos, images, covered, colors);
         let lines = attachment_lines(attachments, as_files, files.width as usize, colors);
         frame.render_widget(Paragraph::new(lines), files);
         text = rest;
@@ -1421,6 +1430,78 @@ fn draw_composer(
 
 fn attachment_rows(attachments: &[Attachment]) -> u16 {
     attachments.len().min(MAX_ATTACHMENT_ROWS) as u16
+}
+
+/// Rows for the pictures of the photos waiting to be sent: as many as the
+/// tallest takes, or none where the terminal only has half blocks, which
+/// are too coarse for a picture this small.
+fn preview_rows(attachments: &[Attachment], images: &Images) -> u16 {
+    if !images.draws_photos() {
+        return 0;
+    }
+    let font = images.font_size();
+    attachments
+        .iter()
+        .filter_map(Attachment::preview)
+        .map(|photo| messages::thumbnail_cells(&photo, font).1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The photos waiting to be sent, side by side, each as big as a link
+/// preview's picture, so a wrong one is seen before it goes. What doesn't
+/// fit is counted after the last one shown.
+fn draw_previews(
+    frame: &mut Frame,
+    attachments: &[Attachment],
+    area: Rect,
+    images: &mut Images,
+    covered: bool,
+    colors: &Colors,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let font = images.font_size();
+    let photos: Vec<&Attachment> = attachments.iter().filter(|a| a.kind.is_photo()).collect();
+    let mut slots = Vec::new();
+    let mut x = 0;
+    for photo in photos.iter().filter_map(|a| a.preview()) {
+        let (cols, rows) = messages::thumbnail_cells(&photo, font);
+        if x + cols > area.width {
+            break;
+        }
+        slots.push(messages::PhotoSlot {
+            line: 0,
+            x,
+            cols,
+            rows,
+            photo,
+        });
+        x += cols + 1;
+    }
+    // The count needs room too, which the last pictures give up.
+    let more = |shown: usize| format!("+{}", photos.len() - shown);
+    while slots.len() < photos.len()
+        && usize::from(area.width.saturating_sub(x)) < more(slots.len()).width()
+        && let Some(slot) = slots.pop()
+    {
+        x = slot.x;
+    }
+    for (slot, attachment) in slots.iter().zip(&photos) {
+        images.local_file(slot.photo.file_id, &attachment.path.to_string_lossy());
+    }
+    messages::draw_photos(frame, area, &slots, 0, images, covered, colors);
+    if slots.len() < photos.len() {
+        let label = more(slots.len());
+        let row = Rect {
+            x: area.x + x,
+            y: area.y + area.height / 2,
+            width: label.width() as u16,
+            height: 1,
+        };
+        frame.render_widget(Span::from(label).fg(colors.subtle), row.intersection(area));
+    }
 }
 
 /// A row per file waiting to be sent: its name, how it goes, and its size.
@@ -1957,6 +2038,14 @@ mod tests {
     use crate::messages::{Editable, MediaFile};
 
     /// Every row of the buffer as a string.
+    /// Half blocks: no pictures of photos to send, just their names.
+    fn no_images() -> Images {
+        Images::new(
+            ratatui_image::picker::Picker::halfblocks(),
+            tokio::sync::mpsc::unbounded_channel().0,
+        )
+    }
+
     fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
         (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
@@ -2124,6 +2213,8 @@ mod tests {
                     &names,
                     area,
                     true,
+                    &mut no_images(),
+                    false,
                     &colors,
                 );
             })
@@ -2169,6 +2260,8 @@ mod tests {
                     &names,
                     area,
                     true,
+                    &mut no_images(),
+                    false,
                     &colors,
                 );
             })
@@ -2218,6 +2311,7 @@ mod tests {
             size,
             kind,
             identity: Default::default(),
+            image_id: 0,
         };
         let photo = Kind::Photo {
             width: 4,
@@ -2227,7 +2321,8 @@ mod tests {
             file("sunrise.jpg", 2_200_000, photo),
             file("route.gpx", 340 * 1024, Kind::File),
         ];
-        let draw = |attachments: &[Attachment], as_files| {
+        let mut images = no_images();
+        let mut draw = |attachments: &[Attachment], as_files| {
             let mut composer = TextArea::default();
             let rows = 2 + BAR_ROWS + attachment_rows(attachments) + 1;
             let mut terminal = Terminal::new(TestBackend::new(48, rows)).unwrap();
@@ -2244,6 +2339,8 @@ mod tests {
                         &names,
                         area,
                         true,
+                        &mut images,
+                        false,
                         &colors,
                     );
                 })
@@ -2286,6 +2383,116 @@ mod tests {
             "the rest by name: {}",
             rows[5]
         );
+    }
+
+    #[test]
+    fn photos_to_send_show_their_picture_over_their_names() {
+        use crate::images::Key;
+        use ratatui_image::picker::{Picker, ProtocolType};
+        /// What the kitty protocol puts in every cell of an image.
+        const KITTY_CELL: char = '\u{10EEEE}';
+
+        let colors = Colors::default();
+        let users = std::collections::HashMap::new();
+        let chats = crate::chats::Chats::default();
+        let names = messages::Names {
+            users: &users,
+            chats: &chats,
+        };
+        let photo = |name: &str, width, height, image_id| Attachment {
+            path: format!("/photos/{name}").into(),
+            name: name.into(),
+            size: 1024,
+            kind: Kind::Photo { width, height },
+            identity: Default::default(),
+            image_id,
+        };
+        let notes = Attachment {
+            kind: Kind::File,
+            image_id: -3,
+            ..photo("notes.txt", 1, 1, -3)
+        };
+        let attachments = [
+            photo("wide.jpg", 800, 600, -1),
+            notes,
+            photo("tall.jpg", 600, 800, -2),
+        ];
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let mut images = Images::new(picker, tokio::sync::mpsc::unbounded_channel().0);
+        // At 10x20 px cells, four rows tall: 11 columns and 6.
+        for (file_id, cols) in [(-1, 11), (-2, 6)] {
+            let key = Key {
+                file_id,
+                cols,
+                rows: 4,
+                thumbnail: false,
+                avatar: false,
+            };
+            let red = image::RgbImage::from_pixel(cols.into(), 8, image::Rgb([255, 0, 0]));
+            images.insert_ready(key, red.into());
+        }
+        assert_eq!(preview_rows(&attachments, &images), 4);
+        let mut draw = |width| {
+            let mut composer = TextArea::default();
+            let rows = 2 + 4 + attachment_rows(&attachments) + 1;
+            let mut terminal = Terminal::new(TestBackend::new(width, rows)).unwrap();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    draw_composer(
+                        f,
+                        &mut composer,
+                        None,
+                        &attachments,
+                        false,
+                        &names,
+                        area,
+                        true,
+                        &mut images,
+                        false,
+                        &colors,
+                    );
+                })
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let picture = |buf: &ratatui::buffer::Buffer, y| -> Vec<u16> {
+            (0..buf.area.width)
+                .filter(|&x| buf[(x, y)].symbol().contains(KITTY_CELL))
+                .collect()
+        };
+        // By cell: a picture's cells hold more than one character each.
+        let plus = |buf: &ratatui::buffer::Buffer, y| {
+            (0..buf.area.width).find(|&x| buf[(x, y)].symbol() == "+")
+        };
+
+        // Inside the border and padding, side by side, a column apart. The
+        // file has none.
+        let buf = draw(48);
+        let rows = buffer_rows(&buf);
+        let wide: Vec<u16> = (2..13).collect();
+        let tall: Vec<u16> = (14..20).collect();
+        for y in 1..5 {
+            assert_eq!(picture(&buf, y), [wide.clone(), tall.clone()].concat());
+        }
+        assert!(rows[5].contains("wide.jpg · Photo"), "{}", rows[5]);
+        assert!(rows[6].contains("notes.txt · File"), "{}", rows[6]);
+        assert!(rows[8].contains("Add a caption…"), "{}", rows[8]);
+
+        // Too narrow for both: the one that doesn't fit is counted.
+        let buf = draw(4 + 15);
+        let rows = buffer_rows(&buf);
+        assert_eq!(picture(&buf, 1), wide);
+        assert!(rows[3].contains("+1"), "{}", rows[3]);
+        assert_eq!(plus(&buf, 3), Some(14));
+
+        // Too narrow for the count beside the first: it gives way.
+        let buf = draw(4 + 12);
+        let rows = buffer_rows(&buf);
+        assert!(picture(&buf, 1).is_empty());
+        assert!(rows[3].contains("+2"), "{}", rows[3]);
+        assert_eq!(plus(&buf, 3), Some(2));
     }
 
     #[test]

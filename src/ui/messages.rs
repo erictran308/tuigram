@@ -117,14 +117,14 @@ struct Placed {
 }
 
 /// Rows reserved inside a bubble where a photo gets drawn after the text.
-struct PhotoSlot {
+pub(super) struct PhotoSlot {
     /// First line of the reserved rows.
-    line: usize,
+    pub line: usize,
     /// Column where the photo starts, from the left of the message area.
-    x: u16,
-    cols: u16,
-    rows: u16,
-    photo: Preview,
+    pub x: u16,
+    pub cols: u16,
+    pub rows: u16,
+    pub photo: Preview,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -309,7 +309,7 @@ fn mark(frame: &mut Frame, gutters: [Rect; 2], msg: &Placed, top: usize, color: 
 
 /// Paints photos over the rows reserved for them. `SlicedImage` draws just
 /// the visible rows of a photo that's partly scrolled out.
-fn draw_photos(
+pub(super) fn draw_photos(
     frame: &mut Frame,
     area: Rect,
     photos: &[PhotoSlot],
@@ -842,7 +842,7 @@ const THUMBNAIL_MAX_COLS: u16 = 15;
 /// Cells for a link preview's picture: [`THUMBNAIL_ROWS`] tall, as wide as
 /// its shape makes that, up to [`THUMBNAIL_MAX_COLS`]; a wider picture is
 /// less tall instead, so it fills its cells.
-fn thumbnail_cells(photo: &Preview, font: FontSize) -> (u16, u16) {
+pub(super) fn thumbnail_cells(photo: &Preview, font: FontSize) -> (u16, u16) {
     let (fw, fh) = (f64::from(font.width.max(1)), f64::from(font.height.max(1)));
     let (pw, ph) = (f64::from(photo.width), f64::from(photo.height));
     let rows = f64::from(THUMBNAIL_ROWS);

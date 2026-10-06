@@ -2235,6 +2235,7 @@ mod tests {
             size: 1,
             kind: crate::attach::Kind::File,
             identity: Default::default(),
+            image_id: 0,
         };
         let mut open = OpenChat::new(1);
         open.attachments = vec![file("chosen.pdf"), file("a.txt"), file("b.txt")];
