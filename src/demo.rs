@@ -521,6 +521,8 @@ fn hike() -> OpenChat {
         styles: Vec::new(),
         revealed: false,
         forwarded: None,
+        poll: None,
+        card: None,
         state: SendState::Sent,
         reply_to: None,
         editable: Editable::Text,

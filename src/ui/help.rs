@@ -16,7 +16,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         "Everywhere",
         &[
             ("?", "This help, and settings"),
-            (":", "Type a command, like logout"),
+            (":", "Type a command, like leave or logout"),
             ("s", "Find a chat or person: a name, @username or t.me link"),
             ("H", "Highlight or unhighlight the selected chat"),
             (
@@ -48,7 +48,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("j / k", "Newer / older message"),
             ("gg / G", "Oldest / newest message"),
             ("Ctrl-d / Ctrl-u", "Half a page newer / older"),
-            ("Enter", "Show spoilers, or open the photo, file or link"),
+            (
+                "Enter",
+                "Show spoilers, vote in a poll, or open the photo, file or link",
+            ),
             ("y", "Copy the text, a link, or the photo or file"),
             ("r", "Reply"),
             ("f", "Forward to another chat (an album goes whole)"),
@@ -81,6 +84,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             (
                 "**bold**",
                 "Formatting: __italic__ ~~strike~~ ||spoiler|| `code` ```block``` [text](url)",
+            ),
+            (
+                "@name / :smile",
+                "Suggests people in the group, or emoji; Tab puts one in",
             ),
             ("Ctrl-v", "Paste a photo, files or text from the clipboard"),
             (

@@ -16,10 +16,12 @@ use crate::app::{
 };
 use crate::attach::{self, Attachment, Kind};
 use crate::chats::{Badge, Chat};
+use crate::complete::Completion;
 use crate::config;
 use crate::messages::{Editing, OpenChat, Replied, Sender};
 use crate::notify::Notifications;
 use crate::picker::{ChatPicker, Choice, Purpose};
+use crate::poll::VoteMenu;
 use crate::reactions::{self, ReactMenu};
 use crate::search;
 use crate::settings::{Settings, Side};
@@ -340,9 +342,13 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     // Popups drawn over the messages, below. Not the toast, which only says
     // what just happened: holding photos back under it would blank them all
     // on every copy.
-    let popup_over_chat = app.menu.is_some()
+    let suggesting =
+        app.focus == Focus::Input && app.completion.as_ref().is_some_and(|c| !c.items.is_empty());
+    let popup_over_chat = suggesting
+        || app.menu.is_some()
         || app.delete_menu.is_some()
         || app.react_menu.is_some()
+        || app.vote_menu.is_some()
         || app.picker.is_some()
         || app.confirm.is_some()
         || app.settings_menu.is_some()
@@ -350,6 +356,8 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             .prompt
             .as_ref()
             .is_some_and(|p| p.kind == PromptKind::Command || !p.completions.is_empty());
+    // Where the composer is, for the suggestions over it.
+    let mut suggestions_at = None;
     match app.open.as_mut() {
         Some(open) => {
             let names = messages::Names {
@@ -387,6 +395,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 stickers::draw(frame, panel_area, panel, &mut app.images, colors);
             }
             // While the sticker panel is open, keys go there, not to the text.
+            suggestions_at = Some(composer);
             draw_composer(
                 frame,
                 &mut app.composer,
@@ -407,6 +416,9 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             chat_area,
         ),
     }
+    if suggesting && let (Some(composer), Some(completion)) = (suggestions_at, &app.completion) {
+        draw_suggestions(frame, composer, completion, colors);
+    }
     draw_status(frame, app, status, colors);
     if let Some(prompt) = app
         .prompt
@@ -423,6 +435,9 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     }
     if let Some(menu) = &app.delete_menu {
         draw_delete(frame, chat_area, menu, colors);
+    }
+    if let Some(menu) = &app.vote_menu {
+        draw_vote(frame, chat_area, menu, colors);
     }
     if let Some(menu) = &mut app.react_menu {
         let yours: Vec<String> = app
@@ -533,6 +548,154 @@ fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors
             ]))
         })
         .collect();
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(Style::new().bg(colors.selection)),
+        list,
+        &mut ListState::default().with_selected(Some(menu.selected)),
+    );
+}
+
+/// Suggestions for the `@name` or `:emoji` being typed, just above the
+/// composer, with the one Tab takes marked.
+fn draw_suggestions(frame: &mut Frame, composer: Rect, completion: &Completion, colors: &Colors) {
+    let longest = completion
+        .items
+        .iter()
+        .map(|s| s.label.width() + 2 + s.detail.width())
+        .max()
+        .unwrap_or(0);
+    let width = (longest as u16 + 4)
+        .clamp(24, 50)
+        .min(composer.width.saturating_sub(2));
+    let height = (completion.items.len() as u16 + 2).min(composer.y);
+    if height < 3 {
+        return;
+    }
+    let rect = Rect {
+        x: composer.x + 1,
+        y: composer.y - height,
+        width,
+        height,
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title_bottom(
+            Line::from(hint_spans(
+                " `Tab` insert ",
+                Style::new().fg(colors.muted),
+                colors,
+            ))
+            .right_aligned(),
+        )
+        .border_style(Style::new().fg(colors.accent))
+        .style(popup_style(colors));
+    let room = usize::from(block.inner(rect).width).saturating_sub(1);
+    let lines: Vec<Line> = completion
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, suggestion)| {
+            let selected = i == completion.selected;
+            let label = truncate(&suggestion.label, room);
+            let detail_room = room.saturating_sub(label.width() + 2);
+            let mut spans = vec![
+                if selected {
+                    Span::from("▌").fg(colors.accent)
+                } else {
+                    Span::from(" ")
+                },
+                Span::from(label),
+            ];
+            if detail_room > 0 && !suggestion.detail.is_empty() {
+                spans.push(Span::from("  "));
+                spans.push(Span::from(truncate(&suggestion.detail, detail_room)).fg(colors.muted));
+            }
+            let line = Line::from(spans);
+            if selected {
+                line.bg(colors.selection)
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// The popup Enter opens on a poll: the question, then its answers, ticked
+/// ones marked in a poll that takes several, and "Take back my vote" once
+/// you voted.
+fn draw_vote(frame: &mut Frame, area: Rect, menu: &VoteMenu, colors: &Colors) {
+    let rows = menu.rows().max(1) as u16;
+    let longest = menu
+        .answers
+        .iter()
+        .map(|a| a.width() + 10)
+        .chain([menu.question.width() + 4])
+        .max()
+        .unwrap_or(0);
+    let width = (longest.clamp(40, 60) as u16).min(area.width);
+    // Borders, the question and a gap, then the answers.
+    let popup = center(area, width, (rows + 4).min(area.height));
+    let keys = if menu.several {
+        " `Space` tick · `Enter` vote · `Esc` close "
+    } else {
+        " `Enter` vote · `Esc` close "
+    };
+    let block = popup_block(" Vote ", keys, colors);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let [question, _, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    let text_width = (inner.width as usize).saturating_sub(3);
+    frame.render_widget(
+        Line::from(vec![
+            Span::from(" ▎ ").fg(colors.accent),
+            Span::from(truncate(&menu.question, text_width)),
+        ]),
+        question,
+    );
+    let answer_width = (inner.width as usize).saturating_sub(8);
+    let mut items: Vec<ListItem> = menu
+        .answers
+        .iter()
+        .enumerate()
+        .map(|(i, answer)| {
+            let bar = if i == menu.selected {
+                Span::from("▌").fg(colors.accent)
+            } else {
+                Span::from(" ")
+            };
+            let shortcut = if i < 9 {
+                format!("{} ", i + 1)
+            } else {
+                "  ".into()
+            };
+            let mut line = vec![bar, Span::from(shortcut).fg(colors.muted)];
+            if menu.several {
+                line.push(Span::from(if menu.ticked[i] { "[x] " } else { "[ ] " }));
+            }
+            line.push(Span::from(truncate(answer, answer_width)));
+            ListItem::new(Line::from(line))
+        })
+        .collect();
+    if menu.can_retract {
+        let bar = if menu.selected == menu.answers.len() {
+            Span::from("▌").fg(colors.accent)
+        } else {
+            Span::from(" ")
+        };
+        items.push(ListItem::new(Line::from(vec![
+            bar,
+            Span::from("  Take back my vote").fg(colors.error),
+        ])));
+    }
     frame.render_stateful_widget(
         List::new(items).highlight_style(Style::new().bg(colors.selection)),
         list,
@@ -1556,21 +1719,17 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
                 }
             },
         ),
-        _ if app
-            .confirm
-            .as_ref()
-            .is_some_and(|c| matches!(c.action, Confirmed::Edit { .. })) =>
-        {
-            (normal, "  `y` edit · `n` or `Esc` cancel")
-        }
-        _ if app
-            .confirm
-            .as_ref()
-            .is_some_and(|c| c.action.verb() == "join") =>
-        {
-            (normal, "  `y` join · `n` or `Esc` cancel")
-        }
-        _ if app.confirm.is_some() => (normal, "  `y` open · `n` or `Esc` cancel"),
+        _ if app.confirm.is_some() => (
+            normal,
+            match app.confirm.as_ref().map(|c| &c.action) {
+                Some(Confirmed::Edit { .. }) => "  `y` edit · `n` or `Esc` cancel",
+                Some(Confirmed::Join(_) | Confirmed::JoinLink { .. }) => {
+                    "  `y` join · `n` or `Esc` cancel"
+                }
+                Some(Confirmed::Leave(_)) => "  `y` leave · `n` or `Esc` cancel",
+                _ => "  `y` open · `n` or `Esc` cancel",
+            },
+        ),
         _ if app.settings_menu.as_ref().map(|m| m.tab) == Some(HelpTab::Shortcuts) => {
             (normal, "  `j/k` scroll · `Tab` settings · `Esc` close")
         }
@@ -1589,6 +1748,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             normal,
             "  `h/j/k/l` choose · `Enter` react, or take yours back · `X` take all yours back · `/` search · `Esc` close",
         ),
+        _ if app.vote_menu.as_ref().is_some_and(|m| m.several) => (
+            normal,
+            "  `j/k` choose · `Space` tick · `Enter` vote for the ticked · `Esc` close",
+        ),
+        _ if app.vote_menu.is_some() => (normal, "  `j/k` choose · `Enter` vote · `Esc` close"),
         _ if app.picker.as_ref().is_some_and(ChatPicker::forwarding) => (
             normal,
             "  type a chat's name · `arrows` choose · `Enter` forward · `Esc` cancel",
@@ -1633,6 +1797,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             sticker,
             "  `h/j/k/l` choose · `H/L` previous/next tab · `Enter` send · `/` search · `Tab` or `Esc` back to writing",
         ),
+        Focus::Input if app.completion.as_ref().is_some_and(|c| !c.items.is_empty()) => (
+            insert,
+            "  `Tab` insert · `arrows` choose · keep typing to narrow it down · `Enter` send · `Esc` normal mode",
+        ),
         Focus::Input if editing => (
             insert,
             "  `Enter` save · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` cancel edit",
@@ -1663,6 +1831,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         || app.resizing.is_some()
         || app.delete_menu.is_some()
         || app.react_menu.is_some()
+        || app.vote_menu.is_some()
         || app.picker.is_some()
         || app.confirm.is_some();
     let mut context = match &app.open {
@@ -1698,8 +1867,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         spans.push(Span::from("  Downloading… copies when done").fg(colors.warning));
     } else if app.pasting {
         spans.push(Span::from("  Reading the clipboard…").fg(colors.warning));
-    } else if let Some(what) = &app.finding {
-        let what = truncate(what, 60);
+    } else if let Some(finding) = &app.finding {
+        let what = truncate(&finding.request, 60);
         let looking = format!("  Looking for {what}… (Esc stops)");
         spans.push(Span::from(looking).fg(colors.warning));
     } else if let Some(message) = &app.status {
@@ -2258,6 +2427,8 @@ mod tests {
             styles: Vec::new(),
             revealed: false,
             forwarded: None,
+            poll: None,
+            card: None,
             state: SendState::Sent,
             reply_to,
             editable: Editable::Text,

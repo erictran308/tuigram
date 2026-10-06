@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use chrono::{Local, TimeZone};
+use chrono::{Datelike, Local, TimeZone};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
@@ -14,10 +14,10 @@ use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
 
 use super::truncate;
-use crate::chats::Chats;
+use crate::chats::{Chats, Presence, Seen};
 use crate::images::Images;
 use crate::messages::{
-    Fetched, Format, Msg, OpenChat, Origin, Preview, Replied, ReplyTo, SPOILER, ScrollAnchor,
+    Card, Fetched, Format, Msg, OpenChat, Origin, Preview, Replied, ReplyTo, SPOILER, ScrollAnchor,
     SendState, Sender, Styled,
 };
 use crate::reactions::{self, Reaction};
@@ -151,8 +151,17 @@ pub fn draw(
         title.push(super::badge_span(badge, colors));
     }
     title.push(Span::from(" "));
+    // What they're doing says more than when they were last seen.
     if let Some(doing) = chat.and_then(|c| super::activity(c, names)) {
         title.push(Span::from(format!("· {doing} ")).fg(colors.activity));
+    } else if let Some(seen) = names.chats.seen(open.chat_id) {
+        let (label, online) = seen_label(seen, Local::now().timestamp());
+        let color = if online {
+            colors.activity
+        } else {
+            colors.muted
+        };
+        title.push(Span::from(format!("· {label} ")).fg(color));
     }
     if let Some(search) = &open.search {
         title.push(Span::from(format!(
@@ -196,6 +205,7 @@ pub fn draw(
         block_gaps,
         body.width as usize,
         font,
+        images.draws_photos(),
         colors,
     );
 
@@ -234,6 +244,46 @@ pub fn draw(
     if focused && let Some(sel) = selected {
         mark(frame, gutters, sel, top, colors.accent);
     }
+}
+
+/// "online", "last seen 5 minutes ago", "bot"… for a chat's title, and
+/// whether they're online. `now` is a unix timestamp.
+fn seen_label(seen: Seen, now: i64) -> (String, bool) {
+    let presence = match seen {
+        Seen::Bot => return ("bot".into(), false),
+        Seen::Person(presence) => presence,
+    };
+    let was_online = match presence {
+        Presence::Online(until) if i64::from(until) > now => return ("online".into(), true),
+        // Telegram didn't say it again, so they went offline then.
+        Presence::Online(at) | Presence::Offline(at) => i64::from(at),
+        Presence::Recently => return ("last seen recently".into(), false),
+        Presence::LastWeek => return ("last seen within a week".into(), false),
+        Presence::LastMonth => return ("last seen within a month".into(), false),
+        Presence::LongAgo => return ("last seen a long time ago".into(), false),
+    };
+    let ago = (now - was_online).max(0);
+    let label = match ago {
+        0..60 => "last seen just now".into(),
+        60..120 => "last seen a minute ago".into(),
+        120..3600 => format!("last seen {} minutes ago", ago / 60),
+        _ => {
+            let (Some(then), Some(today)) = (
+                Local.timestamp_opt(was_online, 0).single(),
+                Local.timestamp_opt(now, 0).single(),
+            ) else {
+                return ("last seen a long time ago".into(), false);
+            };
+            let days = (today.date_naive() - then.date_naive()).num_days();
+            match days {
+                0 => format!("last seen today at {}", then.format("%H:%M")),
+                1 => format!("last seen yesterday at {}", then.format("%H:%M")),
+                _ if then.year() == today.year() => format!("last seen {}", then.format("%-d %b")),
+                _ => format!("last seen {}", then.format("%-d %b %Y")),
+            }
+        }
+    };
+    (label, false)
 }
 
 /// Bars in both gutters beside a message's bubble, for its visible rows.
@@ -290,8 +340,10 @@ fn draw_photos(
         } else {
             "Loading…"
         };
+        // A link preview's picture is too small to say so.
         let middle = y + i64::from(slot.rows / 2);
-        if (0..i64::from(area.height)).contains(&middle) {
+        if label.width() <= usize::from(slot.cols) && (0..i64::from(area.height)).contains(&middle)
+        {
             let row = Rect {
                 x: area.x + slot.x,
                 y: area.y + middle as u16,
@@ -365,7 +417,9 @@ fn scroll_top(
 
 /// Measures every loaded message and works out where each goes. With
 /// `gaps`, messages in a block have a row of their bubble's background
-/// between them.
+/// between them. Link previews get their picture only with `thumbnails`:
+/// half blocks are too coarse for one a few cells big.
+#[allow(clippy::too_many_arguments)]
 fn measure<'a>(
     open: &'a OpenChat,
     names: &Names,
@@ -373,6 +427,7 @@ fn measure<'a>(
     gaps: bool,
     width: usize,
     font: FontSize,
+    thumbnails: bool,
     colors: &Colors,
 ) -> Laid<'a> {
     // Text width inside a bubble, after one column of padding each side.
@@ -484,7 +539,14 @@ fn measure<'a>(
             None => msg.reactions.clone(),
         };
         let chips = chip_rows(&reactions, max_text);
-        let bubble = Bubble::new(msg, caption, header, photo, meta, chips, matches, max_text);
+        let card_photo = caption
+            .and_then(|c| c.card.as_ref())
+            .and_then(|card| card.image.as_ref())
+            .filter(|_| thumbnails);
+        let card_image = card_photo.map(|p| (p, thumbnail_cells(p, font)));
+        let bubble = Bubble::new(
+            msg, caption, header, photo, card_image, meta, chips, matches, max_text,
+        );
         // Messages in a row from one sender form a block, with no gap between
         // them. Not in channels, where every post has the same sender, and
         // not for stickers, which have no bubble to join up.
@@ -524,18 +586,29 @@ fn measure<'a>(
             bubble_start += 1 + usize::from(start > 0);
         }
         let msg = m.bubble.msg;
-        if let (Some(photo), Some((cols, photo_rows))) = (&msg.preview, m.bubble.photo) {
-            // Rows are right-aligned for own messages, so measure from the right.
-            let bubble_x = if msg.outgoing {
-                width.saturating_sub(inner + 2)
-            } else {
-                0
-            };
+        // Rows are right-aligned for own messages, so measure from the right.
+        let bubble_x = if msg.outgoing {
+            width.saturating_sub(inner + 2)
+        } else {
+            0
+        };
+        let photo_rows = m.bubble.photo.map_or(0, |(_, rows)| usize::from(rows));
+        if let (Some(photo), Some((cols, rows))) = (&msg.preview, m.bubble.photo) {
             laid.photos.push(PhotoSlot {
                 line: bubble_start + m.bubble.header.rows(),
                 x: (bubble_x + 1) as u16,
                 cols,
-                rows: photo_rows,
+                rows,
+                photo: photo.clone(),
+            });
+        }
+        // A link preview's picture sits after its bar, under the text.
+        if let Some((photo, (cols, rows))) = m.bubble.card_image {
+            laid.photos.push(PhotoSlot {
+                line: bubble_start + m.bubble.header.rows() + photo_rows + m.bubble.text.len(),
+                x: (bubble_x + 3) as u16,
+                cols,
+                rows,
                 photo: photo.clone(),
             });
         }
@@ -607,7 +680,7 @@ fn layout(
     font: FontSize,
     colors: &Colors,
 ) -> (Vec<Line<'static>>, Vec<Placed>, Vec<PhotoSlot>) {
-    let mut laid = measure(open, names, show_names, gaps, width, font, colors);
+    let mut laid = measure(open, names, show_names, gaps, width, font, true, colors);
     let placed = laid.placed.clone();
     let photos = std::mem::take(&mut laid.photos);
     let total = laid.total;
@@ -750,6 +823,65 @@ fn chip_rows(reactions: &[Reaction], max: usize) -> Vec<Vec<Chip>> {
     rows
 }
 
+/// Lines of a link preview's description shown under a message.
+const CARD_LINES: usize = 3;
+
+/// What a row of a link preview shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CardRow {
+    Host,
+    Title,
+    Description,
+}
+
+/// A link preview's picture is this many rows tall, or less if it's wide.
+const THUMBNAIL_ROWS: u16 = 4;
+/// And at most this many columns wide.
+const THUMBNAIL_MAX_COLS: u16 = 15;
+
+/// Cells for a link preview's picture: [`THUMBNAIL_ROWS`] tall, as wide as
+/// its shape makes that, up to [`THUMBNAIL_MAX_COLS`]; a wider picture is
+/// less tall instead, so it fills its cells.
+fn thumbnail_cells(photo: &Preview, font: FontSize) -> (u16, u16) {
+    let (fw, fh) = (f64::from(font.width.max(1)), f64::from(font.height.max(1)));
+    let (pw, ph) = (f64::from(photo.width), f64::from(photo.height));
+    let rows = f64::from(THUMBNAIL_ROWS);
+    let cols = rows * fh * pw / ph / fw;
+    if cols <= f64::from(THUMBNAIL_MAX_COLS) {
+        return (cols.round().max(1.0) as u16, THUMBNAIL_ROWS);
+    }
+    let cols = f64::from(THUMBNAIL_MAX_COLS);
+    let rows = cols * fw * ph / pw / fh;
+    (THUMBNAIL_MAX_COLS, rows.round().max(1.0) as u16)
+}
+
+/// A link preview's rows, `width` columns wide after its bar. With a
+/// picture, its text goes to the right of it, and there are at least as
+/// many rows as the picture is tall.
+fn card_rows(card: &Card, width: usize, image: Option<(u16, u16)>) -> Vec<(String, CardRow)> {
+    let width = width.saturating_sub(image.map_or(0, |(cols, _)| usize::from(cols) + 1));
+    let mut rows = vec![(truncate(&card.host, width), CardRow::Host)];
+    if !card.title.is_empty() {
+        rows.push((truncate(&card.title, width), CardRow::Title));
+    }
+    let lines = wrap(&card.description, width);
+    let more = lines.len() > CARD_LINES;
+    for (i, (line, _)) in lines.into_iter().take(CARD_LINES).enumerate() {
+        let line = if more && i + 1 == CARD_LINES {
+            // `truncate` adds the "…" once the line can't take another.
+            truncate(&format!("{line} …"), width)
+        } else {
+            line
+        };
+        rows.push((line, CardRow::Description));
+    }
+    let tall = image.map_or(0, |(_, rows)| usize::from(rows));
+    while rows.len() < tall {
+        rows.push((String::new(), CardRow::Description));
+    }
+    rows
+}
+
 /// Where a bubble's time goes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetaAt {
@@ -783,6 +915,12 @@ struct Bubble<'a> {
     matches: Vec<Range<usize>>,
     /// Wrapped lines, each with the byte offset where it starts in the text.
     text: Vec<(String, usize)>,
+    /// The link preview under the text, cut to fit: where the link goes,
+    /// the page's title, and a few lines of its description.
+    card: Vec<(String, CardRow)>,
+    /// The preview's picture, and the columns and rows it takes on the
+    /// left of the preview's text.
+    card_image: Option<(&'a Preview, (u16, u16))>,
     meta_at: MetaAt,
     /// Columns the contents need, inside the padding.
     width: usize,
@@ -798,6 +936,7 @@ impl<'a> Bubble<'a> {
         caption: Option<&'a Msg>,
         header: Header,
         photo: Option<(u16, u16)>,
+        card_image: Option<(&'a Preview, (u16, u16))>,
         meta: Option<String>,
         chips: Vec<Vec<Chip>>,
         matches: Vec<Range<usize>>,
@@ -811,15 +950,25 @@ impl<'a> Bubble<'a> {
         } else {
             wrap(source, max_text)
         };
+        // The preview's bar takes two columns, and its picture its own and
+        // one more.
+        let image = card_image.map(|(_, cells)| cells);
+        let card = caption
+            .and_then(|c| c.card.as_ref())
+            .map_or(Vec::new(), |card| {
+                card_rows(card, max_text.saturating_sub(2), image)
+            });
+        let card_indent = 2 + image.map_or(0, |(cols, _)| usize::from(cols) + 1);
         let meta_w = meta.as_ref().map_or(0, |m| m.width());
         // The time goes beside the last row of reactions, else the last line
-        // of text, if it fits.
+        // of text, if it fits. Under a link preview it has a row of its own.
         let last_w = match chips.last() {
             Some(row) => chips_width(row),
             None => text.last().map_or(0, |(l, _)| l.width()),
         };
         let meta_at = match () {
             _ if meta.is_none() || last_w + META_GAP + meta_w > max_text => MetaAt::Own,
+            _ if chips.is_empty() && !card.is_empty() => MetaAt::Own,
             _ if chips.is_empty() => MetaAt::Text,
             _ => MetaAt::Reactions,
         };
@@ -828,6 +977,7 @@ impl<'a> Bubble<'a> {
             .iter()
             .map(|(l, _)| l.width())
             .chain(chips.iter().map(|row| chips_width(row)))
+            .chain(card.iter().map(|(l, _)| card_indent + l.width()))
             .max()
             .unwrap_or(0)
             .max(meta_w);
@@ -872,6 +1022,8 @@ impl<'a> Bubble<'a> {
             chips,
             matches,
             text,
+            card,
+            card_image,
             meta_at,
             width,
         }
@@ -882,6 +1034,7 @@ impl<'a> Bubble<'a> {
         self.header.rows()
             + self.photo.map_or(0, |(_, rows)| usize::from(rows))
             + self.text.len()
+            + self.card.len()
             + self.chips.len()
             + usize::from(self.meta_at == MetaAt::Own && self.meta.is_some())
     }
@@ -921,6 +1074,8 @@ impl<'a> Bubble<'a> {
             chips,
             matches,
             text,
+            card,
+            card_image,
             meta_at,
             width,
         } = self;
@@ -1006,6 +1161,22 @@ impl<'a> Bubble<'a> {
             } else {
                 out.push(row(line_spans, w));
             }
+        }
+        // Blank under the picture, for `draw_photos` to paint.
+        let image_cols = card_image.map_or(0, |(_, (cols, _))| usize::from(cols) + 1);
+        for (line, kind) in card {
+            let w = line.width();
+            let text_style = match kind {
+                CardRow::Host => style.fg(faded),
+                CardRow::Title => style.bold(),
+                CardRow::Description => style,
+            };
+            let spans = vec![
+                Span::styled("▎ ", style.fg(faded)),
+                Span::styled(" ".repeat(image_cols), style),
+                Span::styled(line, text_style),
+            ];
+            out.push(row(spans, 2 + image_cols + w));
         }
         let chip_style = |chosen| {
             if chosen {
@@ -1237,6 +1408,8 @@ mod tests {
             styles: Vec::new(),
             revealed: false,
             forwarded: None,
+            poll: None,
+            card: None,
             state: SendState::Sent,
             reply_to: None,
             editable: Editable::Text,
@@ -1814,6 +1987,142 @@ mod tests {
             }
         }
         assert_eq!(underlined, "https://example.com/a/long/path");
+    }
+
+    #[test]
+    fn a_link_preview_sits_under_the_text_with_the_links_real_host() {
+        let mut open = OpenChat::new(42);
+        let mut m = msg(false, 1_790_000_000, "look https://example.com/a");
+        m.card = Some(Card {
+            host: "example.com".into(),
+            title: "Example Domain".into(),
+            description: "word ".repeat(60),
+            image: None,
+        });
+        open.messages.insert(1, m);
+        let rows = render(&mut open, false);
+        let at = |needle: &str| {
+            rows.iter()
+                .position(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}: {rows:#?}"))
+        };
+        let (text, host, title) = (
+            at("look https"),
+            at("▎ example.com"),
+            at("▎ Example Domain"),
+        );
+        assert!(text < host && host < title);
+        let description = rows.iter().filter(|r| r.contains("▎ word")).count();
+        assert_eq!(description, CARD_LINES, "a few lines of it");
+        assert!(rows[title + CARD_LINES].contains('…'), "then it stops");
+    }
+
+    #[test]
+    fn a_link_previews_picture_sits_left_of_its_text() {
+        let mut open = OpenChat::new(42);
+        let mut m = msg(false, 1_790_000_000, "look");
+        let square = Preview {
+            file_id: 9,
+            width: 300,
+            height: 300,
+            thumbnail: None,
+            sticker: false,
+        };
+        m.card = Some(Card {
+            host: "example.com".into(),
+            title: "Example Domain".into(),
+            description: "Short".into(),
+            image: Some(square),
+        });
+        open.messages.insert(1, m);
+        let users = HashMap::new();
+        let chats = Chats::default();
+        let names = Names {
+            users: &users,
+            chats: &chats,
+        };
+        let font = FontSize {
+            width: 10,
+            height: 20,
+        };
+        let colors = Colors::default();
+        let (lines, _, photos) = layout(&open, &names, false, true, 58, font, &colors);
+        let rows: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let [slot] = photos.as_slice() else {
+            panic!("one picture: {}", photos.len());
+        };
+        // Square, so twice as many columns as rows (cells are twice as tall).
+        assert_eq!((slot.cols, slot.rows), (8, 4));
+        assert_eq!(slot.x, 3, "after the bubble's padding and the bar");
+        assert!(
+            rows[slot.line].contains("▎          example.com"),
+            "{rows:#?}"
+        );
+        assert!(rows[slot.line + 1].contains("Example Domain"));
+        assert!(
+            rows[slot.line + 3].trim_end().ends_with('▎'),
+            "as tall as the picture"
+        );
+
+        let wide = Preview {
+            width: 1200,
+            height: 300,
+            ..slot.photo.clone()
+        };
+        assert_eq!(
+            thumbnail_cells(&wide, font),
+            (15, 2),
+            "a wide one is less tall"
+        );
+        let page = Preview {
+            width: 1200,
+            height: 630,
+            ..slot.photo.clone()
+        };
+        assert_eq!(
+            thumbnail_cells(&page, font),
+            (15, 4),
+            "a web page's picture"
+        );
+    }
+
+    #[test]
+    fn the_title_says_when_the_other_person_was_last_seen() {
+        let now = Local
+            .with_ymd_and_hms(2026, 10, 6, 15, 0, 0)
+            .unwrap()
+            .timestamp();
+        let ago = |seconds: i64| (now - seconds) as i32;
+        let seen = |presence| seen_label(Seen::Person(presence), now).0;
+        assert_eq!(
+            seen_label(Seen::Person(Presence::Online(ago(-60))), now),
+            ("online".into(), true)
+        );
+        assert_eq!(
+            seen(Presence::Online(ago(30))),
+            "last seen just now",
+            "online ran out"
+        );
+        assert_eq!(seen(Presence::Offline(ago(90))), "last seen a minute ago");
+        assert_eq!(
+            seen(Presence::Offline(ago(5 * 60))),
+            "last seen 5 minutes ago"
+        );
+        assert_eq!(
+            seen(Presence::Offline(ago(3 * 3600))),
+            "last seen today at 12:00"
+        );
+        assert_eq!(
+            seen(Presence::Offline(ago(20 * 3600))),
+            "last seen yesterday at 19:00"
+        );
+        assert_eq!(seen(Presence::Offline(ago(10 * 86400))), "last seen 26 Sep");
+        assert_eq!(
+            seen(Presence::Offline(ago(400 * 86400))),
+            "last seen 1 Sep 2025"
+        );
+        assert_eq!(seen(Presence::Recently), "last seen recently");
+        assert_eq!(seen_label(Seen::Bot, now), ("bot".into(), false));
     }
 
     #[test]

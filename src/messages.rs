@@ -5,8 +5,8 @@ use std::ops::Range;
 
 use base64::Engine;
 use tdlib_rs::enums::{
-    MessageContent, MessageOrigin, MessageReplyTo, MessageSender, MessageSendingState,
-    StickerFormat, TextEntityType, ThumbnailFormat,
+    LinkPreviewType, MessageContent, MessageOrigin, MessageReplyTo, MessageSender,
+    MessageSendingState, StickerFormat, TextEntityType, ThumbnailFormat,
 };
 use tdlib_rs::types::{self, Message};
 use unicode_width::UnicodeWidthStr;
@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::attach::{Attachment, Dropped};
 use crate::chats::content_text_as_sent;
 use crate::images::Thumbnail;
+use crate::poll::Poll;
 use crate::reactions::{self, Reaction, ReactionKind};
 use crate::search::MessageSearch;
 use crate::text;
@@ -22,6 +23,8 @@ use crate::tg::Page;
 /// Download the smallest size at least this big (TDLib's "x", ~800px), sharp
 /// enough for a bubble on a high-DPI screen without fetching the original.
 const PHOTO_MIN_SIDE: i32 = 640;
+/// A link preview's thumbnail is a few cells: TDLib's "m" (320 px) does.
+const THUMBNAIL_MIN_SIDE: i32 = 200;
 
 /// Messages kept loaded while following new ones; see [`OpenChat::add_new`].
 const MAX_FOLLOWED: usize = 1000;
@@ -60,10 +63,16 @@ pub struct Preview {
 
 impl Preview {
     fn from_photo(photo: &types::Photo) -> Option<Self> {
+        Self::sized(photo, PHOTO_MIN_SIDE)
+    }
+
+    /// A photo's smallest size at least `min_side` pixels on its long side,
+    /// else its largest.
+    fn sized(photo: &types::Photo, min_side: i32) -> Option<Self> {
         let size = photo
             .sizes
             .iter()
-            .filter(|s| s.width.max(s.height) >= PHOTO_MIN_SIDE)
+            .filter(|s| s.width.max(s.height) >= min_side)
             .min_by_key(|s| s.width)
             .or_else(|| largest(photo))?;
         Some(Self {
@@ -180,6 +189,10 @@ pub struct Msg {
     pub revealed: bool,
     /// Who it was forwarded from, if it was.
     pub forwarded: Option<Origin>,
+    /// A poll, which Enter votes in.
+    pub poll: Option<Poll>,
+    /// Telegram's preview of a link in the text.
+    pub card: Option<Card>,
     pub state: SendState,
     /// Set when this message is a reply.
     pub reply_to: Option<ReplyTo>,
@@ -385,6 +398,52 @@ pub fn without_spoilers(text: &types::FormattedText) -> String {
     hide_spoilers(&text.text, &styles(text))
 }
 
+/// What a link in a message leads to, as Telegram previews it under the
+/// text: the page's title and the start of its description, beside a small
+/// picture if it has one.
+#[derive(Clone)]
+pub struct Card {
+    /// Where the link really goes, read from its address: the name a page
+    /// gives itself could be anyone's. Always the host of one of the
+    /// message's own links, which Enter opens.
+    pub host: String,
+    pub title: String,
+    pub description: String,
+    /// The page's picture, a video's cover, or the photo linked to.
+    pub image: Option<Preview>,
+}
+
+impl Card {
+    fn new(preview: &types::LinkPreview) -> Option<Self> {
+        let host = link_host(&preview.url)?;
+        let title = match one_line(&preview.title) {
+            title if title.is_empty() => one_line(&preview.site_name),
+            title => title,
+        };
+        let description = one_line(&without_spoilers(&preview.description));
+        if title.is_empty() && description.is_empty() {
+            return None;
+        }
+        let small = |photo: &types::Photo| Preview::sized(photo, THUMBNAIL_MIN_SIDE);
+        let image = match &preview.r#type {
+            LinkPreviewType::Article(a) => a.photo.as_ref().and_then(small),
+            LinkPreviewType::Photo(p) => small(&p.photo),
+            LinkPreviewType::Video(v) => v
+                .cover
+                .as_ref()
+                .and_then(small)
+                .or_else(|| Preview::from_video(&v.video)),
+            _ => None,
+        };
+        Some(Card {
+            host: text::clean(&host),
+            title,
+            description,
+            image,
+        })
+    }
+}
+
 /// Who a forwarded message first came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Origin {
@@ -498,6 +557,8 @@ struct Body {
     links: Vec<Link>,
     link_ranges: Vec<Range<usize>>,
     styles: Vec<Styled>,
+    poll: Option<Poll>,
+    card: Option<Card>,
     editable: Editable,
     formatted: bool,
 }
@@ -512,6 +573,8 @@ fn body(content: &MessageContent) -> Body {
         links: Vec::new(),
         link_ranges: Vec::new(),
         styles: Vec::new(),
+        poll: None,
+        card: None,
         editable: Editable::No,
         formatted: false,
     };
@@ -528,6 +591,7 @@ fn body(content: &MessageContent) -> Body {
         C::MessageText(m) => {
             source = Some(&m.text);
             body.editable = Editable::Text;
+            body.card = m.link_preview.as_ref().and_then(Card::new);
         }
         C::MessagePhoto(m) => {
             body.editable = Editable::Caption {
@@ -589,6 +653,12 @@ fn body(content: &MessageContent) -> Body {
             source = Some(&m.caption);
         }
         C::MessageVideoNote(m) => body.file = file(m.video_note.video.id, "Video message".into()),
+        C::MessagePoll(m) => {
+            let poll = Poll::new(&m.poll);
+            body.text = poll.text();
+            body.source_text = body.text.clone();
+            body.poll = Some(poll);
+        }
         C::MessageSticker(m) => {
             body.preview = Preview::from_sticker(&m.sticker);
             if body.preview.is_some() {
@@ -632,6 +702,20 @@ fn body(content: &MessageContent) -> Body {
                 None => body.links.push(link),
             }
         }
+    }
+    // A sender can attach a preview of another page than the links in the
+    // text, and Enter opens those links, not the preview's: a preview of
+    // paypal.com under a link to a look-alike would vouch for it. So it
+    // shows only when it's of one of the text's own links.
+    let bare = |host: &str| host.strip_prefix("www.").unwrap_or(host).to_string();
+    if let Some(card) = &body.card
+        && !body
+            .links
+            .iter()
+            .filter_map(|l| link_host(&l.url))
+            .any(|host| bare(&text::clean(&host)) == bare(&card.host))
+    {
+        body.card = None;
     }
     let ranges = body
         .link_ranges
@@ -728,7 +812,7 @@ fn same_place(shown: &str, url: &str) -> bool {
 }
 
 /// Byte offset of a UTF-16 offset, clamped to the text.
-fn byte_offset(text: &str, utf16: i32) -> usize {
+pub fn byte_offset(text: &str, utf16: i32) -> usize {
     let mut units = 0;
     for (i, c) in text.char_indices() {
         if units >= utf16.max(0) as usize {
@@ -827,6 +911,8 @@ impl From<Message> for Msg {
             styles: body.styles,
             revealed: false,
             forwarded: message.forward_info.map(|f| Origin::from(&f.origin)),
+            poll: body.poll,
+            card: body.card,
             state,
             reply_to,
             editable: body.editable,
@@ -1272,6 +1358,7 @@ impl OpenChat {
             (msg.editable, msg.formatted) = (body.editable, body.formatted);
             // New spoilers stay hidden until asked for again.
             (msg.styles, msg.revealed) = (body.styles, false);
+            (msg.poll, msg.card) = (body.poll, body.card);
             if let Some(reply) = self.reply.as_mut().filter(|r| r.id == message_id) {
                 reply.snippet = msg.snippet();
             }
@@ -1809,6 +1896,56 @@ mod tests {
         assert!(!open.reveal_spoilers(2), "nothing left to show");
     }
 
+    #[test]
+    fn a_link_preview_shows_only_for_a_link_in_the_message() {
+        let with_preview = |text: &str, preview_url: &str| {
+            let start = text.find("https://").unwrap_or(0);
+            let entities = if text.contains("https://") {
+                let length = (text.len() - start) as i32;
+                vec![entity(start as i32, length, TextEntityType::Url)]
+            } else {
+                Vec::new()
+            };
+            body(&MessageContent::MessageText(types::MessageText {
+                text: types::FormattedText {
+                    text: text.into(),
+                    entities,
+                },
+                link_preview: Some(types::LinkPreview {
+                    url: preview_url.into(),
+                    display_url: preview_url.into(),
+                    site_name: "Site".into(),
+                    title: "Log in".into(),
+                    description: types::FormattedText::default(),
+                    author: String::new(),
+                    r#type: LinkPreviewType::Unsupported,
+                    has_large_media: false,
+                    show_large_media: false,
+                    show_media_above_description: false,
+                    skip_confirmation: false,
+                    show_above_text: false,
+                    instant_view_version: 0,
+                }),
+                link_preview_options: None,
+            }))
+        };
+        let shown = with_preview("see https://www.example.com/a", "https://example.com/a");
+        assert_eq!(shown.card.map(|c| c.host).as_deref(), Some("example.com"));
+        let elsewhere = with_preview(
+            "sign in: https://paypa1-login.example/x",
+            "https://www.paypal.com/signin",
+        );
+        assert!(
+            elsewhere.card.is_none(),
+            "it would vouch for the other link"
+        );
+        assert!(
+            with_preview("no link here", "https://example.com")
+                .card
+                .is_none()
+        );
+    }
+
     /// A page of plain messages with these ids.
     fn page(ids: impl IntoIterator<Item = i64>) -> Vec<(i64, Msg)> {
         ids.into_iter()
@@ -1826,6 +1963,8 @@ mod tests {
                     styles: Vec::new(),
                     revealed: false,
                     forwarded: None,
+                    poll: None,
+                    card: None,
                     state: SendState::Sent,
                     reply_to: None,
                     editable: Editable::Text,

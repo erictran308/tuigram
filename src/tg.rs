@@ -100,7 +100,14 @@ pub enum TgEvent {
     /// Or what to say if it can't be opened.
     ChatFound {
         request: String,
-        found: Result<(i64, Option<i64>), String>,
+        found: Result<(i64, Option<i64>), Missed>,
+    },
+    /// Members of a group whose name has `query` in it, for `@` completion.
+    /// Failures find nobody.
+    Members {
+        chat_id: i64,
+        query: String,
+        user_ids: Vec<i64>,
     },
     /// Telegram took messages to forward to this chat.
     Forwarded {
@@ -110,12 +117,34 @@ pub enum TgEvent {
     Joined {
         chat_id: i64,
     },
+    /// You left this group or channel.
+    Left {
+        chat_id: i64,
+    },
     /// An invite link to a chat you're not in, to ask before joining.
     Invite {
         request: String,
         link: String,
         invite: Invite,
     },
+}
+
+/// Why a chat looked up to open wasn't opened.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Missed {
+    /// What to tell the user.
+    Said(String),
+    /// Nothing more to say: an invite asks to join instead.
+    Quiet,
+    /// A link tuigram doesn't open itself (a sticker set, a bot's start
+    /// link…), which a browser can.
+    Elsewhere,
+}
+
+impl From<String> for Missed {
+    fn from(why: String) -> Self {
+        Missed::Said(why)
+    }
 }
 
 /// A chat an invite link leads to, as the link describes it.
@@ -168,6 +197,8 @@ const NOTIFICATION_GROUPS: i64 = 5;
 
 /// Stickers a search in the sticker panel asks for.
 const STICKER_SEARCH_LIMIT: i32 = 100;
+/// Members an `@` completion asks for.
+const MEMBER_SEARCH_LIMIT: i32 = 20;
 /// Contacts a search in the `s` picker asks for.
 const CONTACT_SEARCH_LIMIT: i32 = 20;
 
@@ -293,7 +324,21 @@ pub fn markdown(text: String) -> types::FormattedText {
         "@type": "parseMarkdown",
         "text": { "@type": "formattedText", "text": text, "entities": [] },
     });
-    execute_text(&request).unwrap_or_else(|| plain(text))
+    let mut parsed = execute_text(&request).unwrap_or_else(|| plain(text));
+    // `[Bob](tg://user?id=123)`, which `@` completion writes for someone
+    // without a username, mentions them, as in the Bot API's Markdown.
+    for entity in &mut parsed.entities {
+        if let enums::TextEntityType::TextUrl(link) = &entity.r#type
+            && let Some(user_id) = link
+                .url
+                .strip_prefix("tg://user?id=")
+                .and_then(|id| id.parse().ok())
+        {
+            entity.r#type =
+                enums::TextEntityType::MentionName(types::TextEntityTypeMentionName { user_id });
+        }
+    }
+    parsed
 }
 
 /// What `e` puts in the composer: your message as Markdown, so saving it
@@ -309,13 +354,32 @@ pub struct EditText {
 pub fn to_markdown(text: &types::FormattedText) -> Option<EditText> {
     let request = json!({ "@type": "getMarkdownText", "text": text });
     let written = execute_text(&request)?;
-    // What Markdown couldn't write is left as entities.
-    let loses = written
-        .entities
-        .iter()
-        .any(|e| !crate::messages::found_by_telegram(&e.r#type));
+    // What Markdown couldn't write is left as entities. A mention of
+    // someone without a username is written as the link `markdown` makes a
+    // mention of again: from the end, so the offsets before stay right.
+    let mut markdown = written.text.clone();
+    let mut loses = false;
+    let mut left = written.entities.clone();
+    left.sort_by_key(|e| std::cmp::Reverse(e.offset));
+    for entity in left {
+        match &entity.r#type {
+            enums::TextEntityType::MentionName(mention) => {
+                let start = crate::messages::byte_offset(&written.text, entity.offset);
+                let end = crate::messages::byte_offset(
+                    &written.text,
+                    entity.offset.saturating_add(entity.length),
+                );
+                if start < end {
+                    markdown.insert_str(end, &format!("](tg://user?id={})", mention.user_id));
+                    markdown.insert(start, '[');
+                }
+            }
+            kind if !crate::messages::found_by_telegram(kind) => loses = true,
+            _ => {}
+        }
+    }
     Some(EditText {
-        markdown: crate::text::clean(&written.text),
+        markdown: crate::text::clean(&markdown),
         loses,
     })
 }
@@ -959,7 +1023,7 @@ impl Tg {
         self.find(request, async move {
             let enums::Chat::Chat(chat) = functions::create_private_chat(user_id, false, client_id)
                 .await
-                .map_err(|e| e.message)?;
+                .map_err(|e| Missed::Said(e.message))?;
             Ok((chat.id, None))
         });
     }
@@ -982,7 +1046,7 @@ impl Tg {
         self.find(request.clone(), async move {
             let kind = functions::get_internal_link_type(link.clone(), client_id)
                 .await
-                .map_err(|_| "That isn't a link tuigram can open".to_string())?;
+                .map_err(|_| Missed::Elsewhere)?;
             match kind {
                 enums::InternalLinkType::PublicChat(p) => {
                     Ok((public_chat(&p.chat_username, client_id).await?, None))
@@ -991,9 +1055,9 @@ impl Tg {
                     let enums::MessageLinkInfo::MessageLinkInfo(info) =
                         functions::get_message_link_info(m.url, client_id)
                             .await
-                            .map_err(|e| e.message)?;
+                            .map_err(|e| Missed::Said(e.message))?;
                     if info.chat_id == 0 {
-                        return Err("That message can't be found".into());
+                        return Err(Missed::Said("That message can't be found".into()));
                     }
                     Ok((info.chat_id, info.message.map(|m| m.id)))
                 }
@@ -1001,7 +1065,7 @@ impl Tg {
                     let enums::ChatInviteLinkInfo::ChatInviteLinkInfo(info) =
                         functions::check_chat_invite_link(i.invite_link.clone(), client_id)
                             .await
-                            .map_err(|e| e.message)?;
+                            .map_err(|e| Missed::Said(e.message))?;
                     // A chat you're in has an id and no time limit on reading it.
                     if info.chat_id != 0 && info.accessible_for == 0 {
                         return Ok((info.chat_id, None));
@@ -1018,9 +1082,9 @@ impl Tg {
                         link: i.invite_link,
                         invite,
                     });
-                    Err(String::new())
+                    Err(Missed::Quiet)
                 }
-                _ => Err("tuigram can't open this kind of link yet".into()),
+                _ => Err(Missed::Elsewhere),
             }
         });
     }
@@ -1031,7 +1095,7 @@ impl Tg {
         self.find(request, async move {
             let enums::Chat::Chat(chat) = functions::join_chat_by_invite_link(link, client_id)
                 .await
-                .map_err(|e| e.message)?;
+                .map_err(|e| Missed::Said(e.message))?;
             Ok((chat.id, None))
         });
     }
@@ -1048,12 +1112,68 @@ impl Tg {
         });
     }
 
+    /// Searches a group's members by name, for `@` completion. TDLib sends
+    /// the users first.
+    pub fn find_members(&self, chat_id: i64, query: String) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let result = functions::search_chat_members(
+                chat_id,
+                query.clone(),
+                MEMBER_SEARCH_LIMIT,
+                None,
+                client_id,
+            )
+            .await;
+            let user_ids = match result {
+                Ok(enums::ChatMembers::ChatMembers(m)) => m
+                    .members
+                    .into_iter()
+                    .filter_map(|m| match m.member_id {
+                        enums::MessageSender::User(u) => Some(u.user_id),
+                        enums::MessageSender::Chat(_) => None,
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            let _ = tx.send(TgEvent::Members {
+                chat_id,
+                query,
+                user_ids,
+            });
+        });
+    }
+
+    /// Votes in a poll for these answers, by index; none takes your vote
+    /// back. TDLib then sends the poll's new counts.
+    pub fn vote(&self, chat_id: i64, message_id: i64, answers: Vec<i32>) {
+        self.spawn(functions::set_poll_answer(
+            chat_id,
+            message_id,
+            answers,
+            self.client_id,
+        ));
+    }
+
+    /// Leaves a group or channel. TDLib then takes it out of the list.
+    pub fn leave_chat(&self, chat_id: i64) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let _ = match functions::leave_chat(chat_id, client_id).await {
+                Ok(()) => tx.send(TgEvent::Left { chat_id }),
+                Err(e) => tx.send(TgEvent::Error(e.message)),
+            };
+        });
+    }
+
     /// Runs a lookup of a chat to open, and reports it as
-    /// [`TgEvent::ChatFound`]. An empty error says nothing more.
+    /// [`TgEvent::ChatFound`].
     fn find(
         &self,
         request: String,
-        lookup: impl Future<Output = Result<(i64, Option<i64>), String>> + Send + 'static,
+        lookup: impl Future<Output = Result<(i64, Option<i64>), Missed>> + Send + 'static,
     ) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -1302,6 +1422,21 @@ mod tests {
     }
 
     #[test]
+    fn a_markdown_link_to_a_user_mentions_them() {
+        quiet();
+        let sent = markdown("hi [Bob Smith](tg://user?id=123)".into());
+        assert_eq!(sent.text, "hi Bob Smith");
+        assert_eq!(
+            entities(&sent),
+            [(
+                3,
+                9,
+                "MentionName(TextEntityTypeMentionName { user_id: 123 })".into()
+            )]
+        );
+    }
+
+    #[test]
     fn single_stars_and_underscores_stay_as_typed() {
         quiet();
         let sent = markdown("2*3*4 = 24, snake_case_name, a ** b".into());
@@ -1335,6 +1470,21 @@ mod tests {
             to_markdown(&underlined).unwrap().loses,
             "Markdown has no underline"
         );
+
+        let mention = types::FormattedText {
+            text: "hi Bob".into(),
+            entities: vec![entity(
+                3,
+                3,
+                enums::TextEntityType::MentionName(types::TextEntityTypeMentionName {
+                    user_id: 123,
+                }),
+            )],
+        };
+        let edit = to_markdown(&mention).unwrap();
+        assert_eq!(edit.markdown, "hi [Bob](tg://user?id=123)");
+        assert!(!edit.loses);
+        assert_eq!(markdown(edit.markdown), mention);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tdlib_rs::enums::{ChatAction, ChatList, ChatType, MessageContent, MessageSender};
+use tdlib_rs::enums::{ChatAction, ChatList, ChatType, MessageContent, MessageSender, UserStatus};
 use tdlib_rs::types::{self, AccentColor, ChatPhotoInfo, ChatPosition, FormattedText, Message};
 
 use crate::images::Thumbnail;
@@ -130,6 +130,45 @@ pub struct Chats {
     usernames: HashMap<Peer, String>,
     /// Groups and channels you're not in: public ones opened with `s`.
     left: HashSet<i64>,
+    /// When people were last on Telegram, by user id.
+    presence: HashMap<i64, Presence>,
+    /// User ids of bots, which have no last seen.
+    bots: HashSet<i64>,
+}
+
+/// When someone was last on Telegram, as far as their privacy settings
+/// tell. Times are unix timestamps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    /// Online, until this time unless Telegram says it again.
+    Online(i32),
+    Offline(i32),
+    Recently,
+    LastWeek,
+    LastMonth,
+    /// They hide it, or haven't been on in a long time.
+    LongAgo,
+}
+
+impl Presence {
+    pub fn of(status: &UserStatus) -> Self {
+        match status {
+            UserStatus::Online(s) => Presence::Online(s.expires),
+            UserStatus::Offline(s) => Presence::Offline(s.was_online),
+            UserStatus::Recently(_) => Presence::Recently,
+            UserStatus::LastWeek(_) => Presence::LastWeek,
+            UserStatus::LastMonth(_) => Presence::LastMonth,
+            UserStatus::Empty => Presence::LongAgo,
+        }
+    }
+}
+
+/// What the title of a chat with one person says about them: online, when
+/// they were last seen, or that it's a bot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seen {
+    Bot,
+    Person(Presence),
 }
 
 impl Chats {
@@ -371,6 +410,35 @@ impl Chats {
         self.usernames.get(&Peer::User(user_id)).map(String::as_str)
     }
 
+    /// When someone was last on Telegram, from `updateUser` and
+    /// `updateUserStatus`.
+    pub fn set_presence(&mut self, user_id: i64, presence: Presence) {
+        self.presence.insert(user_id, presence);
+    }
+
+    pub fn set_bot(&mut self, user_id: i64, bot: bool) {
+        if bot {
+            self.bots.insert(user_id);
+        } else {
+            self.bots.remove(&user_id);
+        }
+    }
+
+    /// What to say about the person a one-on-one chat is with; `None` for
+    /// groups, channels and Saved Messages.
+    pub fn seen(&self, chat_id: i64) -> Option<Seen> {
+        if self.is_saved(chat_id) {
+            return None;
+        }
+        let Some(Peer::User(user_id)) = self.by_id.get(&chat_id)?.peer else {
+            return None;
+        };
+        if self.bots.contains(&user_id) {
+            return Some(Seen::Bot);
+        }
+        self.presence.get(&user_id).copied().map(Seen::Person)
+    }
+
     /// Whether you're in a group or channel, from `updateSupergroup`.
     pub fn set_member(&mut self, supergroup_id: i64, member: bool) {
         if member {
@@ -536,7 +604,7 @@ fn labeled_text(content: &MessageContent, text: impl Fn(&FormattedText) -> Strin
         MessageContent::MessageVoiceNote(m) => labeled("Voice message", &m.caption),
         MessageContent::MessageVideoNote(_) => "[Video message]".into(),
         MessageContent::MessageSticker(m) => format!("[Sticker {}]", m.sticker.emoji),
-        MessageContent::MessagePoll(_) => "[Poll]".into(),
+        MessageContent::MessagePoll(m) => labeled("Poll", &m.poll.question),
         MessageContent::MessageLocation(_) => "[Location]".into(),
         MessageContent::MessageContact(_) => "[Contact]".into(),
         _ => "[Message]".into(),

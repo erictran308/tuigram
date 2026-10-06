@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::chats::Chats;
+use crate::messages::link_host;
 
 /// How long typing has to pause before Telegram is searched, so a name typed
 /// quickly is one search, not one per letter.
@@ -185,6 +186,14 @@ fn search_text(query: &str) -> &str {
     query.strip_prefix('@').unwrap_or(query)
 }
 
+/// Whether a link goes to Telegram (`t.me`, `telegram.me`, `telegram.dog`,
+/// or a `username.t.me`), judged by its real host, so tuigram can open it.
+pub fn telegram_link(url: &str) -> bool {
+    link_host(url).is_some_and(|host| {
+        ["t.me", "telegram.me", "telegram.dog"].contains(&host.as_str()) || host.ends_with(".t.me")
+    })
+}
+
 /// What a query names by itself: a username after an @, or a link to
 /// t.me (also written `telegram.me`, `telegram.dog` or `tg:`).
 pub fn typed(query: &str) -> Option<Choice> {
@@ -215,6 +224,21 @@ pub fn typed(query: &str) -> Option<Choice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telegram_links_are_known_by_their_real_host() {
+        assert!(telegram_link("https://t.me/durov"));
+        assert!(telegram_link("https://T.ME/+AbC"));
+        assert!(telegram_link("http://telegram.me/durov/12"));
+        assert!(telegram_link("https://durov.t.me"));
+        assert!(!telegram_link("https://t.me.evil.example/x"));
+        assert!(!telegram_link("https://evil.example/t.me/x"));
+        assert!(
+            !telegram_link("https://t.me@evil.example/x"),
+            "the host is after the @"
+        );
+        assert!(!telegram_link("https://notat.me/x"));
+    }
 
     #[test]
     fn usernames_and_telegram_links_are_recognized_as_typed() {
