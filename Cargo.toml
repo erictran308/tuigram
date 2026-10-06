@@ -61,9 +61,6 @@ unicode-width = "0.2.2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[build-dependencies]
-tdlib-rs = { version = "1.4.0", features = ["static"] }
-
 [features]
 default = ["download-tdlib"]
 # Where TDLib comes from: tdlib-rs's build script downloads it (the default),

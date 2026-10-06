@@ -2,8 +2,11 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::path::Path;
 
+// TDLib is linked by tdlib-rs's own build script (its `static` feature), so
+// this one doesn't use tdlib-rs: as a build dependency it would be built for
+// the machine doing the build, which a cross-compiled release (Windows ARM64
+// on an x64 runner) can't link against the target's TDLib.
 fn main() {
-    tdlib_rs::build::build(None);
     write_built_in_keys();
 }
 
