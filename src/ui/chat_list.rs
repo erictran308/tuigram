@@ -1,12 +1,13 @@
 //! The chat list: two rows per chat, its title over its last message (or
 //! "typing…" while someone is), with the chat's photo on the left (a square
 //! of color if it has none), and a blank row between chats unless that's
-//! turned off.
+//! turned off. With folders, a row of tabs over it says which one is shown,
+//! with a line under them joined to the border.
 
 use std::collections::HashMap;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
@@ -14,7 +15,7 @@ use ratatui_image::FontSize;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
 
-use crate::chats::Chats;
+use crate::chats::{self, Chats, Tab};
 use crate::images::Images;
 use crate::theme::Colors;
 
@@ -30,6 +31,8 @@ const MIN_WIDTH_FOR_PHOTOS: u16 = 24;
 const MUTED: &str = " 🔕";
 /// On the right of a pinned chat with nothing unread.
 const PINNED: &str = "📌";
+/// A folder's tab shows at most this many columns of its name.
+const TAB_NAME_COLS: usize = 16;
 
 /// What the list shows, from the app's state.
 pub struct ChatList<'a> {
@@ -68,6 +71,29 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
         .title(title)
         .border_style(border(list.focused, colors));
     let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let tabs = chats.tabs();
+    let inner = if tabs.is_empty() {
+        inner
+    } else {
+        let [bar, rule, rest] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .areas(inner);
+        let line = tab_line(&tabs, chats.shown(), bar.width.into(), colors);
+        frame.render_widget(line, bar);
+        // Across the whole list, meeting the border on both sides.
+        let rule_line = format!("├{}┤", "─".repeat(rule.width.into()));
+        let rule = Rect {
+            x: area.x,
+            width: rule.width + 2,
+            ..rule
+        };
+        frame.render_widget(Line::styled(rule_line, border(list.focused, colors)), rule);
+        rest
+    };
     let photo_cols = if inner.width >= MIN_WIDTH_FOR_PHOTOS {
         photo_cols(images.font_size())
     } else {
@@ -106,7 +132,7 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
                 Span::from(format!(" {} ", chat.unread))
                     .fg(colors.bg)
                     .bg(bg)
-            } else if chat.pinned {
+            } else if chats.pinned(id) {
                 Span::from(PINNED)
             } else {
                 Span::from("")
@@ -150,18 +176,20 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
         })
         .collect();
 
-    if items.is_empty() && !filter.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No chats match")
-                .fg(colors.muted)
-                .centered()
-                .block(block),
-            area,
-        );
+    let empty = match () {
+        _ if !items.is_empty() => None,
+        _ if !filter.is_empty() => Some("No chats match"),
+        _ if list.loading => Some("Loading…"),
+        // The main list is empty only until it loads.
+        _ if chats.shown() != chats::List::Main => Some("No chats here"),
+        _ => None,
+    };
+    if let Some(empty) = empty {
+        frame.render_widget(Paragraph::new(empty).fg(colors.muted).centered(), inner);
         return;
     }
     let mut state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(List::new(items).block(block), area, &mut state);
+    frame.render_stateful_widget(List::new(items), inner, &mut state);
     if photo_cols == 0 {
         return;
     }
@@ -180,6 +208,58 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
         };
         draw_photo(frame, area, id, list, images, colors);
     }
+}
+
+/// The tabs over the list, the one shown filled in, each with its count of
+/// unread unmuted chats. When they don't all fit, they scroll so the one
+/// shown does, with `‹` / `›` where more are hidden.
+fn tab_line(tabs: &[Tab], shown: chats::List, width: usize, colors: &Colors) -> Line<'static> {
+    let label = |tab: &Tab| {
+        let name = truncate(&tab.name, TAB_NAME_COLS);
+        match tab.unread {
+            0 => format!(" {name} "),
+            n => format!(" {name} {n} "),
+        }
+    };
+    let labels: Vec<String> = tabs.iter().map(label).collect();
+    let widths: Vec<usize> = labels.iter().map(|l| l.width()).collect();
+    let current = tabs.iter().position(|t| t.list == shown).unwrap_or(0);
+    // Columns tabs `from..=to` take, with a space between them and room for
+    // the marks at both ends.
+    let span = |from: usize, to: usize| {
+        let gaps = to - from;
+        let marks = usize::from(from > 0) + usize::from(to + 1 < tabs.len());
+        widths[from..=to].iter().sum::<usize>() + gaps + marks
+    };
+    let mut first = 0;
+    while first < current && span(first, current) > width {
+        first += 1;
+    }
+    let mut last = current;
+    while last + 1 < tabs.len() && span(first, last + 1) <= width {
+        last += 1;
+    }
+    let mut spans = Vec::new();
+    if first > 0 {
+        spans.push(Span::from("‹").fg(colors.muted));
+    }
+    for (i, label) in labels.into_iter().enumerate().take(last + 1).skip(first) {
+        if i > first {
+            spans.push(Span::from(" "));
+        }
+        let style = if i == current {
+            Style::new().fg(colors.bg).bg(colors.accent).bold()
+        } else if tabs[i].unread > 0 {
+            Style::new().fg(colors.fg)
+        } else {
+            Style::new().fg(colors.subtle)
+        };
+        spans.push(Span::styled(label, style));
+    }
+    if last + 1 < tabs.len() {
+        spans.push(Span::from("›").fg(colors.muted));
+    }
+    Line::from(spans)
 }
 
 /// Columns for a round photo two rows high: about twice the rows, since
@@ -308,7 +388,9 @@ mod tests {
     fn pinned_chats_show_a_pin_and_muted_ones_a_bell_and_a_grey_count() {
         use tdlib_rs::types::ChatNotificationSettings;
         let mut chats = Chats::default();
-        chats.add_local(1, "Pinned", None).pinned = true;
+        chats
+            .add_local(1, "Pinned", None)
+            .set_pinned(chats::List::Main, true);
         chats.add_local(2, "Quiet", None).unread = 4;
         chats.set_notifications(
             2,
@@ -515,6 +597,61 @@ mod tests {
         let buf = render(&list(&chats, None), &mut images, 40, 10);
         assert!(is_square(&buf, 2, 1, 4, colors.primary));
         assert_eq!(cells(&buf, 7, 1, 14), "Saved Messages");
+    }
+
+    #[test]
+    fn folders_are_tabs_over_the_list_scrolled_to_the_one_shown() {
+        use tdlib_rs::types::{ChatFolderInfo, ChatFolderName, FormattedText};
+        let colors = Colors::default();
+        let folder = |id, name: &str| ChatFolderInfo {
+            id,
+            name: ChatFolderName {
+                text: FormattedText {
+                    text: name.into(),
+                    entities: Vec::new(),
+                },
+                animate_custom_emoji: false,
+            },
+            ..ChatFolderInfo::default()
+        };
+        let mut chats = Chats::default();
+        chats.add_local(1, "Alice", None);
+        chats.set_folders(
+            &[folder(1, "Friends"), folder(2, "Work"), folder(3, "Games")],
+            0,
+        );
+        chats.set_unread_in(chats::List::Folder(2), 4);
+        chats.refresh();
+        let rows = |chats: &Chats, width| {
+            let buf = render(
+                &list(chats, None),
+                &mut images(ProtocolType::Halfblocks),
+                width,
+                10,
+            );
+            let row: String = cells(&buf, 1, 1, width - 2);
+            (buf, row)
+        };
+
+        let (buf, row) = rows(&chats, 40);
+        assert_eq!(row.trim_end(), " All   Friends   Work 4   Games");
+        assert_eq!(buf[(2, 1)].bg, colors.accent, "the one shown");
+        let rule = format!("├{}┤", "─".repeat(38));
+        assert_eq!(cells(&buf, 0, 2, 40), rule, "a line under the tabs");
+        assert_eq!(buf[(0, 2)].fg, colors.accent, "the border's color");
+        assert_eq!(cells(&buf, 7, 3, 5), "Alice", "the chats under it");
+
+        chats.show(chats::List::Folder(3));
+        chats.refresh();
+        let (_, row) = rows(&chats, 20);
+        assert_eq!(row.trim_end(), "‹ Work 4   Games", "{row}");
+        let (_, row) = rows(&chats, 40);
+        assert!(row.contains("Games"));
+        let (buf, _) = rows(&chats, 40);
+        assert!(
+            cells(&buf, 1, 3, 38).contains("No chats here"),
+            "Alice isn't in Games"
+        );
     }
 
     #[test]

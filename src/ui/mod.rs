@@ -11,10 +11,11 @@ use unicode_width::UnicodeWidthStr;
 use ratatui_textarea::TextArea;
 
 use crate::app::{
-    App, Command, Confirm, Confirmed, DeleteMenu, Focus, HelpTab, Login, LoginStep, MenuAction,
-    PickMenu, PromptKind, Screen, SettingsMenu, Target, Toast,
+    App, Command, Confirm, Confirmed, DeleteMenu, Focus, HelpTab, Jumps, Login, LoginStep,
+    MenuAction, Notice, PickMenu, PromptKind, Screen, SettingsMenu, Target, Toast,
 };
 use crate::attach::{self, Attachment, Kind};
+use crate::buttons::ButtonMenu;
 use crate::chats::{Badge, Chat};
 use crate::complete::Completion;
 use crate::config;
@@ -22,6 +23,7 @@ use crate::images::Images;
 use crate::messages::{Editing, OpenChat, Replied, Sender};
 use crate::notify::Notifications;
 use crate::picker::{ChatPicker, Choice, Purpose};
+use crate::pins::{PinMenu, PinnedMenu};
 use crate::poll::VoteMenu;
 use crate::reactions::{self, ReactMenu};
 use crate::search;
@@ -327,7 +329,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         chats: &app.chats,
         users: &app.users,
         selected: app.selected,
-        loading: app.chats_loading,
+        loading: app.chats_loading(),
         focused: app.focus == Focus::Chats,
         // The settings popup, the command list and toasts can reach over it;
         // a toast only when the list is on the right, where toasts go.
@@ -350,6 +352,10 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         || app.delete_menu.is_some()
         || app.react_menu.is_some()
         || app.vote_menu.is_some()
+        || app.button_menu.is_some()
+        || app.notice.is_some()
+        || app.pin_menu.is_some()
+        || app.pinned_menu.is_some()
         || app.picker.is_some()
         || app.confirm.is_some()
         || app.settings_menu.is_some()
@@ -442,6 +448,22 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     }
     if let Some(menu) = &app.vote_menu {
         draw_vote(frame, chat_area, menu, colors);
+    }
+    if let Some(menu) = &app.button_menu {
+        draw_buttons(frame, chat_area, menu, colors);
+    }
+    if let Some(notice) = &app.notice {
+        draw_notice(frame, chat_area, notice, colors);
+    }
+    if let Some(menu) = &app.pin_menu {
+        draw_pin(frame, chat_area, menu, colors);
+    }
+    if let (Some(menu), Some(open)) = (&app.pinned_menu, &app.open) {
+        let names = messages::Names {
+            users: &app.users,
+            chats: &app.chats,
+        };
+        draw_pinned(frame, chat_area, menu, open, &names, colors);
     }
     if let Some(menu) = &mut app.react_menu {
         let yours: Vec<String> = app
@@ -1275,6 +1297,198 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+/// The popup Enter opens on a bot's message: the message on a line, then
+/// its buttons as the bot laid them out, a row of the popup for each row of
+/// buttons, then the message's file and links. Buttons only Telegram's own
+/// apps can press are greyed out.
+fn draw_buttons(frame: &mut Frame, area: Rect, menu: &ButtonMenu, colors: &Colors) {
+    let widest = menu
+        .rows
+        .iter()
+        .map(|row| row.iter().map(|b| b.label.width() + 3).sum::<usize>())
+        .chain([menu.snippet.width().min(60) + 3])
+        .max()
+        .unwrap_or(0);
+    let width = ((widest + 4).clamp(36, 76) as u16).min(area.width);
+    // Borders, the message and a gap, then the buttons.
+    let height = (menu.rows.len() as u16 + 4).min(area.height);
+    let popup = center(area, width, height);
+    let (title, keys) = if menu.reply {
+        (" Reply buttons ", " `Enter` send · `Esc` close ")
+    } else {
+        (" Buttons ", " `Enter` press · `Esc` close ")
+    };
+    let block = popup_block(title, keys, colors);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let [snippet, _, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Line::from(vec![
+            Span::from(" ▎ ").fg(colors.accent),
+            Span::from(truncate(
+                &menu.snippet,
+                (inner.width as usize).saturating_sub(3),
+            )),
+        ]),
+        snippet,
+    );
+    // Scrolled so the cursor's row shows.
+    let shown = usize::from(list.height).max(1);
+    let first = (menu.row + 1).saturating_sub(shown);
+    let cells = Rect {
+        x: list.x + 1,
+        width: list.width.saturating_sub(2),
+        ..list
+    };
+    for (i, row) in menu.rows.iter().enumerate().skip(first).take(shown) {
+        let area = Rect {
+            y: cells.y + (i - first) as u16,
+            height: 1,
+            ..cells
+        };
+        let look = |j, button: &crate::buttons::Button| {
+            let muted = Style::new().fg(colors.muted);
+            if (i, j) == (menu.row, menu.col) {
+                let on = Style::new().fg(colors.bg).bg(colors.accent).bold();
+                (on, on)
+            } else if button.works() {
+                (muted, Style::new().fg(colors.fg))
+            } else {
+                (muted, muted)
+            }
+        };
+        let spans = messages::button_row(row, area.width.into(), Style::new(), look);
+        frame.render_widget(Line::from(spans), area);
+    }
+}
+
+/// The `P` popup: the message, then how to pin it.
+fn draw_pin(frame: &mut Frame, area: Rect, menu: &PinMenu, colors: &Colors) {
+    let rows = menu.choices.len().max(1) as u16;
+    let width = ((menu.snippet.width() + 6).clamp(40, 60) as u16).min(area.width);
+    // Borders, the message and a gap, then the choices.
+    let popup = center(area, width, rows + 4);
+    let block = popup_block(" Pin message ", " `Enter` pin · `Esc` cancel ", colors);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let [message, _, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    let text_width = (inner.width as usize).saturating_sub(3);
+    frame.render_widget(
+        Line::from(vec![
+            Span::from(" ▎ ").fg(colors.accent),
+            Span::from(truncate(&menu.snippet, text_width)),
+        ]),
+        message,
+    );
+    if menu.choices.is_empty() {
+        frame.render_widget(Line::from(" Checking…").fg(colors.muted), list);
+        return;
+    }
+    let choice_width = (inner.width as usize).saturating_sub(3);
+    let items: Vec<ListItem> = menu
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(i, &choice)| {
+            let bar = if i == menu.selected {
+                Span::from("▌").fg(colors.accent)
+            } else {
+                Span::from(" ")
+            };
+            ListItem::new(Line::from(vec![
+                bar,
+                Span::from(format!("{} ", i + 1)).fg(colors.muted),
+                Span::from(truncate(&menu.label(choice), choice_width)),
+            ]))
+        })
+        .collect();
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(Style::new().bg(colors.selection)),
+        list,
+        &mut ListState::default().with_selected(Some(menu.selected)),
+    );
+}
+
+/// The `gp` popup: the chat's pinned messages, newest first, each with who
+/// sent it and when.
+fn draw_pinned(
+    frame: &mut Frame,
+    area: Rect,
+    menu: &PinnedMenu,
+    open: &OpenChat,
+    names: &messages::Names,
+    colors: &Colors,
+) {
+    let width = 64.min(area.width);
+    let rows = (open.pinned.len() as u16).min(area.height.saturating_sub(2));
+    let popup = center(area, width, rows + 2);
+    let title = format!(" Pinned messages ({}) ", open.pinned.len());
+    let block = popup_block(title, " `Enter` go to · `P` unpin · `Esc` close ", colors);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let items: Vec<ListItem> = open
+        .pinned
+        .iter()
+        .enumerate()
+        .map(|(i, pinned)| {
+            let bar = if i == menu.selected {
+                Span::from("▌").fg(colors.accent)
+            } else {
+                Span::from(" ")
+            };
+            let who = truncate(&names.author(pinned.sender, pinned.outgoing), 16);
+            let when = chrono::TimeZone::timestamp_opt(&chrono::Local, i64::from(pinned.date), 0)
+                .single()
+                .map_or(String::new(), |t| t.format("%-d %b").to_string());
+            let head = format!("{who} · {when}  ");
+            let room = (inner.width as usize).saturating_sub(1 + head.width());
+            ListItem::new(Line::from(vec![
+                bar,
+                Span::from(head).fg(colors.muted),
+                Span::from(truncate(&pinned.snippet, room)),
+            ]))
+        })
+        .collect();
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(Style::new().bg(colors.selection)),
+        inner,
+        &mut ListState::default().with_selected(Some(menu.selected)),
+    );
+}
+
+/// A bot's alert, answering a button: its words, wrapped, until Enter.
+fn draw_notice(frame: &mut Frame, area: Rect, notice: &Notice, colors: &Colors) {
+    let width = 56.min(area.width);
+    let text_width = usize::from(width.saturating_sub(4)).max(1);
+    let lines: Vec<Line> = messages::wrap(&notice.text, text_width)
+        .into_iter()
+        .take(usize::from(area.height.saturating_sub(4)).max(1))
+        .map(|(line, _)| Line::from(format!(" {line}")))
+        .collect();
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = center(area, width, height);
+    let title = format!(" {} ", truncate(&notice.title, text_width));
+    let block = popup_block(title, " `Enter` OK ", colors);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
 fn popup_block<'a>(title: impl Into<Line<'a>>, keys: &'a str, colors: &Colors) -> Block<'a> {
     Block::bordered()
         .title(title)
@@ -1755,11 +1969,17 @@ fn as_files_hint(open: &OpenChat) -> Option<&'static str> {
 }
 
 /// Hints for keys that depend on the cursor: Enter on hidden spoilers, `gd`
-/// on a reply, and Ctrl-o after a `gd`.
-fn jump_hints(open: &OpenChat) -> Vec<&'static str> {
+/// on a reply, and Ctrl-o / Ctrl-i after leaving a chat or a reply.
+fn jump_hints(open: &OpenChat, jumps: &Jumps) -> Vec<&'static str> {
     let mut hints = Vec::new();
     if open.cursor_id().is_some_and(|id| open.hides_spoilers(id)) {
         hints.push("`Enter` show spoiler");
+    } else if open
+        .cursor_id()
+        .and_then(|id| open.messages.get(&id))
+        .is_some_and(|m| m.keyboard.is_some())
+    {
+        hints.push("`Enter` buttons");
     }
     let on_reply = open
         .cursor_id()
@@ -1768,8 +1988,11 @@ fn jump_hints(open: &OpenChat) -> Vec<&'static str> {
     if on_reply {
         hints.push("`gd` go to replied");
     }
-    if !open.jumps.is_empty() {
-        hints.push("`Ctrl-o` back to reply");
+    if jumps.can_go_back() {
+        hints.push("`Ctrl-o` back");
+    }
+    if jumps.can_go_forward() {
+        hints.push("`Ctrl-i` forward");
     }
     hints
 }
@@ -1834,6 +2057,20 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             "  `j/k` choose · `Space` tick · `Enter` vote for the ticked · `Esc` close",
         ),
         _ if app.vote_menu.is_some() => (normal, "  `j/k` choose · `Enter` vote · `Esc` close"),
+        _ if app.notice.is_some() => (normal, "  `Enter` or `Esc` close"),
+        _ if app.pin_menu.is_some() => (normal, "  `j/k` choose · `Enter` pin · `Esc` cancel"),
+        _ if app.pinned_menu.is_some() => (
+            normal,
+            "  `j/k` choose · `Enter` go to it · `P` unpin it · `Esc` close",
+        ),
+        _ if app.button_menu.as_ref().is_some_and(|m| m.reply) => (
+            normal,
+            "  `h/j/k/l` choose · `Enter` send its words · `1-9` send by number · `Esc` close",
+        ),
+        _ if app.button_menu.is_some() => (
+            normal,
+            "  `h/j/k/l` choose · `Enter` press · `1-9` press by number · `Esc` close",
+        ),
         _ if app.picker.as_ref().is_some_and(ChatPicker::forwarding) => (
             normal,
             "  type a chat's name · `arrows` choose · `Enter` forward · `Esc` cancel",
@@ -1845,6 +2082,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         Focus::Chats if !app.chats.filter().is_empty() => (
             normal,
             "  `j/k` move · `Enter` open · `Esc` clear search · `/` search again · `i` write · `q` quit",
+        ),
+        Focus::Chats if !app.chats.tabs().is_empty() => (
+            normal,
+            "  `j/k` move · `Enter` open · `i` write · `Tab/Shift-Tab` folders · `/` search · `s` find anyone · `p` pin · `m` mute · `Ctrl-o/i` back/forward · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         Focus::Chats => (
             normal,
@@ -1868,7 +2109,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages => (
             normal,
-            "  `j/k` newer/older · `y` copy · `r` reply · `f` forward · `R` react · `X` unreact · `e` edit · `d` delete · `Enter` open media · `i` write · `a` attach · `p` paste · `/` search · `s` find anyone · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            "  `j/k` newer/older · `y` copy · `r` reply · `f` forward · `R` react · `X` unreact · `e` edit · `d` delete · `P` pin · `gp` pinned · `Enter` open media · `i` write · `a` attach · `p` paste · `/` search · `s` find anyone · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         _ if picking && app.stickers.as_ref().is_some_and(|p| p.query.is_some()) => (
             sticker,
@@ -1913,10 +2154,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         || app.delete_menu.is_some()
         || app.react_menu.is_some()
         || app.vote_menu.is_some()
+        || app.button_menu.is_some()
+        || app.notice.is_some()
+        || app.pin_menu.is_some()
+        || app.pinned_menu.is_some()
         || app.picker.is_some()
         || app.confirm.is_some();
     let mut context = match &app.open {
-        Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open),
+        Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open, &app.jumps),
         _ => Vec::new(),
     };
     if let Some(open) = &app.open
@@ -2643,6 +2888,8 @@ mod tests {
             edited: false,
             album: 0,
             reactions: Vec::new(),
+            keyboard: None,
+            pinned: false,
         };
         let mut open = OpenChat::new(1);
         open.messages.insert(1, msg(None));
@@ -2652,15 +2899,19 @@ mod tests {
         };
         open.messages.insert(2, msg(Some(to_first)));
 
+        let mut jumps = Jumps::default();
         assert_eq!(
-            jump_hints(&open),
+            jump_hints(&open, &jumps),
             ["`gd` go to replied"],
             "newest is a reply"
         );
         open.selected = Some(1);
-        assert!(jump_hints(&open).is_empty());
-        open.jumps.push(2);
-        assert_eq!(jump_hints(&open), ["`Ctrl-o` back to reply"]);
+        assert!(jump_hints(&open, &jumps).is_empty());
+        jumps.leave(crate::app::Jump {
+            chat_id: 1,
+            message_id: Some(2),
+        });
+        assert_eq!(jump_hints(&open, &jumps), ["`Ctrl-o` back"]);
     }
 
     #[test]

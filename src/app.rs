@@ -11,24 +11,27 @@ use ratatui::style::Style;
 use ratatui::widgets::Block;
 use ratatui_textarea::{DataCursor, TextArea};
 use tdlib_rs::enums::{
-    AuthenticationCodeType, AuthorizationState, ChatList, ChatMemberStatus, MessageSender,
-    NotificationType, OptionValue, Update, UserType,
+    AuthenticationCodeType, AuthorizationState, ChatMemberStatus, MessageSender, NotificationType,
+    OptionValue, Update, UserType,
 };
 use tdlib_rs::types::{Message, UpdateNotificationGroup};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Instant, sleep_until};
 
 use crate::attach::{self, Attachment, Dropped};
-use crate::chats::{Badge, Chats, Peer, Presence};
+use crate::buttons::{ButtonMenu, Press};
+use crate::chats::{Badge, Chats, List, Peer, Presence};
 use crate::clipboard::{Clipboard, ClipboardEvent, Copied, Decoded, Paste, Pasted};
 use crate::complete::{self, Commands, Completion, Kind, Suggestion};
 use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
 use crate::messages::{
-    Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState, Sender, link_host,
+    Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState, Sender, link_host, one_line,
+    web_url,
 };
 use crate::notify::{self, Note, Notifications, Notifier};
 use crate::picker::{self, ChatPicker, Choice, Purpose};
+use crate::pins::{PinMenu, Pinned, PinnedMenu, Place};
 use crate::poll::{Vote, VoteMenu};
 use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search::{self, MessageSearch};
@@ -256,6 +259,13 @@ pub struct PickMenu {
     pub selected: usize,
 }
 
+/// A bot's alert, answering a button: shown until Enter or Esc.
+pub struct Notice {
+    /// The button's words.
+    pub title: String,
+    pub text: String,
+}
+
 /// A note in the corner that something worked, gone after [`TOAST_TIME`].
 pub struct Toast {
     pub title: String,
@@ -361,6 +371,62 @@ impl SettingsMenu {
             settings_scroll: 0,
             saved_notifications: settings.notifications,
         }
+    }
+}
+
+/// Places Ctrl-o and Ctrl-i go back to at most.
+const MAX_JUMPS: usize = 100;
+
+/// A place to come back to: a chat, and the message the cursor was on
+/// (`None` for the newest, following new ones).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Jump {
+    pub chat_id: i64,
+    pub message_id: Option<i64>,
+}
+
+/// Where Ctrl-o goes back to and Ctrl-i forward to again, as vim's jump
+/// list: chats you left for another, and replies `gd` left.
+#[derive(Default)]
+pub struct Jumps {
+    back: Vec<Jump>,
+    forward: Vec<Jump>,
+}
+
+impl Jumps {
+    /// Leaving `from` for somewhere new: Ctrl-o comes back to it, and the
+    /// places Ctrl-o had come back from are forgotten.
+    pub fn leave(&mut self, from: Jump) {
+        self.forward.clear();
+        if self.back.last() != Some(&from) {
+            self.back.push(from);
+        }
+        if self.back.len() > MAX_JUMPS {
+            self.back.remove(0);
+        }
+    }
+
+    /// Ctrl-o (`back`) or Ctrl-i: where to go from `here`, which the other
+    /// one then comes back to.
+    fn go(&mut self, back: bool, here: Option<Jump>) -> Option<Jump> {
+        let (from, to) = if back {
+            (&mut self.back, &mut self.forward)
+        } else {
+            (&mut self.forward, &mut self.back)
+        };
+        let next = from.pop()?;
+        to.extend(here);
+        Some(next)
+    }
+
+    /// Ctrl-o has somewhere to go.
+    pub fn can_go_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    /// Ctrl-i has somewhere to go.
+    pub fn can_go_forward(&self) -> bool {
+        !self.forward.is_empty()
     }
 }
 
@@ -477,6 +543,14 @@ pub struct App {
     pub react_menu: Option<ReactMenu>,
     /// Enter on a poll: its answers to vote for.
     pub vote_menu: Option<VoteMenu>,
+    /// Enter on a bot's message with buttons: them, to press.
+    pub button_menu: Option<ButtonMenu>,
+    /// A bot's alert, answering a button.
+    pub notice: Option<Notice>,
+    /// `P`: how to pin the message under the cursor.
+    pub pin_menu: Option<PinMenu>,
+    /// `gp`: the chat's pinned messages, to go to.
+    pub pinned_menu: Option<PinnedMenu>,
     /// `f` to forward a message, or `s` to find a chat to open.
     pub picker: Option<ChatPicker>,
     /// A chat being looked up to open. Opening another chat meanwhile
@@ -508,8 +582,16 @@ pub struct App {
     pub settings_menu: Option<SettingsMenu>,
     /// Shown in the status bar while typing a `/` search.
     pub prompt: Option<Prompt>,
-    pub chats_loading: bool,
-    all_chats_loaded: bool,
+    /// Chat lists with a `loadChats` call on its way.
+    loading_lists: HashSet<List>,
+    /// Chat lists with every chat loaded.
+    loaded_lists: HashSet<List>,
+    /// Chat lists loaded in the background until every chat is in, since
+    /// unread chats go first wherever Telegram has them: the main list, and
+    /// the folders shown.
+    wanted_lists: HashSet<List>,
+    /// Where Ctrl-o and Ctrl-i go.
+    pub jumps: Jumps,
     /// Last error, shown in the status bar until the next key press.
     pub status: Option<String>,
     /// First `g` of `gg` was pressed.
@@ -584,6 +666,10 @@ impl App {
             delete_menu: None,
             react_menu: None,
             vote_menu: None,
+            button_menu: None,
+            notice: None,
+            pin_menu: None,
+            pinned_menu: None,
             picker: None,
             finding: None,
             completion: None,
@@ -600,8 +686,10 @@ impl App {
             built_in_rejected: false,
             settings_menu: None,
             prompt: None,
-            chats_loading: false,
-            all_chats_loaded: false,
+            loading_lists: HashSet::new(),
+            loaded_lists: HashSet::new(),
+            wanted_lists: HashSet::new(),
+            jumps: Jumps::default(),
             // Only development builds read `.env`; someone expecting it to
             // pick a separate session should know this one didn't.
             status: config::dotenv_ignored()
@@ -816,14 +904,21 @@ impl App {
                 }
                 Screen::Main => self.status = Some(message),
             },
-            TgEvent::ChatsLoaded { all, failed } => {
-                self.chats_loading = false;
-                self.all_chats_loaded |= all;
+            TgEvent::ChatsLoaded { list, all, failed } => {
+                self.loading_lists.remove(&list);
+                if all {
+                    self.loaded_lists.insert(list);
+                }
                 // Unread chats go first wherever Telegram has them, so every
-                // chat has to be loaded. After an error, scrolling to the end
-                // of the list tries again.
-                if !failed {
-                    self.load_more_chats();
+                // chat of a list shown has to be loaded. After an error,
+                // scrolling to the end of the list tries again.
+                if !failed && self.wanted_lists.contains(&list) {
+                    self.load_more_chats(list);
+                }
+                // A first page of the archive says whether there is one,
+                // for its tab.
+                if all && list == List::Main {
+                    self.load_more_chats(List::Archive);
                 }
             }
             TgEvent::History {
@@ -850,6 +945,16 @@ impl App {
                 message_id,
                 deletable,
             } => self.on_deletable(chat_id, message_id, deletable),
+            TgEvent::Pinned {
+                chat_id,
+                request,
+                messages,
+            } => self.on_pinned(chat_id, request, messages),
+            TgEvent::Pinnable {
+                chat_id,
+                message_id,
+                pinnable,
+            } => self.on_pinnable(chat_id, message_id, pinnable),
             TgEvent::Editable {
                 chat_id,
                 message_id,
@@ -982,6 +1087,13 @@ impl App {
                 let title = self.chats.title(chat_id).unwrap_or_default().to_string();
                 self.show_toast("Left", &title);
             }
+            TgEvent::BotAnswer {
+                chat_id,
+                label,
+                text,
+                alert,
+                url,
+            } => self.on_bot_answer(chat_id, label, &text, alert, &url),
             TgEvent::Invite {
                 request,
                 link,
@@ -1067,9 +1179,16 @@ impl App {
                 .set_default_mute(&u.scope, u.notification_settings.mute_for),
             Update::ChatAction(u) => self.chats.set_action(u.chat_id, &u.sender_id, &u.action),
             Update::NotificationGroup(u) => self.on_notifications(u),
-            Update::UnreadChatCount(u) if matches!(u.chat_list, ChatList::Main) => {
-                self.set_unread_chats(u.unread_unmuted_count)
+            Update::UnreadChatCount(u) => {
+                let list = List::of(&u.chat_list);
+                self.chats.set_unread_in(list, u.unread_unmuted_count);
+                if list == List::Main {
+                    self.set_unread_chats(u.unread_unmuted_count);
+                }
             }
+            Update::ChatFolders(u) => self
+                .chats
+                .set_folders(&u.chat_folders, u.main_chat_list_position),
             Update::ChatPhoto(u) => self.chats.set_photo(u.chat_id, u.photo.as_ref()),
             Update::ChatAccentColors(u) => self.chats.set_accent(u.chat_id, u.accent_color_id),
             Update::AccentColors(u) => self.chats.set_accent_colors(&u.colors),
@@ -1154,6 +1273,21 @@ impl App {
             Update::MessageEdited(u) => {
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
                     open.set_edited(u.message_id);
+                    open.set_keyboard(u.message_id, u.reply_markup.as_ref());
+                    // Its buttons may be other ones now.
+                    if self
+                        .button_menu
+                        .as_ref()
+                        .is_some_and(|m| m.message_id == u.message_id)
+                    {
+                        self.button_menu = None;
+                    }
+                }
+            }
+            Update::MessageIsPinned(u) => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
+                    open.set_pinned(u.message_id, u.is_pinned);
+                    self.ask_pinned();
                 }
             }
             Update::MessageInteractionInfo(u) => {
@@ -1164,6 +1298,13 @@ impl App {
             Update::DeleteMessages(u) if u.is_permanent => {
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
                     open.remove(&u.message_ids);
+                    if self
+                        .button_menu
+                        .as_ref()
+                        .is_some_and(|m| u.message_ids.contains(&m.message_id))
+                    {
+                        self.button_menu = None;
+                    }
                 }
             }
             _ => {}
@@ -1200,7 +1341,8 @@ impl App {
             ),
             AuthorizationState::Ready => {
                 self.screen = Screen::Main;
-                self.load_more_chats();
+                self.wanted_lists.insert(List::Main);
+                self.load_more_chats(List::Main);
                 // Even when they're off: they can be turned on any time.
                 self.tg.enable_notifications();
                 self.notify_since = unix_now();
@@ -1251,10 +1393,20 @@ impl App {
         match self.screen {
             Screen::Login(_) => self.on_login_key(key),
             Screen::Main if self.confirm.is_some() => self.on_confirm_key(key),
+            Screen::Main if self.notice.is_some() => {
+                // Not any key: one typed for something else as it came up
+                // would close it unread.
+                if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                    self.notice = None;
+                }
+            }
             Screen::Main if self.settings_menu.is_some() => self.on_settings_key(key, ctrl),
             Screen::Main if self.delete_menu.is_some() => self.on_delete_key(key),
             Screen::Main if self.react_menu.is_some() => self.on_react_key(key, ctrl),
             Screen::Main if self.vote_menu.is_some() => self.on_vote_key(key),
+            Screen::Main if self.button_menu.is_some() => self.on_button_key(key),
+            Screen::Main if self.pin_menu.is_some() => self.on_pin_key(key),
+            Screen::Main if self.pinned_menu.is_some() => self.on_pinned_key(key),
             Screen::Main if self.menu.is_some() => self.on_menu_key(key),
             Screen::Main if self.picker.is_some() => self.on_picker_key(key, ctrl),
             Screen::Main if self.resizing.is_some() => self.on_resize_key(key, ctrl),
@@ -1449,6 +1601,13 @@ impl App {
                 self.settings_menu = Some(SettingsMenu::new(HelpTab::Shortcuts, &self.settings));
             }
             (_, KeyCode::Char(':')) => self.open_prompt(PromptKind::Command),
+            (_, KeyCode::Char('o')) if ctrl => self.jump(true),
+            // Before `i`, which writes. Terminals without the kitty keyboard
+            // protocol send Ctrl-i as Tab, which goes forward in the chat too.
+            (_, KeyCode::Char('i')) if ctrl => self.jump(false),
+            (Focus::Messages, KeyCode::Tab) => self.jump(false),
+            (Focus::Chats, KeyCode::Tab) => self.switch_list(1),
+            (Focus::Chats, KeyCode::BackTab) => self.switch_list(-1),
             (_, KeyCode::Char('s')) => self.picker = Some(ChatPicker::new(Purpose::Open)),
             (Focus::Chats, KeyCode::Char('/')) => self.open_prompt(PromptKind::Chats),
             (Focus::Messages, KeyCode::Char('/')) => self.open_prompt(PromptKind::Messages),
@@ -1496,14 +1655,15 @@ impl App {
             (Focus::Messages, KeyCode::Char('e')) => self.edit_selected(),
             (Focus::Messages, KeyCode::Char('y')) => self.copy_selected(),
             (Focus::Messages, KeyCode::Char('a')) => self.open_prompt(PromptKind::Attach),
+            (Focus::Messages, KeyCode::Char('p')) if pending_g => self.open_pinned_menu(),
             (Focus::Messages, KeyCode::Char('p')) => self.paste_clipboard(),
+            (Focus::Messages, KeyCode::Char('P')) => self.toggle_pin_message(),
             (Focus::Messages, KeyCode::Char('t')) if ctrl => self.toggle_as_files(),
             (Focus::Messages, KeyCode::Char('d')) if pending_g => self.go_to_replied(),
             (Focus::Messages, KeyCode::Char('d')) => self.open_delete_menu(),
             (Focus::Messages, KeyCode::Char('R')) => self.open_react_menu(),
             (Focus::Messages, KeyCode::Char('X')) => self.remove_reactions(),
             (Focus::Messages, KeyCode::Char('f')) => self.forward_selected(),
-            (Focus::Messages, KeyCode::Char('o')) if ctrl => self.jump_back(),
             (Focus::Chats, KeyCode::Enter) => self.open_selected_chat(),
             (Focus::Chats, KeyCode::Char(c)) if c == to_chat => self.open_selected_chat(),
             (Focus::Chats, KeyCode::Char('i')) => {
@@ -2126,6 +2286,10 @@ impl App {
         self.delete_menu = None;
         self.react_menu = None;
         self.vote_menu = None;
+        self.button_menu = None;
+        self.notice = None;
+        self.pin_menu = None;
+        self.pinned_menu = None;
         self.picker = None;
         self.finding = None;
         self.completion = None;
@@ -2135,8 +2299,11 @@ impl App {
         self.confirm = None;
         self.settings_menu = None;
         self.prompt = None;
-        self.chats_loading = false;
-        self.all_chats_loaded = false;
+        self.loading_lists.clear();
+        self.loaded_lists.clear();
+        self.wanted_lists.clear();
+        // Chats of the old account.
+        self.jumps = Jumps::default();
         self.pending_g = false;
         // The client that knew about being online and typing is gone.
         self.online = false;
@@ -2233,8 +2400,44 @@ impl App {
     }
 
     /// Opens a chat, in the list or not: one found with `s` may be a
-    /// public group you're not in.
+    /// public group you're not in. Ctrl-o comes back to the chat before.
     fn open_chat(&mut self, chat_id: i64) {
+        if let Some(here) = self.here().filter(|h| h.chat_id != chat_id) {
+            self.jumps.leave(here);
+        }
+        self.enter_chat(chat_id);
+    }
+
+    /// Where the cursor is: the open chat, and the message it's on.
+    fn here(&self) -> Option<Jump> {
+        self.open.as_ref().map(|o| Jump {
+            chat_id: o.chat_id,
+            message_id: o.selected,
+        })
+    }
+
+    /// Ctrl-o (`back`) or Ctrl-i: to the chat or message left before, or
+    /// forward again to where Ctrl-o came from.
+    fn jump(&mut self, back: bool) {
+        let here = self.here();
+        match self.jumps.go(back, here) {
+            Some(to) => {
+                if self.open.as_ref().is_none_or(|o| o.chat_id != to.chat_id) {
+                    self.enter_chat(to.chat_id);
+                }
+                self.focus = Focus::Messages;
+                match to.message_id {
+                    Some(id) => self.jump_to_message(id),
+                    None => self.jump_to_newest(),
+                }
+            }
+            None if back => self.status = Some("Nothing to go back to".into()),
+            None => self.status = Some("Nothing to go forward to".into()),
+        }
+    }
+
+    /// [`App::open_chat`], without Ctrl-o coming back to the chat before.
+    fn enter_chat(&mut self, chat_id: i64) {
         // A lookup still on its way would open another chat over this one.
         self.finding = None;
         // Popups about a message of the chat before are no use in this one.
@@ -2242,7 +2445,10 @@ impl App {
         self.delete_menu = None;
         self.react_menu = None;
         self.vote_menu = None;
-        if self.chats.listed(chat_id) && self.selected != Some(chat_id) {
+        self.button_menu = None;
+        self.pin_menu = None;
+        self.pinned_menu = None;
+        if self.chats.in_list(chat_id, self.chats.shown()) && self.selected != Some(chat_id) {
             // The list's cursor goes to it, even if the filter hid it.
             if !self.chats.ids().contains(&chat_id) {
                 self.chats.set_filter("");
@@ -2264,11 +2470,187 @@ impl App {
         self.open = Some(OpenChat::new(chat_id));
         self.composer = new_composer();
         self.load_older_messages();
+        self.ask_pinned();
+    }
+
+    /// Asks for the open chat's pinned messages, again whenever one is
+    /// pinned or unpinned.
+    fn ask_pinned(&mut self) {
+        if let Some(open) = self.open.as_mut() {
+            open.pinned_asked += 1;
+            self.tg.pinned_messages(open.chat_id, open.pinned_asked);
+        }
+    }
+
+    fn on_pinned(&mut self, chat_id: i64, request: u32, messages: Option<Vec<Message>>) {
+        // Only the last answer for the chat open: an older one may miss a
+        // message pinned since.
+        let Some(open) = self
+            .open
+            .as_mut()
+            .filter(|o| o.chat_id == chat_id && o.pinned_asked == request)
+        else {
+            return;
+        };
+        // On an error, TDLib's message is already in the status bar.
+        let Some(messages) = messages else {
+            return;
+        };
+        open.pinned = messages
+            .into_iter()
+            .map(|m| {
+                let id = m.id;
+                Pinned::new(id, &m.into())
+            })
+            .collect();
+        let count = open.pinned.len();
+        if count == 0 {
+            self.pinned_menu = None;
+        } else if let Some(menu) = self.pinned_menu.as_mut() {
+            menu.selected = menu.selected.min(count - 1);
+        }
+    }
+
+    /// `P`: pins the message under the cursor, asking how, or unpins it.
+    /// The popup opens at once and fills in when TDLib says it can be.
+    fn toggle_pin_message(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let Some((&id, msg)) = open
+            .cursor_id()
+            .and_then(|id| open.messages.get_key_value(&id))
+        else {
+            return;
+        };
+        match msg.state {
+            SendState::Pending => self.status = Some("Wait until it's sent".into()),
+            SendState::Failed => self.status = Some("This message wasn't sent".into()),
+            SendState::Sent if msg.pinned => self.tg.unpin_message(open.chat_id, id),
+            SendState::Sent => {
+                let chat = self.chats.get(open.chat_id);
+                let place = match chat {
+                    _ if self.chats.is_saved(open.chat_id) => Place::Saved,
+                    Some(c) if c.is_private => Place::Private,
+                    Some(c) if c.is_channel => Place::Channel,
+                    _ => Place::Group,
+                };
+                let with = self.chats.title(open.chat_id).unwrap_or("them").to_string();
+                self.pin_menu = Some(PinMenu::new(id, msg.snippet(), place, with));
+                self.tg.check_pinnable(open.chat_id, id);
+            }
+        }
+    }
+
+    fn on_pinnable(&mut self, chat_id: i64, message_id: i64, pinnable: Option<bool>) {
+        // Drop answers for a popup that closed, or a chat that changed.
+        if self.open.as_ref().is_none_or(|o| o.chat_id != chat_id) {
+            return;
+        }
+        let Some(menu) = self
+            .pin_menu
+            .as_mut()
+            .filter(|m| m.message_id == message_id)
+        else {
+            return;
+        };
+        match pinnable {
+            // On an error, TDLib's message is already in the status bar.
+            None => self.pin_menu = None,
+            Some(false) => {
+                self.pin_menu = None;
+                self.status = Some("You can't pin messages here".into());
+            }
+            Some(true) => menu.allow(),
+        }
+    }
+
+    /// The pin popup takes all keys while it's up.
+    fn on_pin_key(&mut self, key: KeyEvent) {
+        let Some(menu) = self.pin_menu.as_mut() else {
+            return;
+        };
+        let last = menu.choices.len().saturating_sub(1);
+        let pick = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                menu.selected = (menu.selected + 1).min(last);
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                menu.selected = menu.selected.saturating_sub(1);
+                None
+            }
+            KeyCode::Enter | KeyCode::Char('l') => Some(menu.selected),
+            KeyCode::Char(c @ '1'..='9') => Some(c as usize - '1' as usize),
+            KeyCode::Esc | KeyCode::Char('q' | 'h') => {
+                self.pin_menu = None;
+                return;
+            }
+            _ => None,
+        };
+        // Nothing to pick while TDLib hasn't answered.
+        let Some(choice) = pick.and_then(|i| menu.choices.get(i).copied()) else {
+            return;
+        };
+        let message_id = menu.message_id;
+        self.pin_menu = None;
+        if let Some(open) = &self.open {
+            let (quietly, only_for_self) = choice.flags();
+            self.tg
+                .pin_message(open.chat_id, message_id, quietly, only_for_self);
+        }
+    }
+
+    /// `gp`: the chat's pinned messages, newest first, to go to one.
+    fn open_pinned_menu(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        if open.pinned.is_empty() {
+            self.status = Some("No pinned messages in this chat".into());
+            return;
+        }
+        self.pinned_menu = Some(PinnedMenu::default());
+    }
+
+    /// The pinned messages popup takes all keys while it's up: Enter goes to
+    /// the one under the cursor, and `P` unpins it.
+    fn on_pinned_key(&mut self, key: KeyEvent) {
+        let (Some(open), Some(menu)) = (&self.open, self.pinned_menu.as_mut()) else {
+            self.pinned_menu = None;
+            return;
+        };
+        let last = open.pinned.len().saturating_sub(1);
+        let current = open.pinned.get(menu.selected).map(|p| p.id);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => menu.selected = (menu.selected + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
+            KeyCode::Char('g') => menu.selected = 0,
+            KeyCode::Char('G') => menu.selected = last,
+            KeyCode::Enter | KeyCode::Char('l') => {
+                self.pinned_menu = None;
+                if let Some(id) = current {
+                    // Ctrl-o comes back.
+                    if let Some(here) = self.here() {
+                        self.jumps.leave(here);
+                    }
+                    self.jump_to_message(id);
+                }
+            }
+            // The list follows once TDLib says it's unpinned.
+            KeyCode::Char('P') => {
+                if let Some(id) = current {
+                    self.tg.unpin_message(open.chat_id, id);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'h') => self.pinned_menu = None,
+            _ => {}
+        }
     }
 
     /// Enter on a message: shows its spoilers first, as a tap does in
-    /// Telegram; then opens its file or link right away, or shows a menu when
-    /// there's more than one.
+    /// Telegram; votes in a poll; lists a bot's buttons; else opens its file
+    /// or link right away, or shows a menu when there's more than one.
     fn open_selected_message(&mut self) {
         let Some(open) = self.open.as_mut() else {
             return;
@@ -2286,6 +2668,25 @@ impl App {
             match (msg.state, poll.cant_vote()) {
                 (SendState::Sent, None) => self.vote_menu = Some(VoteMenu::new(id, poll)),
                 (SendState::Sent, Some(why)) => self.status = Some(why.into()),
+                _ => self.status = Some("Wait until it's sent".into()),
+            }
+            return;
+        }
+        if let Some((&id, msg)) = open
+            .cursor_id()
+            .and_then(|id| open.messages.get_key_value(&id))
+            && let Some(keyboard) = &msg.keyboard
+        {
+            match msg.state {
+                SendState::Sent => {
+                    self.button_menu = Some(ButtonMenu::new(
+                        id,
+                        msg.snippet(),
+                        keyboard,
+                        msg.file.as_ref(),
+                        &msg.links,
+                    ));
+                }
                 _ => self.status = Some("Wait until it's sent".into()),
             }
             return;
@@ -2708,6 +3109,111 @@ impl App {
         self.tg.vote(open.chat_id, menu.message_id, answers);
     }
 
+    /// The button popup takes all keys while it's up: `h/j/k/l` move as the
+    /// buttons are laid out, Tab goes through them in order.
+    fn on_button_key(&mut self, key: KeyEvent) {
+        let Some(menu) = self.button_menu.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => menu.move_rows(1),
+            KeyCode::Char('k') | KeyCode::Up => menu.move_rows(-1),
+            KeyCode::Char('h') | KeyCode::Left => menu.move_cols(-1),
+            KeyCode::Char('l') | KeyCode::Right => menu.move_cols(1),
+            KeyCode::Tab => menu.move_by(1),
+            KeyCode::BackTab => menu.move_by(-1),
+            KeyCode::Char(c @ '1'..='9') => {
+                if menu.select(c as usize - '1' as usize) {
+                    self.press_button();
+                }
+            }
+            KeyCode::Enter => self.press_button(),
+            KeyCode::Esc | KeyCode::Char('q') => self.button_menu = None,
+            _ => {}
+        }
+    }
+
+    /// Enter in the button popup: does what the button under the cursor
+    /// does, and closes the popup. One tuigram can't press says why, and
+    /// the popup stays.
+    fn press_button(&mut self) {
+        let Some(menu) = &self.button_menu else {
+            return;
+        };
+        let Some(button) = menu.current().cloned() else {
+            return;
+        };
+        if let Press::Unsupported(why) = button.press {
+            self.status = Some(why.into());
+            return;
+        }
+        let message_id = menu.message_id;
+        self.button_menu = None;
+        let Some(chat_id) = self.open.as_ref().map(|o| o.chat_id) else {
+            return;
+        };
+        match button.press {
+            Press::Callback(data) => {
+                self.show_toast("Pressed", &button.label);
+                self.tg
+                    .press_button(chat_id, message_id, data, button.label);
+            }
+            Press::Open(link) => self.open_target(Target::Link(link)),
+            Press::File(file) => self.open_target(Target::File(file)),
+            Press::Telegram(url) => {
+                self.finding = Some(Finding::new(&url));
+                self.tg.find_link(url.clone(), url);
+            }
+            Press::User(user_id) => {
+                let name = self
+                    .users
+                    .get(&user_id)
+                    .cloned()
+                    .unwrap_or_else(|| button.label.clone());
+                self.finding = Some(Finding::new(&name));
+                self.tg.find_private_chat(user_id, name);
+            }
+            Press::Copy(text) => self.copy_target(Target::Text(text)),
+            Press::Send(text) => {
+                // In a group it answers the bot's message, as Telegram's
+                // apps do, so the bot knows whose buttons they were.
+                let private = self.chats.get(chat_id).is_some_and(|c| c.is_private);
+                let reply_to = (!private).then_some(message_id);
+                self.tg.send_plain(chat_id, text, reply_to);
+                self.jump_to_newest();
+            }
+            Press::Unsupported(_) => {}
+        }
+    }
+
+    /// A bot answered a button: a note goes in the corner, an alert in a
+    /// popup. A link it sends opens only while its chat is open and nothing
+    /// else holds the keys, and asks first, since nothing said where it goes.
+    fn on_bot_answer(&mut self, chat_id: i64, label: String, text: &str, alert: bool, url: &str) {
+        let text = one_line(text);
+        let here = self.open.as_ref().is_some_and(|o| o.chat_id == chat_id) && !self.busy();
+        if !text.is_empty() {
+            if alert && here {
+                self.notice = Some(Notice {
+                    title: label.clone(),
+                    text,
+                });
+            } else {
+                self.show_toast(&label, &text);
+            }
+        }
+        if url.is_empty() || !here || self.notice.is_some() {
+            return;
+        }
+        match web_url(url) {
+            Some(url) => self.open_link_outside(Link {
+                url,
+                disguise: Some(label),
+            }),
+            None => self.status = Some("The bot's link isn't a web address".into()),
+        }
+    }
+
     /// `f`: forwards the message under the cursor, or its whole album, to a
     /// chat picked from your list.
     fn forward_selected(&mut self) {
@@ -2999,26 +3505,18 @@ impl App {
     /// `gd`: from a reply to the message it answers, loading the history
     /// around it if needed. Ctrl-o comes back.
     fn go_to_replied(&mut self) {
-        let Some(open) = self.open.as_mut() else {
+        let Some(open) = self.open.as_ref() else {
             return;
         };
         match open.replied_jump() {
             Ok((from, to)) => {
-                open.jumps.push(from);
+                self.jumps.leave(Jump {
+                    chat_id: open.chat_id,
+                    message_id: Some(from),
+                });
                 self.jump_to_message(to);
             }
             Err(why) => self.status = Some(why.into()),
-        }
-    }
-
-    /// Ctrl-o: back to the reply the last `gd` left.
-    fn jump_back(&mut self) {
-        let Some(open) = self.open.as_mut() else {
-            return;
-        };
-        match open.jumps.pop() {
-            Some(id) => self.jump_to_message(id),
-            None => self.status = Some("Nothing to go back to".into()),
         }
     }
 
@@ -3115,6 +3613,10 @@ impl App {
             || self.delete_menu.is_some()
             || self.react_menu.is_some()
             || self.vote_menu.is_some()
+            || self.button_menu.is_some()
+            || self.notice.is_some()
+            || self.pin_menu.is_some()
+            || self.pinned_menu.is_some()
             || self.menu.is_some()
             || self.picker.is_some()
             || self.resizing.is_some()
@@ -3594,26 +4096,46 @@ impl App {
         self.selected = Some(ids[index]);
 
         if index + LOAD_AHEAD >= last {
-            self.load_more_chats();
+            self.load_more_chats(self.chats.shown());
         }
     }
 
-    fn load_more_chats(&mut self) {
-        if self.chats_loading || self.all_chats_loaded {
+    fn load_more_chats(&mut self, list: List) {
+        if self.loading_lists.contains(&list) || self.loaded_lists.contains(&list) {
             return;
         }
-        self.chats_loading = true;
-        self.tg.load_chats(CHAT_PAGE);
+        self.loading_lists.insert(list);
+        self.tg.load_chats(list, CHAT_PAGE);
     }
 
-    /// `p` in the list: pins the selected chat to the top, or unpins it, on
-    /// Telegram, so your other devices show it too.
+    /// The list shown is still loading.
+    pub fn chats_loading(&self) -> bool {
+        self.loading_lists.contains(&self.chats.shown())
+    }
+
+    /// Tab (`step` 1) / Shift-Tab (-1) in the chat list: the next or
+    /// previous folder, round the end, with the cursor on its first chat.
+    fn switch_list(&mut self, step: isize) {
+        if self.chats.tabs().is_empty() {
+            self.status = Some("No folders yet: Telegram's apps can make them".into());
+            return;
+        }
+        let list = self.chats.next_list(step);
+        self.chats.show(list);
+        self.chats.refresh();
+        self.selected = self.chats.ids().first().copied();
+        self.wanted_lists.insert(list);
+        self.load_more_chats(list);
+    }
+
+    /// `p` in the list: pins the selected chat to the top of the list
+    /// shown, or unpins it, on Telegram, so your other devices show it too.
     fn toggle_pin(&mut self) {
         let Some(chat_id) = self.selected else {
             return;
         };
-        let pinned = self.chats.get(chat_id).is_some_and(|c| c.pinned);
-        self.tg.pin_chat(chat_id, !pinned);
+        let pinned = self.chats.pinned(chat_id);
+        self.tg.pin_chat(self.chats.shown(), chat_id, !pinned);
     }
 
     /// `m` in the list: mutes the selected chat for good, or unmutes it, on
@@ -4049,6 +4571,280 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
         crate::demo::demo_app(Tg::detached(unbounded_channel().0), images, &dir)
+    }
+
+    #[test]
+    fn ctrl_o_and_ctrl_i_go_back_and_forward_like_vims_jump_list() {
+        let at = |chat_id, message_id| Jump {
+            chat_id,
+            message_id,
+        };
+        let mut jumps = Jumps::default();
+        jumps.leave(at(1, None));
+        jumps.leave(at(2, Some(5)));
+        jumps.leave(at(2, Some(5)));
+        assert_eq!(jumps.go(true, Some(at(3, None))), Some(at(2, Some(5))));
+        assert_eq!(jumps.go(true, Some(at(2, Some(5)))), Some(at(1, None)));
+        assert_eq!(
+            jumps.go(true, Some(at(1, None))),
+            None,
+            "the same place once"
+        );
+        assert_eq!(jumps.go(false, Some(at(1, None))), Some(at(2, Some(5))));
+        assert!(jumps.can_go_back() && jumps.can_go_forward());
+
+        // Going somewhere new forgets where Ctrl-i would have gone.
+        jumps.leave(at(2, Some(5)));
+        assert!(!jumps.can_go_forward());
+        for id in 0..MAX_JUMPS as i64 * 2 {
+            jumps.leave(at(id, None));
+        }
+        assert_eq!(jumps.back.len(), MAX_JUMPS);
+    }
+
+    #[test]
+    fn gd_then_ctrl_o_and_ctrl_i_move_between_a_reply_and_what_it_answers() {
+        let mut app = test_app("jumps");
+        app.focus = Focus::Messages;
+        let (none, ctrl) = (KeyModifiers::NONE, KeyModifiers::CONTROL);
+        let reply = app
+            .open
+            .as_ref()
+            .unwrap()
+            .messages
+            .iter()
+            .find_map(|(&id, m)| {
+                let to = m.reply_to.as_ref()?.message_id?;
+                Some((id, to))
+            });
+        let (from, to) = reply.expect("the demo has a reply");
+        let cursor = |app: &App| app.open.as_ref().unwrap().selected;
+        app.open.as_mut().unwrap().selected = Some(from);
+
+        press(&mut app, KeyCode::Char('g'), none);
+        press(&mut app, KeyCode::Char('d'), none);
+        assert_eq!(cursor(&app), Some(to));
+        press(&mut app, KeyCode::Char('o'), ctrl);
+        assert_eq!(cursor(&app), Some(from));
+        // Ctrl-i, from a terminal with the kitty keyboard protocol.
+        press(&mut app, KeyCode::Char('i'), ctrl);
+        assert_eq!(cursor(&app), Some(to));
+        assert!(app.focus == Focus::Messages, "not Insert mode");
+        // And as most terminals send it.
+        press(&mut app, KeyCode::Char('o'), ctrl);
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(cursor(&app), Some(to));
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(app.status.as_deref(), Some("Nothing to go forward to"));
+    }
+
+    #[test]
+    fn tab_and_shift_tab_in_the_chat_list_go_round_the_folders() {
+        let mut app = test_app("folders");
+        app.focus = Focus::Chats;
+        // The demo's folders, loaded already, so nothing is asked of TDLib.
+        let (friends, work) = (List::Folder(1), List::Folder(2));
+        app.loaded_lists.extend([List::Main, friends, work]);
+        let none = KeyModifiers::NONE;
+        let top = |app: &mut App| screen(app)[1].clone();
+        assert!(top(&mut app).contains(" All 3 "), "{}", top(&mut app));
+
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(app.chats.shown(), friends);
+        app.chats.refresh();
+        assert!(
+            app.chats
+                .ids()
+                .iter()
+                .all(|&id| app.chats.in_list(id, friends))
+        );
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(app.chats.shown(), work);
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(app.chats.shown(), List::Main, "round the end");
+        press(&mut app, KeyCode::BackTab, none);
+        assert_eq!(app.chats.shown(), work);
+        let first = app.chats.ids()[0];
+        assert_eq!(app.selected, Some(first), "on the folder's first chat");
+    }
+
+    /// The id of a message in the demo chat that Enter does nothing else
+    /// with, under the cursor.
+    fn plain_message(app: &mut App) -> i64 {
+        let open = app.open.as_mut().unwrap();
+        let id = open
+            .messages
+            .iter()
+            .find(|(_, m)| m.state == SendState::Sent && m.poll.is_none() && !m.hides_spoilers())
+            .map(|(&id, _)| id)
+            .unwrap();
+        open.selected = Some(id);
+        id
+    }
+
+    #[test]
+    fn gp_lists_the_pinned_messages_and_enter_goes_to_one() {
+        let mut app = test_app("pinned");
+        app.focus = Focus::Messages;
+        let (none, ctrl) = (KeyModifiers::NONE, KeyModifiers::CONTROL);
+        let pinned = app.open.as_ref().unwrap().pinned[0].id;
+        let cursor = |app: &App| app.open.as_ref().unwrap().selected;
+        assert_eq!(cursor(&app), None, "on the newest");
+
+        press(&mut app, KeyCode::Char('g'), none);
+        press(&mut app, KeyCode::Char('p'), none);
+        assert!(app.pinned_menu.is_some(), "not a paste");
+        assert!(
+            screen(&mut app)
+                .join("\n")
+                .contains(" Pinned messages (1) ")
+        );
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.pinned_menu.is_none());
+        assert_eq!(cursor(&app), Some(pinned));
+        press(&mut app, KeyCode::Char('o'), ctrl);
+        assert_eq!(cursor(&app), None, "Ctrl-o comes back");
+
+        app.open.as_mut().unwrap().pinned.clear();
+        press(&mut app, KeyCode::Char('g'), none);
+        press(&mut app, KeyCode::Char('p'), none);
+        assert!(app.pinned_menu.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("No pinned messages in this chat")
+        );
+    }
+
+    #[test]
+    fn the_pin_popup_fills_in_once_tdlib_says_and_old_lists_are_dropped() {
+        let mut app = test_app("pin");
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        let menu = |id| PinMenu::new(id, "hi".into(), Place::Group, String::new());
+        let pinnable = |message_id, pinnable| TgEvent::Pinnable {
+            chat_id,
+            message_id,
+            pinnable: Some(pinnable),
+        };
+        app.pin_menu = Some(menu(4));
+        app.on_tg(pinnable(5, true));
+        assert!(
+            app.pin_menu.as_ref().unwrap().choices.is_empty(),
+            "another message"
+        );
+        app.on_tg(pinnable(4, true));
+        assert_eq!(app.pin_menu.as_ref().unwrap().choices.len(), 2);
+        app.pin_menu = Some(menu(4));
+        app.on_tg(pinnable(4, false));
+        assert!(app.pin_menu.is_none());
+        assert_eq!(app.status.as_deref(), Some("You can't pin messages here"));
+
+        // An answer to an older request misses what was pinned since.
+        app.open.as_mut().unwrap().pinned_asked = 2;
+        app.on_tg(TgEvent::Pinned {
+            chat_id,
+            request: 1,
+            messages: Some(Vec::new()),
+        });
+        assert_eq!(app.open.as_ref().unwrap().pinned.len(), 1);
+        app.on_tg(TgEvent::Pinned {
+            chat_id,
+            request: 2,
+            messages: Some(Vec::new()),
+        });
+        assert!(app.open.as_ref().unwrap().pinned.is_empty());
+    }
+
+    #[test]
+    fn enter_on_a_bots_message_lists_its_buttons_then_its_links() {
+        use crate::buttons::{Button, Keyboard};
+        let mut app = test_app("buttons");
+        app.focus = Focus::Messages;
+        let id = plain_message(&mut app);
+        let none = KeyModifiers::NONE;
+        let msg = app.open.as_mut().unwrap().messages.get_mut(&id).unwrap();
+        msg.links = vec![Link::from("https://example.com/menu")];
+        msg.keyboard = Some(Keyboard {
+            rows: vec![vec![
+                Button {
+                    label: "Play".into(),
+                    press: Press::Unsupported("Games only run in Telegram's own apps"),
+                },
+                Button {
+                    label: "Our site".into(),
+                    press: Press::Open(Link {
+                        url: "https://shop.example/".into(),
+                        disguise: Some("Our site".into()),
+                    }),
+                },
+            ]],
+            reply: false,
+        });
+
+        press(&mut app, KeyCode::Enter, none);
+        let menu = app.button_menu.as_ref().expect("the buttons");
+        assert_eq!(menu.rows.len(), 2, "and the message's link");
+        let rows = screen(&mut app).join("\n");
+        assert!(rows.contains(" Buttons "), "{rows}");
+        assert!(rows.contains("Open link: example.com"), "{rows}");
+
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Games only run in Telegram's own apps")
+        );
+        assert!(app.button_menu.is_some(), "stays up");
+        press(&mut app, KeyCode::Char('l'), none);
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.button_menu.is_none());
+        let confirm = app.confirm.as_ref().expect("its words aren't its address");
+        assert!(matches!(&confirm.action, Confirmed::OpenLink(u) if u == "https://shop.example/"));
+
+        // 1-9 press by number, counted through the rows.
+        app.confirm = None;
+        press(&mut app, KeyCode::Enter, none);
+        press(&mut app, KeyCode::Char('2'), none);
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn a_bots_answer_is_a_note_or_an_alert_and_its_link_asks_first() {
+        let mut app = test_app("bot-answer");
+        app.focus = Focus::Messages;
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        let answer = |text: &str, alert, url: &str| TgEvent::BotAnswer {
+            chat_id,
+            label: "Buy".into(),
+            text: text.into(),
+            alert,
+            url: url.into(),
+        };
+
+        app.on_tg(answer("Added\nto cart", false, ""));
+        let toast = app.toast.as_ref().expect("a note in the corner");
+        assert_eq!(
+            (toast.title.as_str(), toast.detail.as_str()),
+            ("Buy", "Added to cart")
+        );
+
+        app.on_tg(answer("Sold \u{202e}out", true, ""));
+        assert_eq!(app.notice.as_ref().unwrap().text, "Sold out");
+        assert!(screen(&mut app).join("\n").contains("Sold out"));
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.notice.is_some(), "only Enter or Esc closes it");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.notice.is_none());
+
+        app.on_tg(answer("", false, "https://game.example/play"));
+        let confirm = app.confirm.take().expect("asks before opening");
+        assert!(
+            matches!(confirm.action, Confirmed::OpenLink(u) if u == "https://game.example/play")
+        );
+
+        // Writing: nothing pops up over it.
+        app.focus = Focus::Input;
+        app.on_tg(answer("Sold out", true, "https://game.example/play"));
+        assert!(app.notice.is_none() && app.confirm.is_none());
+        assert_eq!(app.toast.as_ref().unwrap().detail, "Sold out");
     }
 
     #[test]

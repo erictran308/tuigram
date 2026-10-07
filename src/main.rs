@@ -1,5 +1,6 @@
 mod app;
 mod attach;
+mod buttons;
 mod chats;
 mod clipboard;
 mod complete;
@@ -9,6 +10,7 @@ mod images;
 mod messages;
 mod notify;
 mod picker;
+mod pins;
 mod poll;
 mod reactions;
 mod search;

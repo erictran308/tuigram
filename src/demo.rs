@@ -17,16 +17,17 @@ use futures::StreamExt;
 use image::{Rgb, RgbImage};
 use ratatui_image::picker::Picker;
 use tdlib_rs::enums::{ChatAction, MessageSender};
-use tdlib_rs::types::MessageSenderUser;
+use tdlib_rs::types::{ChatFolderInfo, ChatFolderName, FormattedText, MessageSenderUser};
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::app::{self, App, Focus, HelpTab, Screen, SettingsMenu};
-use crate::chats::{Chat, ChatPhoto, Chats};
+use crate::chats::{Chat, ChatPhoto, Chats, List};
 use crate::clipboard::Clipboard;
 use crate::images::Images;
 use crate::messages::{
     Editable, Link, Msg, OpenChat, Preview, Replied, ReplyTo, SendState, Sender,
 };
+use crate::pins::Pinned;
 use crate::reactions::{ReactMenu, Reaction, ReactionKind};
 use crate::search::MessageSearch;
 use crate::settings::Settings;
@@ -50,6 +51,10 @@ const RUSTACEANS: i64 = -103;
 const TOKYO: i64 = -104;
 const BOOK_CLUB: i64 = -105;
 const DESIGN: i64 = -106;
+
+// Folders, by id.
+const FRIENDS: i32 = 1;
+const WORK: i32 = 2;
 
 // Photos, by file id.
 const SUNRISE: i32 = 1;
@@ -409,6 +414,33 @@ fn fill_chats(chats: &mut Chats) {
     chats.set_action(HIKE, &user(MAYA), &ChatAction::Typing);
     chats.set_highlighted(&[MOM]);
     chats.opened(HIKE);
+
+    // Folders, as tabs over the list, with their unread chats.
+    let folder = |id, name: &str| ChatFolderInfo {
+        id,
+        name: ChatFolderName {
+            text: FormattedText {
+                text: name.into(),
+                entities: Vec::new(),
+            },
+            animate_custom_emoji: false,
+        },
+        ..ChatFolderInfo::default()
+    };
+    chats.set_folders(&[folder(FRIENDS, "Friends"), folder(WORK, "Work")], 0);
+    for id in [HIKE, ALEX, MOM, TOKYO, DAD] {
+        chats.add_local_to(List::Folder(FRIENDS), id);
+    }
+    for id in [TERMINAL_WEEKLY, RUSTACEANS, DESIGN] {
+        chats.add_local_to(List::Folder(WORK), id);
+    }
+    for (list, unread) in [
+        (List::Main, 3),
+        (List::Folder(FRIENDS), 1),
+        (List::Folder(WORK), 2),
+    ] {
+        chats.set_unread_in(list, unread);
+    }
     chats.refresh();
 }
 
@@ -530,6 +562,8 @@ fn hike() -> OpenChat {
         edited: false,
         album: 0,
         reactions: Vec::new(),
+        keyboard: None,
+        pinned: false,
     };
     let url = "https://trails.example.com/eagle-ridge";
     let link = msg(LEO, at(2, 19, 5), &format!("Here's the trail: {url}"));
@@ -586,6 +620,11 @@ fn hike() -> OpenChat {
         (8, snacks),
         (9, msg(ME, at(3, 7, 55), "On my way!")),
     ]);
+    // The trail's link, pinned for everyone to find.
+    if let Some(link) = open.messages.get_mut(&TRAIL_LINK) {
+        link.pinned = true;
+        open.pinned = vec![Pinned::new(TRAIL_LINK, link)];
+    }
     open
 }
 

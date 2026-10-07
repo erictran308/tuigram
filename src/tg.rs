@@ -17,7 +17,7 @@ use tdlib_rs::{enums, functions, types};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::error::SendError;
 
-use crate::chats::{Badge, Peer};
+use crate::chats::{Badge, List, Peer};
 use crate::config::{ApiKeys, Config};
 use crate::reactions::{self, Available, ReactionKind};
 use crate::stickers::{Source, Sticker};
@@ -26,9 +26,11 @@ pub enum TgEvent {
     Update(Box<enums::Update>),
     /// A request failed. The text is TDLib's, e.g. `PHONE_CODE_INVALID`.
     Error(String),
-    /// A `loadChats` call finished; `all` is true once every chat is loaded.
-    /// `failed` if TDLib answered with an error (sent before as `Error`).
+    /// A `loadChats` call for a list finished; `all` is true once every
+    /// chat in it is loaded. `failed` if TDLib answered with an error (sent
+    /// before as `Error`).
     ChatsLoaded {
+        list: List,
         all: bool,
         failed: bool,
     },
@@ -49,6 +51,19 @@ pub enum TgEvent {
         chat_id: i64,
         message_id: i64,
         replied: Option<Box<types::Message>>,
+    },
+    /// A chat's pinned messages, newest first, for request number
+    /// `request`; `None` if TDLib couldn't send them.
+    Pinned {
+        chat_id: i64,
+        request: u32,
+        messages: Option<Vec<types::Message>>,
+    },
+    /// Whether a message can be pinned; `None` if TDLib couldn't say.
+    Pinnable {
+        chat_id: i64,
+        message_id: i64,
+        pinnable: Option<bool>,
     },
     /// Who a message can be deleted for; `None` if TDLib couldn't say.
     Deletable {
@@ -127,6 +142,17 @@ pub enum TgEvent {
     Left {
         chat_id: i64,
     },
+    /// A bot's answer to a button pressed on its message: a note, or an
+    /// alert to show until a key is pressed, and maybe a link to open.
+    /// Empty when it only changed its message.
+    BotAnswer {
+        chat_id: i64,
+        /// The button's words.
+        label: String,
+        text: String,
+        alert: bool,
+        url: String,
+    },
     /// An invite link to a chat you're not in, to ask before joining.
     Invite {
         request: String,
@@ -200,6 +226,11 @@ const QUIET_DOWNLOAD_PRIORITY: i32 = 8;
 /// Chats with notifications at once. Only new ones are announced, so a few
 /// is plenty; TDLib allows up to 25.
 const NOTIFICATION_GROUPS: i64 = 5;
+
+/// Pinned messages asked for at once, TDLib's most.
+const PINNED_PAGE: i32 = 100;
+/// Pages of pinned messages asked for at most.
+const PINNED_PAGES: usize = 5;
 
 /// Stickers a search in the sticker panel asks for.
 const STICKER_SEARCH_LIMIT: i32 = 100;
@@ -554,14 +585,14 @@ impl Tg {
         ));
     }
 
-    /// Asks TDLib for the next `limit` chats of the main list. They arrive as
+    /// Asks TDLib for the next `limit` chats of a list. They arrive as
     /// `updateNewChat`/`updateChatPosition` updates, not in the response.
-    pub fn load_chats(&self, limit: i32) {
+    pub fn load_chats(&self, list: List, limit: i32) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
         tokio::spawn(async move {
             let (all, failed) =
-                match functions::load_chats(Some(enums::ChatList::Main), limit, client_id).await {
+                match functions::load_chats(Some(list.tdlib()), limit, client_id).await {
                     Ok(()) => (false, false),
                     // 404 is TDLib's way of saying there are no more chats.
                     Err(e) if e.code == 404 => (true, false),
@@ -570,7 +601,7 @@ impl Tg {
                         (false, true)
                     }
                 };
-            let _ = tx.send(TgEvent::ChatsLoaded { all, failed });
+            let _ = tx.send(TgEvent::ChatsLoaded { list, all, failed });
         });
     }
 
@@ -649,6 +680,97 @@ impl Tg {
                 found,
             });
         });
+    }
+
+    /// Fetches a chat's pinned messages, newest first, as
+    /// [`TgEvent::Pinned`] numbered `request`.
+    pub fn pinned_messages(&self, chat_id: i64, request: u32) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let mut messages = Vec::new();
+            let mut from = 0;
+            for _ in 0..PINNED_PAGES {
+                let result = functions::search_chat_messages(
+                    chat_id,
+                    None,
+                    String::new(),
+                    None,
+                    from,
+                    0,
+                    PINNED_PAGE,
+                    Some(enums::SearchMessagesFilter::Pinned),
+                    client_id,
+                )
+                .await;
+                match result {
+                    Ok(enums::FoundChatMessages::FoundChatMessages(found)) => {
+                        messages.extend(found.messages);
+                        from = found.next_from_message_id;
+                        if from == 0 {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(TgEvent::Error(e.message));
+                        let _ = tx.send(TgEvent::Pinned {
+                            chat_id,
+                            request,
+                            messages: None,
+                        });
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(TgEvent::Pinned {
+                chat_id,
+                request,
+                messages: Some(messages),
+            });
+        });
+    }
+
+    /// Asks whether a message can be pinned, which depends on the chat and
+    /// your rights in it.
+    pub fn check_pinnable(&self, chat_id: i64, message_id: i64) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let result = functions::get_message_properties(chat_id, message_id, client_id).await;
+            let pinnable = match result {
+                Ok(enums::MessageProperties::MessageProperties(p)) => Some(p.can_be_pinned),
+                Err(e) => {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    None
+                }
+            };
+            let _ = tx.send(TgEvent::Pinnable {
+                chat_id,
+                message_id,
+                pinnable,
+            });
+        });
+    }
+
+    /// Pins a message: `quietly` without a notification, `only_for_self`
+    /// in a chat with one person. TDLib then sends `updateMessageIsPinned`.
+    pub fn pin_message(&self, chat_id: i64, message_id: i64, quietly: bool, only_for_self: bool) {
+        self.spawn(functions::pin_chat_message(
+            chat_id,
+            message_id,
+            quietly,
+            only_for_self,
+            self.client_id,
+        ));
+    }
+
+    /// Unpins a message. TDLib then sends `updateMessageIsPinned`.
+    pub fn unpin_message(&self, chat_id: i64, message_id: i64) {
+        self.spawn(functions::unpin_chat_message(
+            chat_id,
+            message_id,
+            self.client_id,
+        ));
     }
 
     /// Fetches the message that message `message_id` replies to, even from
@@ -818,8 +940,18 @@ impl Tg {
     /// temporary id (`updateNewMessage`), then `updateMessageSendSucceeded`
     /// or `…Failed`.
     pub fn send_text(&self, chat_id: i64, text: String, reply_to: Option<i64>) {
+        self.send_formatted(chat_id, markdown(text), reply_to);
+    }
+
+    /// Sends text as it is, without making its Markdown formatting: a
+    /// bot's reply button sends its words exactly.
+    pub fn send_plain(&self, chat_id: i64, text: String, reply_to: Option<i64>) {
+        self.send_formatted(chat_id, plain(text), reply_to);
+    }
+
+    fn send_formatted(&self, chat_id: i64, text: types::FormattedText, reply_to: Option<i64>) {
         let content = enums::InputMessageContent::InputMessageText(types::InputMessageText {
-            text: markdown(text),
+            text,
             link_preview_options: None,
             clear_draft: true,
         });
@@ -1207,11 +1339,11 @@ impl Tg {
         });
     }
 
-    /// Pins a chat to the top of the main list, or unpins it. TDLib then
-    /// sends `updateChatPosition`; past Telegram's limit it's an error.
-    pub fn pin_chat(&self, chat_id: i64, pinned: bool) {
+    /// Pins a chat to the top of a list, or unpins it. TDLib then sends
+    /// `updateChatPosition`; past Telegram's limit it's an error.
+    pub fn pin_chat(&self, list: List, chat_id: i64, pinned: bool) {
         self.spawn(functions::toggle_chat_is_pinned(
-            enums::ChatList::Main,
+            list.tdlib(),
             chat_id,
             pinned,
             self.client_id,
@@ -1237,6 +1369,32 @@ impl Tg {
             answers,
             self.client_id,
         ));
+    }
+
+    /// Presses a bot's button on its message, sending the bot the button's
+    /// data. Its answer comes back as [`TgEvent::BotAnswer`]; one that
+    /// doesn't come in time is an error.
+    pub fn press_button(&self, chat_id: i64, message_id: i64, data: String, label: String) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let payload =
+                enums::CallbackQueryPayload::Data(types::CallbackQueryPayloadData { data });
+            let answer =
+                functions::get_callback_query_answer(chat_id, message_id, payload, client_id).await;
+            let _ = match answer {
+                Ok(enums::CallbackQueryAnswer::CallbackQueryAnswer(a)) => {
+                    tx.send(TgEvent::BotAnswer {
+                        chat_id,
+                        label,
+                        text: a.text,
+                        alert: a.show_alert,
+                        url: a.url,
+                    })
+                }
+                Err(e) => tx.send(TgEvent::Error(e.message)),
+            };
+        });
     }
 
     /// Leaves a group or channel. TDLib then takes it out of the list.

@@ -6,15 +6,17 @@ use std::ops::Range;
 use base64::Engine;
 use tdlib_rs::enums::{
     LinkPreviewType, MessageContent, MessageOrigin, MessageReplyTo, MessageSender,
-    MessageSendingState, StickerFormat, TextEntityType, ThumbnailFormat,
+    MessageSendingState, ReplyMarkup, StickerFormat, TextEntityType, ThumbnailFormat,
 };
 use tdlib_rs::types::{self, Message};
 use unicode_width::UnicodeWidthStr;
 
 use crate::attach::{Attachment, Dropped};
+use crate::buttons::Keyboard;
 use crate::chats::content_text_as_sent;
 use crate::complete::Commands;
 use crate::images::Thumbnail;
+use crate::pins::Pinned;
 use crate::poll::Poll;
 use crate::reactions::{self, Reaction, ReactionKind};
 use crate::search::MessageSearch;
@@ -208,6 +210,10 @@ pub struct Msg {
     pub album: i64,
     /// Reactions people added, most added first.
     pub reactions: Vec<Reaction>,
+    /// A bot's buttons, which Enter lists to press.
+    pub keyboard: Option<Keyboard>,
+    /// Pinned in the chat.
+    pub pinned: bool,
 }
 
 /// What `e` can change in a message, which decides how TDLib is asked.
@@ -479,7 +485,7 @@ impl From<&MessageOrigin> for Origin {
 /// The text on one line, at most [`SNIPPET_CHARS`] long: a quote or a popup
 /// shows only its start, and a sender's 4096 characters would be measured
 /// again on every frame.
-fn one_line(text: &str) -> String {
+pub fn one_line(text: &str) -> String {
     let line = text::clean(text)
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -542,7 +548,7 @@ impl Replied {
 }
 
 /// A message's downloadable file, with what to call it in the open menu.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaFile {
     pub id: i32,
     pub label: String,
@@ -799,7 +805,7 @@ fn links(text: &types::FormattedText) -> Vec<(Link, Range<usize>)> {
 
 /// Whether link text spells out the URL it leads to, give or take the
 /// scheme, `www.`, a trailing slash and case.
-fn same_place(shown: &str, url: &str) -> bool {
+pub fn same_place(shown: &str, url: &str) -> bool {
     let bare = |s: &str| {
         let s = s.trim().to_lowercase();
         let s = s
@@ -825,7 +831,7 @@ pub fn byte_offset(text: &str, utf16: i32) -> usize {
 }
 
 /// `example.com/x` becomes `https://example.com/x`; other schemes are dropped.
-fn web_url(url: &str) -> Option<String> {
+pub fn web_url(url: &str) -> Option<String> {
     let url = text::clean(url);
     let url = url.trim();
     // A link with a line break in it would be copied as several lines, and
@@ -921,6 +927,8 @@ impl From<Message> for Msg {
             edited: message.edit_date != 0,
             album: message.media_album_id,
             reactions: reactions::from_info(message.interaction_info.as_ref()),
+            keyboard: Keyboard::of(message.reply_markup.as_ref()),
+            pinned: message.is_pinned,
         }
     }
 }
@@ -979,10 +987,14 @@ pub struct OpenChat {
     /// What replies answer when it isn't among the loaded messages, by the
     /// id of the reply.
     pub replied: HashMap<i64, Fetched>,
-    /// Replies `gd` jumped away from, latest last, for Ctrl-o to go back to.
-    pub jumps: Vec<i64>,
     /// The commands of the chat's bots, for `/` completion.
     pub commands: Commands,
+    /// The chat's pinned messages, newest first, for the bar over it and
+    /// `gp`.
+    pub pinned: Vec<Pinned>,
+    /// The last time the pinned messages were asked for, counted, so an
+    /// older answer can't replace a newer one.
+    pub pinned_asked: u32,
 }
 
 impl OpenChat {
@@ -1004,8 +1016,9 @@ impl OpenChat {
             as_files: false,
             uploads: HashMap::new(),
             replied: HashMap::new(),
-            jumps: Vec::new(),
             commands: Commands::NotAsked,
+            pinned: Vec::new(),
+            pinned_asked: 0,
         }
     }
 
@@ -1197,6 +1210,26 @@ impl OpenChat {
         }
     }
 
+    /// A message was pinned or unpinned, by you or anyone. The list follows
+    /// at once where it can; asking TDLib again brings it up to date.
+    pub fn set_pinned(&mut self, message_id: i64, pinned: bool) {
+        self.pinned.retain(|p| p.id != message_id);
+        if let Some(msg) = self.messages.get_mut(&message_id) {
+            msg.pinned = pinned;
+            if pinned {
+                let at = self.pinned.partition_point(|p| p.id > message_id);
+                self.pinned.insert(at, Pinned::new(message_id, msg));
+            }
+        }
+    }
+
+    /// A bot changed a message's buttons, or took them away.
+    pub fn set_keyboard(&mut self, message_id: i64, markup: Option<&ReplyMarkup>) {
+        if let Some(msg) = self.messages.get_mut(&message_id) {
+            msg.keyboard = Keyboard::of(markup);
+        }
+    }
+
     /// Where `gd` goes from the message under the cursor: (the reply, the
     /// message it answers), or why it can't go anywhere.
     pub fn replied_jump(&self) -> Result<(i64, i64), &'static str> {
@@ -1371,6 +1404,7 @@ impl OpenChat {
 
     pub fn remove(&mut self, message_ids: &[i64]) {
         for id in message_ids {
+            self.pinned.retain(|p| p.id != *id);
             self.messages.remove(id);
             if self.selected == Some(*id) {
                 self.selected = None;
@@ -1976,6 +2010,8 @@ mod tests {
                     edited: false,
                     album: 0,
                     reactions: Vec::new(),
+                    keyboard: None,
+                    pinned: false,
                 };
                 (id, msg)
             })
@@ -2322,6 +2358,28 @@ mod tests {
             Err("The message it answers was deleted"),
             "no selection means the newest"
         );
+    }
+
+    #[test]
+    fn pinning_keeps_the_list_newest_first_and_marks_the_message() {
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page(1..=6));
+        let ids = |open: &OpenChat| open.pinned.iter().map(|p| p.id).collect::<Vec<_>>();
+        for id in [2, 5, 3] {
+            open.set_pinned(id, true);
+        }
+        assert_eq!(ids(&open), [5, 3, 2]);
+        assert!(open.messages[&3].pinned);
+        assert_eq!(open.pinned[1].snippet, "message 3");
+
+        open.set_pinned(3, false);
+        assert_eq!(ids(&open), [5, 2]);
+        assert!(!open.messages[&3].pinned);
+        open.remove(&[5]);
+        assert_eq!(ids(&open), [2], "deleted, so no longer pinned");
+        // Not loaded: asking TDLib again brings it.
+        open.set_pinned(99, true);
+        assert_eq!(ids(&open), [2]);
     }
 
     #[test]

@@ -20,6 +20,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("s", "Find a chat or person: a name, @username or t.me link"),
             ("H", "Highlight or unhighlight the selected chat"),
             (
+                "Ctrl-o / Ctrl-i",
+                "Back to the chat or reply you left / forward again",
+            ),
+            (
                 "Ctrl-r",
                 "Resize the panes: h / l, = as at first, Enter keeps, Esc cancels",
             ),
@@ -38,6 +42,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Open the chat (Enter / h with the list on the right)",
             ),
             ("i", "Open the chat and write"),
+            (
+                "Tab / Shift-Tab",
+                "Next / previous folder, then the archive",
+            ),
             ("/", "Filter chats by name"),
             ("p", "Pin or unpin the chat (on all your devices)"),
             ("m", "Mute or unmute the chat"),
@@ -52,7 +60,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-d / Ctrl-u", "Half a page newer / older"),
             (
                 "Enter",
-                "Show spoilers, vote in a poll, or open the photo, file or link",
+                "Show spoilers, vote in a poll, list a bot's buttons, or open the photo, file or link",
             ),
             ("y", "Copy the text, a link, or the photo or file"),
             ("r", "Reply"),
@@ -64,8 +72,13 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ),
             ("X", "Take back all your reactions"),
             ("d", "Delete"),
+            ("P", "Pin the message (asks how), or unpin it"),
+            ("gp", "Pinned messages: Enter goes to one, P unpins it"),
             ("gd", "Go to the message a reply answers"),
-            ("Ctrl-o", "Back to the reply"),
+            (
+                "Tab",
+                "Forward again, as Ctrl-i (most terminals send Ctrl-i as Tab)",
+            ),
             ("i", "Write a message"),
             ("a", "Attach a file by its path (Tab completes it)"),
             ("p", "Paste a photo, files or text from the clipboard"),
@@ -118,6 +131,19 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Enter", "Send the sticker, or the reply"),
             ("/", "Find stickers by emoji or word"),
             ("Tab / Esc", "Back to writing"),
+        ],
+    ),
+    (
+        "Bot buttons",
+        &[
+            ("h / j / k / l", "Move, as the buttons are laid out"),
+            ("Tab / Shift-Tab", "Next / previous button"),
+            (
+                "Enter",
+                "Press it: the bot answers, a link opens (asking first), a reply button sends its words",
+            ),
+            ("1-9", "Press by number"),
+            ("Esc / q", "Close"),
         ],
     ),
     (

@@ -14,6 +14,7 @@ use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
 
 use super::truncate;
+use crate::buttons::Keyboard;
 use crate::chats::{Chats, Presence, Seen};
 use crate::images::Images;
 use crate::messages::{
@@ -34,8 +35,12 @@ const MAX_STICKER_COLS: usize = 20;
 const MAX_STICKER_ROWS: usize = 10;
 /// Least space between a message's last line and the time beside it.
 const META_GAP: usize = 3;
-/// Space between two reactions under a bubble.
+/// Space between two reactions under a bubble, and two of a bot's buttons.
 const CHIP_GAP: usize = 1;
+/// Before the words of a bot's reply buttons, under its message.
+const REPLY_BUTTONS: &str = "⌨ ";
+/// Before the time of a pinned message, and the bar of pinned messages.
+const PIN: &str = "📌";
 
 /// Resolves message senders to display names.
 pub struct Names<'a> {
@@ -173,11 +178,34 @@ pub fn draw(
     if open.loading.is_some() {
         title.push(Span::from("· loading… "));
     }
+    let border = super::border(focused, colors);
     let block = Block::bordered()
         .title(Line::from(title))
-        .border_style(super::border(focused, colors));
+        .border_style(border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let inner = match open.pinned.first() {
+        Some(newest) => {
+            let [bar, rule, rest] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .areas(inner);
+            let line = pinned_bar(newest, open.pinned.len(), bar.width.into(), colors);
+            frame.render_widget(line, bar);
+            // Across the pane, meeting the border on both sides.
+            let rule_line = format!("├{}┤", "─".repeat(rule.width.into()));
+            let rule = Rect {
+                x: area.x,
+                width: rule.width + 2,
+                ..rule
+            };
+            frame.render_widget(Line::styled(rule_line, border), rule);
+            rest
+        }
+        None => inner,
+    };
 
     if open.messages.is_empty() {
         let text = if open.loading.is_some() {
@@ -499,6 +527,7 @@ fn measure<'a>(
             _ => Some(msg),
         };
         let edited = msg.edited || caption.is_some_and(|c| c.edited);
+        let pinned = msg.pinned || caption.is_some_and(|c| c.pinned);
         // An album has one time, at the bottom; a photo still on its way, or
         // that didn't make it, says so under itself.
         let meta = match msg.state {
@@ -510,6 +539,9 @@ fn measure<'a>(
                 } else {
                     time.to_string()
                 };
+                if pinned {
+                    meta = format!("{PIN} {meta}");
+                }
                 // One tick once it's sent, two once it's been read.
                 if msg.outgoing
                     && let Some(read) = read_outbox
@@ -882,6 +914,71 @@ fn card_rows(card: &Card, width: usize, image: Option<(u16, u16)>) -> Vec<(Strin
     rows
 }
 
+/// The bar over a chat with pinned messages: the newest one, how many
+/// there are, and the key that lists them.
+fn pinned_bar(
+    newest: &crate::pins::Pinned,
+    count: usize,
+    width: usize,
+    colors: &Colors,
+) -> Line<'static> {
+    let label = match count {
+        1 => format!(" {PIN} Pinned "),
+        n => format!(" {PIN} {n} pinned "),
+    };
+    let (key, more) = (" gp ", "list ");
+    let room = width.saturating_sub(label.width() + key.width() + more.width() + 2);
+    let snippet = truncate(&newest.snippet, room);
+    let pad = room.saturating_sub(snippet.width());
+    Line::from(vec![
+        Span::from(label).fg(colors.accent).bold(),
+        Span::from(snippet),
+        Span::from(" ".repeat(pad + 2)),
+        Span::from(key).fg(colors.accent).bold(),
+        Span::from(more).fg(colors.muted),
+    ])
+}
+
+/// Columns a bot's buttons want under its message, up to `max`: each row
+/// of inline buttons side by side, or reply buttons' words on one line.
+fn keyboard_width(keyboard: &Keyboard, max: usize) -> usize {
+    let wanted = if keyboard.reply {
+        reply_buttons_line(keyboard).width()
+    } else {
+        keyboard
+            .rows
+            .iter()
+            .map(|row| {
+                let gaps = row.len().saturating_sub(1) * CHIP_GAP;
+                row.iter().map(|b| b.label.width() + 2).sum::<usize>() + gaps
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    wanted.min(max)
+}
+
+/// Reply buttons as their bubble shows them: their words on one line. They
+/// work like a keyboard, not on the message, so they take little room.
+fn reply_buttons_line(keyboard: &Keyboard) -> String {
+    let words: Vec<String> = keyboard
+        .rows
+        .iter()
+        .flatten()
+        .map(|b| format!("[{}]", b.label))
+        .collect();
+    format!("{REPLY_BUTTONS}{}", words.join(" "))
+}
+
+/// Rows a bot's buttons take under its message.
+fn keyboard_rows(keyboard: Option<&Keyboard>) -> usize {
+    match keyboard {
+        Some(k) if k.reply => 1,
+        Some(k) => k.rows.len(),
+        None => 0,
+    }
+}
+
 /// Where a bubble's time goes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetaAt {
@@ -1007,6 +1104,9 @@ impl<'a> Bubble<'a> {
         if let Some((cols, _)) = photo {
             width = width.max(usize::from(cols));
         }
+        if let Some(keyboard) = &msg.keyboard {
+            width = width.max(keyboard_width(keyboard, max_text));
+        }
         Bubble {
             msg,
             links: caption.map_or(&[], |c| c.link_ranges.as_slice()),
@@ -1037,6 +1137,7 @@ impl<'a> Bubble<'a> {
             + self.card.len()
             + self.chips.len()
             + usize::from(self.meta_at == MetaAt::Own && self.meta.is_some())
+            + keyboard_rows(self.msg.keyboard.as_ref())
     }
 
     /// Stickers float on the pane, without a bubble behind them.
@@ -1222,8 +1323,53 @@ impl<'a> Bubble<'a> {
                 inner,
             ));
         }
+        // A bot's buttons come last, under the time, as in Telegram.
+        match &msg.keyboard {
+            Some(keyboard) if keyboard.reply => {
+                let line = truncate(&reply_buttons_line(keyboard), inner);
+                let w = line.width();
+                out.push(row(vec![Span::styled(line, style.fg(faded))], w));
+            }
+            Some(keyboard) => {
+                let look = |_, _: &_| (style.fg(faded), style);
+                for buttons in &keyboard.rows {
+                    out.push(row(button_row(buttons, inner, style, look), inner));
+                }
+            }
+            None => {}
+        }
         out
     }
+}
+
+/// A row of a bot's buttons, `[ like this ]`, sharing `width` columns
+/// evenly, each one's words in the middle of its brackets. `look` gives the
+/// button at each place in the row the style of its brackets and of its
+/// words; `gap` goes between buttons.
+pub(super) fn button_row(
+    buttons: &[crate::buttons::Button],
+    width: usize,
+    gap: Style,
+    look: impl Fn(usize, &crate::buttons::Button) -> (Style, Style),
+) -> Vec<Span<'static>> {
+    let count = buttons.len().max(1);
+    let free = width.saturating_sub((count - 1) * CHIP_GAP);
+    let (each, extra) = (free / count, free % count);
+    let mut spans = Vec::new();
+    for (i, b) in buttons.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" ".repeat(CHIP_GAP), gap));
+        }
+        let (brackets, words) = look(i, b);
+        let cell = each + usize::from(i < extra);
+        let label = truncate(&b.label, cell.saturating_sub(2));
+        let pad = cell.saturating_sub(label.width() + 2);
+        let (left, right) = (pad / 2, pad - pad / 2);
+        spans.push(Span::styled(format!("[{}", " ".repeat(left)), brackets));
+        spans.push(Span::styled(label, words));
+        spans.push(Span::styled(format!("{}]", " ".repeat(right)), brackets));
+    }
+    spans
 }
 
 /// A bubble's background and the color of its time and send status.
@@ -1238,7 +1384,7 @@ fn bubble_colors(outgoing: bool, colors: &Colors) -> (Color, Color) {
 /// Word-wraps text to `width` columns, keeping the message's own line breaks.
 /// Each line comes with the byte offset where it starts in `text`, so link
 /// ranges can be matched up after wrapping.
-fn wrap(text: &str, width: usize) -> Vec<(String, usize)> {
+pub(super) fn wrap(text: &str, width: usize) -> Vec<(String, usize)> {
     let options = textwrap::Options::new(width).break_words(true);
     let mut out = Vec::new();
     let mut line_start = 0;
@@ -1417,6 +1563,8 @@ mod tests {
             edited: false,
             album: 0,
             reactions: Vec::new(),
+            keyboard: None,
+            pinned: false,
         }
     }
 
@@ -2526,6 +2674,84 @@ mod tests {
         let heart = at("❤\u{FE0F}").expect("❤ drawn two columns wide");
         assert_eq!(buf[(heart, y)].bg, colors.other_reaction);
         assert_eq!(buf[(heart + 3, y)].symbol(), "1");
+    }
+
+    #[test]
+    fn a_bots_buttons_go_under_its_message_sharing_the_bubbles_width() {
+        use crate::buttons::{Button, Keyboard, Press};
+        let button = |label: &str| Button {
+            label: label.into(),
+            press: Press::Callback(label.into()),
+        };
+        let colors = Colors::default();
+        let mut open = OpenChat::new(42);
+        let mut pick = msg(false, 1_790_000_000, "Pick a size");
+        pick.keyboard = Some(Keyboard {
+            rows: vec![
+                vec![button("Small"), button("Large")],
+                vec![button("Cancel the whole order")],
+            ],
+            reply: false,
+        });
+        open.messages.insert(1, pick);
+        let buf = render_buffer(&mut open, false, &mut images());
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let text = rows.iter().position(|r| r.contains("Pick a size")).unwrap();
+        let (sizes, cancel) = (&rows[text + 1], &rows[text + 2]);
+        // The widest row sets the width, and the others share it evenly.
+        assert!(sizes.contains("[  Small   ] [  Large  ]"), "{sizes}");
+        assert!(cancel.contains("[Cancel the whole order]"), "{cancel}");
+        let col = |row: &str, s: &str| row.chars().take(row.find(s).unwrap()).count() as u16;
+        let y = (text + 1) as u16;
+        let (bracket, small) = (col(sizes, "["), col(sizes, "Small"));
+        assert_eq!(buf[(bracket, y)].fg, colors.other_meta, "faded brackets");
+        assert_eq!(buf[(small, y)].fg, colors.fg);
+        assert_eq!(buf[(small, y)].bg, colors.other_bubble, "on the bubble");
+    }
+
+    #[test]
+    fn pinned_messages_show_in_a_bar_over_the_chat_and_by_their_time() {
+        let mut open = sample();
+        open.set_pinned(1, true);
+        let rows = render(&mut open, false);
+        assert!(
+            rows[1].contains("📌") && rows[1].contains(" Pinned hi there"),
+            "{}",
+            rows[1]
+        );
+        assert!(rows[1].trim_end().ends_with("gp list │"), "{}", rows[1]);
+        assert!(
+            rows[2].starts_with('├') && rows[2].ends_with('┤'),
+            "{}",
+            rows[2]
+        );
+        let text = rows.iter().rposition(|r| r.contains("hi there")).unwrap();
+        assert!(rows[text].contains("📌 "), "by its time: {}", rows[text]);
+
+        open.set_pinned(4, true);
+        let rows = render(&mut open, false);
+        assert!(rows[1].contains(" 2 pinned ok"), "the newest: {}", rows[1]);
+    }
+
+    #[test]
+    fn reply_buttons_are_one_line_of_their_words() {
+        use crate::buttons::{Button, Keyboard, Press};
+        let button = |label: &str| Button {
+            label: label.into(),
+            press: Press::Send(label.into()),
+        };
+        let mut open = OpenChat::new(42);
+        let mut menu = msg(false, 1_790_000_000, "What next?");
+        menu.keyboard = Some(Keyboard {
+            rows: vec![vec![button("Yes"), button("No")], vec![button("Later")]],
+            reply: true,
+        });
+        open.messages.insert(1, menu);
+        let rows = render(&mut open, false);
+        let text = rows.iter().position(|r| r.contains("What next?")).unwrap();
+        assert!(rows[text + 1].contains("⌨ [Yes] [No] [Later]"), "{rows:#?}");
     }
 
     #[test]

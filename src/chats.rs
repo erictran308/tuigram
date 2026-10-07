@@ -1,7 +1,8 @@
-//! The main chat list, rebuilt from TDLib updates.
+//! The chat list, rebuilt from TDLib updates.
 //!
-//! TDLib gives every chat an `order` per chat list. The list is the chats with a
-//! non-zero order, sorted by (order, chat id) descending. On top of that, chats
+//! TDLib gives every chat an `order` per chat list: the main one, the archive
+//! and each of your folders. The list shown is the chats with a non-zero
+//! order in it, sorted by (order, chat id) descending. On top of that, chats
 //! with unread messages come first. A `/` search narrows the list to chats
 //! whose title matches.
 
@@ -12,8 +13,8 @@ use tdlib_rs::enums::{
     UserStatus,
 };
 use tdlib_rs::types::{
-    self, AccentColor, ChatNotificationSettings, ChatPhotoInfo, ChatPosition, FormattedText,
-    Message,
+    self, AccentColor, ChatFolderInfo, ChatNotificationSettings, ChatPhotoInfo, ChatPosition,
+    FormattedText, Message,
 };
 
 use crate::images::Thumbnail;
@@ -33,8 +34,9 @@ pub struct Chat {
     pub read_outbox: i64,
     /// One-line summary of the last message, e.g. "You: see you at 5".
     pub preview: String,
-    /// Position in the main list; 0 means the chat isn't in it (e.g. archived).
-    order: i64,
+    /// Where the chat is in each list it's in: the main list or the archive,
+    /// and any of your folders.
+    positions: HashMap<List, Position>,
     pub photo: Option<ChatPhoto>,
     /// Telegram's accent color id, which colors the chat's badge when it has
     /// no photo.
@@ -44,10 +46,91 @@ pub struct Chat {
     pub activity: Vec<(Sender, &'static str)>,
     /// The person or group the chat is with, for its [`Badge`].
     pub peer: Option<Peer>,
-    /// Pinned to the top of the main list.
-    pub pinned: bool,
     /// How the chat notifies, which `m` changes the mute of.
     notifications: ChatNotificationSettings,
+}
+
+/// A list of chats: the main one, the archive, or one of your folders.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum List {
+    #[default]
+    Main,
+    Archive,
+    Folder(i32),
+}
+
+impl List {
+    pub fn of(list: &ChatList) -> Self {
+        match list {
+            ChatList::Main => List::Main,
+            ChatList::Archive => List::Archive,
+            ChatList::Folder(f) => List::Folder(f.chat_folder_id),
+        }
+    }
+
+    /// The list as TDLib takes it.
+    pub fn tdlib(self) -> ChatList {
+        match self {
+            List::Main => ChatList::Main,
+            List::Archive => ChatList::Archive,
+            List::Folder(id) => ChatList::Folder(types::ChatListFolder { chat_folder_id: id }),
+        }
+    }
+}
+
+/// Where a chat is in a list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Position {
+    order: i64,
+    /// Pinned to the top of the list.
+    pinned: bool,
+}
+
+/// A tab over the chat list: a folder, all chats, or the archive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tab {
+    pub list: List,
+    pub name: String,
+    /// Unread chats in it that aren't muted, as Telegram counts them.
+    pub unread: i32,
+}
+
+/// What the tab of the main list is called, as in Telegram.
+const ALL_CHATS: &str = "All";
+/// And the archive's.
+const ARCHIVE: &str = "Archive";
+
+impl Chat {
+    /// TDLib's order of the chat in a list; 0 if it isn't in it.
+    fn order(&self, list: List) -> i64 {
+        self.positions.get(&list).map_or(0, |p| p.order)
+    }
+
+    /// Pinned to the top of a list.
+    pub fn pinned(&self, list: List) -> bool {
+        self.positions.get(&list).is_some_and(|p| p.pinned)
+    }
+
+    fn set_position(&mut self, position: &ChatPosition) {
+        let list = List::of(&position.list);
+        if position.order == 0 {
+            self.positions.remove(&list);
+        } else {
+            let place = Position {
+                order: position.order,
+                pinned: position.is_pinned,
+            };
+            self.positions.insert(list, place);
+        }
+    }
+
+    /// Pins the chat in a list it's in, or unpins it, for tests.
+    #[cfg(test)]
+    pub fn set_pinned(&mut self, list: List, pinned: bool) {
+        if let Some(place) = self.positions.get_mut(&list) {
+            place.pinned = pinned;
+        }
+    }
 }
 
 /// Whom a chat is with: a person, or a group or channel.
@@ -135,6 +218,14 @@ pub struct Chats {
     /// Accent color ids past the seven built-in ones, mapped to the built-in
     /// one they look like.
     accent_colors: HashMap<i32, i32>,
+    /// The list shown: the main one, the archive or a folder.
+    shown: List,
+    /// Your folders, by id and name, in your order.
+    folders: Vec<(i32, String)>,
+    /// Where the main list's tab goes among the folders.
+    main_at: usize,
+    /// Unread unmuted chats in each list, from `updateUnreadChatCount`.
+    unread_in: HashMap<List, i32>,
     /// What Telegram says about the people and groups chats are with.
     badges: HashMap<Peer, Badge>,
     /// The @username of people and groups that have one.
@@ -195,7 +286,6 @@ impl Chats {
             ChatType::Supergroup(s) => Some(Peer::Supergroup(s.supergroup_id)),
             ChatType::BasicGroup(b) => Some(Peer::BasicGroup(b.basic_group_id)),
         };
-        let main = main_position(&chat.positions);
         let entry = Chat {
             title: text::clean(&chat.title),
             is_channel,
@@ -203,24 +293,23 @@ impl Chats {
             unread: chat.unread_count,
             read_outbox: chat.last_read_outbox_message_id,
             preview: chat.last_message.as_ref().map(preview).unwrap_or_default(),
-            order: main.map_or(0, |p| p.order),
+            positions: HashMap::new(),
             photo: chat.photo.as_ref().map(ChatPhoto::new),
             accent: chat.accent_color_id,
             activity: Vec::new(),
             peer,
-            pinned: main.is_some_and(|p| p.is_pinned),
             notifications: chat.notification_settings,
         };
-        self.by_id.insert(chat.id, entry);
+        let entry = self.by_id.entry(chat.id).insert_entry(entry).into_mut();
+        for position in &chat.positions {
+            entry.set_position(position);
+        }
         self.dirty = true;
     }
 
     pub fn set_position(&mut self, chat_id: i64, position: &ChatPosition) {
-        if let ChatList::Main = position.list
-            && let Some(chat) = self.by_id.get_mut(&chat_id)
-        {
-            chat.order = position.order;
-            chat.pinned = position.is_pinned;
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            chat.set_position(position);
             self.dirty = true;
         }
     }
@@ -233,9 +322,8 @@ impl Chats {
     ) {
         if let Some(chat) = self.by_id.get_mut(&chat_id) {
             chat.preview = message.map(preview).unwrap_or_default();
-            if let Some(main) = main_position(positions) {
-                chat.order = main.order;
-                chat.pinned = main.is_pinned;
+            for position in positions {
+                chat.set_position(position);
                 self.dirty = true;
             }
         }
@@ -323,10 +411,11 @@ impl Chats {
         if !self.dirty {
             return;
         }
+        let list = self.shown;
         self.sorted = self
             .by_id
             .iter()
-            .filter(|(_, chat)| chat.order != 0)
+            .filter(|(_, chat)| chat.order(list) != 0)
             .map(|(&id, _)| id)
             .collect();
         self.total = self.sorted.len();
@@ -343,7 +432,7 @@ impl Chats {
         self.sorted.sort_unstable_by_key(|&id| {
             let chat = &by_id[&id];
             let unread = chat.unread > 0 || held == Some(id);
-            std::cmp::Reverse((chat.pinned, unread, chat.order, id))
+            std::cmp::Reverse((chat.pinned(list), unread, chat.order(list), id))
         });
         self.dirty = false;
     }
@@ -360,9 +449,90 @@ impl Chats {
         &self.filter
     }
 
-    /// How many chats are in the main list, filtered out or not.
+    /// How many chats are in the list shown, filtered out or not.
     pub fn total(&self) -> usize {
         self.total
+    }
+
+    /// The list shown: the main one, the archive or a folder.
+    pub fn shown(&self) -> List {
+        self.shown
+    }
+
+    /// Shows another list. The `/` filter stays.
+    pub fn show(&mut self, list: List) {
+        if self.shown != list {
+            self.shown = list;
+            self.dirty = true;
+        }
+    }
+
+    /// The chat is pinned to the top of the list shown.
+    pub fn pinned(&self, chat_id: i64) -> bool {
+        self.by_id
+            .get(&chat_id)
+            .is_some_and(|c| c.pinned(self.shown))
+    }
+
+    /// Your folders, from `updateChatFolders`, and where the main list goes
+    /// among them. A folder that's gone can't stay shown.
+    pub fn set_folders(&mut self, folders: &[ChatFolderInfo], main_at: i32) {
+        self.folders = folders
+            .iter()
+            .map(|f| {
+                let name = text::clean(&f.name.text.text);
+                (f.id, name.split_whitespace().collect::<Vec<_>>().join(" "))
+            })
+            .collect();
+        self.main_at = usize::try_from(main_at).unwrap_or(0);
+        if !self.tabs().iter().any(|t| t.list == self.shown) {
+            self.show(List::Main);
+        }
+    }
+
+    /// Unread unmuted chats in a list, for its tab.
+    pub fn set_unread_in(&mut self, list: List, count: i32) {
+        self.unread_in.insert(list, count);
+    }
+
+    /// The tabs over the list, in Telegram's order: your folders with all
+    /// chats among them where you put it, then the archive once it has
+    /// chats. With neither folders nor an archive there are none.
+    pub fn tabs(&self) -> Vec<Tab> {
+        let tab = |list, name: &str| Tab {
+            list,
+            name: name.to_string(),
+            unread: self.unread_in.get(&list).copied().unwrap_or(0),
+        };
+        let mut tabs: Vec<Tab> = self
+            .folders
+            .iter()
+            .map(|(id, name)| tab(List::Folder(*id), name))
+            .collect();
+        tabs.insert(self.main_at.min(tabs.len()), tab(List::Main, ALL_CHATS));
+        let archived = self
+            .by_id
+            .values()
+            .any(|c| c.positions.contains_key(&List::Archive));
+        if archived || self.shown == List::Archive {
+            tabs.push(tab(List::Archive, ARCHIVE));
+        }
+        if tabs.len() == 1 { Vec::new() } else { tabs }
+    }
+
+    /// The list `step` tabs away from the one shown, round the end.
+    pub fn next_list(&self, step: isize) -> List {
+        let tabs = self.tabs();
+        let Some(at) = tabs.iter().position(|t| t.list == self.shown) else {
+            return List::Main;
+        };
+        let at = (at as isize + step).rem_euclid(tabs.len() as isize);
+        tabs[at as usize].list
+    }
+
+    /// The chat is in a list.
+    pub fn in_list(&self, chat_id: i64, list: List) -> bool {
+        self.by_id.get(&chat_id).is_some_and(|c| c.order(list) != 0)
     }
 
     pub fn set_my_id(&mut self, id: i64) {
@@ -527,7 +697,7 @@ impl Chats {
 
     /// The chat is in the main list, not e.g. a public channel found with `s`.
     pub fn listed(&self, chat_id: i64) -> bool {
-        self.by_id.get(&chat_id).is_some_and(|c| c.order != 0)
+        self.in_list(chat_id, List::Main)
     }
 
     /// Chats in the main list whose name or username contains `query`, in
@@ -540,7 +710,7 @@ impl Chats {
         let mut ids: Vec<i64> = self
             .by_id
             .iter()
-            .filter(|(_, chat)| chat.order != 0)
+            .filter(|(_, chat)| chat.order(List::Main) != 0)
             .map(|(&id, _)| id)
             .filter(|&id| {
                 username.is_empty()
@@ -550,7 +720,7 @@ impl Chats {
                         .is_some_and(|name| !search::find(name, username).is_empty())
             })
             .collect();
-        ids.sort_unstable_by_key(|&id| std::cmp::Reverse((self.by_id[&id].order, id)));
+        ids.sort_unstable_by_key(|&id| std::cmp::Reverse((self.by_id[&id].order(List::Main), id)));
         ids
     }
 
@@ -577,24 +747,55 @@ impl Chats {
     pub fn add_local(&mut self, id: i64, title: &str, photo: Option<ChatPhoto>) -> &mut Chat {
         let order = 1000 - self.by_id.len() as i64;
         self.dirty = true;
-        self.by_id
-            .entry(id)
-            .insert_entry(Chat {
-                title: title.into(),
-                is_channel: false,
-                is_private: false,
-                unread: 0,
-                read_outbox: 0,
-                preview: String::new(),
-                order,
-                photo,
-                accent: 0,
-                activity: Vec::new(),
-                peer: None,
-                pinned: false,
-                notifications: ChatNotificationSettings::default(),
+        let mut chat = Chat::local(title, &[(List::Main, order)]);
+        chat.photo = photo;
+        self.by_id.entry(id).insert_entry(chat).into_mut()
+    }
+
+    /// Puts a chat added with [`Chats::add_local`] in another list too,
+    /// where it keeps its place.
+    pub fn add_local_to(&mut self, list: List, chat_id: i64) {
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            let order = chat.order(List::Main);
+            chat.positions.insert(
+                list,
+                Position {
+                    order,
+                    pinned: false,
+                },
+            );
+            self.dirty = true;
+        }
+    }
+}
+
+impl Chat {
+    /// A chat with nothing in it yet, in these lists at these orders.
+    fn local(title: &str, lists: &[(List, i64)]) -> Self {
+        let positions = lists
+            .iter()
+            .map(|&(list, order)| {
+                let place = Position {
+                    order,
+                    pinned: false,
+                };
+                (list, place)
             })
-            .into_mut()
+            .collect();
+        Chat {
+            title: title.into(),
+            is_channel: false,
+            is_private: false,
+            unread: 0,
+            read_outbox: 0,
+            preview: String::new(),
+            positions,
+            photo: None,
+            accent: 0,
+            activity: Vec::new(),
+            peer: None,
+            notifications: ChatNotificationSettings::default(),
+        }
     }
 }
 
@@ -626,10 +827,6 @@ fn activity(action: &ChatAction) -> Option<&'static str> {
         ChatAction::UploadingVideoNote(_) => "sending a video message",
         ChatAction::WatchingAnimations(_) | ChatAction::Cancel => return None,
     })
-}
-
-fn main_position(positions: &[ChatPosition]) -> Option<&ChatPosition> {
-    positions.iter().find(|p| matches!(p.list, ChatList::Main))
 }
 
 /// How much of the last message a chat list row keeps.
@@ -694,24 +891,14 @@ mod tests {
     fn chats(list: &[(i64, i64, i32)]) -> Chats {
         let mut chats = Chats::default();
         for &(id, order, unread) in list {
-            chats.by_id.insert(
-                id,
-                Chat {
-                    title: format!("chat {id}"),
-                    is_channel: false,
-                    is_private: false,
-                    unread,
-                    read_outbox: 0,
-                    preview: String::new(),
-                    order,
-                    photo: None,
-                    accent: 0,
-                    activity: Vec::new(),
-                    peer: None,
-                    pinned: false,
-                    notifications: ChatNotificationSettings::default(),
-                },
-            );
+            let lists: &[(List, i64)] = if order == 0 {
+                &[]
+            } else {
+                &[(List::Main, order)]
+            };
+            let mut chat = Chat::local(&format!("chat {id}"), lists);
+            chat.unread = unread;
+            chats.by_id.insert(id, chat);
         }
         chats.dirty = true;
         chats.refresh();
@@ -765,7 +952,7 @@ mod tests {
     #[test]
     fn pinned_chats_stay_on_top_then_unread_ones() {
         let mut list = chats(&[(1, 50, 0), (2, 40, 3), (3, 30, 0)]);
-        list.by_id.get_mut(&3).unwrap().pinned = true;
+        list.by_id.get_mut(&3).unwrap().set_pinned(List::Main, true);
         list.dirty = true;
         list.refresh();
         assert_eq!(list.ids(), [3, 2, 1]);
@@ -814,24 +1001,9 @@ mod tests {
         list.set_title(2, "Bob".into());
         list.set_title(3, "alina".into());
         list.set_my_id(4);
-        list.by_id.insert(
-            4,
-            Chat {
-                title: "Eric".into(),
-                is_channel: false,
-                is_private: true,
-                unread: 0,
-                read_outbox: 0,
-                preview: String::new(),
-                order: 10,
-                photo: None,
-                accent: 0,
-                activity: Vec::new(),
-                peer: None,
-                pinned: false,
-                notifications: ChatNotificationSettings::default(),
-            },
-        );
+        let mut me = Chat::local("Eric", &[(List::Main, 10)]);
+        me.is_private = true;
+        list.by_id.insert(4, me);
 
         list.set_filter("ALI");
         list.refresh();
@@ -863,6 +1035,80 @@ mod tests {
         assert_eq!(list.accent(1), 3);
         assert_eq!(list.accent(2), 5);
         assert_eq!(list.accent(3), 5, "an unknown id still gets a color");
+    }
+
+    fn folder(id: i32, name: &str) -> ChatFolderInfo {
+        ChatFolderInfo {
+            id,
+            name: types::ChatFolderName {
+                text: FormattedText {
+                    text: name.into(),
+                    entities: Vec::new(),
+                },
+                animate_custom_emoji: false,
+            },
+            ..ChatFolderInfo::default()
+        }
+    }
+
+    fn position(list: List, order: i64, pinned: bool) -> ChatPosition {
+        ChatPosition {
+            list: list.tdlib(),
+            order,
+            is_pinned: pinned,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn a_folder_lists_its_own_chats_pinned_then_unread_first() {
+        let mut list = chats(&[(1, 50, 0), (2, 40, 3), (3, 30, 0), (4, 20, 1)]);
+        let work = List::Folder(7);
+        list.set_position(1, &position(work, 10, false));
+        list.set_position(3, &position(work, 30, true));
+        list.set_position(4, &position(work, 20, false));
+        list.show(work);
+        list.refresh();
+        assert_eq!(list.ids(), [3, 4, 1], "its own order and pins");
+        assert_eq!(list.total(), 3);
+        assert!(list.pinned(3) && !list.pinned(1));
+
+        // Taken out of the folder, as TDLib says with an order of 0.
+        list.set_position(4, &position(work, 0, false));
+        list.refresh();
+        assert_eq!(list.ids(), [3, 1]);
+
+        list.show(List::Main);
+        list.refresh();
+        assert_eq!(list.ids(), [2, 4, 1, 3], "the main list as it was");
+        assert!(!list.pinned(3), "pinned only in the folder");
+    }
+
+    #[test]
+    fn tabs_put_all_chats_where_telegram_says_and_the_archive_last() {
+        let mut list = chats(&[(1, 50, 0), (2, 40, 0)]);
+        assert!(list.tabs().is_empty(), "no folders, no archive: no tabs");
+
+        list.set_folders(&[folder(7, "Work"), folder(8, "Fam\u{202e}ily  ")], 1);
+        list.set_unread_in(List::Folder(8), 2);
+        let tabs = list.tabs();
+        let names: Vec<&str> = tabs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Work", "All", "Family"], "names are cleaned");
+        assert_eq!(tabs[2].unread, 2);
+
+        list.set_position(2, &position(List::Archive, 5, false));
+        let tabs = list.tabs();
+        assert_eq!(tabs.last().unwrap().list, List::Archive);
+
+        assert_eq!(list.next_list(1), List::Folder(8));
+        assert_eq!(list.next_list(-1), List::Folder(7));
+        list.show(List::Archive);
+        assert_eq!(list.next_list(1), List::Folder(7), "round the end");
+
+        // A folder deleted while shown leaves the main list shown.
+        list.show(List::Folder(8));
+        list.set_folders(&[folder(7, "Work")], 0);
+        assert_eq!(list.shown(), List::Main);
     }
 
     #[test]
