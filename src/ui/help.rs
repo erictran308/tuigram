@@ -53,6 +53,23 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Forum topics",
+        &[
+            ("j / k", "Move down / up"),
+            ("gg / G", "First / last topic"),
+            (
+                "Enter / l",
+                "Open the topic's messages (Enter / h with the list on the right)",
+            ),
+            ("i", "Open the topic and write"),
+            ("Ctrl-r", "Resize the topics pane: h / l, = as at first"),
+            (
+                "h / Esc",
+                "Back to the chat list (l with the list on the right)",
+            ),
+        ],
+    ),
+    (
         "Messages",
         &[
             ("j / k", "Newer / older message"),
@@ -96,7 +113,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Esc",
                 "End the search, cancel the edit, remove the files, cancel the reply, or go back",
             ),
-            ("h", "Back to the chat list (l with the list on the right)"),
+            (
+                "h",
+                "Back to the chat list, or a forum's topics (l with the list on the right)",
+            ),
         ],
     ),
     (

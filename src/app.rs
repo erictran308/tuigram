@@ -11,8 +11,8 @@ use ratatui::style::Style;
 use ratatui::widgets::Block;
 use ratatui_textarea::{DataCursor, TextArea};
 use tdlib_rs::enums::{
-    AuthenticationCodeType, AuthorizationState, ChatMemberStatus, MessageSender, NotificationType,
-    OptionValue, Update, UserType,
+    AuthenticationCodeType, AuthorizationState, ChatMemberStatus, MessageSender, MessageTopic,
+    NotificationType, OptionValue, Update, UserType,
 };
 use tdlib_rs::types::{Message, UpdateNotificationGroup};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -41,6 +41,7 @@ use crate::stickers::{self, Source, StickerPanel};
 use crate::text;
 use crate::tg::{Deletable, EditText, Found, Invite, Missed, Page, Tagged, Tg, TgEvent};
 use crate::theme::{Colors, Themes};
+use crate::topics::Forum;
 use crate::ui;
 use crate::voice::{Happened, Player, VoiceEvent};
 
@@ -430,11 +431,12 @@ impl SettingsMenu {
 /// Places Ctrl-o and Ctrl-i go back to at most.
 const MAX_JUMPS: usize = 100;
 
-/// A place to come back to: a chat, and the message the cursor was on
-/// (`None` for the newest, following new ones).
+/// A place to come back to: a chat (and a forum's topic), and the message
+/// the cursor was on (`None` for the newest, following new ones).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Jump {
     pub chat_id: i64,
+    pub topic: Option<i32>,
     pub message_id: Option<i64>,
 }
 
@@ -618,10 +620,22 @@ impl Command {
     }
 }
 
+/// Ctrl-r's resize mode: the pane whose edge `h` and `l` move, with its
+/// width before, which Esc puts back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resizing {
+    /// The chat list, in percent of the window.
+    List(u16),
+    /// A forum's topics pane, in columns.
+    Topics(u16),
+}
+
 /// Where keys go. `Input` is Insert mode; the others are Normal mode.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Chats,
+    /// A forum's topics, in the pane between the chats and the messages.
+    Topics,
     Messages,
     Input,
 }
@@ -636,6 +650,9 @@ pub struct App {
     /// Selected chat id, not index, so the cursor stays put when chats reorder.
     pub selected: Option<i64>,
     pub open: Option<OpenChat>,
+    /// The forum open, whose topics show in a pane of their own; `open`
+    /// is then one of its topics, if any.
+    pub forum: Option<Forum>,
     /// The message being written. Cleared when switching chats.
     pub composer: TextArea<'static>,
     pub images: Images,
@@ -677,9 +694,9 @@ pub struct App {
     pub completion: Option<Completion>,
     /// Opened with Tab while writing; only open in Insert mode.
     pub stickers: Option<StickerPanel>,
-    /// In resize mode (Ctrl-r): the chat list's width before, which Esc
-    /// puts back.
-    pub resizing: Option<u16>,
+    /// In resize mode (Ctrl-r): which pane `h` and `l` resize, and its
+    /// width before, which Esc puts back.
+    pub resizing: Option<Resizing>,
     pub confirm: Option<Confirm>,
     pub settings: Settings,
     settings_path: PathBuf,
@@ -698,6 +715,9 @@ pub struct App {
     pub settings_menu: Option<SettingsMenu>,
     /// Shown in the status bar while typing a `/` search.
     pub prompt: Option<Prompt>,
+    /// Pages of forum topics asked for, counted, so an answer from an
+    /// earlier visit to a forum can't pass for the visit now.
+    topics_asked: u32,
     /// Chat lists with a `loadChats` call on its way.
     loading_lists: HashSet<List>,
     /// Chat lists with every chat loaded.
@@ -727,9 +747,9 @@ pub struct App {
     last_input_wall: SystemTime,
     /// What TDLib was last told: shown as online to others.
     online: bool,
-    /// The chat last told you're typing, and when. `None` once it was told
-    /// you stopped.
-    typing: Option<(i64, Instant)>,
+    /// The chat last told you're typing, and the topic in a forum, and
+    /// when. `None` once it was told you stopped.
+    typing: Option<((i64, Option<i32>), Instant)>,
     /// Tells the user about new messages while they're away from tuigram.
     notifier: Notifier,
     /// How notifications reach this terminal (never `Auto`).
@@ -775,6 +795,7 @@ impl App {
             users: HashMap::new(),
             selected: None,
             open: None,
+            forum: None,
             composer: new_composer(),
             images,
             player,
@@ -809,6 +830,7 @@ impl App {
             built_in_rejected: false,
             settings_menu: None,
             prompt: None,
+            topics_asked: 0,
             loading_lists: HashSet::new(),
             loaded_lists: HashSet::new(),
             wanted_lists: HashSet::new(),
@@ -1076,14 +1098,40 @@ impl App {
             }
             TgEvent::History {
                 chat_id,
+                topic,
                 page,
                 messages,
-            } => self.on_history(chat_id, page, messages),
+            } => self.on_history((chat_id, topic), page, messages),
             TgEvent::Found {
                 chat_id,
+                topic,
                 query,
                 found,
-            } => self.on_found(chat_id, &query, found),
+            } => self.on_found((chat_id, topic), &query, found),
+            TgEvent::Topics {
+                chat_id,
+                request,
+                page,
+            } => {
+                if let Some(forum) = self.forum.as_mut().filter(|f| f.chat_id == chat_id) {
+                    forum.add_page(request, page.as_ref());
+                    // A forum's topics start with its first page; the cursor
+                    // may already be near the end of a short one.
+                    self.ask_topics();
+                }
+            }
+            TgEvent::Topic {
+                chat_id,
+                topic_id,
+                topic,
+            } => {
+                if let Some(forum) = self.forum.as_mut().filter(|f| f.chat_id == chat_id) {
+                    match topic {
+                        Some(topic) => forum.upsert(&topic),
+                        None => forum.not_found(topic_id),
+                    }
+                }
+            }
             TgEvent::Replied {
                 chat_id,
                 message_id,
@@ -1100,9 +1148,10 @@ impl App {
             } => self.on_deletable(chat_id, message_id, deletable),
             TgEvent::Pinned {
                 chat_id,
+                topic,
                 request,
                 messages,
-            } => self.on_pinned(chat_id, request, messages),
+            } => self.on_pinned((chat_id, topic), request, messages),
             TgEvent::Pinnable {
                 chat_id,
                 message_id,
@@ -1238,9 +1287,17 @@ impl App {
                     return;
                 }
                 match (found, link) {
-                    (Ok((chat_id, message_id)), _) => {
-                        self.open_chat(chat_id);
-                        if let Some(id) = message_id {
+                    (Ok(spot), _) => {
+                        self.open_chat(spot.chat_id);
+                        if let Some(topic) = spot.topic
+                            && self
+                                .forum
+                                .as_ref()
+                                .is_some_and(|f| f.chat_id == spot.chat_id)
+                        {
+                            self.open_topic(topic);
+                        }
+                        if let Some(id) = spot.message_id {
                             self.jump_to_message(id);
                         }
                     }
@@ -1255,7 +1312,12 @@ impl App {
             }
             TgEvent::Forwarded { chat_id } => {
                 let title = self.chats.title(chat_id).unwrap_or_default().to_string();
-                self.show_toast("Forwarded", &format!("to {title}"));
+                // Forwards into a forum go to its General topic.
+                let to = match self.chats.is_forum(chat_id) {
+                    true => format!("to {title} › General"),
+                    false => format!("to {title}"),
+                };
+                self.show_toast("Forwarded", &to);
             }
             TgEvent::Joined { chat_id } => {
                 let title = self.chats.title(chat_id).unwrap_or_default().to_string();
@@ -1271,11 +1333,12 @@ impl App {
             }
             TgEvent::BotAnswer {
                 chat_id,
+                topic,
                 label,
                 text,
                 alert,
                 url,
-            } => self.on_bot_answer(chat_id, label, &text, alert, &url),
+            } => self.on_bot_answer((chat_id, topic), label, &text, alert, &url),
             TgEvent::Invite {
                 request,
                 link,
@@ -1290,16 +1353,17 @@ impl App {
 
     fn on_history(
         &mut self,
-        chat_id: i64,
+        place: (i64, Option<i32>),
         page: Page,
         messages: Option<Vec<tdlib_rs::types::Message>>,
     ) {
-        // Ignore pages for a chat that was closed, or a request that was
-        // replaced (e.g. by jumping elsewhere), while it was in flight.
+        // Ignore pages for a chat or topic that was closed, or a request
+        // that was replaced (e.g. by jumping elsewhere), while it was in
+        // flight.
         let Some(open) = self
             .open
             .as_mut()
-            .filter(|o| o.chat_id == chat_id && o.loading == Some(page))
+            .filter(|o| o.place() == place && o.loading == Some(page))
         else {
             return;
         };
@@ -1307,6 +1371,16 @@ impl App {
         let Some(messages) = messages else {
             return;
         };
+        // A topic's history has only its own messages: going to one of
+        // another topic (`gd` to what a reply answers) would land on a
+        // message near it instead, so the view stays.
+        if let Page::Around(target) = page
+            && open.topic.is_some()
+            && !messages.iter().any(|m| m.id == target)
+        {
+            self.status = Some("That message isn't in this topic".into());
+            return;
+        }
         open.add_page(
             page,
             messages.into_iter().map(|m| (m.id, m.into())).collect(),
@@ -1317,9 +1391,9 @@ impl App {
         }
     }
 
-    fn on_found(&mut self, chat_id: i64, query: &str, found: Option<Found>) {
+    fn on_found(&mut self, place: (i64, Option<i32>), query: &str, found: Option<Found>) {
         // Ignore results for a search that was replaced or ended meanwhile.
-        let Some(open) = self.open.as_mut().filter(|o| o.chat_id == chat_id) else {
+        let Some(open) = self.open.as_mut().filter(|o| o.place() == place) else {
             return;
         };
         let Some(search) = open
@@ -1360,7 +1434,14 @@ impl App {
             Update::ScopeNotificationSettings(u) => self
                 .chats
                 .set_default_mute(&u.scope, u.notification_settings.mute_for),
-            Update::ChatAction(u) => self.chats.set_action(u.chat_id, &u.sender_id, &u.action),
+            Update::ChatAction(u) => {
+                let topic = match u.topic_id {
+                    Some(MessageTopic::Forum(t)) => Some(t.forum_topic_id),
+                    _ => None,
+                };
+                self.chats
+                    .set_action(u.chat_id, topic, &u.sender_id, &u.action);
+            }
             Update::NotificationGroup(u) => self.on_notifications(u),
             Update::UnreadChatCount(u) => {
                 let list = List::of(&u.chat_list);
@@ -1443,15 +1524,47 @@ impl App {
                     .set_username(Peer::Supergroup(group.id), group.usernames.as_ref());
                 let member = !matches!(group.status, ChatMemberStatus::Left);
                 self.chats.set_member(group.id, member);
+                self.chats.set_forum(group.id, group.is_forum);
             }
             Update::NewMessage(u) => {
-                // While older messages are shown, new ones load with the rest.
-                if let Some(open) = self
-                    .open
+                // In a forum, its topic moves up, and the message shows
+                // only in it.
+                let mut topic = None;
+                let mut ask = None;
+                if let Some(forum) = self
+                    .forum
                     .as_mut()
-                    .filter(|o| o.chat_id == u.message.chat_id && o.at_newest)
+                    .filter(|f| f.chat_id == u.message.chat_id)
                 {
+                    let arrived = forum.arrived(&u.message);
+                    topic = Some(arrived.topic);
+                    ask = forum.add_message(&arrived);
+                }
+                if let Some(id) = ask {
+                    self.ask_topic(id);
+                }
+                // While older messages are shown, new ones load with the rest.
+                if let Some(open) = self.open.as_mut().filter(|o| {
+                    o.chat_id == u.message.chat_id
+                        && o.at_newest
+                        && (o.topic.is_none() || o.topic == topic)
+                }) {
                     open.insert(u.message);
+                }
+            }
+            Update::ForumTopicInfo(u) => {
+                if let Some(forum) = self.forum.as_mut().filter(|f| f.chat_id == u.info.chat_id) {
+                    forum.set_info(&u.info);
+                }
+            }
+            Update::ForumTopic(u) => {
+                let ask = self
+                    .forum
+                    .as_mut()
+                    .filter(|f| f.chat_id == u.chat_id)
+                    .and_then(|f| f.set_state(&u));
+                if let Some(id) = ask {
+                    self.ask_topic(id);
                 }
             }
             Update::MessageSendSucceeded(u) => {
@@ -1514,6 +1627,16 @@ impl App {
                     .any(|&id| self.player.is_on(u.chat_id, id))
                 {
                     self.player.stop();
+                }
+                // A topic whose newest message went shows the one before.
+                let stale = self
+                    .forum
+                    .as_ref()
+                    .filter(|f| f.chat_id == u.chat_id)
+                    .map(|f| f.deleted(&u.message_ids))
+                    .unwrap_or_default();
+                for id in stale {
+                    self.ask_topic(id);
                 }
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
                     open.remove(&u.message_ids);
@@ -1809,6 +1932,7 @@ impl App {
         if let Some(delta) = motion {
             match self.focus {
                 Focus::Chats => self.move_chat_cursor(delta),
+                Focus::Topics => self.move_topic_cursor(delta),
                 Focus::Messages => self.move_message_cursor(delta),
                 Focus::Input => {}
             }
@@ -1816,8 +1940,12 @@ impl App {
         }
         match (self.focus, key.code) {
             // Before `r`, which replies.
+            // In a forum's topics, the topics pane; else the chat list.
+            (Focus::Topics, KeyCode::Char('r')) if ctrl && self.forum.is_some() => {
+                self.resizing = Some(Resizing::Topics(self.settings.topics_width));
+            }
             (_, KeyCode::Char('r')) if ctrl => {
-                self.resizing = Some(self.settings.chat_list_width);
+                self.resizing = Some(Resizing::List(self.settings.chat_list_width));
             }
             (_, KeyCode::Char('g')) => self.pending_g = true,
             (_, KeyCode::Char('q')) => self.quit(),
@@ -1897,12 +2025,27 @@ impl App {
             (Focus::Chats, KeyCode::Char(c)) if c == to_chat => self.open_selected_chat(),
             (Focus::Chats, KeyCode::Char('i')) => {
                 self.open_selected_chat();
+                // A forum: the topic under the cursor there, as `i` in the
+                // topics, not whichever was open.
+                if self.focus == Focus::Topics {
+                    self.open_selected_topic();
+                }
                 self.start_writing();
             }
             (Focus::Messages, KeyCode::Char('i')) => self.start_writing(),
+            (Focus::Topics, KeyCode::Enter) => self.open_selected_topic(),
+            (Focus::Topics, KeyCode::Char(c)) if c == to_chat => self.open_selected_topic(),
+            (Focus::Topics, KeyCode::Char('i')) => {
+                self.open_selected_topic();
+                self.start_writing();
+            }
+            (Focus::Topics, KeyCode::Esc) => self.focus = Focus::Chats,
+            (Focus::Topics, KeyCode::Char(c)) if c == to_list => self.focus = Focus::Chats,
             (Focus::Messages, KeyCode::Enter) => self.open_selected_message(),
-            (Focus::Messages, KeyCode::Esc) => self.focus = Focus::Chats,
-            (Focus::Messages, KeyCode::Char(c)) if c == to_list => self.focus = Focus::Chats,
+            (Focus::Messages, KeyCode::Esc) => self.focus = self.left_of_messages(),
+            (Focus::Messages, KeyCode::Char(c)) if c == to_list => {
+                self.focus = self.left_of_messages();
+            }
             _ => {}
         }
     }
@@ -2246,17 +2389,17 @@ impl App {
     /// Tells the open chat whether you're typing: again every
     /// [`TYPING_EVERY`] while you are, and once when you stop.
     fn set_typing(&mut self, typing: bool) {
-        let chat_id = self.open.as_ref().map(|o| o.chat_id);
-        if typing && let Some(chat_id) = chat_id {
+        let place = self.open.as_ref().map(|o| (o.chat_id, o.topic));
+        if typing && let Some(place) = place {
             let told = self
                 .typing
-                .is_some_and(|(id, at)| id == chat_id && at.elapsed() < TYPING_EVERY);
+                .is_some_and(|(at, when)| at == place && when.elapsed() < TYPING_EVERY);
             if !told {
-                self.tg.send_typing(chat_id, true);
-                self.typing = Some((chat_id, Instant::now()));
+                self.tg.send_typing(place.0, place.1, true);
+                self.typing = Some((place, Instant::now()));
             }
-        } else if let Some((chat_id, _)) = self.typing.take() {
-            self.tg.send_typing(chat_id, false);
+        } else if let Some(((chat_id, topic), _)) = self.typing.take() {
+            self.tg.send_typing(chat_id, topic, false);
         }
     }
 
@@ -2291,14 +2434,16 @@ impl App {
         }
         let reply_to = open.reply.take().map(|r| r.id);
         if open.attachments.is_empty() {
-            self.tg.send_text(open.chat_id, text, reply_to, secret);
+            self.tg
+                .send_text(open.chat_id, open.topic, text, reply_to, secret);
         } else {
             let as_files = open.as_files;
             let groups = attach::albums(&open.attachments, as_files)
                 .into_iter()
                 .map(|album| album.iter().map(|a| a.upload(as_files)).collect())
                 .collect();
-            self.tg.send_files(open.chat_id, groups, text, reply_to);
+            self.tg
+                .send_files(open.chat_id, open.topic, groups, text, reply_to);
             open.attachments.clear();
             open.dropped = None;
             open.as_files = false;
@@ -2460,7 +2605,7 @@ impl App {
             && id > open.seen
         {
             open.seen = id;
-            self.tg.view_messages(open.chat_id, vec![id]);
+            self.tg.view_messages(open.chat_id, open.topic, vec![id]);
             // Read, their self-destruct timers start.
             open.start_timers(false, id, SystemTime::now());
         }
@@ -2525,11 +2670,17 @@ impl App {
     /// The user would see a new message in this chat without being told:
     /// tuigram's window has focus. Where the terminal never reports focus,
     /// only the chat being read counts.
-    fn sees(&self, chat_id: i64) -> bool {
+    /// In a forum, only the topic open is being read: `topic` is the one
+    /// the message is in.
+    fn sees(&self, chat_id: i64, topic: Option<i32>) -> bool {
         if self.focus_reported {
             self.terminal_focused
         } else {
             self.watching(chat_id)
+                && self
+                    .open
+                    .as_ref()
+                    .is_some_and(|o| o.topic.is_none() || o.topic == topic)
         }
     }
 
@@ -2568,7 +2719,15 @@ impl App {
         }
         let chat_id = update.chat_id;
         for notification in update.added_notifications {
-            if notification.date < self.notify_since || self.sees(chat_id) {
+            let topic = match &notification.r#type {
+                NotificationType::NewMessage(new) => self
+                    .forum
+                    .as_ref()
+                    .filter(|f| f.chat_id == chat_id)
+                    .map(|f| f.topic_of(&new.message)),
+                _ => None,
+            };
+            if notification.date < self.notify_since || self.sees(chat_id, topic) {
                 continue;
             }
             let new = match notification.r#type {
@@ -2623,6 +2782,22 @@ impl App {
     /// "Alice: see you at 5" in groups; just the text in private chats,
     /// where the chat's name says who, and in channels.
     fn notification_text(&self, message: &Message) -> String {
+        // "Alice joined the group", whatever the chat.
+        if let Some(service) = crate::service::Service::of(&message.content) {
+            let sender = Sender::from(&message.sender_id);
+            let name = |id| {
+                self.users
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "Someone".into())
+            };
+            let actor = match sender {
+                Sender::User(id) => name(id),
+                Sender::Chat(id) => self.chats.title(id).unwrap_or("Someone").to_string(),
+            };
+            let parts = service.sentence(sender, crate::service::Part::Name(actor), name);
+            return crate::service::text(&parts);
+        }
         let text = crate::chats::content_text(&message.content);
         match &message.sender_id {
             MessageSender::User(sender) if sender.user_id != message.chat_id => {
@@ -2857,6 +3032,7 @@ impl App {
         self.users.clear();
         self.selected = None;
         self.open = None;
+        self.forum = None;
         self.focus = Focus::Chats;
         self.composer = new_composer();
         self.images.forget_files();
@@ -2931,6 +3107,7 @@ impl App {
                 let secret = self.chats.is_secret(open.chat_id);
                 self.tg.search_messages(
                     open.chat_id,
+                    open.topic,
                     secret,
                     query,
                     ask,
@@ -2965,7 +3142,8 @@ impl App {
         // The page replaces the loaded messages when it arrives.
         let page = Page::Around(id);
         open.loading = Some(page);
-        self.tg.load_history(open.chat_id, page, HISTORY_PAGE);
+        self.tg
+            .load_history(open.chat_id, open.topic, page, HISTORY_PAGE);
     }
 
     /// Back to following the newest message, reloading if an older part of
@@ -3006,6 +3184,7 @@ impl App {
     fn here(&self) -> Option<Jump> {
         self.open.as_ref().map(|o| Jump {
             chat_id: o.chat_id,
+            topic: o.topic,
             message_id: o.selected,
         })
     }
@@ -3016,8 +3195,23 @@ impl App {
         let here = self.here();
         match self.jumps.go(back, here) {
             Some(to) => {
-                if self.open.as_ref().is_none_or(|o| o.chat_id != to.chat_id) {
+                if self
+                    .open
+                    .as_ref()
+                    .is_none_or(|o| o.place() != (to.chat_id, to.topic))
+                {
                     self.enter_chat(to.chat_id);
+                    if let Some(topic) = to.topic {
+                        self.enter_topic(topic);
+                    }
+                }
+                // A chat that became a forum shows its topics.
+                if self
+                    .open
+                    .as_ref()
+                    .is_none_or(|o| o.place() != (to.chat_id, to.topic))
+                {
+                    return;
                 }
                 self.focus = Focus::Messages;
                 match to.message_id {
@@ -3032,9 +3226,148 @@ impl App {
 
     /// [`App::open_chat`], without Ctrl-o coming back to the chat before.
     fn enter_chat(&mut self, chat_id: i64) {
+        self.close_chat_popups();
+        if self.chats.in_list(chat_id, self.chats.shown()) && self.selected != Some(chat_id) {
+            // The list's cursor goes to it, even if the filter hid it.
+            if !self.chats.ids().contains(&chat_id) {
+                self.chats.set_filter("");
+            }
+            self.selected = Some(chat_id);
+        }
+        if self.chats.is_forum(chat_id) {
+            self.enter_forum(chat_id);
+            return;
+        }
+        self.focus = Focus::Messages;
+        if self.open.as_ref().is_some_and(|o| o.chat_id == chat_id) {
+            return;
+        }
+        self.leave_chat();
+        // TDLib only sends some updates (e.g. for channels) while a chat is open.
+        self.tg.open_chat(chat_id);
+        self.chats.opened(chat_id);
+        let mut open = OpenChat::new(chat_id);
+        // Reading a secret chat's messages starts their timers: it opens
+        // where you stopped reading, not with all of them read at once.
+        if self.chats.is_secret(chat_id) && self.chats.get(chat_id).is_some_and(|c| c.unread > 0) {
+            open.unread_after = Some(self.chats.read_inbox(chat_id));
+        }
+        self.show_messages(open);
+    }
+
+    /// Shows a forum's topics in a pane of their own, the keys there, to
+    /// pick one to read.
+    fn enter_forum(&mut self, chat_id: i64) {
+        self.focus = Focus::Topics;
+        if self.forum.as_ref().is_some_and(|f| f.chat_id == chat_id) {
+            return;
+        }
+        self.leave_chat();
+        // Topics are only kept up to date while the forum is open.
+        self.tg.open_chat(chat_id);
+        self.chats.opened(chat_id);
+        self.composer = new_composer();
+        self.forum = Some(Forum::new(chat_id));
+        self.ask_topics();
+    }
+
+    /// Opens a topic of the forum shown, as [`App::open_chat`] opens a
+    /// chat: Ctrl-o comes back to where the cursor was.
+    fn open_topic(&mut self, topic_id: i32) {
+        let Some(chat_id) = self.forum.as_ref().map(|f| f.chat_id) else {
+            return;
+        };
+        if let Some(here) = self
+            .here()
+            .filter(|h| (h.chat_id, h.topic) != (chat_id, Some(topic_id)))
+        {
+            self.jumps.leave(here);
+        }
+        self.enter_topic(topic_id);
+    }
+
+    /// [`App::open_topic`], without Ctrl-o coming back.
+    fn enter_topic(&mut self, topic_id: i32) {
+        let Some(forum) = self.forum.as_mut() else {
+            return;
+        };
+        forum.selected = Some(topic_id);
+        let chat_id = forum.chat_id;
+        // One opened from a link or Ctrl-o may not be loaded: its name is
+        // asked for, rather than leaving it unnamed.
+        if forum.get(topic_id).is_none() {
+            self.ask_topic(topic_id);
+        }
+        self.focus = Focus::Messages;
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|o| o.place() == (chat_id, Some(topic_id)))
+        {
+            return;
+        }
+        self.close_chat_popups();
+        // The forum stays open in TDLib: it's the same chat.
+        self.leave_messages();
+        let mut open = OpenChat::new(chat_id);
+        open.topic = Some(topic_id);
+        self.show_messages(open);
+    }
+
+    /// Enter on a topic in the pane.
+    fn open_selected_topic(&mut self) {
+        // The one selected may not be loaded yet: one opened from a link.
+        let id = self
+            .forum
+            .as_ref()
+            .and_then(|f| f.current().map(|t| t.id).or(f.selected));
+        if let Some(id) = id {
+            self.open_topic(id);
+        }
+    }
+
+    /// Asks for the next page of the forum's topics, when one is wanted:
+    /// the first, or more as the cursor nears the end.
+    fn ask_topics(&mut self) {
+        let request = self.topics_asked.wrapping_add(1);
+        if let Some(forum) = self.forum.as_mut()
+            && let Some(from) = forum.page_to_ask(request)
+        {
+            self.topics_asked = request;
+            self.tg.forum_topics(forum.chat_id, request, from);
+        }
+    }
+
+    /// Asks TDLib how one of the forum's topics is now, unless it was asked
+    /// already.
+    fn ask_topic(&mut self, topic_id: i32) {
+        if let Some(forum) = self.forum.as_mut()
+            && forum.ask(topic_id)
+        {
+            self.tg.forum_topic(forum.chat_id, topic_id);
+        }
+    }
+
+    fn move_topic_cursor(&mut self, delta: isize) {
+        if let Some(forum) = self.forum.as_mut() {
+            forum.move_cursor(delta);
+        }
+        self.ask_topics();
+    }
+
+    /// Where `h` and Esc go from the messages: a forum topic's goes back to
+    /// the topics.
+    fn left_of_messages(&self) -> Focus {
+        match (&self.open, &self.forum) {
+            (Some(open), Some(_)) if open.topic.is_some() => Focus::Topics,
+            _ => Focus::Chats,
+        }
+    }
+
+    /// Popups about a message of the chat before are no use in another.
+    fn close_chat_popups(&mut self) {
         // A lookup still on its way would open another chat over this one.
         self.finding = None;
-        // Popups about a message of the chat before are no use in this one.
         self.menu = None;
         self.delete_menu = None;
         self.react_menu = None;
@@ -3044,33 +3377,32 @@ impl App {
         self.pinned_menu = None;
         self.timer_menu = None;
         self.key_view = None;
-        if self.chats.in_list(chat_id, self.chats.shown()) && self.selected != Some(chat_id) {
-            // The list's cursor goes to it, even if the filter hid it.
-            if !self.chats.ids().contains(&chat_id) {
-                self.chats.set_filter("");
-            }
-            self.selected = Some(chat_id);
+    }
+
+    /// Leaves the chat open, or the forum shown, telling TDLib.
+    fn leave_chat(&mut self) {
+        self.leave_messages();
+        let open = self.open.take().map(|o| o.chat_id);
+        let forum = self.forum.take().map(|f| f.chat_id);
+        if let Some(chat_id) = open.or(forum) {
+            self.tg.close_chat(chat_id);
         }
-        self.focus = Focus::Messages;
-        if self.open.as_ref().is_some_and(|o| o.chat_id == chat_id) {
-            return;
-        }
+    }
+
+    /// Before the messages shown give way to others: you stop typing in
+    /// them, and a voice message in them stops playing.
+    fn leave_messages(&mut self) {
         self.set_typing(false);
+        // A paste on its way was for these messages.
+        self.pasting = false;
         // A voice message plays in its own chat, where it shows playing.
         self.player.stop();
-        // TDLib only sends some updates (e.g. for channels) while a chat is open.
-        if let Some(old) = self.open.take() {
-            self.tg.close_chat(old.chat_id);
+        if self.open.is_some() {
             self.images.clear();
         }
-        self.tg.open_chat(chat_id);
-        self.chats.opened(chat_id);
-        let mut open = OpenChat::new(chat_id);
-        // Reading a secret chat's messages starts their timers: it opens
-        // where you stopped reading, not with all of them read at once.
-        if self.chats.is_secret(chat_id) && self.chats.get(chat_id).is_some_and(|c| c.unread > 0) {
-            open.unread_after = Some(self.chats.read_inbox(chat_id));
-        }
+    }
+
+    fn show_messages(&mut self, open: OpenChat) {
         self.open = Some(open);
         self.composer = new_composer();
         self.load_older_messages();
@@ -3088,17 +3420,23 @@ impl App {
             .filter(|o| !self.chats.is_secret(o.chat_id))
         {
             open.pinned_asked += 1;
-            self.tg.pinned_messages(open.chat_id, open.pinned_asked);
+            self.tg
+                .pinned_messages(open.chat_id, open.topic, open.pinned_asked);
         }
     }
 
-    fn on_pinned(&mut self, chat_id: i64, request: u32, messages: Option<Vec<Message>>) {
+    fn on_pinned(
+        &mut self,
+        place: (i64, Option<i32>),
+        request: u32,
+        messages: Option<Vec<Message>>,
+    ) {
         // Only the last answer for the chat open: an older one may miss a
         // message pinned since.
         let Some(open) = self
             .open
             .as_mut()
-            .filter(|o| o.chat_id == chat_id && o.pinned_asked == request)
+            .filter(|o| o.place() == place && o.pinned_asked == request)
         else {
             return;
         };
@@ -3792,8 +4130,9 @@ impl App {
         match button.press {
             Press::Callback(data) => {
                 self.show_toast("Pressed", &button.label);
+                let topic = self.open.as_ref().and_then(|o| o.topic);
                 self.tg
-                    .press_button(chat_id, message_id, data, button.label);
+                    .press_button(chat_id, topic, message_id, data, button.label);
             }
             Press::Open(link) => self.open_target(Target::Link(link)),
             Press::File(file) => {
@@ -3828,7 +4167,8 @@ impl App {
                 // apps do, so the bot knows whose buttons they were.
                 let private = self.chats.get(chat_id).is_some_and(|c| c.is_private);
                 let reply_to = (!private).then_some(message_id);
-                self.tg.send_plain(chat_id, text, reply_to);
+                let topic = self.open.as_ref().and_then(|o| o.topic);
+                self.tg.send_plain(chat_id, topic, text, reply_to);
                 self.jump_to_newest();
             }
             Press::Unsupported(_) => {}
@@ -3838,9 +4178,17 @@ impl App {
     /// A bot answered a button: a note goes in the corner, an alert in a
     /// popup. A link it sends opens only while its chat is open and nothing
     /// else holds the keys, and asks first, since nothing said where it goes.
-    fn on_bot_answer(&mut self, chat_id: i64, label: String, text: &str, alert: bool, url: &str) {
+    fn on_bot_answer(
+        &mut self,
+        place: (i64, Option<i32>),
+        label: String,
+        text: &str,
+        alert: bool,
+        url: &str,
+    ) {
         let text = one_line(text);
-        let here = self.open.as_ref().is_some_and(|o| o.chat_id == chat_id) && !self.busy();
+        // Still in the chat, and the topic, of the button pressed.
+        let here = self.open.as_ref().is_some_and(|o| o.place() == place) && !self.busy();
         if !text.is_empty() {
             if alert && here {
                 self.notice = Some(Notice {
@@ -4014,31 +4362,49 @@ impl App {
         let Some(before) = self.resizing else {
             return;
         };
-        // `h` and `l` move the line between the panes that way.
+        // `h` and `l` move the line between the panes that way: the chat
+        // list's edge, or the topics pane's, which is beside the messages.
         let left = match self.settings.chat_list_side {
             Side::Left => -1,
             Side::Right => 1,
         };
-        match key.code {
-            KeyCode::Char('h') | KeyCode::Left => self.settings.resize_list(left),
-            KeyCode::Char('l') | KeyCode::Right => self.settings.resize_list(-left),
-            KeyCode::Char('=') => self.settings.chat_list_width = settings::DEFAULT_LIST_WIDTH,
-            KeyCode::Esc => {
-                self.settings.chat_list_width = before;
+        let settings = &mut self.settings;
+        match (before, key.code) {
+            (Resizing::List(_), KeyCode::Char('h') | KeyCode::Left) => settings.resize_list(left),
+            (Resizing::List(_), KeyCode::Char('l') | KeyCode::Right) => settings.resize_list(-left),
+            (Resizing::Topics(_), KeyCode::Char('h') | KeyCode::Left) => {
+                settings.resize_topics(left)
+            }
+            (Resizing::Topics(_), KeyCode::Char('l') | KeyCode::Right) => {
+                settings.resize_topics(-left)
+            }
+            (Resizing::List(_), KeyCode::Char('=')) => {
+                settings.chat_list_width = settings::DEFAULT_LIST_WIDTH;
+            }
+            (Resizing::Topics(_), KeyCode::Char('=')) => {
+                settings.topics_width = settings::DEFAULT_TOPICS_WIDTH;
+            }
+            (_, KeyCode::Esc) => {
+                match before {
+                    Resizing::List(width) => settings.chat_list_width = width,
+                    Resizing::Topics(width) => settings.topics_width = width,
+                }
                 self.resizing = None;
             }
-            KeyCode::Enter => self.end_resize(),
-            KeyCode::Char('r') if ctrl => self.end_resize(),
+            (_, KeyCode::Enter) => self.end_resize(),
+            (_, KeyCode::Char('r')) if ctrl => self.end_resize(),
             _ => {}
         }
     }
 
     /// Leaves resize mode with the panes as they are, saved for next time.
     fn end_resize(&mut self) {
-        let before = self.resizing.take();
-        if before != Some(self.settings.chat_list_width)
-            && let Err(e) = self.settings.save(&self.settings_path)
-        {
+        let changed = match self.resizing.take() {
+            Some(Resizing::List(width)) => width != self.settings.chat_list_width,
+            Some(Resizing::Topics(width)) => width != self.settings.topics_width,
+            None => false,
+        };
+        if changed && let Err(e) = self.settings.save(&self.settings_path) {
             self.status = Some(format!("Couldn't save settings: {e:#}"));
         }
     }
@@ -4152,7 +4518,8 @@ impl App {
             return;
         };
         let reply_to = open.reply.take().map(|r| r.id);
-        self.tg.send_sticker(open.chat_id, &sticker, reply_to);
+        self.tg
+            .send_sticker(open.chat_id, open.topic, &sticker, reply_to);
         self.stickers = None;
         // The message arriving ends the typing status for everyone.
         self.typing = None;
@@ -4172,6 +4539,7 @@ impl App {
             Ok((from, to)) => {
                 self.jumps.leave(Jump {
                     chat_id: open.chat_id,
+                    topic: open.topic,
                     message_id: Some(from),
                 });
                 self.jump_to_message(to);
@@ -4559,18 +4927,20 @@ impl App {
         let Some(open) = &self.open else {
             return;
         };
-        self.clipboard.paste(open.chat_id);
+        self.clipboard.paste(open.place());
         self.pasting = true;
     }
 
     fn on_pasted(&mut self, pasted: Pasted) {
         self.pasting = false;
-        // Not into another chat than the one it was meant for.
-        if self
-            .open
-            .as_ref()
-            .is_none_or(|o| o.chat_id != pasted.chat_id)
-        {
+        // Not into another chat or topic than the one it was meant for.
+        if self.open.as_ref().is_none_or(|o| o.place() != pasted.place) {
+            return;
+        }
+        // Nor into Insert mode once the keys went to the chats or topics,
+        // where an Enter meant to open one would send it.
+        if !matches!(self.focus, Focus::Messages | Focus::Input) {
+            self.status = Some("The paste came after you left the messages: p pastes again".into());
             return;
         }
         match pasted.content {
@@ -4795,7 +5165,8 @@ impl App {
         }
         let page = open.oldest_id().map_or(Page::Latest, Page::Older);
         open.loading = Some(page);
-        self.tg.load_history(open.chat_id, page, HISTORY_PAGE);
+        self.tg
+            .load_history(open.chat_id, open.topic, page, HISTORY_PAGE);
     }
 
     /// Only needed after jumping to an old message.
@@ -4811,7 +5182,8 @@ impl App {
         };
         let page = Page::Newer(newest);
         open.loading = Some(page);
-        self.tg.load_history(open.chat_id, page, HISTORY_PAGE);
+        self.tg
+            .load_history(open.chat_id, open.topic, page, HISTORY_PAGE);
     }
 
     fn move_message_cursor(&mut self, delta: isize) {
@@ -5058,6 +5430,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
+    use crate::tg::Spot;
 
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         app.on_key(KeyEvent::new(code, modifiers));
@@ -5146,7 +5519,7 @@ mod tests {
         app.focus = Focus::Messages;
         let chat = app.open.as_ref().unwrap().chat_id;
         assert!(
-            app.watching(chat) && app.sees(chat),
+            app.watching(chat) && app.sees(chat, None),
             "a key was just pressed"
         );
 
@@ -5154,20 +5527,23 @@ mod tests {
         // By the wall clock: Instant can't go back past boot on Windows.
         app.last_input_wall = SystemTime::now() - (IDLE_AFTER + Duration::from_secs(1));
         assert!(!app.watching(chat), "new messages aren't marked read");
-        assert!(!app.sees(chat), "and they notify");
+        assert!(!app.sees(chat, None), "and they notify");
 
         // A terminal that reports focus is believed instead, for a while.
         app.focus_reported = true;
-        assert!(app.watching(chat) && app.sees(chat));
+        assert!(app.watching(chat) && app.sees(chat, None));
         app.last_input_wall = SystemTime::now() - AWAY_AFTER;
         assert!(
             !app.watching(chat),
             "not for good: the screen may be left on"
         );
-        assert!(app.sees(chat), "the window has focus, so no notification");
+        assert!(
+            app.sees(chat, None),
+            "the window has focus, so no notification"
+        );
         app.last_input_wall = SystemTime::now();
         app.terminal_focused = false;
-        assert!(!app.watching(chat) && !app.sees(chat));
+        assert!(!app.watching(chat) && !app.sees(chat, None));
     }
 
     #[test]
@@ -5200,7 +5576,7 @@ mod tests {
         // Already closing, so the detached client gets no request.
         app.quit_deadline = Some(Instant::now() + CLOSE_TIMEOUT);
         app.hang_up();
-        assert!(!app.watching(chat) && !app.sees(chat));
+        assert!(!app.watching(chat) && !app.sees(chat, None));
     }
 
     #[test]
@@ -5336,6 +5712,7 @@ mod tests {
     fn ctrl_o_and_ctrl_i_go_back_and_forward_like_vims_jump_list() {
         let at = |chat_id, message_id| Jump {
             chat_id,
+            topic: None,
             message_id,
         };
         let mut jumps = Jumps::default();
@@ -5395,6 +5772,174 @@ mod tests {
         assert_eq!(cursor(&app), Some(to));
         press(&mut app, KeyCode::Tab, none);
         assert_eq!(app.status.as_deref(), Some("Nothing to go forward to"));
+    }
+
+    #[test]
+    fn h_and_l_go_from_the_chats_to_a_forums_topics_to_a_topics_messages_and_back() {
+        let mut app = test_app("forum");
+        crate::demo::show_forum(&mut app);
+        let none = KeyModifiers::NONE;
+        let topic = |app: &App| app.forum.as_ref().and_then(|f| f.current()).map(|t| t.id);
+        assert!(app.focus == Focus::Topics);
+        let open = topic(&app);
+        assert_eq!(app.open.as_ref().and_then(|o| o.topic), open);
+
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_ne!(topic(&app), open);
+        press(&mut app, KeyCode::Char('k'), none);
+        assert_eq!(topic(&app), open);
+        // The topic open: nothing to load.
+        press(&mut app, KeyCode::Char('l'), none);
+        assert!(app.focus == Focus::Messages);
+        press(&mut app, KeyCode::Char('h'), none);
+        assert!(
+            app.focus == Focus::Topics,
+            "back to the topics, not the chats"
+        );
+        press(&mut app, KeyCode::Char('h'), none);
+        assert!(app.focus == Focus::Chats);
+        // The forum shown: its topics again, the one open kept.
+        press(&mut app, KeyCode::Char('l'), none);
+        assert!(app.focus == Focus::Topics);
+        assert_eq!(app.open.as_ref().and_then(|o| o.topic), open);
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.focus == Focus::Chats);
+        press(&mut app, KeyCode::Enter, none);
+        press(&mut app, KeyCode::Enter, none);
+        press(&mut app, KeyCode::Esc, none);
+        assert!(
+            app.focus == Focus::Topics,
+            "Esc leaves a topic for the topics"
+        );
+    }
+
+    #[test]
+    fn whats_meant_for_one_topic_stays_out_of_another() {
+        let mut app = test_app("forum-place");
+        crate::demo::show_forum(&mut app);
+        let (chat, topic) = app.open.as_ref().unwrap().place();
+        let other = (chat, topic.map(|t| t + 1));
+        app.focus = Focus::Messages;
+
+        // A paste that comes back after another topic was opened.
+        app.pasting = true;
+        app.on_pasted(Pasted {
+            place: other,
+            content: Ok(Paste::Text("the screenshot".into())),
+        });
+        assert!(app.focus == Focus::Messages, "not Insert mode");
+        assert!(!app.pasting);
+        assert!(app.composer.is_empty());
+        // Or once the keys went back to the topics.
+        app.focus = Focus::Topics;
+        app.on_pasted(Pasted {
+            place: (chat, topic),
+            content: Ok(Paste::Text("the screenshot".into())),
+        });
+        assert!(app.focus == Focus::Topics);
+        assert!(app.composer.is_empty());
+        app.focus = Focus::Messages;
+
+        // A bot's alert, for a button pressed in another topic.
+        app.on_bot_answer(other, "Buy".into(), "Sold out", true, "");
+        assert!(app.notice.is_none());
+        app.on_bot_answer((chat, topic), "Buy".into(), "Sold out", true, "");
+        assert!(app.notice.is_some());
+        app.notice = None;
+
+        // `gd` to a message of another topic keeps the view.
+        let before: Vec<i64> = app
+            .open
+            .as_ref()
+            .unwrap()
+            .messages
+            .keys()
+            .copied()
+            .collect();
+        app.open.as_mut().unwrap().loading = Some(Page::Around(1));
+        app.on_history((chat, topic), Page::Around(1), Some(Vec::new()));
+        let after: Vec<i64> = app
+            .open
+            .as_ref()
+            .unwrap()
+            .messages
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("That message isn't in this topic")
+        );
+
+        // Reading one topic, a message in another still notifies, where the
+        // terminal never says whether its window has focus.
+        assert!(app.sees(chat, topic));
+        assert!(!app.sees(chat, other.1));
+    }
+
+    #[test]
+    fn ctrl_r_in_a_forums_topics_resizes_their_pane() {
+        let mut app = test_app("forum-resize");
+        crate::demo::show_forum(&mut app);
+        let none = KeyModifiers::NONE;
+        // Where the topics pane's top right corner is: the chat list's is
+        // the first.
+        let edge = |rows: &[String]| {
+            let top: Vec<char> = rows[0].chars().collect();
+            top.iter()
+                .enumerate()
+                .filter(|&(_, &c)| c == '┐')
+                .map(|(i, _)| i)
+                .nth(1)
+                .unwrap()
+        };
+        let start = edge(&screen_of(&mut app, 140));
+        let list = app.settings.chat_list_width;
+
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(app.resizing, Some(Resizing::Topics(30)));
+        press(&mut app, KeyCode::Char('l'), none);
+        press(&mut app, KeyCode::Char('l'), none);
+        let rows = screen_of(&mut app, 140);
+        assert_eq!(edge(&rows), start + 4, "two columns a press");
+        assert!(rows.last().unwrap().contains("topics 34 columns"));
+        assert_eq!(app.settings.chat_list_width, list, "the chat list stays");
+        press(&mut app, KeyCode::Esc, none);
+        assert_eq!(edge(&screen_of(&mut app, 140)), start, "Esc puts it back");
+
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('h'), none);
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.resizing.is_none());
+        assert_eq!(app.settings.topics_width, 28);
+        let saved = Settings::load(&app.settings_path).unwrap();
+        assert_eq!(saved.topics_width, 28, "kept for next time");
+
+        // Elsewhere, Ctrl-r still resizes the chat list.
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(matches!(app.resizing, Some(Resizing::List(_))));
+    }
+
+    #[test]
+    fn with_the_chat_list_on_the_right_the_topics_are_still_between_it_and_the_messages() {
+        let mut app = test_app("forum-right");
+        crate::demo::show_forum(&mut app);
+        app.settings.chat_list_side = Side::Right;
+        let rows = screen_of(&mut app, 140);
+        let top = &rows[0];
+        let messages = top.find("Rustaceans › Async").expect("the messages' title");
+        let topics = top.find("Rustaceans · topics").expect("the topics' title");
+        let chats = top.find("Chats (").expect("the chat list's title");
+        assert!(messages < topics && topics < chats, "{top}");
+        // `l` goes toward the list, now on the right.
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        assert!(app.focus == Focus::Chats);
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(app.focus == Focus::Topics);
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(app.focus == Focus::Messages);
     }
 
     #[test]
@@ -5618,12 +6163,14 @@ mod tests {
         app.open.as_mut().unwrap().pinned_asked = 2;
         app.on_tg(TgEvent::Pinned {
             chat_id,
+            topic: None,
             request: 1,
             messages: Some(Vec::new()),
         });
         assert_eq!(app.open.as_ref().unwrap().pinned.len(), 1);
         app.on_tg(TgEvent::Pinned {
             chat_id,
+            topic: None,
             request: 2,
             messages: Some(Vec::new()),
         });
@@ -5728,6 +6275,7 @@ mod tests {
         let chat_id = app.open.as_ref().unwrap().chat_id;
         let answer = |text: &str, alert, url: &str| TgEvent::BotAnswer {
             chat_id,
+            topic: None,
             label: "Buy".into(),
             text: text.into(),
             alert,
@@ -5837,7 +6385,7 @@ mod tests {
         let chat_id = app.open.as_ref().unwrap().chat_id;
         app.focus = Focus::Input;
         // Typing was already told, so this test sends nothing to TDLib.
-        app.typing = Some((chat_id, Instant::now()));
+        app.typing = Some(((chat_id, None), Instant::now()));
         app.composer.insert_str("first line");
         app.composer.insert_newline();
         app.composer.insert_str("second line");
@@ -5860,7 +6408,7 @@ mod tests {
         app.finding = Some(Finding::new("@bob"));
         app.on_tg(TgEvent::ChatFound {
             request: "@bob".into(),
-            found: Ok((999, None)),
+            found: Ok(Spot::chat(999)),
         });
         assert_eq!(app.open.as_ref().unwrap().chat_id, chat_id);
         assert!(app.focus == Focus::Input);
@@ -5936,7 +6484,7 @@ mod tests {
         let chat_id = app.open.as_ref().unwrap().chat_id;
         app.focus = Focus::Input;
         // Typing was already told, so this test sends nothing to TDLib.
-        app.typing = Some((chat_id, Instant::now()));
+        app.typing = Some(((chat_id, None), Instant::now()));
 
         app.composer.insert_str("hi @ma");
         app.update_completion();
@@ -5974,7 +6522,7 @@ mod tests {
         let mut app = test_app("commands");
         let chat_id = app.open.as_ref().unwrap().chat_id;
         app.focus = Focus::Input;
-        app.typing = Some((chat_id, Instant::now()));
+        app.typing = Some(((chat_id, None), Instant::now()));
         let command = |name: &str| complete::Command {
             bot: 9,
             name: name.into(),

@@ -4,8 +4,8 @@
 //! The photos are drawn here and written to a temporary folder, removed on
 //! exit.
 //!
-//! Keys: 1–9, 0 or Tab / Shift-Tab switch scenes, t / T change the theme,
-//! q quits.
+//! Keys: 1–9, 0 or Tab / Shift-Tab switch scenes (the forum comes after
+//! 0), t / T change the theme, q quits.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,8 +34,10 @@ use crate::poll::{Answer, Poll};
 use crate::reactions::{ReactMenu, Reaction, ReactionKind};
 use crate::search::MessageSearch;
 use crate::secret::{Destruct, KeyView, Secret, SecretState};
+use crate::service::Service;
 use crate::settings::Settings;
 use crate::tg::Tg;
+use crate::topics::{Forum, GENERAL, Topic};
 use crate::ui;
 use crate::voice::{Output, Player};
 
@@ -61,6 +63,15 @@ const DESIGN: i64 = -106;
 const SECRET_ALEX: i64 = -201;
 /// TDLib's id for that secret chat.
 const ALEX_SECRET_ID: i32 = 1;
+/// The Rustaceans group, a forum, by supergroup id.
+const RUSTACEANS_GROUP: i64 = 103;
+
+// Its topics, by id.
+const ASYNC: i32 = 2;
+const SHOW_AND_TELL: i32 = 3;
+const JOBS: i32 = 4;
+const HELP: i32 = 5;
+const ANNOUNCEMENTS: i32 = 6;
 
 // Folders, by id.
 const FRIENDS: i32 = 1;
@@ -107,10 +118,12 @@ enum Scene {
     Settings,
     /// The `?` popup on its shortcuts tab.
     Shortcuts,
+    /// A forum: its topics in a pane of their own, one of them open.
+    Forum,
 }
 
-/// In order of their keys: 1 to 9, then 0.
-const SCENES: [Scene; 10] = [
+/// In order of their keys: 1 to 9, then 0. The forum has no key of its own.
+const SCENES: [Scene; 11] = [
     Scene::Reading,
     Scene::Replying,
     Scene::Reacting,
@@ -121,7 +134,11 @@ const SCENES: [Scene; 10] = [
     Scene::Key,
     Scene::Settings,
     Scene::Shortcuts,
+    Scene::Forum,
 ];
+
+/// The scene `0` shows.
+const SCENE_0: usize = 9;
 
 pub async fn run() -> Result<()> {
     let dir = new_private_dir()?;
@@ -239,6 +256,12 @@ pub(crate) fn demo_app(tg: Tg, images: Images, dir: &Path) -> App {
     app
 }
 
+/// Shows the forum, its topics' pane focused, for tests elsewhere.
+#[cfg(test)]
+pub(crate) fn show_forum(app: &mut App) {
+    show_scene(app, Scene::Forum);
+}
+
 /// Returns false to quit.
 fn on_key(app: &mut App, scene: &mut usize, key: KeyEvent) -> bool {
     if key.kind != KeyEventKind::Press {
@@ -250,7 +273,7 @@ fn on_key(app: &mut App, scene: &mut usize, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return false,
         KeyCode::Char('c') if ctrl => return false,
-        KeyCode::Char('0') => *scene = SCENES.len() - 1,
+        KeyCode::Char('0') => *scene = SCENE_0,
         KeyCode::Char(c @ '1'..='9') => *scene = c as usize - '1' as usize,
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => *scene = next(*scene, 1),
         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => *scene = next(*scene, -1),
@@ -290,6 +313,7 @@ fn show_scene(app: &mut App, scene: Scene) {
         Scene::Planning => TOKYO,
         Scene::Bot => TRAIL_BOT,
         Scene::Secret | Scene::Key => SECRET_ALEX,
+        Scene::Forum => RUSTACEANS,
         _ => HIKE,
     };
     // Built again each time, so the countdowns start over.
@@ -297,9 +321,11 @@ fn show_scene(app: &mut App, scene: Scene) {
         TOKYO => tokyo(),
         TRAIL_BOT => trail_bot(),
         SECRET_ALEX => secret_chat(),
+        RUSTACEANS => async_topic(),
         _ => hike(),
     };
     app.selected = Some(chat);
+    app.forum = (chat == RUSTACEANS).then(rustaceans_topics);
     match scene {
         Scene::Replying => {
             open.reply = open
@@ -348,6 +374,7 @@ fn show_scene(app: &mut App, scene: Scene) {
         }
         // On the photo, whose key the status bar shows first.
         Scene::Secret => open.selected = Some(43),
+        Scene::Forum => app.focus = Focus::Topics,
         Scene::Reading | Scene::Planning | Scene::Settings | Scene::Shortcuts => {}
     }
     app.open = Some(open);
@@ -447,9 +474,11 @@ fn fill_chats(chats: &mut Chats) {
         RUSTACEANS,
         "Rustaceans",
         None,
-        "nextest cut our CI time in half",
+        "is tokio::select! cancel-safe here?",
     );
-    rust.unread = 12;
+    rust.unread = 6;
+    rust.peer = Some(Peer::Supergroup(RUSTACEANS_GROUP));
+    chats.set_forum(RUSTACEANS_GROUP, true);
     add(
         chats,
         ME,
@@ -505,8 +534,8 @@ fn fill_chats(chats: &mut Chats) {
     chats.set_read_outbox(SECRET_ALEX, 44);
     chats.set_presence(ALEX, Presence::Online(i32::MAX));
     chats.set_bot(TRAIL_BOT, true);
-    chats.set_action(ALEX, &user(ALEX), &ChatAction::Typing);
-    chats.set_action(HIKE, &user(MAYA), &ChatAction::Typing);
+    chats.set_action(ALEX, None, &user(ALEX), &ChatAction::Typing);
+    chats.set_action(HIKE, None, &user(MAYA), &ChatAction::Typing);
     chats.set_highlighted(&[MOM]);
     chats.opened(HIKE);
 
@@ -665,6 +694,7 @@ fn msg(sender: i64, date: i32, text: &str) -> Msg {
         hidden: None,
         saveable: true,
         voice: None,
+        service: None,
     }
 }
 
@@ -943,11 +973,16 @@ fn secret_chat() -> OpenChat {
     open.messages.extend([
         (
             41,
-            msg(
-                ALEX,
-                at(3, 8, 1),
-                "[Set messages to disappear after 30 seconds]",
-            ),
+            Msg {
+                service: Some(Service::Did(
+                    "set messages to disappear after 30 seconds".into(),
+                )),
+                ..msg(
+                    ALEX,
+                    at(3, 8, 1),
+                    "Set messages to disappear after 30 seconds",
+                )
+            },
         ),
         (
             42,
@@ -964,6 +999,123 @@ fn secret_chat() -> OpenChat {
             lasting(ALEX, at(3, 8, 3), "4729, the box is left of the door", 23),
         ),
         (45, lasting(ME, at(3, 8, 4), "Got it, deleting my note", 0)),
+    ]);
+    open
+}
+
+/// The Rustaceans forum's topics, Async open.
+fn rustaceans_topics() -> Forum {
+    let mut forum = Forum::new(RUSTACEANS);
+    let topic = |id, name: &str, color, unread, from, preview: &str| {
+        let mut topic = Topic::local(id, name, color, unread, preview);
+        topic.from = Some(Sender::User(from));
+        topic
+    };
+    let mut general = topic(
+        GENERAL,
+        "General",
+        0,
+        0,
+        ALEX,
+        "Welcome! The rules are pinned",
+    );
+    general.pinned = true;
+    forum.add_local(general);
+    let mut async_topic = topic(
+        ASYNC,
+        "Async",
+        0x6F_B9_F0,
+        4,
+        LEO,
+        "is tokio::select! cancel-safe here?",
+    );
+    async_topic.mentions = 1;
+    forum.add_local(async_topic);
+    forum.add_local(topic(
+        JOBS,
+        "Jobs",
+        0xFF_D6_7E,
+        2,
+        PRIYA,
+        "Remote Rust role at a robotics startup",
+    ));
+    forum.add_local(topic(
+        SHOW_AND_TELL,
+        "Show and tell",
+        0x8E_EE_98,
+        0,
+        MAYA,
+        "A TUI that waters my plants 🌱",
+    ));
+    forum.add_local(topic(
+        HELP,
+        "Help",
+        0xFF_93_B2,
+        0,
+        ME,
+        "Thanks, Arc<Mutex<…>> did it",
+    ));
+    let mut news = topic(
+        ANNOUNCEMENTS,
+        "Announcements",
+        0xFB_6F_5F,
+        0,
+        ALEX,
+        "Meetup on the 14th, slides welcome",
+    );
+    news.closed = true;
+    forum.add_local(news);
+    forum.selected = Some(ASYNC);
+    forum
+}
+
+/// The Async topic of the Rustaceans forum.
+fn async_topic() -> OpenChat {
+    let mut open = OpenChat::new(RUSTACEANS);
+    open.topic = Some(ASYNC);
+    open.all_loaded = true;
+    let code = "tokio::select!";
+    let question = Msg {
+        styles: styled(
+            "Is tokio::select! cancel-safe when one branch reads a socket?",
+            &[(
+                code,
+                Format {
+                    code: true,
+                    ..Format::default()
+                },
+            )],
+        ),
+        ..msg(
+            LEO,
+            at(3, 9, 12),
+            "Is tokio::select! cancel-safe when one branch reads a socket?",
+        )
+    };
+    let answer = Msg {
+        reply_to: Some(ReplyTo {
+            message_id: Some(201),
+            quote: None,
+        }),
+        reactions: reactions(&[("👍", 3, true)]),
+        ..msg(
+            MAYA,
+            at(3, 9, 15),
+            "Only if the future is: read() on a TcpStream is, read_exact() isn't",
+        )
+    };
+    open.messages.extend([
+        (201, question),
+        (202, answer),
+        (
+            203,
+            msg(
+                ME,
+                at(3, 9, 17),
+                "Pin the read_exact future outside the loop and poll it by &mut",
+            ),
+        ),
+        (204, msg(LEO, at(3, 9, 20), "That fixed it, thanks both 🙏")),
     ]);
     open
 }
@@ -1161,6 +1313,13 @@ mod tests {
 
         show_scene(&mut app, Scene::Settings);
         assert!(has(&rows(&mut app), "Catppuccin Mocha"));
+
+        show_scene(&mut app, Scene::Forum);
+        let screen = rows(&mut app);
+        assert!(has(&screen, "Rustaceans · topics"), "{screen:#?}");
+        assert!(has(&screen, "Rustaceans › Async"), "{screen:#?}");
+        assert!(has(&screen, "Show and tell"));
+        assert!(has(&screen, "cancel-safe"));
     }
 
     #[test]
@@ -1174,13 +1333,17 @@ mod tests {
         assert!(on_key(&mut app, &mut scene, press(KeyCode::Char('2'))));
         assert_eq!(SCENES[scene], Scene::Replying);
         assert!(on_key(&mut app, &mut scene, press(KeyCode::Char('0'))));
-        assert_eq!(SCENES[scene], Scene::Shortcuts, "0 is the last");
+        assert_eq!(SCENES[scene], Scene::Shortcuts, "0 is the shortcuts");
         assert!(on_key(&mut app, &mut scene, press(KeyCode::Char('7'))));
         assert_eq!(app.selected, Some(SECRET_ALEX), "the list follows");
         assert!(on_key(&mut app, &mut scene, press(KeyCode::Char('2'))));
         assert!(on_key(&mut app, &mut scene, press(KeyCode::BackTab)));
         assert!(on_key(&mut app, &mut scene, press(KeyCode::BackTab)));
-        assert_eq!(SCENES[scene], Scene::Shortcuts, "wraps around");
+        assert_eq!(
+            SCENES[scene],
+            Scene::Forum,
+            "wraps around to the forum, after 0"
+        );
 
         let before = app.settings.theme.clone();
         on_key(&mut app, &mut scene, press(KeyCode::Char('t')));

@@ -22,6 +22,7 @@ use crate::poll::Poll;
 use crate::reactions::{self, Reaction, ReactionKind};
 use crate::search::MessageSearch;
 use crate::secret::Destruct;
+use crate::service::Service;
 use crate::text;
 use crate::tg::Page;
 use crate::voice::Voice;
@@ -227,6 +228,9 @@ pub struct Msg {
     pub saveable: bool,
     /// A voice message, which Enter plays.
     pub voice: Option<Voice>,
+    /// What happened in the chat, when it's a service message: drawn in the
+    /// middle, like a date, not in a bubble.
+    pub service: Option<Service>,
 }
 
 /// A photo or video its sender wants seen only while it's open (view once,
@@ -1061,11 +1065,12 @@ impl From<Message> for Msg {
             _ => None,
         };
         let body = body(&message.content);
+        let service = Service::of(&message.content);
         Self {
             sender,
             outgoing: message.is_outgoing,
             date: message.date,
-            text: body.text,
+            text: service.as_ref().map_or(body.text, |s| s.label(sender)),
             source_text: body.source_text,
             preview: body.preview,
             file: body.file,
@@ -1089,6 +1094,7 @@ impl From<Message> for Msg {
             hidden: body.hidden,
             saveable: message.can_be_saved,
             voice: body.voice,
+            service,
         }
     }
 }
@@ -1114,6 +1120,9 @@ pub struct ScrollAnchor {
 /// new stretch around it, and scrolling down then loads the newer ones.
 pub struct OpenChat {
     pub chat_id: i64,
+    /// In a forum, the topic open: only its messages are loaded, and what's
+    /// sent goes there.
+    pub topic: Option<i32>,
     /// The newest message a read receipt was sent for.
     pub seen: i64,
     pub messages: BTreeMap<i64, Msg>,
@@ -1172,6 +1181,7 @@ impl OpenChat {
     pub fn new(chat_id: i64) -> Self {
         Self {
             chat_id,
+            topic: None,
             seen: 0,
             messages: BTreeMap::new(),
             selected: None,
@@ -1194,6 +1204,11 @@ impl OpenChat {
             opening: None,
             unread_after: None,
         }
+    }
+
+    /// The chat, and in a forum the topic: what TDLib's answers are for.
+    pub fn place(&self) -> (i64, Option<i32>) {
+        (self.chat_id, self.topic)
     }
 
     /// Ctrl-z after a paste of file paths: takes back the files it
@@ -1581,6 +1596,10 @@ impl OpenChat {
             return;
         }
         msg.set_body(body);
+        msg.service = Service::of(content);
+        if let Some(service) = &msg.service {
+            msg.text = service.label(msg.sender);
+        }
         // New spoilers stay hidden until asked for again.
         msg.revealed = false;
         if self.viewing == Some(message_id) {
@@ -2374,6 +2393,7 @@ mod tests {
                     hidden: None,
                     saveable: true,
                     voice: None,
+                    service: None,
                 };
                 (id, msg)
             })

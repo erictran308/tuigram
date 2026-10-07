@@ -35,6 +35,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Write faster.** `@` and a few letters suggests people in the group, `:` and a few letters suggests emoji (`:tada` 🎉), and `/` starting a message lists the bots' commands; `Tab` puts one in.
 - **Pin and mute.** `p` pins a chat to the top and `m` mutes it, on Telegram, so your other devices follow.
 - **Folders.** Your Telegram folders, and the archive, are tabs over the chat list, each with its unread chats; `Tab` and `Shift-Tab` go round them.
+- **Forum topics.** A group split into topics shows them in a pane of their own beside the chat list, with their unread counts and newest message; `Enter` opens one, and what you write goes there.
 - **Bot buttons.** A bot's buttons show under its message. `Enter` lists them to press: the bot answers, a link opens (asking first), and a reply button sends its words.
 - **Pinned messages.** `P` pins a message (for both of you or just you, with or without notifying a group) or unpins it. A bar over the chat shows the newest pinned message, and `gp` lists them all to jump to.
 - **Jump back.** `Ctrl-o` goes back to the chat you were in before, as in vim, and `Ctrl-i` forward again.
@@ -166,9 +167,9 @@ The status bar always shows the keys for where you are. The essentials:
 | `j` / `k` | Move down / up |
 | `gg` / `G` | Jump to top / bottom |
 | `Ctrl-d` / `Ctrl-u` | Half a page down / up |
-| `Enter` / `l` | Open a chat, or the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens). On a message with spoilers, `Enter` shows them first; on a voice message, it plays it in tuigram, and pauses it; on a poll, it votes; on a bot's message, it lists its buttons, then the message's file and links (`h/j/k/l` choose, `Enter` presses); a `t.me` link opens in tuigram |
+| `Enter` / `l` | Open a chat (a forum shows its topics: `Enter` opens one), or the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens). On a message with spoilers, `Enter` shows them first; on a voice message, it plays it in tuigram, and pauses it; on a poll, it votes; on a bot's message, it lists its buttons, then the message's file and links (`h/j/k/l` choose, `Enter` presses); a `t.me` link opens in tuigram |
 | `Tab` / `Shift-Tab` | In the chat list: your next / previous folder, in Telegram's order, then the archive. With folders, they're tabs over the list, each with its count of unread chats |
-| `h` / `Esc` | Back to the chat list. To have the list on the right, tick **On the right side of the window** in `?` > **Settings**; `h` and `l` then swap, to follow the screen |
+| `h` / `Esc` | Back to the chat list, or from a topic to its forum's topics. To have the list on the right, tick **On the right side of the window** in `?` > **Settings**; `h` and `l` then swap, to follow the screen |
 | `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line. `@name` or `:emoji` shows suggestions, and so does `/` starting a message (the bots' commands); `Tab` puts one in. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
 | `Tab` | While writing: stickers. `h/j/k/l` pick one, `H` / `L` switch between Recent, Favorites and your sets, `/` finds stickers by emoji or word, `Enter` sends |
 | `y` | Copy the selected message: its text, a link, or the photo or file |
@@ -187,7 +188,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `H` | Highlight a chat |
 | `p` / `m` | Pin the selected chat to the top, or mute it, on Telegram, so your phone shows the same; again to undo. Pinned chats show 📌, muted ones 🔕 and a grey unread count |
 | `s` | Find a chat or person: type a name, an `@username` or a `t.me` link, then `Enter` opens it. In a public group or channel you're not in, `i` asks to join |
-| `Ctrl-r` | Resize the panes: `h` / `l` move the line between them left / right, `=` puts it back as at first, `Enter` keeps it (also next time), `Esc` cancels |
+| `Ctrl-r` | Resize the panes: `h` / `l` move the line between them left / right, `=` puts it back as at first, `Enter` keeps it (also next time), `Esc` cancels. In a forum's topics, it resizes their pane |
 | `:` | Run a command, typed in full (`Tab` completes the name, and goes on to the next one that fits): `:leave` leaves the group or channel, or ends a secret chat (asks first), `:logout` logs out of Telegram on this computer (asks first), and `:secret`, `:key` and `:timer` for [secret chats](#secret-chats) |
 | `?` | Every shortcut, plus settings and themes |
 | `q` | Quit |

@@ -23,6 +23,7 @@ use crate::messages::Sender;
 use crate::reactions::{self, Available, ReactionKind};
 use crate::search::{Has, Query, Who};
 use crate::stickers::{Source, Sticker};
+use crate::topics::{self, Offset};
 
 pub enum TgEvent {
     Update(Box<enums::Update>),
@@ -39,12 +40,14 @@ pub enum TgEvent {
     /// A page of history, newest first. `None` if the request failed.
     History {
         chat_id: i64,
+        topic: Option<i32>,
         page: Page,
         messages: Option<Vec<types::Message>>,
     },
     /// A page of message search results. `None` if the request failed.
     Found {
         chat_id: i64,
+        topic: Option<i32>,
         query: String,
         found: Option<Found>,
     },
@@ -58,8 +61,22 @@ pub enum TgEvent {
     /// `request`; `None` if TDLib couldn't send them.
     Pinned {
         chat_id: i64,
+        topic: Option<i32>,
         request: u32,
         messages: Option<Vec<types::Message>>,
+    },
+    /// A page of a forum's topics, for request number `request`; `None`
+    /// if TDLib couldn't send it.
+    Topics {
+        chat_id: i64,
+        request: u32,
+        page: Option<types::ForumTopics>,
+    },
+    /// One of a forum's topics, as it is now; `None` if TDLib couldn't say.
+    Topic {
+        chat_id: i64,
+        topic_id: i32,
+        topic: Option<Box<types::ForumTopic>>,
     },
     /// Whether a message can be pinned; `None` if TDLib couldn't say.
     Pinnable {
@@ -117,7 +134,7 @@ pub enum TgEvent {
     /// Or what to say if it can't be opened.
     ChatFound {
         request: String,
-        found: Result<(i64, Option<i64>), Missed>,
+        found: Result<Spot, Missed>,
     },
     /// Members of a group whose name has `query` in it, for `@` completion.
     /// Failures find nobody.
@@ -149,6 +166,8 @@ pub enum TgEvent {
     /// Empty when it only changed its message.
     BotAnswer {
         chat_id: i64,
+        /// In a forum, the topic the button was pressed in.
+        topic: Option<i32>,
         /// The button's words.
         label: String,
         text: String,
@@ -161,6 +180,25 @@ pub enum TgEvent {
         link: String,
         invite: Invite,
     },
+}
+
+/// Where a chat looked up to open leads: the chat, and in a forum maybe a
+/// topic, and maybe a message a link pointed at.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Spot {
+    pub chat_id: i64,
+    pub topic: Option<i32>,
+    pub message_id: Option<i64>,
+}
+
+impl Spot {
+    pub fn chat(chat_id: i64) -> Self {
+        Self {
+            chat_id,
+            topic: None,
+            message_id: None,
+        }
+    }
 }
 
 /// Why a chat looked up to open wasn't opened.
@@ -629,9 +667,10 @@ impl Tg {
         self.spawn(functions::close_chat(chat_id, self.client_id));
     }
 
-    /// Fetches a page of history, up to `limit` (at most 100) messages.
-    /// TDLib may return fewer.
-    pub fn load_history(&self, chat_id: i64, page: Page, limit: i32) {
+    /// Fetches a page of history, up to `limit` (at most 100) messages:
+    /// of the whole chat, or of one of a forum's topics. TDLib may return
+    /// fewer.
+    pub fn load_history(&self, chat_id: i64, topic: Option<i32>, page: Page, limit: i32) {
         // A negative offset adds that many messages newer than `from`.
         let (from, offset) = match page {
             Page::Latest => (0, 0),
@@ -642,8 +681,18 @@ impl Tg {
         let tx = self.tx.clone();
         let client_id = self.client_id;
         tokio::spawn(async move {
-            let result =
-                functions::get_chat_history(chat_id, from, offset, limit, false, client_id).await;
+            let result = match topic {
+                Some(topic) => {
+                    functions::get_forum_topic_history(
+                        chat_id, topic, from, offset, limit, client_id,
+                    )
+                    .await
+                }
+                None => {
+                    functions::get_chat_history(chat_id, from, offset, limit, false, client_id)
+                        .await
+                }
+            };
             let messages = match result {
                 Ok(enums::Messages::Messages(page)) => {
                     Some(page.messages.into_iter().flatten().collect())
@@ -655,14 +704,15 @@ impl Tg {
             };
             let _ = tx.send(TgEvent::History {
                 chat_id,
+                topic,
                 page,
                 messages,
             });
         });
     }
 
-    /// Searches a chat's whole history for `ask`: its words, from whom,
-    /// with what in it, and between which days. Results come newest first,
+    /// Searches a chat's whole history, or a forum topic's, for `ask`: its
+    /// words, from whom, with what in it, and between which days. Results come newest first,
     /// a page of up to `limit` from where the last page left off (`from`,
     /// or in a `secret` chat maybe `offset`; nothing for the newest);
     /// `query` is the search as typed, to match the answer. TDLib looks up
@@ -672,6 +722,7 @@ impl Tg {
     pub fn search_messages(
         &self,
         chat_id: i64,
+        topic: Option<i32>,
         secret: bool,
         query: String,
         ask: Query,
@@ -684,7 +735,7 @@ impl Tg {
         tokio::spawn(async move {
             let found = match secret && !ask.words.is_empty() {
                 true => secret_search_page(chat_id, &ask, offset, limit, client_id).await,
-                false => search_page(chat_id, &ask, from, limit, client_id).await,
+                false => search_page(chat_id, topic, &ask, from, limit, client_id).await,
             };
             let found = match found {
                 Ok(found) => Some(found),
@@ -695,15 +746,16 @@ impl Tg {
             };
             let _ = tx.send(TgEvent::Found {
                 chat_id,
+                topic,
                 query,
                 found,
             });
         });
     }
 
-    /// Fetches a chat's pinned messages, newest first, as
-    /// [`TgEvent::Pinned`] numbered `request`.
-    pub fn pinned_messages(&self, chat_id: i64, request: u32) {
+    /// Fetches a chat's pinned messages, or a forum topic's, newest first,
+    /// as [`TgEvent::Pinned`] numbered `request`.
+    pub fn pinned_messages(&self, chat_id: i64, topic: Option<i32>, request: u32) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
         tokio::spawn(async move {
@@ -712,7 +764,7 @@ impl Tg {
             for _ in 0..PINNED_PAGES {
                 let result = functions::search_chat_messages(
                     chat_id,
-                    None,
+                    forum_topic(topic),
                     String::new(),
                     None,
                     from,
@@ -734,6 +786,7 @@ impl Tg {
                         let _ = tx.send(TgEvent::Error(e.message));
                         let _ = tx.send(TgEvent::Pinned {
                             chat_id,
+                            topic,
                             request,
                             messages: None,
                         });
@@ -743,6 +796,7 @@ impl Tg {
             }
             let _ = tx.send(TgEvent::Pinned {
                 chat_id,
+                topic,
                 request,
                 messages: Some(messages),
             });
@@ -959,19 +1013,33 @@ impl Tg {
     /// temporary id (`updateNewMessage`), then `updateMessageSendSucceeded`
     /// or `…Failed`. In a `secret` chat, links go without a preview: it
     /// would be made on Telegram's servers, which would see the link.
-    pub fn send_text(&self, chat_id: i64, text: String, reply_to: Option<i64>, secret: bool) {
-        self.send_formatted(chat_id, markdown(text), reply_to, secret);
+    pub fn send_text(
+        &self,
+        chat_id: i64,
+        topic: Option<i32>,
+        text: String,
+        reply_to: Option<i64>,
+        secret: bool,
+    ) {
+        self.send_formatted(chat_id, topic, markdown(text), reply_to, secret);
     }
 
     /// Sends text as it is, without making its Markdown formatting: a
     /// bot's reply button sends its words exactly.
-    pub fn send_plain(&self, chat_id: i64, text: String, reply_to: Option<i64>) {
-        self.send_formatted(chat_id, plain(text), reply_to, false);
+    pub fn send_plain(
+        &self,
+        chat_id: i64,
+        topic: Option<i32>,
+        text: String,
+        reply_to: Option<i64>,
+    ) {
+        self.send_formatted(chat_id, topic, plain(text), reply_to, false);
     }
 
     fn send_formatted(
         &self,
         chat_id: i64,
+        topic: Option<i32>,
         text: types::FormattedText,
         reply_to: Option<i64>,
         no_preview: bool,
@@ -988,7 +1056,7 @@ impl Tg {
         let reply_to = reply_to.map(reply_to_message);
         self.spawn(functions::send_message(
             chat_id,
-            None,
+            forum_topic(topic),
             reply_to,
             None,
             content,
@@ -997,7 +1065,13 @@ impl Tg {
     }
 
     /// Sends a sticker, as a reply to message `reply_to` if given.
-    pub fn send_sticker(&self, chat_id: i64, sticker: &Sticker, reply_to: Option<i64>) {
+    pub fn send_sticker(
+        &self,
+        chat_id: i64,
+        topic: Option<i32>,
+        sticker: &Sticker,
+        reply_to: Option<i64>,
+    ) {
         let content = enums::InputMessageContent::InputMessageSticker(types::InputMessageSticker {
             sticker: enums::InputFile::Id(types::InputFileId {
                 id: sticker.file_id,
@@ -1010,7 +1084,7 @@ impl Tg {
         let reply_to = reply_to.map(reply_to_message);
         self.spawn(functions::send_message(
             chat_id,
-            None,
+            forum_topic(topic),
             reply_to,
             None,
             content,
@@ -1098,6 +1172,7 @@ impl Tg {
     pub fn send_files(
         &self,
         chat_id: i64,
+        topic: Option<i32>,
         groups: Vec<Vec<Upload>>,
         caption: String,
         reply_to: Option<i64>,
@@ -1115,12 +1190,18 @@ impl Tg {
                 let reply_to = reply_to.take();
                 let result = if contents.len() == 1 {
                     let content = contents.remove(0);
-                    functions::send_message(chat_id, None, reply_to, None, content, client_id)
+                    let topic = forum_topic(topic);
+                    functions::send_message(chat_id, topic, reply_to, None, content, client_id)
                         .await
                         .map(drop)
                 } else {
                     functions::send_message_album(
-                        chat_id, None, reply_to, None, contents, client_id,
+                        chat_id,
+                        forum_topic(topic),
+                        reply_to,
+                        None,
+                        contents,
+                        client_id,
                     )
                     .await
                     .map(drop)
@@ -1192,7 +1273,7 @@ impl Tg {
             let enums::Chat::Chat(chat) = functions::create_private_chat(user_id, false, client_id)
                 .await
                 .map_err(|e| Missed::Said(e.message))?;
-            Ok((chat.id, None))
+            Ok(Spot::chat(chat.id))
         });
     }
 
@@ -1201,7 +1282,7 @@ impl Tg {
         let client_id = self.client_id;
         self.find(request, async move {
             let id = public_chat(&username, client_id).await?;
-            Ok((id, None))
+            Ok(Spot::chat(id))
         });
     }
 
@@ -1217,7 +1298,7 @@ impl Tg {
                 .map_err(|_| Missed::Elsewhere)?;
             match kind {
                 enums::InternalLinkType::PublicChat(p) => {
-                    Ok((public_chat(&p.chat_username, client_id).await?, None))
+                    Ok(Spot::chat(public_chat(&p.chat_username, client_id).await?))
                 }
                 enums::InternalLinkType::Message(m) => {
                     let enums::MessageLinkInfo::MessageLinkInfo(info) =
@@ -1227,7 +1308,17 @@ impl Tg {
                     if info.chat_id == 0 {
                         return Err(Missed::Said("That message can't be found".into()));
                     }
-                    Ok((info.chat_id, info.message.map(|m| m.id)))
+                    // In a forum, a link can lead to a topic, or a message
+                    // in one.
+                    let topic = match info.topic_id {
+                        Some(enums::MessageTopic::Forum(t)) => Some(t.forum_topic_id),
+                        _ => None,
+                    };
+                    Ok(Spot {
+                        chat_id: info.chat_id,
+                        topic,
+                        message_id: info.message.map(|m| m.id),
+                    })
                 }
                 enums::InternalLinkType::ChatInvite(i) => {
                     let enums::ChatInviteLinkInfo::ChatInviteLinkInfo(info) =
@@ -1236,7 +1327,7 @@ impl Tg {
                             .map_err(|e| Missed::Said(e.message))?;
                     // A chat you're in has an id and no time limit on reading it.
                     if info.chat_id != 0 && info.accessible_for == 0 {
-                        return Ok((info.chat_id, None));
+                        return Ok(Spot::chat(info.chat_id));
                     }
                     let invite = Invite {
                         title: crate::text::clean(&info.title),
@@ -1264,7 +1355,7 @@ impl Tg {
             let enums::Chat::Chat(chat) = functions::join_chat_by_invite_link(link, client_id)
                 .await
                 .map_err(|e| Missed::Said(e.message))?;
-            Ok((chat.id, None))
+            Ok(Spot::chat(chat.id))
         });
     }
 
@@ -1404,7 +1495,14 @@ impl Tg {
     /// Presses a bot's button on its message, sending the bot the button's
     /// data. Its answer comes back as [`TgEvent::BotAnswer`]; one that
     /// doesn't come in time is an error.
-    pub fn press_button(&self, chat_id: i64, message_id: i64, data: String, label: String) {
+    pub fn press_button(
+        &self,
+        chat_id: i64,
+        topic: Option<i32>,
+        message_id: i64,
+        data: String,
+        label: String,
+    ) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
         tokio::spawn(async move {
@@ -1416,6 +1514,7 @@ impl Tg {
                 Ok(enums::CallbackQueryAnswer::CallbackQueryAnswer(a)) => {
                     tx.send(TgEvent::BotAnswer {
                         chat_id,
+                        topic,
                         label,
                         text: a.text,
                         alert: a.show_alert,
@@ -1435,7 +1534,7 @@ impl Tg {
             let enums::Chat::Chat(chat) = functions::create_new_secret_chat(user_id, client_id)
                 .await
                 .map_err(|e| Missed::Said(e.message))?;
-            Ok((chat.id, None))
+            Ok(Spot::chat(chat.id))
         });
     }
 
@@ -1538,7 +1637,7 @@ impl Tg {
     fn find(
         &self,
         request: String,
-        lookup: impl Future<Output = Result<(i64, Option<i64>), Missed>> + Send + 'static,
+        lookup: impl Future<Output = Result<Spot, Missed>> + Send + 'static,
     ) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -1550,11 +1649,12 @@ impl Tg {
     /// Tells the chat you're typing, or that you stopped. Others see it for
     /// about 5 seconds unless it's sent again. Failing is harmless (TDLib
     /// already skips chats you can't write in), so errors aren't shown.
-    pub fn send_typing(&self, chat_id: i64, typing: bool) {
+    pub fn send_typing(&self, chat_id: i64, topic: Option<i32>, typing: bool) {
         let action = typing.then_some(enums::ChatAction::Typing);
         let client_id = self.client_id;
         tokio::spawn(async move {
-            let _ = functions::send_chat_action(chat_id, None, action, client_id).await;
+            let topic = forum_topic(topic);
+            let _ = functions::send_chat_action(chat_id, topic, action, client_id).await;
         });
     }
 
@@ -1615,15 +1715,66 @@ impl Tg {
         ));
     }
 
-    /// Marks messages as read, which also sends read receipts.
-    pub fn view_messages(&self, chat_id: i64, message_ids: Vec<i64>) {
+    /// Marks messages as read, which also sends read receipts. In a forum,
+    /// the messages are a topic's, read there.
+    pub fn view_messages(&self, chat_id: i64, topic: Option<i32>, message_ids: Vec<i64>) {
+        let source = topic.map(|_| enums::MessageSource::ForumTopicHistory);
         self.spawn(functions::view_messages(
             chat_id,
             message_ids,
-            None,
+            source,
             true,
             self.client_id,
         ));
+    }
+
+    /// Fetches a page of a forum's topics, from where the last one ended,
+    /// as [`TgEvent::Topics`] numbered `request`.
+    pub fn forum_topics(&self, chat_id: i64, request: u32, from: Offset) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let result = functions::get_forum_topics(
+                chat_id,
+                String::new(),
+                from.date,
+                from.message_id,
+                from.topic_id,
+                topics::PAGE,
+                client_id,
+            )
+            .await;
+            let page = match result {
+                Ok(enums::ForumTopics::ForumTopics(page)) => Some(page),
+                Err(e) => {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    None
+                }
+            };
+            let _ = tx.send(TgEvent::Topics {
+                chat_id,
+                request,
+                page,
+            });
+        });
+    }
+
+    /// Fetches one of a forum's topics as it is now, as [`TgEvent::Topic`].
+    /// Failing says nothing: the topic was deleted, or the forum left.
+    pub fn forum_topic(&self, chat_id: i64, topic_id: i32) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let result = functions::get_forum_topic(chat_id, topic_id, client_id).await;
+            let topic = result
+                .ok()
+                .map(|enums::ForumTopic::ForumTopic(t)| Box::new(t));
+            let _ = tx.send(TgEvent::Topic {
+                chat_id,
+                topic_id,
+                topic,
+            });
+        });
     }
 
     /// Flushes TDLib's database and ends with `authorizationStateClosed`.
@@ -1717,6 +1868,7 @@ impl Upload {
 /// A page of a message search; see [`Tg::search_messages`].
 async fn search_page(
     chat_id: i64,
+    topic: Option<i32>,
     ask: &Query,
     mut from: i64,
     limit: i32,
@@ -1755,7 +1907,7 @@ async fn search_page(
     }
     let enums::FoundChatMessages::FoundChatMessages(found) = functions::search_chat_messages(
         chat_id,
-        None,
+        forum_topic(topic),
         ask.words.clone(),
         sender,
         from,
@@ -1825,6 +1977,13 @@ impl Found {
             self.total = -1;
         }
     }
+}
+
+/// A forum's topic, as TDLib takes it where messages go or come from.
+fn forum_topic(topic: Option<i32>) -> Option<enums::MessageTopic> {
+    topic.map(|forum_topic_id| {
+        enums::MessageTopic::Forum(types::MessageTopicForum { forum_topic_id })
+    })
 }
 
 fn user_sender(user_id: i64) -> enums::MessageSender {

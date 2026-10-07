@@ -41,9 +41,10 @@ pub struct Decoded {
     pub image: Result<RgbaImage, String>,
 }
 
-/// What the clipboard held when `p` asked, for the chat that was open then.
+/// What the clipboard held when `p` asked, for the chat that was open then,
+/// and in a forum the topic.
 pub struct Pasted {
-    pub chat_id: i64,
+    pub place: (i64, Option<i32>),
     pub content: Result<Paste, String>,
 }
 
@@ -115,14 +116,14 @@ impl Clipboard {
 
     /// Reads the clipboard on a blocking thread, since an image takes a
     /// moment to convert and save. It comes back as a [`Pasted`] for
-    /// `chat_id`: files first, as a file manager copies an icon image along
+    /// `place`: files first, as a file manager copies an icon image along
     /// with them, then an image, then text.
-    pub fn paste(&self, chat_id: i64) {
+    pub fn paste(&self, place: (i64, Option<i32>)) {
         let tx = self.tx.clone();
         let outbox = self.outbox.clone();
         tokio::task::spawn_blocking(move || {
             let content = read(&outbox);
-            let _ = tx.send(ClipboardEvent::Pasted(Pasted { chat_id, content }));
+            let _ = tx.send(ClipboardEvent::Pasted(Pasted { place, content }));
         });
     }
 

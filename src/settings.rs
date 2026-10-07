@@ -35,6 +35,9 @@ pub struct Settings {
     /// The chat list's share of the window's width, in percent. Ctrl-r
     /// changes it; see [`Settings::list_width`].
     pub chat_list_width: u16,
+    /// A forum's topics pane's width, in columns. Ctrl-r in the pane
+    /// changes it; see [`Settings::topics_pane_width`].
+    pub topics_width: u16,
     /// This computer takes the secret chats others start with you. One
     /// lives on whichever of your devices accepts it first, so it's off
     /// unless asked for, and they go to your phone.
@@ -55,6 +58,7 @@ impl Default for Settings {
             chat_gaps: true,
             chat_list_side: Side::Left,
             chat_list_width: DEFAULT_LIST_WIDTH,
+            topics_width: DEFAULT_TOPICS_WIDTH,
             accept_secret_chats: false,
             api_keys: None,
         }
@@ -77,6 +81,14 @@ pub const DEFAULT_LIST_WIDTH: u16 = 35;
 const LIST_WIDTHS: std::ops::RangeInclusive<u16> = 15..=70;
 /// Percent a press of `h` or `l` moves the line between the panes.
 const LIST_STEP: u16 = 5;
+
+/// A forum's topics pane's width, in columns, at first and after `=`.
+pub const DEFAULT_TOPICS_WIDTH: u16 = 30;
+/// How narrow and how wide the topics pane can be, in columns. It never
+/// takes more than half the room beside the chat list either.
+const TOPICS_WIDTHS: std::ops::RangeInclusive<u16> = 20..=80;
+/// Columns a press of `h` or `l` moves the topics pane's edge.
+const TOPICS_STEP: u16 = 2;
 
 impl Settings {
     /// Defaults if the file doesn't exist yet; an error if it can't be read.
@@ -103,6 +115,20 @@ impl Settings {
         let width = self.list_width() as i16 + steps * LIST_STEP as i16;
         self.chat_list_width =
             (width.max(0) as u16).clamp(*LIST_WIDTHS.start(), *LIST_WIDTHS.end());
+    }
+
+    /// The topics pane's width as drawn, in columns: within
+    /// [`TOPICS_WIDTHS`], whatever the file says.
+    pub fn topics_pane_width(&self) -> u16 {
+        self.topics_width
+            .clamp(*TOPICS_WIDTHS.start(), *TOPICS_WIDTHS.end())
+    }
+
+    /// Makes the topics pane `steps` steps wider, or narrower if negative.
+    pub fn resize_topics(&mut self, steps: i16) {
+        let width = self.topics_pane_width() as i16 + steps * TOPICS_STEP as i16;
+        self.topics_width =
+            (width.max(0) as u16).clamp(*TOPICS_WIDTHS.start(), *TOPICS_WIDTHS.end());
     }
 
     /// Writes the settings, which can hold API credentials: readable only by
@@ -152,13 +178,14 @@ mod tests {
             chat_gaps: false,
             chat_list_side: Side::Right,
             chat_list_width: 40,
+            topics_width: 26,
             accept_secret_chats: true,
             api_keys: None,
         };
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40\naccept_secret_chats = true"
+            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40\ntopics_width = 26\naccept_secret_chats = true"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
 
@@ -184,6 +211,7 @@ mod tests {
         let old = Settings::load(&file).unwrap();
         assert!(old.block_gaps && old.chat_gaps);
         assert_eq!(old.chat_list_width, DEFAULT_LIST_WIDTH);
+        assert_eq!(old.topics_width, DEFAULT_TOPICS_WIDTH);
         assert_eq!(old.chat_list_side, Side::Left);
 
         // A theme that's gone is the app's to deal with, not a broken file.
@@ -209,5 +237,18 @@ mod tests {
         assert_eq!(settings.list_width(), 70);
         settings.resize_list(-1);
         assert_eq!(settings.list_width(), 65);
+    }
+
+    #[test]
+    fn the_topics_pane_resizes_in_columns_within_bounds() {
+        let mut settings = Settings::default();
+        settings.resize_topics(2);
+        assert_eq!(settings.topics_pane_width(), 34);
+        settings.resize_topics(-100);
+        assert_eq!(settings.topics_pane_width(), 20, "the topics stay");
+        settings.resize_topics(100);
+        assert_eq!(settings.topics_pane_width(), 80);
+        settings.topics_width = 0;
+        assert_eq!(settings.topics_pane_width(), 20, "whatever the file says");
     }
 }

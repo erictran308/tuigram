@@ -13,7 +13,7 @@ use ratatui_textarea::TextArea;
 
 use crate::app::{
     App, Command, Confirm, Confirmed, DeleteMenu, Focus, HelpTab, Jumps, Login, LoginStep,
-    MenuAction, Notice, PickMenu, PromptKind, Screen, SettingsMenu, Target, Toast,
+    MenuAction, Notice, PickMenu, PromptKind, Resizing, Screen, SettingsMenu, Target, Toast,
 };
 use crate::attach::{self, Attachment, Kind};
 use crate::buttons::ButtonMenu;
@@ -32,6 +32,7 @@ use crate::secret::{self, KeyView, TimerMenu};
 use crate::settings::{Settings, Side};
 use crate::text;
 use crate::theme::{Colors, Themes};
+use crate::topics::Topic;
 
 /// The composer grows with its text up to this many rows, then scrolls.
 const MAX_COMPOSER_ROWS: usize = 6;
@@ -61,6 +62,7 @@ mod help;
 mod messages;
 mod qr;
 mod stickers;
+mod topics;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let colors = app.colors;
@@ -94,17 +96,24 @@ fn title_style(chats: &crate::chats::Chats, chat_id: i64, colors: &Colors) -> St
 /// What people are doing in a chat, in Telegram's words: "typing…" in a
 /// one-on-one chat; "Alice is typing…", "Alice and Bob are typing…" or "3
 /// people are typing…" in a group. When people are doing different things,
-/// whoever started first decides which one shows.
-fn activity(chat: &Chat, names: &messages::Names) -> Option<String> {
-    let &(_, doing) = chat.activity.first()?;
+/// whoever started first decides which one shows. Given a forum's topic,
+/// only what's done in it.
+fn activity(chat: &Chat, names: &messages::Names, topic: Option<&Topic>) -> Option<String> {
+    // TDLib may name no topic for General.
+    let here = |at: Option<i32>| match topic {
+        Some(t) => at.map_or(t.general, |at| at == t.id),
+        None => true,
+    };
+    let mut doings = chat.activity.iter().filter(|&&(_, _, at)| here(at));
+    let &(_, doing, _) = doings.next()?;
     if chat.is_private {
         return Some(format!("{doing}…"));
     }
     let who: Vec<Sender> = chat
         .activity
         .iter()
-        .filter(|&&(_, d)| d == doing)
-        .map(|&(sender, _)| sender)
+        .filter(|&&(_, d, at)| d == doing && here(at))
+        .map(|&(sender, _, _)| sender)
         .collect();
     Some(match who[..] {
         [one] => format!("{} is {doing}…", names.get(one)),
@@ -365,6 +374,28 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             [list, chat]
         }
     };
+    // A forum's topics go between the chat list and the messages.
+    let (topics_area, chat_area) = match &app.forum {
+        Some(_) => {
+            // As wide as set (Ctrl-r in the pane), but never more than half
+            // of what the chat list leaves, so the messages keep room.
+            let width = app.settings.topics_pane_width().min(chat_area.width / 2);
+            let width = Constraint::Length(width);
+            match app.settings.chat_list_side {
+                Side::Left => {
+                    let [topics, chat] =
+                        Layout::horizontal([width, Constraint::Fill(1)]).areas(chat_area);
+                    (Some(topics), chat)
+                }
+                Side::Right => {
+                    let [chat, topics] =
+                        Layout::horizontal([Constraint::Fill(1), width]).areas(chat_area);
+                    (Some(topics), chat)
+                }
+            }
+        }
+        None => (None, chat_area),
+    };
 
     let list = chat_list::ChatList {
         chats: &app.chats,
@@ -383,6 +414,19 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         gaps: app.settings.chat_gaps,
     };
     chat_list::draw(frame, list_area, &list, &mut app.images, colors);
+    if let (Some(area), Some(forum)) = (topics_area, &app.forum) {
+        let names = messages::Names {
+            users: &app.users,
+            chats: &app.chats,
+        };
+        let pane = topics::TopicList {
+            forum,
+            names: &names,
+            focused: app.focus == Focus::Topics,
+            gaps: app.settings.chat_gaps,
+        };
+        topics::draw(frame, area, &pane, colors);
+    }
     // Popups drawn over the messages, below. Not the toast, which only says
     // what just happened: holding photos back under it would blank them all
     // on every copy.
@@ -432,10 +476,23 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             ])
             .areas(chat_area);
             let playing = app.player.playback(open.chat_id);
+            // A topic opened from a link may not be loaded yet: its name
+            // shows as "…" until it is.
+            let loading = open
+                .topic
+                .filter(|&id| app.forum.as_ref().is_none_or(|f| f.get(id).is_none()))
+                .map(|id| Topic::local(id, "…", 0, 0, ""));
+            let topic = app
+                .forum
+                .as_ref()
+                .zip(open.topic)
+                .and_then(|(forum, id)| forum.get(id))
+                .or(loading.as_ref());
             messages::draw(
                 frame,
                 history,
                 open,
+                topic,
                 &names,
                 &mut app.images,
                 app.focus == Focus::Messages,
@@ -465,10 +522,13 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             );
         }
         None => frame.render_widget(
-            Paragraph::new("Press Enter to open a chat")
-                .fg(colors.muted)
-                .centered()
-                .block(Block::bordered().border_style(border(false, colors))),
+            Paragraph::new(match app.forum {
+                Some(_) => "Press Enter to open a topic",
+                None => "Press Enter to open a chat",
+            })
+            .fg(colors.muted)
+            .centered()
+            .block(Block::bordered().border_style(border(false, colors))),
             chat_area,
         ),
     }
@@ -2351,6 +2411,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             normal,
             "  `j/k` move · `Enter` open · `i` write · `/` search · `s` find anyone · `p` pin · `m` mute · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
+        Focus::Topics => (
+            normal,
+            "  `j/k` move · `Enter` open · `i` write · `h` back · `s` find anyone · `Ctrl-o/i` back/forward · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+        ),
         Focus::Messages if searching => (
             normal,
             "  `n/N` older/newer match · `Esc` end search · `/` search again · `j/k` newer/older · `Enter` open/play media · `r` reply · `i` write · `h` back",
@@ -2427,7 +2491,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         _ => Vec::new(),
     };
     if let Some(open) = &app.open
-        && app.focus != Focus::Chats
+        && matches!(app.focus, Focus::Messages | Focus::Input)
         && !popup
         && let Some(hint) = as_files_hint(open)
     {
@@ -2443,9 +2507,16 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         spans.extend(hint_spans(&here, Style::new().fg(colors.fg), colors));
         spans.extend(hint_spans(hints.trim_start(), muted, colors));
     }
-    if app.resizing.is_some() {
-        let width = format!("  chat list {}%", app.settings.list_width());
-        spans.push(Span::from(width).fg(colors.fg));
+    match app.resizing {
+        Some(Resizing::List(_)) => {
+            let width = format!("  chat list {}%", app.settings.list_width());
+            spans.push(Span::from(width).fg(colors.fg));
+        }
+        Some(Resizing::Topics(_)) => {
+            let width = format!("  topics {} columns", app.settings.topics_pane_width());
+            spans.push(Span::from(width).fg(colors.fg));
+        }
+        None => {}
     }
     if app.quit_deadline.is_some() {
         spans.push(Span::from("  Closing… (q again to force)").fg(colors.warning));
@@ -2516,6 +2587,10 @@ pub(crate) fn truncate(text: &str, max: usize) -> String {
     if text.width() <= max {
         return text.to_string();
     }
+    // Not even the "…" fits.
+    if max == 0 {
+        return String::new();
+    }
     let mut out = String::new();
     let mut used = 0;
     // Zero-width characters don't add to `used`, so a run of them would all
@@ -2557,6 +2632,40 @@ mod tests {
         (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    #[test]
+    fn truncating_to_nothing_leaves_nothing_not_even_the_ellipsis() {
+        assert_eq!(truncate("Announcements", 0), "");
+        assert_eq!(truncate("Announcements", 1), "…");
+        assert_eq!(truncate("Announcements", 4), "Ann…");
+    }
+
+    #[test]
+    fn in_a_forum_topic_only_who_is_typing_in_it_shows() {
+        use tdlib_rs::enums::{ChatAction, MessageSender};
+        use tdlib_rs::types::MessageSenderUser;
+
+        let mut chats = crate::chats::Chats::default();
+        chats.add_local(-100, "Rustaceans", None);
+        let user = |user_id| MessageSender::User(MessageSenderUser { user_id });
+        chats.set_action(-100, Some(2), &user(7), &ChatAction::Typing);
+        chats.set_action(-100, None, &user(8), &ChatAction::Typing);
+        let users =
+            std::collections::HashMap::from([(7, "Leo".to_string()), (8, "Maya".to_string())]);
+        let names = messages::Names {
+            users: &users,
+            chats: &chats,
+        };
+        let chat = chats.get(-100).unwrap();
+        let general = Topic::local(crate::topics::GENERAL, "General", 0, 0, "");
+        let help = Topic::local(2, "Help", 0, 0, "");
+        let other = Topic::local(3, "Jobs", 0, 0, "");
+        let doing = |topic| activity(chat, &names, topic);
+        assert_eq!(doing(None).as_deref(), Some("Leo and Maya are typing…"));
+        assert_eq!(doing(Some(&help)).as_deref(), Some("Leo is typing…"));
+        assert_eq!(doing(Some(&general)).as_deref(), Some("Maya is typing…"));
+        assert_eq!(doing(Some(&other)), None);
     }
 
     #[test]
@@ -3178,6 +3287,7 @@ mod tests {
             hidden: None,
             saveable: true,
             voice: None,
+            service: None,
         };
         let mut open = OpenChat::new(1);
         open.messages.insert(1, msg(None));
@@ -3197,6 +3307,7 @@ mod tests {
         assert!(jump_hints(&open, &jumps).is_empty());
         jumps.leave(crate::app::Jump {
             chat_id: 1,
+            topic: None,
             message_id: Some(2),
         });
         assert_eq!(jump_hints(&open, &jumps), ["`Ctrl-o` back"]);

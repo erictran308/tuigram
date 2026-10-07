@@ -16,6 +16,7 @@ mod poll;
 mod reactions;
 mod search;
 mod secret;
+mod service;
 mod settings;
 mod sound;
 mod stickers;
@@ -23,6 +24,7 @@ mod text;
 mod tg;
 mod theme;
 mod tmux;
+mod topics;
 mod ui;
 mod voice;
 

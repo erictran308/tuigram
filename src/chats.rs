@@ -21,6 +21,7 @@ use crate::images::Thumbnail;
 use crate::messages::{Sender, decode_minithumbnail, without_spoilers};
 use crate::search;
 use crate::secret::Secret;
+use crate::service::Service;
 use crate::text;
 
 pub struct Chat {
@@ -45,8 +46,9 @@ pub struct Chat {
     /// no photo.
     accent: i32,
     /// Who is typing (or recording, sending a photo, …) right now, in the
-    /// order they started, with what they're doing, e.g. "typing".
-    pub activity: Vec<(Sender, &'static str)>,
+    /// order they started, with what they're doing, e.g. "typing", and in a
+    /// forum the topic they're doing it in.
+    pub activity: Vec<(Sender, &'static str, Option<i32>)>,
     /// The person or group the chat is with, for its [`Badge`].
     pub peer: Option<Peer>,
     /// How the chat notifies, which `m` changes the mute of.
@@ -240,6 +242,8 @@ pub struct Chats {
     usernames: HashMap<Peer, String>,
     /// Groups and channels you're not in: public ones opened with `s`.
     left: HashSet<i64>,
+    /// Groups split into topics, by supergroup id.
+    forums: HashSet<i64>,
     /// How long chats of each kind are muted for unless they say
     /// otherwise: private chats, groups, channels.
     default_mute: [i32; 3],
@@ -346,21 +350,28 @@ impl Chats {
         }
     }
 
-    /// Someone started or stopped typing (or recording, …). TDLib sends the
-    /// stop itself when the message arrives, or when the action isn't
-    /// repeated within about 5 seconds.
-    pub fn set_action(&mut self, chat_id: i64, sender: &MessageSender, action: &ChatAction) {
+    /// Someone started or stopped typing (or recording, …), in a forum's
+    /// `topic` or the whole chat. TDLib sends the stop itself when the
+    /// message arrives, or when the action isn't repeated within about 5
+    /// seconds.
+    pub fn set_action(
+        &mut self,
+        chat_id: i64,
+        topic: Option<i32>,
+        sender: &MessageSender,
+        action: &ChatAction,
+    ) {
         let Some(chat) = self.by_id.get_mut(&chat_id) else {
             return;
         };
         let sender = Sender::from(sender);
-        let at = chat.activity.iter().position(|(s, _)| *s == sender);
+        let at = chat.activity.iter().position(|(s, _, _)| *s == sender);
         match (at, activity(action)) {
-            (Some(i), Some(doing)) => chat.activity[i].1 = doing,
+            (Some(i), Some(doing)) => chat.activity[i] = (sender, doing, topic),
             (Some(i), None) => {
                 chat.activity.remove(i);
             }
-            (None, Some(doing)) => chat.activity.push((sender, doing)),
+            (None, Some(doing)) => chat.activity.push((sender, doing, topic)),
             (None, None) => {}
         }
     }
@@ -731,6 +742,24 @@ impl Chats {
         }
     }
 
+    /// Whether a group is split into topics, from `updateSupergroup`.
+    pub fn set_forum(&mut self, supergroup_id: i64, forum: bool) {
+        if forum {
+            self.forums.insert(supergroup_id);
+        } else {
+            self.forums.remove(&supergroup_id);
+        }
+    }
+
+    /// The chat is a forum: a group whose messages are in topics, which
+    /// open one at a time.
+    pub fn is_forum(&self, chat_id: i64) -> bool {
+        match self.by_id.get(&chat_id).and_then(|c| c.peer) {
+            Some(Peer::Supergroup(id)) => self.forums.contains(&id),
+            _ => false,
+        }
+    }
+
     /// You're in the chat: always for private chats and basic groups, which
     /// can't be read from outside.
     pub fn joined(&self, chat_id: i64) -> bool {
@@ -925,15 +954,24 @@ fn activity(action: &ChatAction) -> Option<&'static str> {
 /// How much of the last message a chat list row keeps.
 const PREVIEW_CHARS: usize = 300;
 
+/// One line of a message for the chat list: "You: see you at 5".
 fn preview(message: &Message) -> String {
-    let text = text::clean(&content_text(&message.content));
-    // Only the start fits in a chat list row, and it's drawn every frame.
-    let text = text::first_chars(&text, PREVIEW_CHARS).replace(['\n', '\t'], " ");
+    let text = snippet(message);
     if message.is_outgoing {
         format!("You: {text}")
     } else {
         text
     }
+}
+
+/// One line of a message for a list, without who sent it.
+pub fn snippet(message: &Message) -> String {
+    let text = match Service::of(&message.content) {
+        Some(service) => format!("[{}]", service.label(Sender::from(&message.sender_id))),
+        None => text::clean(&content_text(&message.content)),
+    };
+    // Only the start fits in a list row, and it's drawn every frame.
+    text::first_chars(&text, PREVIEW_CHARS).replace(['\n', '\t'], " ")
 }
 
 /// Plain-text rendering of a message body; media becomes a `[Label]`.
@@ -976,16 +1014,6 @@ fn labeled_text(content: &MessageContent, text: impl Fn(&FormattedText) -> Strin
         MessageContent::MessageExpiredVideo => "[Video expired]".into(),
         MessageContent::MessageExpiredVideoNote => "[Video message expired]".into(),
         MessageContent::MessageExpiredVoiceNote => "[Voice message expired]".into(),
-        MessageContent::MessageScreenshotTaken => "[Took a screenshot]".into(),
-        MessageContent::MessageChatSetMessageAutoDeleteTime(m) => {
-            match m.message_auto_delete_time {
-                0 => "[Turned the timer off]".into(),
-                secs => format!(
-                    "[Set messages to disappear after {}]",
-                    crate::secret::timer_words(secs)
-                ),
-            }
-        }
         _ => "[Message]".into(),
     }
 }
@@ -1020,28 +1048,34 @@ mod tests {
     fn activity_lasts_until_tdlib_says_it_stopped() {
         let mut list = chats(&[(1, 50, 0)]);
         let activity = |list: &Chats| list.get(1).unwrap().activity.clone();
-        list.set_action(1, &user(7), &ChatAction::Typing);
-        list.set_action(1, &user(8), &ChatAction::ChoosingSticker);
+        list.set_action(1, None, &user(7), &ChatAction::Typing);
+        list.set_action(1, None, &user(8), &ChatAction::ChoosingSticker);
         assert_eq!(
             activity(&list),
             [
-                (Sender::User(7), "typing"),
-                (Sender::User(8), "choosing a sticker")
+                (Sender::User(7), "typing", None),
+                (Sender::User(8), "choosing a sticker", None)
             ]
         );
 
         // Someone doing something else keeps their place.
         let photo = types::ChatActionUploadingPhoto { progress: 10 };
-        list.set_action(1, &user(7), &ChatAction::UploadingPhoto(photo));
-        assert_eq!(activity(&list)[0], (Sender::User(7), "sending a photo"));
+        list.set_action(1, None, &user(7), &ChatAction::UploadingPhoto(photo));
+        assert_eq!(
+            activity(&list)[0],
+            (Sender::User(7), "sending a photo", None)
+        );
 
-        list.set_action(1, &user(7), &ChatAction::Cancel);
-        assert_eq!(activity(&list), [(Sender::User(8), "choosing a sticker")]);
+        list.set_action(1, None, &user(7), &ChatAction::Cancel);
+        assert_eq!(
+            activity(&list),
+            [(Sender::User(8), "choosing a sticker", None)]
+        );
         // An emoji animation being watched shows nothing.
         let watching = types::ChatActionWatchingAnimations {
             emoji: "🎉".into()
         };
-        list.set_action(1, &user(9), &ChatAction::WatchingAnimations(watching));
+        list.set_action(1, None, &user(9), &ChatAction::WatchingAnimations(watching));
         assert_eq!(activity(&list).len(), 1);
     }
 

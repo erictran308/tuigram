@@ -25,11 +25,16 @@ use crate::messages::{
 use crate::reactions::{self, Reaction};
 use crate::search;
 use crate::secret::{self, SecretState};
+use crate::service::Part;
 use crate::theme::Colors;
+use crate::topics::Topic;
 use crate::voice::{self, Playback, Voice};
 
 /// Bubbles take at most this share of the pane width.
 const BUBBLE_WIDTH_PERCENT: usize = 75;
+/// Columns a topic's name brings to the title besides itself: " › " and
+/// " · closed".
+const TOPIC_MARKS: usize = 12;
 /// Largest inline photo, in terminal cells.
 const MAX_PHOTO_COLS: usize = 40;
 const MAX_PHOTO_ROWS: usize = 16;
@@ -122,6 +127,8 @@ struct Placed {
     start: usize,
     bubble_start: usize,
     end: usize,
+    /// Where the first message of its day is placed, which has the date.
+    day: usize,
 }
 
 /// Rows reserved inside a bubble where a photo gets drawn after the text.
@@ -140,6 +147,7 @@ pub fn draw(
     frame: &mut Frame,
     area: Rect,
     open: &mut OpenChat,
+    topic: Option<&Topic>,
     names: &Names,
     images: &mut Images,
     focused: bool,
@@ -151,21 +159,40 @@ pub fn draw(
     let chat = names.chats.get(open.chat_id);
     let secret = names.chats.secret(open.chat_id);
     let mut title = vec![Span::from(" ")];
-    if names.chats.is_secret(open.chat_id) {
+    let is_secret = names.chats.is_secret(open.chat_id);
+    if is_secret {
         title.extend(super::lock_spans(colors));
     }
+    // Names are cut to fit, so Telegram's verdict on the chat (SCAM, FAKE,
+    // ✓) is never pushed out of sight; a topic's name gets at most half.
+    let badge = names.chats.badge(open.chat_id);
+    let room = usize::from(area.width.saturating_sub(4))
+        .saturating_sub(if is_secret { super::LOCK_WIDTH } else { 0 })
+        .saturating_sub(badge.map_or(0, |b| b.mark().width()));
+    let topic_name = topic.map(|t| truncate(&t.name, room.saturating_sub(TOPIC_MARKS) / 2));
+    let topic_w = topic_name.as_ref().map_or(0, |n| n.width() + TOPIC_MARKS);
+    let chat_title = names.chats.title(open.chat_id).unwrap_or_default();
     title.push(
-        Span::from(
-            names
-                .chats
-                .title(open.chat_id)
-                .unwrap_or_default()
-                .to_string(),
-        )
-        .style(super::title_style(names.chats, open.chat_id, colors)),
+        Span::from(truncate(chat_title, room.saturating_sub(topic_w))).style(super::title_style(
+            names.chats,
+            open.chat_id,
+            colors,
+        )),
     );
-    if let Some(badge) = names.chats.badge(open.chat_id) {
+    if let Some(badge) = badge {
         title.push(super::badge_span(badge, colors));
+    }
+    // A forum's topic, after the forum's name.
+    if let (Some(topic), Some(name)) = (topic, topic_name) {
+        title.push(Span::from(" › ").fg(colors.muted));
+        let color = match topic.general {
+            true => colors.fg,
+            false => colors.names[topic.accent()],
+        };
+        title.push(Span::from(name).fg(color).bold());
+        if topic.closed {
+            title.push(Span::from(" · closed").fg(colors.muted));
+        }
     }
     title.push(Span::from(" "));
     // How long messages last, in a secret chat.
@@ -189,7 +216,7 @@ pub fn draw(
             _ => ("· ended ".into(), colors.muted),
         };
         title.push(Span::from(label).fg(color));
-    } else if let Some(doing) = chat.and_then(|c| super::activity(c, names)) {
+    } else if let Some(doing) = chat.and_then(|c| super::activity(c, names, topic)) {
         // What they're doing says more than when they were last seen.
         title.push(Span::from(format!("· {doing} ")).fg(colors.activity));
     } else if let Some(seen) = names.chats.seen(open.chat_id) {
@@ -278,33 +305,46 @@ pub fn draw(
         None => placed.last(),
     };
     let (top, anchor) = scroll_top(open, &placed, selected, laid.total, height);
+    // Once the date of the day at the top has scrolled away, it stays on the
+    // first row, in place of the row there; or above it, when that's where
+    // the cursor's message starts, so the date never hides it.
+    let date = (height > 3).then(|| laid.date_above(top)).flatten();
+    let (first, rows) = match (&date, selected) {
+        (None, _) => (top, height),
+        (Some(_), Some(sel)) if sel.start == top => (top, height - 1),
+        (Some(_), _) => (top + 1, height - 1),
+    };
     let photos = std::mem::take(&mut laid.photos);
-    let visible = laid.lines(top, height, block_gaps, colors);
+    let visible = laid.lines(first, rows, block_gaps, colors);
     open.scroll = anchor;
+    if let Some(date) = date {
+        let row = Rect { height: 1, ..body };
+        frame.render_widget(Line::from(date).fg(colors.muted).centered(), row);
+    }
     // Short chats sit at the bottom of the pane, like in Telegram.
-    let pad = (height - visible.len()) as u16;
+    let pad = (rows - visible.len()) as u16 + (height - rows) as u16;
     let shift = |r: Rect| Rect {
         y: r.y + pad,
         height: r.height - pad,
         ..r
     };
     frame.render_widget(Paragraph::new(visible), shift(body));
-    draw_photos(frame, shift(body), &photos, top, images, covered, colors);
+    draw_photos(frame, shift(body), &photos, first, images, covered, colors);
 
     let gutters = [shift(left), shift(right)];
     // The message being answered or edited stays marked while writing.
     if let Some(reply) = &open.reply
         && let Some(target) = placed.iter().find(|p| p.id == reply.id)
     {
-        mark(frame, gutters, target, top, colors.reply);
+        mark(frame, gutters, target, first, colors.reply);
     }
     if let Some(editing) = &open.editing
         && let Some(target) = placed.iter().find(|p| p.id == editing.id)
     {
-        mark(frame, gutters, target, top, colors.edit);
+        mark(frame, gutters, target, first, colors.edit);
     }
     if focused && let Some(sel) = selected {
-        mark(frame, gutters, sel, top, colors.accent);
+        mark(frame, gutters, sel, first, colors.accent);
     }
 }
 
@@ -626,19 +666,34 @@ fn measure<'a>(
         let bubble = Bubble::new(
             msg, caption, header, photo, voice, card_image, meta, chips, matches, max_text,
         );
+        // "Alice added Bob", in the middle like a date. It breaks a block:
+        // the next message says who it's from again.
+        let service = msg.service.as_ref().map(|service| {
+            let actor = match msg.outgoing {
+                true => Part::You,
+                false => Part::Name(names.get(msg.sender)),
+            };
+            let parts = service.sentence(msg.sender, actor, |id| names.get(Sender::User(id)));
+            service_lines(&parts, max_text, colors)
+        });
         // Messages in a row from one sender form a block, with no gap between
         // them. Not in channels, where every post has the same sender, and
         // not for stickers, which have no bubble to join up.
         let sticker = bubble.sticker();
-        let joined = show_names && prev_sender == Some(msg.sender) && !sticker && !prev_sticker;
+        let joined = show_names
+            && prev_sender == Some(msg.sender)
+            && !sticker
+            && !prev_sticker
+            && service.is_none();
+        prev_sender = service.is_none().then_some(msg.sender);
         measured.push(Measured {
             id,
             separator,
             joined,
             bubble,
+            service,
         });
         prev_day = day;
-        prev_sender = Some(msg.sender);
         prev_sticker = sticker;
     }
 
@@ -658,8 +713,12 @@ fn measure<'a>(
         photos: Vec::new(),
         total: 0,
     };
+    let mut day = 0;
     for (m, inner) in measured.into_iter().zip(widths) {
         let start = laid.total;
+        if m.separator.is_some() {
+            day = laid.placed.len();
+        }
         let mut bubble_start = start + usize::from(!m.joined || gaps);
         if m.separator.is_some() {
             bubble_start += 1 + usize::from(start > 0);
@@ -696,12 +755,13 @@ fn measure<'a>(
                 photo: photo.clone(),
             });
         }
-        let end = bubble_start + m.bubble.height();
+        let end = bubble_start + m.service.as_ref().map_or(m.bubble.height(), Vec::len);
         laid.placed.push(Placed {
             id: m.id,
             start,
             bubble_start,
             end,
+            day,
         });
         laid.messages.push((m, inner));
         laid.total = end;
@@ -720,6 +780,19 @@ struct Laid<'a> {
 }
 
 impl Laid<'_> {
+    /// The date of the day row `line` is in, if its date is above that row,
+    /// scrolled out of sight.
+    fn date_above(&self, line: usize) -> Option<String> {
+        let at = self.placed.iter().position(|p| p.end > line)?;
+        let first = self.placed[at].day;
+        let start = self.placed[first].start;
+        // A blank row comes before every date but the first.
+        let date_row = start + usize::from(start > 0);
+        (date_row < line)
+            .then(|| self.messages[first].0.separator.clone())
+            .flatten()
+    }
+
     /// Rows `top..top + height`, building only the messages they show.
     fn lines(self, top: usize, height: usize, gaps: bool, colors: &Colors) -> Vec<Line<'static>> {
         let bottom = top.saturating_add(height);
@@ -742,7 +815,10 @@ impl Laid<'_> {
             } else if gaps {
                 lines.push(m.bubble.gap(inner, colors));
             }
-            lines.extend(m.bubble.rows(inner, colors));
+            match m.service {
+                Some(rows) => lines.extend(rows.into_iter().map(Line::centered)),
+                None => lines.extend(m.bubble.rows(inner, colors)),
+            }
             debug_assert_eq!(lines.len(), placed.end - placed.start, "measured right");
             let from = top.saturating_sub(placed.start);
             let to = bottom.min(placed.end) - placed.start;
@@ -822,6 +898,49 @@ struct Measured<'a> {
     /// Whether it continues the block above, with no gap between.
     joined: bool,
     bubble: Bubble<'a>,
+    /// A service message's sentence, wrapped, drawn in the middle instead of
+    /// the bubble.
+    service: Option<Vec<Line<'static>>>,
+}
+
+/// A service message's sentence, wrapped: tuigram's own words muted, like a
+/// date, and the names and titles people picked in colors of their own, so
+/// a name can't pass for a date or for something that happened.
+fn service_lines(parts: &[Part], width: usize, colors: &Colors) -> Vec<Line<'static>> {
+    let mut text = String::new();
+    let mut styles: Vec<(Range<usize>, Style)> = Vec::new();
+    for part in parts {
+        let style = match part {
+            Part::Words(_) => Style::new().fg(colors.muted),
+            Part::Name(_) => Style::new().fg(colors.fg),
+            Part::You => Style::new().fg(colors.primary),
+            Part::Quote(_) => Style::new().fg(colors.fg).italic(),
+        };
+        let start = text.len();
+        // On one line, whatever the name: a line of its own would be
+        // drawn as one of tuigram's.
+        text.push_str(&part.text().replace(['\n', '\t'], " "));
+        styles.push((start..text.len(), style));
+    }
+    wrap(&text, width)
+        .into_iter()
+        .map(|(line, at)| {
+            let end = at + line.len();
+            if text.get(at..end) != Some(line.as_str()) {
+                // Not where it was expected: drawn as someone else's words.
+                return Line::from(line).fg(colors.fg);
+            }
+            let spans: Vec<Span> = styles
+                .iter()
+                .filter_map(|(range, style)| {
+                    let (from, to) = (range.start.max(at), range.end.min(end));
+                    let piece = text.get(from..to).filter(|p| !p.is_empty())?;
+                    Some(Span::styled(piece.to_string(), *style))
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Each sender keeps one of the theme's name colors.
@@ -1713,6 +1832,7 @@ mod tests {
             hidden: None,
             saveable: true,
             voice: None,
+            service: None,
         }
     }
 
@@ -1764,6 +1884,7 @@ mod tests {
                     f,
                     f.area(),
                     open,
+                    None,
                     &names,
                     images,
                     focused,
@@ -2003,7 +2124,7 @@ mod tests {
         let typing = tdlib_rs::enums::ChatAction::Typing;
         let chardy =
             tdlib_rs::enums::MessageSender::User(tdlib_rs::types::MessageSenderUser { user_id: 2 });
-        chats.set_action(42, &chardy, &typing);
+        chats.set_action(42, None, &chardy, &typing);
         let buf = render_in(&mut sample(), &chats, false, &mut images());
         let title: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(title.contains(" Chardy · typing… "), "{title}");
@@ -2196,6 +2317,7 @@ mod tests {
                         f,
                         f.area(),
                         &mut open,
+                        None,
                         &names,
                         &mut images,
                         false,
@@ -3154,5 +3276,148 @@ mod tests {
             !rows.iter().any(|r| r.contains("▌▌")),
             "only on its own message"
         );
+    }
+    #[test]
+    fn service_messages_sit_in_the_middle_like_a_date_without_a_bubble() {
+        use crate::service::Service;
+        let mut open = sample();
+        let at = 1_790_086_500;
+        open.messages.insert(
+            5,
+            Msg {
+                service: Some(Service::Did("pinned a message".into())),
+                ..msg(false, at, "Pinned a message")
+            },
+        );
+        open.messages.insert(6, msg(false, at + 60, "see above"));
+        let buf = render_buffer(&mut open, false, &mut images());
+        let rows = rows_of(&buf);
+        let y = rows
+            .iter()
+            .position(|r| r.contains("Unknown pinned a message"))
+            .expect("a sentence, with who did it");
+        let row = &rows[y];
+        let (left, right) = (
+            row.len() - row.trim_start().len(),
+            row.len() - row.trim_end().len(),
+        );
+        assert!(left.abs_diff(right) <= 2, "in the middle: {row:?}");
+        let time = Local
+            .timestamp_opt(i64::from(at), 0)
+            .unwrap()
+            .format("%H:%M")
+            .to_string();
+        assert!(!row.contains(&time), "no time, like a date");
+        let x = row.find("pinned").unwrap() as u16;
+        let colors = Colors::default();
+        assert_ne!(buf[(x, y as u16)].bg, colors.other_bubble, "no bubble");
+        assert_eq!(buf[(x, y as u16)].fg, colors.muted);
+        // What comes next says who it's from again.
+        assert!(rows[y + 2].contains("Unknown"), "{:?}", &rows[y..]);
+    }
+    #[test]
+    fn a_name_in_a_service_message_cant_pass_for_a_date() {
+        use crate::chats::Peer;
+        use crate::service::Service;
+        let mut open = OpenChat::new(42);
+        let at = 1_790_086_500;
+        open.messages.insert(
+            5,
+            Msg {
+                service: Some(Service::Added(vec![7])),
+                ..msg(false, at, "Joined the group")
+            },
+        );
+        let mut chats = Chats::default();
+        chats.add_local(42, "Group", None).peer = Some(Peer::Supergroup(1));
+        let users = HashMap::from([(7, "Thu 8 Oct 2026".to_string())]);
+        let names = Names {
+            users: &users,
+            chats: &chats,
+        };
+        // The message is from user 0 ("Unknown"), who added user 7.
+        let colors = Colors::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(
+                    f,
+                    f.area(),
+                    &mut open,
+                    None,
+                    &names,
+                    &mut images(),
+                    false,
+                    false,
+                    &colors,
+                    true,
+                    None,
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows = rows_of(buf);
+        let y = rows
+            .iter()
+            .position(|r| r.contains("added Thu 8 Oct 2026"))
+            .expect("the sentence");
+        let date = rows[y].find("Thu").unwrap() as u16;
+        let words = rows[y].find("added").unwrap() as u16;
+        assert_eq!(buf[(words, y as u16)].fg, colors.muted, "tuigram's words");
+        assert_ne!(buf[(date, y as u16)].fg, colors.muted, "someone's name");
+    }
+
+    #[test]
+    fn a_long_chat_name_is_cut_so_telegrams_verdict_still_shows() {
+        use crate::chats::{Badge, Peer};
+        let mut open = sample();
+        let mut chats = Chats::default();
+        let name = "Official Wallet Support and Refunds for Every Customer Worldwide";
+        chats.add_local(42, name, None).peer = Some(Peer::Supergroup(1));
+        chats.set_badge(Peer::Supergroup(1), Some(Badge::Scam));
+        let buf = render_in(&mut open, &chats, false, &mut images());
+        let rows = rows_of(&buf);
+        assert!(rows[0].contains("… SCAM"), "{:?}", rows[0]);
+    }
+
+    /// A chat of one long day: 40 messages, a minute apart.
+    fn long_day() -> (OpenChat, String) {
+        let mut open = OpenChat::new(42);
+        let day = 1_790_000_000;
+        for i in 0..40 {
+            let text = format!("message {i}");
+            open.messages
+                .insert(i, msg(false, day + i as i32 * 60, &text));
+        }
+        let date = Local.timestamp_opt(i64::from(day), 0).unwrap();
+        (open, date.format("%a %-d %b %Y").to_string())
+    }
+
+    #[test]
+    fn the_date_stays_on_top_while_a_long_day_scrolls_by() {
+        let (mut open, date) = long_day();
+        let rows = render(&mut open, false);
+        // Row 0 is the pane's border.
+        assert_eq!(rows[1].trim_matches(['│', ' ']), date, "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("message 39")), "the newest");
+        assert_eq!(rows.iter().filter(|r| r.contains(&date)).count(), 1, "once");
+
+        // The cursor's message at the top isn't hidden behind it.
+        open.selected = Some(5);
+        open.scroll = None;
+        let rows = render(&mut open, true);
+        assert_eq!(rows[1].trim_matches(['│', ' ']), date);
+        let at = rows.iter().position(|r| r.contains("message 5 ")).unwrap();
+        // Its own blank row first, as under any date.
+        assert_eq!(at, 3, "right under the date: {rows:#?}");
+        assert_eq!(rows[2].trim_matches(['│', ' ']), "");
+    }
+
+    #[test]
+    fn a_date_already_on_screen_isnt_repeated_on_top() {
+        let rows = render(&mut sample(), false);
+        let day1 = Local.timestamp_opt(1_790_000_000, 0).unwrap();
+        let date = day1.format("%a %-d %b %Y").to_string();
+        assert_eq!(rows.iter().filter(|r| r.contains(&date)).count(), 1);
     }
 }

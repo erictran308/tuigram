@@ -169,7 +169,7 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
             } else {
                 Style::new()
             };
-            let second = match activity(chat, &names) {
+            let second = match activity(chat, &names, None) {
                 Some(doing) => Span::from(truncate(&doing, width)).fg(colors.activity),
                 None => Span::from(truncate(&chat.preview, width)).fg(colors.subtle),
             };
@@ -539,9 +539,9 @@ mod tests {
         chats.add_local(2, "Climbing club", None);
         chats.refresh();
         let user = |user_id| MessageSender::User(MessageSenderUser { user_id });
-        chats.set_action(1, &user(7), &ChatAction::Typing);
-        chats.set_action(2, &user(7), &ChatAction::Typing);
-        chats.set_action(2, &user(8), &ChatAction::Typing);
+        chats.set_action(1, None, &user(7), &ChatAction::Typing);
+        chats.set_action(2, None, &user(7), &ChatAction::Typing);
+        chats.set_action(2, None, &user(8), &ChatAction::Typing);
         let users = HashMap::from([(7, "Alice".to_string()), (8, "Bob".to_string())]);
         let draw = |chats: &Chats| {
             let list = ChatList {
@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(buf[(7, 2)].fg, colors.activity);
         assert_eq!(cells(&buf, 7, 5, 25), "Alice and Bob are typing…");
 
-        chats.set_action(1, &user(7), &ChatAction::Cancel);
+        chats.set_action(1, None, &user(7), &ChatAction::Cancel);
         let buf = draw(&chats);
         assert_eq!(cells(&buf, 7, 2, 7), "       ", "back to the last message");
     }
