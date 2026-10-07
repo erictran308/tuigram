@@ -27,6 +27,7 @@ use crate::pins::{PinMenu, PinnedMenu};
 use crate::poll::VoteMenu;
 use crate::reactions::{self, ReactMenu};
 use crate::search;
+use crate::secret::{self, KeyView, TimerMenu};
 use crate::settings::{Settings, Side};
 use crate::text;
 use crate::theme::{Colors, Themes};
@@ -39,6 +40,20 @@ const BAR_ROWS: u16 = 2;
 /// Files waiting to be sent get a row each in the composer, up to this
 /// many; the last row then counts the rest.
 const MAX_ATTACHMENT_ROWS: usize = 3;
+/// Before a secret chat's title, which is the other person's name, as is
+/// the title of the chat with them that isn't secret: see [`lock_spans`].
+const LOCK: &str = "🔒";
+/// Columns [`lock_spans`] take.
+const LOCK_WIDTH: usize = 3;
+
+/// The lock before a secret chat's title, on the secret color, and a space:
+/// a name is only text, so one starting with 🔒 can't look like it.
+fn lock_spans(colors: &Colors) -> [Span<'static>; 2] {
+    [
+        Span::styled(LOCK, Style::new().bg(colors.secret)),
+        Span::from(" "),
+    ]
+}
 
 mod chat_list;
 mod help;
@@ -60,11 +75,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Chats you highlighted (`H`) stand out the most, then Saved Messages, as in
-/// Telegram. Other titles keep whatever style surrounds them.
+/// Chats you highlighted (`H`) stand out the most, then secret chats and
+/// Saved Messages, as in Telegram. Other titles keep whatever style
+/// surrounds them.
 fn title_style(chats: &crate::chats::Chats, chat_id: i64, colors: &Colors) -> Style {
     if chats.is_highlighted(chat_id) {
         Style::new().fg(colors.highlighted)
+    } else if chats.is_secret(chat_id) {
+        Style::new().fg(colors.secret)
     } else if chats.is_saved(chat_id) {
         Style::new().fg(colors.primary)
     } else {
@@ -356,6 +374,8 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         || app.notice.is_some()
         || app.pin_menu.is_some()
         || app.pinned_menu.is_some()
+        || app.timer_menu.is_some()
+        || app.key_view.is_some()
         || app.picker.is_some()
         || app.confirm.is_some()
         || app.settings_menu.is_some()
@@ -407,6 +427,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             draw_composer(
                 frame,
                 &mut app.composer,
+                app.chats.is_secret(open.chat_id),
                 ComposerBar::of(open),
                 &open.attachments,
                 open.as_files,
@@ -457,6 +478,14 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     }
     if let Some(menu) = &app.pin_menu {
         draw_pin(frame, chat_area, menu, colors);
+    }
+    if let Some(menu) = &app.timer_menu {
+        let current = app.chats.auto_delete(menu.chat_id);
+        let with = app.chats.title(menu.chat_id).unwrap_or_default();
+        draw_timer(frame, chat_area, menu, with, current, colors);
+    }
+    if let Some(key) = &app.key_view {
+        draw_key(frame, chat_area, key, colors);
     }
     if let (Some(menu), Some(open)) = (&app.pinned_menu, &app.open) {
         let names = messages::Names {
@@ -825,7 +854,10 @@ fn draw_picker(
             let selected = i == cursor;
             let (title, style, badge, detail) = match choice {
                 Choice::Chat(id) => {
+                    let secret = chats.is_secret(*id);
                     let detail = match chats.username(*id) {
+                        // Its title is the same as the other chat's.
+                        _ if secret => "secret chat".into(),
                         Some(name) => format!("@{name}"),
                         None if !chats.listed(*id) => "public".into(),
                         None => String::new(),
@@ -860,8 +892,10 @@ fn draw_picker(
             };
             let badge = badge.map(|b| badge_span(b, colors));
             let badge_w = badge.as_ref().map_or(0, |b| b.content.width());
+            let secret = matches!(choice, Choice::Chat(id) if chats.is_secret(*id));
+            let lock_w = if secret { LOCK_WIDTH } else { 0 };
             // The detail takes up to half the row, the title what's left.
-            let room = width.saturating_sub(badge_w);
+            let room = width.saturating_sub(badge_w + lock_w);
             let detail = truncate(&detail, room / 2);
             let detail_w = if detail.is_empty() {
                 0
@@ -869,15 +903,16 @@ fn draw_picker(
                 detail.width() + 2
             };
             let title = truncate(&title, room.saturating_sub(detail_w));
-            let used = title.width() + badge_w;
-            let mut spans = vec![
-                if selected {
-                    Span::from("▌").fg(colors.accent)
-                } else {
-                    Span::from(" ")
-                },
-                Span::styled(title, style),
-            ];
+            let used = lock_w + title.width() + badge_w;
+            let mut spans = vec![if selected {
+                Span::from("▌").fg(colors.accent)
+            } else {
+                Span::from(" ")
+            }];
+            if secret {
+                spans.extend(lock_spans(colors));
+            }
+            spans.push(Span::styled(title, style));
             spans.extend(badge);
             if !detail.is_empty() {
                 let gap = width.saturating_sub(used + detail.width()).max(2);
@@ -1166,6 +1201,14 @@ fn draw_settings(
         "Back to Normal mode after sending a message",
     );
     lines.push(Line::default());
+    lines.push(heading(" Secret chats"));
+    add(
+        &mut lines,
+        SettingsMenu::SECRET_CHATS,
+        check(settings.accept_secret_chats),
+        "Take the ones others start here, not on your phone",
+    );
+    lines.push(Line::default());
     lines.push(heading(" Theme"));
     for (i, theme) in themes.list.iter().enumerate() {
         // The dot marks the theme in use.
@@ -1448,6 +1491,137 @@ fn draw_pin(frame: &mut Frame, area: Rect, menu: &PinMenu, colors: &Colors) {
     );
 }
 
+/// The `:timer` popup: how long messages in a secret chat last once seen,
+/// the one it has marked.
+fn draw_timer(
+    frame: &mut Frame,
+    area: Rect,
+    menu: &TimerMenu,
+    with: &str,
+    current: i32,
+    colors: &Colors,
+) {
+    const ABOUT: &str = " New messages disappear this long after they're seen.";
+    let rows = (menu.choices.len() as u16).min(area.height.saturating_sub(4).max(1));
+    let width = (ABOUT.width() as u16 + 2).min(area.width);
+    let popup = center(area, width, rows + 4);
+    // Which chat it changes, as the popup can be over another.
+    let title = format!(
+        " Self-destruct timer · {} ",
+        truncate(with, usize::from(width).saturating_sub(26))
+    );
+    let block = popup_block(title, " `Enter` set · `Esc` cancel ", colors);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let [about, _, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    frame.render_widget(Line::from(ABOUT).fg(colors.subtle), about);
+    let items: Vec<ListItem> = menu
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(i, &seconds)| {
+            let bar = if i == menu.selected {
+                Span::from("▌").fg(colors.accent)
+            } else {
+                Span::from(" ")
+            };
+            // The dot marks the timer the chat has.
+            let mark = if seconds == current { "● " } else { "○ " };
+            ListItem::new(Line::from(vec![
+                bar,
+                Span::from(mark).fg(colors.accent),
+                Span::from(secret::timer_words(seconds)),
+            ]))
+        })
+        .collect();
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(Style::new().bg(colors.selection)),
+        list,
+        &mut ListState::default().with_selected(Some(menu.selected)),
+    );
+}
+
+/// The `:key` popup: the picture Telegram's apps draw from a secret chat's
+/// key, two columns a pixel so it's square, with the key in numbers beside
+/// it, and what to do with them.
+fn draw_key(frame: &mut Frame, area: Rect, key: &KeyView, colors: &Colors) {
+    let Some(picture) = secret::key_picture(&key.hash) else {
+        return;
+    };
+    let hex = secret::key_hex(&key.hash);
+    let picture_cols = secret::KEY_SIDE as u16 * 2;
+    let hex_cols = hex.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+    // The numbers beside the picture, or under it where that's too wide;
+    // with margins and borders.
+    let beside = 1 + picture_cols + 3 + hex_cols + 1 + 2;
+    let side = area.width >= beside;
+    let width = if side {
+        beside
+    } else {
+        1 + picture_cols.max(hex_cols) + 1 + 2
+    };
+    let text_width = usize::from(width.saturating_sub(4)).max(1);
+    let about = format!(
+        "If {} sees the same picture in this chat on their device, nobody can read it but the two of you.",
+        key.with
+    );
+    let about = messages::wrap(&about, text_width);
+    let art_rows = secret::KEY_SIDE as u16 + if side { 0 } else { 1 + hex.len() as u16 };
+    let height = art_rows + about.len() as u16 + 3;
+    // Part of the key can't be compared, and would pass for all of it.
+    if width > area.width || height > area.height {
+        let text = " Make the window bigger to compare the key.";
+        let popup = center(area, (text.width() as u16 + 3).min(area.width), 3);
+        let block = popup_block(" Encryption key ", " `Enter` close ", colors);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Paragraph::new(text).block(block), popup);
+        return;
+    }
+    let popup = center(area, width, height);
+    let title = format!(" Encryption key · {} ", truncate(&key.with, text_width / 2));
+    let block = popup_block(title, " `Enter` close ", colors);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let [art, _, words] = Layout::vertical([
+        Constraint::Length(art_rows),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    let mut lines: Vec<Line> = picture
+        .iter()
+        .enumerate()
+        .map(|(row, pixels)| {
+            let mut spans = vec![Span::from(" ")];
+            spans.extend(pixels.iter().map(|&pixel| {
+                let (r, g, b) = secret::KEY_COLORS[usize::from(pixel)];
+                Span::from("  ").bg(ratatui::style::Color::Rgb(r, g, b))
+            }));
+            if side && let Some(numbers) = hex.get(row) {
+                spans.push(Span::from(format!("   {numbers}")));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    if !side {
+        lines.push(Line::default());
+        lines.extend(hex.iter().map(|numbers| Line::from(format!(" {numbers}"))));
+    }
+    frame.render_widget(Paragraph::new(lines), art);
+    let about: Vec<Line> = about
+        .into_iter()
+        .map(|(line, _)| Line::from(format!(" {line}")).fg(colors.subtle))
+        .collect();
+    frame.render_widget(Paragraph::new(about), words);
+}
+
 /// The `gp` popup: the chat's pinned messages, newest first, each with who
 /// sent it and when.
 fn draw_pinned(
@@ -1606,6 +1780,7 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
 fn draw_composer(
     frame: &mut Frame,
     composer: &mut TextArea<'static>,
+    secret: bool,
     bar: Option<ComposerBar>,
     attachments: &[Attachment],
     as_files: bool,
@@ -1617,9 +1792,17 @@ fn draw_composer(
     colors: &Colors,
 ) {
     // Text starts a column in, in line with the message bubbles above.
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_style(border(insert, colors))
         .padding(Padding::horizontal(1));
+    // Where it matters most what kind of chat it is: what you write goes
+    // only to the other person's device, or into Telegram's cloud.
+    if secret {
+        let mut title = vec![Span::from(" ")];
+        title.extend(lock_spans(colors));
+        title.push(Span::from("secret chat ").fg(colors.secret));
+        block = block.title(Line::from(title));
+    }
     let mut text = block.inner(area);
     frame.render_widget(block, area);
     if let Some(bar) = &bar {
@@ -2014,7 +2197,10 @@ fn as_files_hint(open: &OpenChat) -> Option<&'static str> {
 /// on a reply, and Ctrl-o / Ctrl-i after leaving a chat or a reply.
 fn jump_hints(open: &OpenChat, jumps: &Jumps) -> Vec<&'static str> {
     let mut hints = Vec::new();
-    if open.cursor_id().is_some_and(|id| open.hides_spoilers(id)) {
+    let msg = open.cursor_id().and_then(|id| open.messages.get(&id));
+    if msg.and_then(|m| m.hidden.as_ref()).is_some_and(|h| !h.open) {
+        hints.push("`Enter` view it");
+    } else if open.cursor_id().is_some_and(|id| open.hides_spoilers(id)) {
         hints.push("`Enter` show spoiler");
     } else if open
         .cursor_id()
@@ -2074,6 +2260,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
                 }
                 Some(Confirmed::Leave(_)) => "  `y` leave · `n` or `Esc` cancel",
                 Some(Confirmed::Logout) => "  `y` log out · `n` or `Esc` cancel",
+                Some(Confirmed::StartSecret { .. }) => "  `y` start it · `n` or `Esc` cancel",
+                Some(Confirmed::EndSecret { .. }) => "  `y` end it · `n` or `Esc` cancel",
                 _ => "  `y` open · `n` or `Esc` cancel",
             },
         ),
@@ -2102,6 +2290,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         _ if app.vote_menu.is_some() => (normal, "  `j/k` choose · `Enter` vote · `Esc` close"),
         _ if app.notice.is_some() => (normal, "  `Enter` or `Esc` close"),
         _ if app.pin_menu.is_some() => (normal, "  `j/k` choose · `Enter` pin · `Esc` cancel"),
+        _ if app.timer_menu.is_some() => (
+            normal,
+            "  `j/k` choose · `Enter` set the timer · `Esc` cancel",
+        ),
+        _ if app.key_view.is_some() => (normal, "  `Enter` or `Esc` close"),
         _ if app.pinned_menu.is_some() => (
             normal,
             "  `j/k` choose · `Enter` go to it · `P` unpin it · `Esc` close",
@@ -2200,6 +2393,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         || app.notice.is_some()
         || app.pin_menu.is_some()
         || app.pinned_menu.is_some()
+        || app.timer_menu.is_some()
+        || app.key_view.is_some()
         || app.picker.is_some()
         || app.confirm.is_some();
     let mut context = match &app.open {
@@ -2494,6 +2689,7 @@ mod tests {
                 draw_composer(
                     f,
                     &mut composer,
+                    false,
                     bar,
                     &[],
                     false,
@@ -2541,6 +2737,7 @@ mod tests {
                 draw_composer(
                     f,
                     &mut composer,
+                    false,
                     Some(ComposerBar::Reply(&reply)),
                     &[],
                     false,
@@ -2620,6 +2817,7 @@ mod tests {
                     draw_composer(
                         f,
                         &mut composer,
+                        false,
                         bar,
                         attachments,
                         as_files,
@@ -2730,6 +2928,7 @@ mod tests {
                     draw_composer(
                         f,
                         &mut composer,
+                        false,
                         None,
                         &attachments,
                         false,
@@ -2932,6 +3131,9 @@ mod tests {
             reactions: Vec::new(),
             keyboard: None,
             pinned: false,
+            destruct: None,
+            hidden: None,
+            saveable: true,
         };
         let mut open = OpenChat::new(1);
         open.messages.insert(1, msg(None));

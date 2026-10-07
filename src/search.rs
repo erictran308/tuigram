@@ -240,6 +240,8 @@ pub struct MessageSearch {
     total: i32,
     /// Where the next page of results starts.
     pub next_from: i64,
+    /// Or this, for words found in a secret chat.
+    pub next_offset: String,
     /// Every match has been fetched.
     pub done: bool,
     /// A page of results is being fetched.
@@ -257,6 +259,7 @@ impl MessageSearch {
             current: None,
             total: -1,
             next_from: 0,
+            next_offset: String::new(),
             done: false,
             loading: false,
             wanted: None,
@@ -271,8 +274,9 @@ impl MessageSearch {
         }
         self.total = found.total;
         self.next_from = found.next_from;
-        // 0 means no more pages.
-        self.done = found.next_from == 0;
+        self.next_offset = found.next_offset;
+        // Neither means no more pages.
+        self.done = self.next_from == 0 && self.next_offset.is_empty();
     }
 
     /// "3 of 41" for the pane title, or "searching…" before the first match.
@@ -382,16 +386,38 @@ mod tests {
             ids: vec![9, 7],
             total: 3,
             next_from: 7,
+            next_offset: String::new(),
         });
         assert!(!search.done);
         search.add(Found {
             ids: vec![7, 2],
             total: 3,
             next_from: 0,
+            next_offset: String::new(),
         });
         assert_eq!(search.results, [9, 7, 2]);
         assert!(search.done);
         search.current = Some(1);
         assert_eq!(search.position(), "2 of 3");
+    }
+
+    #[test]
+    fn a_secret_chats_search_goes_on_from_where_tdlib_says() {
+        let mut search = MessageSearch::new("hi".into(), parse("hi").unwrap());
+        search.add(Found {
+            ids: vec![9, 7],
+            total: 3,
+            next_from: 0,
+            next_offset: "7".into(),
+        });
+        assert!(!search.done, "an offset to go on from");
+        assert_eq!(search.next_offset, "7");
+        search.add(Found {
+            ids: vec![2],
+            total: 3,
+            next_from: 0,
+            next_offset: String::new(),
+        });
+        assert!(search.done);
     }
 }

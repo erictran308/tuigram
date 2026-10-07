@@ -14,6 +14,7 @@ mod pins;
 mod poll;
 mod reactions;
 mod search;
+mod secret;
 mod settings;
 mod stickers;
 mod text;

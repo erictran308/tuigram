@@ -16,7 +16,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         "Everywhere",
         &[
             ("?", "This help, and settings"),
-            (":", "Type a command, like leave or logout"),
+            (":", "Type a command: secret, key, timer, leave or logout"),
             ("s", "Find a chat or person: a name, @username or t.me link"),
             ("H", "Highlight or unhighlight the selected chat"),
             (
@@ -60,7 +60,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-d / Ctrl-u", "Half a page newer / older"),
             (
                 "Enter",
-                "Show spoilers, vote in a poll, list a bot's buttons, or open the photo, file or link",
+                "Show spoilers, view a photo shown only while open, vote in a poll, list a bot's buttons, or open the photo, file or link",
             ),
             ("y", "Copy the text, a link, or the photo or file"),
             ("r", "Reply"),
@@ -151,6 +151,28 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Press it: the bot answers, a link opens (asking first), a reply button sends its words",
             ),
             ("Esc / q", "Close"),
+        ],
+    ),
+    (
+        "Secret chats",
+        &[
+            (
+                ":secret",
+                "Start one with the person in this chat (asks first); it's kept on this computer only",
+            ),
+            (
+                ":key",
+                "Its key as a picture, to compare with the other person's",
+            ),
+            (":timer", "How long new messages last once they're seen"),
+            (
+                ":leave",
+                "End it for both of you, and delete it here (asks first)",
+            ),
+            (
+                "Enter",
+                "On a 🔥 photo: view it; it's covered again when you move on",
+            ),
         ],
     ),
     (

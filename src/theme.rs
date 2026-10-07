@@ -307,6 +307,7 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
         command: role("command", p("purple"))?,
         reply: role("reply", p("cyan"))?,
         activity: role("activity", p("blue"))?,
+        secret: role("secret", p("green"))?,
         edit: role("edit", p("orange"))?,
         attach: role("attach", p("blue"))?,
         code: role("code", p("green"))?,
@@ -362,6 +363,8 @@ pub struct Colors {
     pub reply: Color,
     /// "typing…" and the like, in the chat list and the chat's title.
     pub activity: Color,
+    /// Secret chats' titles and their lock, as Telegram colors them.
+    pub secret: Color,
     /// The "Edit message" bar over the composer, and the marker on the
     /// message being edited.
     pub edit: Color,

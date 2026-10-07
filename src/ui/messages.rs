@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::time::SystemTime;
 
 use chrono::{Datelike, Local, TimeZone};
 use ratatui::Frame;
@@ -23,6 +24,7 @@ use crate::messages::{
 };
 use crate::reactions::{self, Reaction};
 use crate::search;
+use crate::secret::{self, SecretState};
 use crate::theme::Colors;
 
 /// Bubbles take at most this share of the pane width.
@@ -145,19 +147,48 @@ pub fn draw(
     block_gaps: bool,
 ) {
     let chat = names.chats.get(open.chat_id);
-    let mut title = vec![
-        Span::from(format!(
-            " {}",
-            names.chats.title(open.chat_id).unwrap_or_default()
-        ))
+    let secret = names.chats.secret(open.chat_id);
+    let mut title = vec![Span::from(" ")];
+    if names.chats.is_secret(open.chat_id) {
+        title.extend(super::lock_spans(colors));
+    }
+    title.push(
+        Span::from(
+            names
+                .chats
+                .title(open.chat_id)
+                .unwrap_or_default()
+                .to_string(),
+        )
         .style(super::title_style(names.chats, open.chat_id, colors)),
-    ];
+    );
     if let Some(badge) = names.chats.badge(open.chat_id) {
         title.push(super::badge_span(badge, colors));
     }
     title.push(Span::from(" "));
-    // What they're doing says more than when they were last seen.
-    if let Some(doing) = chat.and_then(|c| super::activity(c, names)) {
+    // How long messages last, in a secret chat.
+    let timer = names.chats.auto_delete(open.chat_id);
+    if secret.is_some() && timer > 0 {
+        let label = format!("· 🔥 {} ", secret::timer_label(timer));
+        title.push(Span::from(label).fg(colors.secret));
+    }
+    // A secret chat not yet accepted, or ended, can't be written in, which
+    // says more than anything else.
+    if let Some(secret) = secret.filter(|s| s.state != SecretState::Ready) {
+        let (label, color) = match secret.state {
+            // A secret chat's title is the other person's name.
+            SecretState::Pending => (
+                format!(
+                    "· waiting for {} to come online ",
+                    names.chats.title(open.chat_id).unwrap_or("them")
+                ),
+                colors.warning,
+            ),
+            _ => ("· ended ".into(), colors.muted),
+        };
+        title.push(Span::from(label).fg(color));
+    } else if let Some(doing) = chat.and_then(|c| super::activity(c, names)) {
+        // What they're doing says more than when they were last seen.
         title.push(Span::from(format!("· {doing} ")).fg(colors.activity));
     } else if let Some(seen) = names.chats.seen(open.chat_id) {
         let (label, online) = seen_label(seen, Local::now().timestamp());
@@ -474,6 +505,8 @@ fn measure<'a>(
         .filter(|c| !c.is_channel && !names.chats.is_saved(open.chat_id))
         .map(|c| c.read_outbox);
 
+    // For the countdowns of messages that self-destruct.
+    let now = SystemTime::now();
     // Measure every bubble first, so the ones in a block can share a width.
     let mut measured = Vec::with_capacity(open.messages.len());
     let mut prev_day = None;
@@ -542,6 +575,10 @@ fn measure<'a>(
                 };
                 if pinned {
                     meta = format!("{PIN} {meta}");
+                }
+                // How long it lasts, or has left.
+                if let Some(destruct) = msg.destruct {
+                    meta = format!("{} {meta}", destruct.label(now));
                 }
                 // One tick once it's sent, two once it's been read.
                 if msg.outgoing
@@ -1566,6 +1603,9 @@ mod tests {
             reactions: Vec::new(),
             keyboard: None,
             pinned: false,
+            destruct: None,
+            hidden: None,
+            saveable: true,
         }
     }
 
@@ -1777,6 +1817,65 @@ mod tests {
         saved.add_local(1, "Saved Messages", None);
         saved.set_my_id(1);
         assert!(!render(&saved, &mut open).iter().any(|r| r.contains('✓')));
+    }
+
+    #[test]
+    fn a_secret_chats_title_has_a_lock_its_timer_and_whether_it_can_be_written_in() {
+        use crate::chats::Peer;
+        use crate::secret::Secret;
+        let mut chats = Chats::default();
+        let chat = chats.add_local(42, "Chardy", None);
+        (chat.is_private, chat.secret_id, chat.peer) = (true, Some(7), Some(Peer::User(2)));
+        let secret = |state| Secret {
+            user_id: 2,
+            state,
+            outbound: true,
+            key_hash: Vec::new(),
+        };
+        chats.set_secret(7, secret(SecretState::Pending));
+        chats.set_auto_delete(42, 30);
+        // An emoji's second cell is blank in the test buffer.
+        let title = |chats: &Chats| -> String {
+            let buf = render_in(&mut sample(), chats, false, &mut images());
+            let row: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
+            row.replace("🔒 ", "🔒").replace("🔥 ", "🔥")
+        };
+        let pending = title(&chats);
+        assert!(pending.contains("🔒 Chardy"), "{pending}");
+        assert!(pending.contains("🔥 30s"), "{pending}");
+        assert!(
+            pending.contains("waiting for Chardy to come online"),
+            "{pending}"
+        );
+        chats.set_secret(7, secret(SecretState::Ready));
+        assert!(!title(&chats).contains("waiting"));
+        chats.set_secret(7, secret(SecretState::Closed));
+        assert!(title(&chats).contains("· ended"));
+        // Without a timer, nothing says so.
+        chats.set_auto_delete(42, 0);
+        assert!(!title(&chats).contains('🔥'));
+    }
+
+    #[test]
+    fn messages_that_self_destruct_show_how_long_they_last_by_the_time() {
+        use crate::secret::Destruct;
+        let mut open = OpenChat::new(42);
+        let timer = Destruct {
+            after: 30,
+            on_open: false,
+            ends: None,
+        };
+        open.messages.insert(
+            1,
+            Msg {
+                destruct: Some(timer),
+                ..msg(false, 1_790_000_000, "gone soon")
+            },
+        );
+        let rows = render(&mut open, false);
+        let row = rows.iter().find(|r| r.contains("gone soon")).unwrap();
+        // An emoji's second cell is blank in the test buffer.
+        assert!(row.contains("🔥  30s"), "{row}");
     }
 
     #[test]

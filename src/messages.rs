@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
+use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use tdlib_rs::enums::{
@@ -20,6 +21,7 @@ use crate::pins::Pinned;
 use crate::poll::Poll;
 use crate::reactions::{self, Reaction, ReactionKind};
 use crate::search::MessageSearch;
+use crate::secret::Destruct;
 use crate::text;
 use crate::tg::Page;
 
@@ -214,6 +216,28 @@ pub struct Msg {
     pub keyboard: Option<Keyboard>,
     /// Pinned in the chat.
     pub pinned: bool,
+    /// Its self-destruct timer, in a secret chat with one or a view-once
+    /// photo.
+    pub destruct: Option<Destruct>,
+    /// A photo or video shown only while it's open, until Enter opens it.
+    pub hidden: Option<Hidden>,
+    /// Telegram lets it be saved: not in a chat that protects its content,
+    /// nor media with a self-destruct timer. `y` copies only what can be.
+    pub saveable: bool,
+}
+
+/// A photo or video its sender wants seen only while it's open (view once,
+/// or a short self-destruct timer), which Telegram blurs until it's tapped:
+/// the bubble names it until Enter opens it, and it's covered again once
+/// the cursor leaves it.
+pub struct Hidden {
+    /// The message as it shows the other way: open while it's covered, and
+    /// covered while it's open.
+    other: Box<Body>,
+    /// Enter opened it.
+    pub open: bool,
+    /// It expired while open: covering it shows that it's gone.
+    gone: bool,
 }
 
 /// What `e` can change in a message, which decides how TDLib is asked.
@@ -260,6 +284,55 @@ impl Msg {
     /// It has spoilers that Enter hasn't shown yet.
     pub fn hides_spoilers(&self) -> bool {
         !self.revealed && self.styles.iter().any(|s| s.format.spoiler)
+    }
+
+    /// Shows a photo or video that's shown only while open. Returns whether
+    /// there was one, covered.
+    pub fn uncover(&mut self) -> bool {
+        let Some(mut hidden) = self.hidden.take() else {
+            return false;
+        };
+        let covered = !hidden.open;
+        if covered {
+            self.swap_body(&mut hidden.other);
+            hidden.open = true;
+        }
+        self.hidden = Some(hidden);
+        covered
+    }
+
+    /// Covers what [`Msg::uncover`] showed; once it expired, for good.
+    pub fn cover(&mut self) {
+        let Some(mut hidden) = self.hidden.take() else {
+            return;
+        };
+        if hidden.open {
+            self.swap_body(&mut hidden.other);
+            hidden.open = false;
+        }
+        if !hidden.gone {
+            self.hidden = Some(hidden);
+        }
+    }
+
+    /// Takes what a new body shows, keeping whatever else is known.
+    fn set_body(&mut self, mut body: Body) {
+        self.hidden = body.hidden.take();
+        self.swap_body(&mut body);
+    }
+
+    fn swap_body(&mut self, body: &mut Body) {
+        std::mem::swap(&mut self.text, &mut body.text);
+        std::mem::swap(&mut self.source_text, &mut body.source_text);
+        std::mem::swap(&mut self.preview, &mut body.preview);
+        std::mem::swap(&mut self.file, &mut body.file);
+        std::mem::swap(&mut self.links, &mut body.links);
+        std::mem::swap(&mut self.link_ranges, &mut body.link_ranges);
+        std::mem::swap(&mut self.styles, &mut body.styles);
+        std::mem::swap(&mut self.poll, &mut body.poll);
+        std::mem::swap(&mut self.card, &mut body.card);
+        std::mem::swap(&mut self.editable, &mut body.editable);
+        std::mem::swap(&mut self.formatted, &mut body.formatted);
     }
 }
 
@@ -568,9 +641,50 @@ struct Body {
     card: Option<Card>,
     editable: Editable,
     formatted: bool,
+    /// The media shown only while it's open, when it's that.
+    hidden: Option<Hidden>,
 }
 
+/// The message as the bubble shows it. A photo or video shown only while
+/// open is covered, with how it shows when open kept aside.
 fn body(content: &MessageContent) -> Body {
+    let mut body = body_as(content, true);
+    if shown_while_open(content) {
+        body.hidden = Some(Hidden {
+            other: Box::new(body_as(content, false)),
+            open: false,
+            gone: false,
+        });
+    }
+    body
+}
+
+/// A photo its sender wants seen only while it's open, which tuigram can
+/// show that way: in the bubble. Videos would need another app, which
+/// keeps them.
+fn shown_while_open(content: &MessageContent) -> bool {
+    matches!(content, MessageContent::MessagePhoto(m) if m.is_secret)
+}
+
+/// Where media seen only while open, which tuigram can't show that way,
+/// can be.
+pub const ON_PHONE: &str = "watch it in Telegram on your phone";
+
+/// Media that expired: a view-once photo once it was opened.
+fn expired(content: &MessageContent) -> bool {
+    use MessageContent as C;
+    matches!(
+        content,
+        C::MessageExpiredPhoto
+            | C::MessageExpiredVideo
+            | C::MessageExpiredVideoNote
+            | C::MessageExpiredVoiceNote
+    )
+}
+
+/// The message as the bubble shows it; media shown only while it's open is
+/// named instead, if `cover`.
+fn body_as(content: &MessageContent, cover: bool) -> Body {
     use MessageContent as C;
     let mut body = Body {
         text: content_text_as_sent(content),
@@ -584,6 +698,7 @@ fn body(content: &MessageContent) -> Body {
         card: None,
         editable: Editable::No,
         formatted: false,
+        hidden: None,
     };
     let file = |id: i32, label: String| {
         Some(MediaFile {
@@ -594,7 +709,31 @@ fn body(content: &MessageContent) -> Body {
     };
     // The text or caption whose links count.
     let mut source = None;
+    // What it is and what to do; the caption, if any, under it.
+    let labeled = |label: String, caption: &types::FormattedText| {
+        if caption.text.is_empty() {
+            label
+        } else {
+            format!("{label}\n{}", caption.text)
+        }
+    };
     match content {
+        C::MessagePhoto(m) if cover && m.is_secret => {
+            body.text = labeled("[Photo · Enter to view]".into(), &m.caption);
+            source = Some(&m.caption);
+        }
+        // Only another app could play these, and it would keep them.
+        C::MessageVideo(m) if m.is_secret => {
+            body.text = labeled(format!("[Video · {ON_PHONE}]"), &m.caption);
+            source = Some(&m.caption);
+        }
+        C::MessageAnimation(m) if m.is_secret => {
+            body.text = labeled(format!("[GIF · {ON_PHONE}]"), &m.caption);
+            source = Some(&m.caption);
+        }
+        C::MessageVideoNote(m) if m.is_secret => {
+            body.text = format!("[Video message · {ON_PHONE}]");
+        }
         C::MessageText(m) => {
             source = Some(&m.text);
             body.editable = Editable::Text;
@@ -608,11 +747,15 @@ fn body(content: &MessageContent) -> Body {
             if body.preview.is_some() {
                 body.text = m.caption.text.clone();
             }
-            body.file = largest(&m.photo).map(|s| MediaFile {
-                id: s.photo.id,
-                label: "Photo".into(),
-                photo: true,
-            });
+            // One shown only while open is shown here, not handed to
+            // another app that keeps it.
+            body.file = largest(&m.photo)
+                .filter(|_| !m.is_secret)
+                .map(|s| MediaFile {
+                    id: s.photo.id,
+                    label: "Photo".into(),
+                    photo: true,
+                });
             source = Some(&m.caption);
         }
         C::MessageVideo(m) => {
@@ -890,6 +1033,7 @@ impl From<&MessageSender> for Sender {
 
 impl From<Message> for Msg {
     fn from(message: Message) -> Self {
+        let destruct = Destruct::of(&message, SystemTime::now());
         let sender = Sender::from(&message.sender_id);
         let state = match message.sending_state {
             None => SendState::Sent,
@@ -929,6 +1073,9 @@ impl From<Message> for Msg {
             reactions: reactions::from_info(message.interaction_info.as_ref()),
             keyboard: Keyboard::of(message.reply_markup.as_ref()),
             pinned: message.is_pinned,
+            destruct,
+            hidden: body.hidden,
+            saveable: message.can_be_saved,
         }
     }
 }
@@ -995,6 +1142,17 @@ pub struct OpenChat {
     /// The last time the pinned messages were asked for, counted, so an
     /// older answer can't replace a newer one.
     pub pinned_asked: u32,
+    /// The message whose photo, shown only while open, Enter opened. It's
+    /// covered again once the cursor leaves it.
+    pub viewing: Option<i64>,
+    /// That message, and its photo's file, until the photo is downloaded:
+    /// only then is the sender told it was opened, and its timer started.
+    pub opening: Option<(i64, i32)>,
+    /// In a secret chat opened with unread messages, the last one read:
+    /// the cursor goes to the first after it once it's loaded, since
+    /// reading them starts their self-destruct timers, and nothing is read
+    /// until the cursor gets to the newest.
+    pub unread_after: Option<i64>,
 }
 
 impl OpenChat {
@@ -1019,6 +1177,9 @@ impl OpenChat {
             commands: Commands::NotAsked,
             pinned: Vec::new(),
             pinned_asked: 0,
+            viewing: None,
+            opening: None,
+            unread_after: None,
         }
     }
 
@@ -1353,6 +1514,7 @@ impl OpenChat {
                     .or_else(|| self.messages.first_key_value())
                     .map(|(&id, _)| id);
                 self.prune_replied();
+                self.forget_replaced_view();
                 return;
             }
             Page::Older(_) => {
@@ -1368,6 +1530,7 @@ impl OpenChat {
         }
         self.messages.extend(messages);
         self.prune_replied();
+        self.forget_replaced_view();
     }
 
     /// Swaps a message sent under a temporary id for the server's version.
@@ -1384,26 +1547,149 @@ impl OpenChat {
             reply.id = message.id;
         }
         self.insert(message);
+        self.forget_replaced_view();
     }
 
     pub fn set_content(&mut self, message_id: i64, content: &MessageContent) {
-        if let Some(msg) = self.messages.get_mut(&message_id) {
-            let body = body(content);
-            (msg.text, msg.preview, msg.file) = (body.text, body.preview, body.file);
-            msg.source_text = body.source_text;
-            (msg.links, msg.link_ranges) = (body.links, body.link_ranges);
-            (msg.editable, msg.formatted) = (body.editable, body.formatted);
-            // New spoilers stay hidden until asked for again.
-            (msg.styles, msg.revealed) = (body.styles, false);
-            (msg.poll, msg.card) = (body.poll, body.card);
-            if let Some(reply) = self.reply.as_mut().filter(|r| r.id == message_id) {
-                reply.snippet = msg.snippet();
+        let Some(msg) = self.messages.get_mut(&message_id) else {
+            return;
+        };
+        let body = body(content);
+        let once = msg.destruct.is_some_and(|d| d.after == 0);
+        // A view-once photo expires as soon as it's opened: it stays on
+        // screen until the cursor leaves it, as Telegram shows it until it's
+        // let go of.
+        if once
+            && expired(content)
+            && let Some(hidden) = msg.hidden.as_mut().filter(|h| h.open)
+        {
+            *hidden.other = body;
+            hidden.gone = true;
+            return;
+        }
+        msg.set_body(body);
+        // New spoilers stay hidden until asked for again.
+        msg.revealed = false;
+        if self.viewing == Some(message_id) {
+            self.viewing = None;
+            self.opening = None;
+        }
+        if let Some(reply) = self.reply.as_mut().filter(|r| r.id == message_id) {
+            reply.snippet = msg.snippet();
+        }
+    }
+
+    /// Enter on a photo shown only while open: opens it until the cursor
+    /// leaves it. Returns whether there was one, covered.
+    pub fn uncover(&mut self, id: i64) -> bool {
+        if self.viewing == Some(id) && self.is_open(id) {
+            return false;
+        }
+        self.cover_viewed();
+        let opened = self.messages.get_mut(&id).is_some_and(Msg::uncover);
+        if opened {
+            self.viewing = Some(id);
+        }
+        opened
+    }
+
+    /// Message `id` shows a photo that's shown only while open.
+    fn is_open(&self, id: i64) -> bool {
+        self.messages
+            .get(&id)
+            .and_then(|m| m.hidden.as_ref())
+            .is_some_and(|h| h.open)
+    }
+
+    /// Covers what Enter opened once the cursor isn't on it any more, or
+    /// nobody is `looking` at the chat.
+    pub fn cover_unless_viewed(&mut self, looking: bool) {
+        if self.viewing.is_some() && (!looking || self.viewing != self.cursor_id()) {
+            self.cover_viewed();
+        }
+    }
+
+    fn cover_viewed(&mut self) {
+        self.opening = None;
+        if let Some(msg) = self
+            .viewing
+            .take()
+            .and_then(|id| self.messages.get_mut(&id))
+        {
+            msg.cover();
+        }
+    }
+
+    /// Forgets what's viewed once its message was replaced by a new copy,
+    /// which comes covered.
+    fn forget_replaced_view(&mut self) {
+        if let Some(id) = self.viewing
+            && !self.is_open(id)
+        {
+            self.viewing = None;
+            self.opening = None;
+        }
+    }
+
+    /// A secret chat opened with unread messages: the cursor goes to the
+    /// first unread one loaded, until it's found. Not when that's the
+    /// newest, which is on screen anyway.
+    pub fn go_to_unread(&mut self) {
+        let Some(read) = self.unread_after else {
+            return;
+        };
+        let Some(first) = self.messages.range(read + 1..).map(|(&id, _)| id).next() else {
+            return;
+        };
+        let found = self.all_loaded || self.oldest_id().is_some_and(|o| o <= read);
+        self.selected = match () {
+            _ if found && self.at_newest && Some(first) == self.newest_id() => None,
+            _ if found => Some(first),
+            // Maybe older still: as far as is loaded, for now.
+            _ => self.oldest_id(),
+        };
+        if found {
+            self.unread_after = None;
+        }
+    }
+
+    /// Starts the self-destruct timers TDLib starts when messages are read:
+    /// of yours up to `up_to` once the other person read them (`outgoing`),
+    /// or of theirs once you did. Media shown only while open starts its own
+    /// when it's opened.
+    pub fn start_timers(&mut self, outgoing: bool, up_to: i64, now: SystemTime) {
+        for msg in self.messages.range_mut(..=up_to).map(|(_, m)| m) {
+            if msg.outgoing == outgoing
+                && msg.state == SendState::Sent
+                && let Some(destruct) = msg.destruct.as_mut().filter(|d| !d.on_open)
+            {
+                destruct.start(now);
             }
         }
     }
 
+    /// A message was opened, by you or the other person: its timer starts.
+    pub fn start_timer(&mut self, id: i64, now: SystemTime) {
+        if let Some(destruct) = self.messages.get_mut(&id).and_then(|m| m.destruct.as_mut()) {
+            destruct.start(now);
+        }
+    }
+
+    /// When the first countdown on a loaded message changes, for the screen
+    /// to follow it.
+    pub fn next_tick(&self, now: SystemTime) -> Option<Duration> {
+        self.messages
+            .values()
+            .filter_map(|m| m.destruct?.changes_in(now))
+            .min()
+    }
+
     pub fn remove(&mut self, message_ids: &[i64]) {
         for id in message_ids {
+            if self.viewing == Some(*id) {
+                self.viewing = None;
+                self.opening = None;
+            }
             self.pinned.retain(|p| p.id != *id);
             self.messages.remove(id);
             if self.selected == Some(*id) {
@@ -1437,6 +1723,47 @@ impl OpenChat {
         self.selected = (index != last || !self.at_newest).then(|| ids[index]);
         Some(index)
     }
+}
+
+/// A photo shown only while open, as TDLib sends one, for tests.
+#[cfg(test)]
+fn secret_photo(caption: &str) -> MessageContent {
+    MessageContent::MessagePhoto(types::MessagePhoto {
+        photo: types::Photo {
+            sizes: vec![types::PhotoSize {
+                r#type: "x".into(),
+                photo: types::File {
+                    id: 20,
+                    ..Default::default()
+                },
+                width: 800,
+                height: 600,
+                progressive_sizes: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        caption: types::FormattedText {
+            text: caption.into(),
+            ..Default::default()
+        },
+        is_secret: true,
+        ..Default::default()
+    })
+}
+
+/// A message that's a photo shown only while open, lasting `after`
+/// seconds once opened (0 for view once), for tests.
+#[cfg(test)]
+pub fn test_secret_photo(after: i32) -> Msg {
+    let mut msg = tests::page([1]).remove(0).1;
+    msg.set_body(body(&secret_photo("for you")));
+    msg.saveable = false;
+    msg.destruct = Some(Destruct {
+        after,
+        on_open: true,
+        ends: None,
+    });
+    msg
 }
 
 #[cfg(test)]
@@ -1985,7 +2312,7 @@ mod tests {
     }
 
     /// A page of plain messages with these ids.
-    fn page(ids: impl IntoIterator<Item = i64>) -> Vec<(i64, Msg)> {
+    pub(super) fn page(ids: impl IntoIterator<Item = i64>) -> Vec<(i64, Msg)> {
         ids.into_iter()
             .map(|id| {
                 let msg = Msg {
@@ -2012,6 +2339,9 @@ mod tests {
                     reactions: Vec::new(),
                     keyboard: None,
                     pinned: false,
+                    destruct: None,
+                    hidden: None,
+                    saveable: true,
                 };
                 (id, msg)
             })
@@ -2261,6 +2591,159 @@ mod tests {
         };
         open.set_reactions(2, Some(&info));
         assert!(open.messages[&2].reactions.is_empty());
+    }
+
+    /// A chat whose newest message, 3, is a photo shown only while open,
+    /// lasting `after` seconds once opened (0 for view once).
+    fn chat_with_secret_photo(after: i32) -> OpenChat {
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page([1, 2]));
+        open.messages.insert(3, test_secret_photo(after));
+        open
+    }
+
+    #[test]
+    fn a_photo_shown_only_while_open_is_covered_until_enter_and_once_the_cursor_leaves() {
+        let mut open = chat_with_secret_photo(10);
+        let photo = &open.messages[&3];
+        assert_eq!(photo.text, "[Photo · Enter to view]\nfor you");
+        assert!(photo.preview.is_none() && photo.file.is_none());
+        assert_eq!(photo.snippet(), "[Photo · Enter to view] for you");
+
+        assert!(open.uncover(3), "Enter on the newest message");
+        let photo = &open.messages[&3];
+        assert_eq!(photo.text, "for you");
+        assert_eq!(photo.preview.as_ref().map(|p| p.file_id), Some(20));
+        assert!(photo.file.is_none(), "not handed to an app that keeps it");
+        assert!(!open.uncover(3), "already open");
+
+        open.cover_unless_viewed(true);
+        assert!(open.messages[&3].preview.is_some(), "still on it");
+        open.selected = Some(2);
+        open.cover_unless_viewed(true);
+        assert!(open.messages[&3].preview.is_none(), "covered again");
+        assert_eq!(open.viewing, None);
+        assert!(open.uncover(3), "Enter opens it again while it lasts");
+        open.cover_unless_viewed(false);
+        assert!(
+            open.messages[&3].preview.is_none(),
+            "looking away covers it"
+        );
+    }
+
+    #[test]
+    fn a_view_once_photo_stays_on_screen_after_it_expires_until_the_cursor_leaves() {
+        let mut open = chat_with_secret_photo(0);
+        open.uncover(3);
+        // TDLib expires it as soon as it's opened.
+        open.set_content(3, &MessageContent::MessageExpiredPhoto);
+        assert!(open.messages[&3].preview.is_some(), "still on screen");
+        open.cover_unless_viewed(false);
+        let photo = &open.messages[&3];
+        assert_eq!(photo.text, "[Photo expired]");
+        assert!(photo.preview.is_none() && photo.hidden.is_none());
+        assert!(!open.uncover(3), "gone for good");
+
+        // One with a timer goes when it runs out, open or not.
+        let mut open = chat_with_secret_photo(10);
+        open.uncover(3);
+        open.set_content(3, &MessageContent::MessageExpiredPhoto);
+        assert_eq!(open.messages[&3].text, "[Photo expired]");
+        assert_eq!(open.viewing, None);
+    }
+
+    #[test]
+    fn a_new_copy_of_an_open_photo_comes_covered_and_enter_opens_it_again() {
+        let mut open = chat_with_secret_photo(10);
+        open.uncover(3);
+        open.add_page(Page::Newer(2), vec![(3, test_secret_photo(10))]);
+        assert_eq!(open.viewing, None, "the copy is covered");
+        assert!(open.uncover(3));
+        assert!(open.messages[&3].preview.is_some(), "and stays open");
+        assert_eq!(open.viewing, Some(3));
+    }
+
+    #[test]
+    fn videos_shown_only_while_open_are_left_to_the_phone() {
+        let mut content = video(ThumbnailFormat::Jpeg, "watch");
+        if let MessageContent::MessageVideo(video) = &mut content {
+            video.is_secret = true;
+        }
+        let body = body(&content);
+        assert_eq!(body.text, format!("[Video · {ON_PHONE}]\nwatch"));
+        assert!(body.preview.is_none() && body.file.is_none() && body.hidden.is_none());
+    }
+
+    #[test]
+    fn a_secret_chat_opens_at_its_first_unread_message() {
+        let mut open = OpenChat::new(1);
+        open.unread_after = Some(5);
+        open.add_page(Page::Latest, page(4..=9));
+        open.go_to_unread();
+        assert_eq!(open.selected, Some(6));
+        assert_eq!(open.unread_after, None);
+
+        // Only the newest is unread: it's on screen, following new ones.
+        let mut open = OpenChat::new(1);
+        open.unread_after = Some(8);
+        open.add_page(Page::Latest, page(4..=9));
+        open.go_to_unread();
+        assert_eq!(open.selected, None);
+
+        // Not loaded back that far yet: the oldest loaded, until it is.
+        let mut open = OpenChat::new(1);
+        open.unread_after = Some(2);
+        open.add_page(Page::Latest, page(6..=9));
+        open.go_to_unread();
+        assert_eq!(open.selected, Some(6));
+        assert_eq!(open.unread_after, Some(2));
+        open.add_page(Page::Older(6), page(1..=5));
+        open.go_to_unread();
+        assert_eq!(open.selected, Some(3));
+        assert_eq!(open.unread_after, None);
+    }
+
+    #[test]
+    fn self_destruct_timers_start_once_read_and_short_ones_on_media_once_opened() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page([1, 2, 3, 4]));
+        for (id, outgoing, on_open) in [
+            (1, false, false),
+            (2, true, false),
+            (3, false, true),
+            (4, false, false),
+        ] {
+            let msg = open.messages.get_mut(&id).unwrap();
+            msg.outgoing = outgoing;
+            msg.destruct = Some(Destruct {
+                after: 30,
+                on_open,
+                ends: None,
+            });
+        }
+        let started = |open: &OpenChat| -> Vec<i64> {
+            open.messages
+                .iter()
+                .filter(|(_, m)| m.destruct.is_some_and(|d| d.ends.is_some()))
+                .map(|(&id, _)| id)
+                .collect()
+        };
+        assert_eq!(open.next_tick(now), None, "nothing counts down yet");
+        // You read up to 3.
+        open.start_timers(false, 3, now);
+        assert_eq!(
+            started(&open),
+            [1],
+            "not yours, nor a voice message not played"
+        );
+        // They read yours.
+        open.start_timers(true, 4, now);
+        assert_eq!(started(&open), [1, 2]);
+        // It was played.
+        open.start_timer(3, now);
+        assert_eq!(started(&open), [1, 2, 3]);
+        assert_eq!(open.next_tick(now), Some(Duration::from_secs(1)));
     }
 
     #[test]

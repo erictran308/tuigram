@@ -20,7 +20,7 @@ use crate::images::Images;
 use crate::theme::Colors;
 
 use super::messages::Names;
-use super::{activity, border, highlight, title_style, truncate};
+use super::{LOCK_WIDTH, activity, border, highlight, lock_spans, title_style, truncate};
 
 /// Rows of text per chat, so also the height of its photo.
 const PHOTO_ROWS: u16 = 2;
@@ -141,11 +141,19 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
             let mark = chats.badge(id);
             let mark_w = mark.map_or(0, |m| m.mark().width());
             let mute_w = if muted { MUTED.width() } else { 0 };
+            let secret = chats.is_secret(id);
+            let lock_w = if secret { LOCK_WIDTH } else { 0 };
             let badge_w = badge.content.width();
-            let title = truncate(title, width.saturating_sub(badge_w + mark_w + mute_w + 1));
-            let pad = width.saturating_sub(title.width() + mark_w + mute_w + badge_w);
+            let title = truncate(
+                title,
+                width.saturating_sub(lock_w + badge_w + mark_w + mute_w + 1),
+            );
+            let pad = width.saturating_sub(lock_w + title.width() + mark_w + mute_w + badge_w);
             let style = title_style(chats, id, colors).bold();
             let mut first = vec![bar.clone(), gap.clone()];
+            if secret {
+                first.extend(lock_spans(colors));
+            }
             first.extend(highlight(&title, filter, style, colors));
             if let Some(mark) = mark {
                 first.push(super::badge_span(mark, colors));
@@ -382,6 +390,41 @@ mod tests {
             rows.iter().any(|r| r.contains("Telegram SCAM")),
             "{rows:#?}"
         );
+    }
+
+    #[test]
+    fn a_secret_chat_has_a_lock_and_its_own_color_beside_the_other_chat() {
+        let mut chats = Chats::default();
+        chats.add_local(1, "Chardy", None);
+        chats.add_local(2, "Chardy", None).secret_id = Some(7);
+        chats.refresh();
+        let colors = Colors::default();
+        let buf = render(
+            &list(&chats, None),
+            &mut images(ProtocolType::Halfblocks),
+            40,
+            10,
+        );
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        // An emoji's second cell is blank in the test buffer.
+        let secret = rows.iter().position(|r| r.contains("🔒  Chardy")).unwrap();
+        let other = rows
+            .iter()
+            .position(|r| r.contains("Chardy") && !r.contains('🔒'))
+            .unwrap();
+        assert_ne!(secret, other);
+        let y = secret as u16;
+        let x = (0..buf.area.width)
+            .find(|&x| buf[(x, y)].symbol() == "C")
+            .unwrap();
+        assert_eq!(buf[(x, y)].fg, colors.secret);
+        // A name can start with 🔒 too, but can't color what's behind it.
+        let lock = (0..buf.area.width)
+            .find(|&x| buf[(x, y)].symbol() == "🔒")
+            .unwrap();
+        assert_eq!(buf[(lock, y)].bg, colors.secret);
     }
 
     #[test]

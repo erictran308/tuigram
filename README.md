@@ -37,6 +37,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Bot buttons.** A bot's buttons show under its message. `Enter` lists them to press: the bot answers, a link opens (asking first), and a reply button sends its words.
 - **Pinned messages.** `P` pins a message (for both of you or just you, with or without notifying a group) or unpins it. A bar over the chat shows the newest pinned message, and `gp` lists them all to jump to.
 - **Jump back.** `Ctrl-o` goes back to the chat you were in before, as in vim, and `Ctrl-i` forward again.
+- **Secret chats.** `:secret` starts an end-to-end encrypted chat with someone, kept only on this computer and their device. `:timer` makes messages self-destruct, with a 🔥 countdown beside them, and `:key` shows the key's picture to compare with theirs. [More below](#secret-chats).
 - **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, **bold**, *italic*, `code` and spoilers (hidden until `Enter`), reactions under them, ✓ / ✓✓ when yours are sent and read, date separators, "typing…" while someone writes to you, when they were last seen, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app. Telegram links (`t.me/…`) open right in tuigram: the chat, the message, or an invite, which asks before joining.
 - **Send photos and files.** Drop them on the window, paste a screenshot with `p`, or type a path with `a` (Tab completes it). Photos show in the composer before they go, what you write goes with them as the caption, and several photos go as one album.
@@ -162,7 +163,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `p` / `m` | Pin the selected chat to the top, or mute it, on Telegram, so your phone shows the same; again to undo. Pinned chats show 📌, muted ones 🔕 and a grey unread count |
 | `s` | Find a chat or person: type a name, an `@username` or a `t.me` link, then `Enter` opens it. In a public group or channel you're not in, `i` asks to join |
 | `Ctrl-r` | Resize the panes: `h` / `l` move the line between them left / right, `=` puts it back as at first, `Enter` keeps it (also next time), `Esc` cancels |
-| `:` | Run a command, typed in full (`Tab` completes the name, and goes on to the next one that fits): `:leave` leaves the group or channel (asks first), `:logout` logs out of Telegram on this computer (asks first) |
+| `:` | Run a command, typed in full (`Tab` completes the name, and goes on to the next one that fits): `:leave` leaves the group or channel, or ends a secret chat (asks first), `:logout` logs out of Telegram on this computer (asks first), and `:secret`, `:key` and `:timer` for [secret chats](#secret-chats) |
 | `?` | Every shortcut, plus settings and themes |
 | `q` | Quit |
 
@@ -191,6 +192,18 @@ They work in Ghostty, kitty, WezTerm, iTerm2, foot and Konsole, also over SSH. I
 To turn them off or on, press `?`, go to **Settings**, and press `Space` or `Enter` on **Notifications**; it's saved at once. To pick how they're sent, set `notifications` in `settings.toml` (in [your data folder](#your-data)) to `"bell"`, `"osc9"`, `"osc777"` or `"osc99"`; the default `"auto"` picks for your terminal.
 
 Like Telegram Desktop, tuigram shows you as online while its window is focused and you've pressed a key in the last minute, so notifications arrive right away instead of waiting to see if you read them on your phone.
+
+## Secret chats
+
+A secret chat is end-to-end encrypted: only you and the other person can read it, and it lives only on the two devices it was made on, not in Telegram's cloud. In a chat with someone, type `:secret` to start one with them. It shows in the list with a 🔒 on green (which a name can't fake), beside your usual chat with them, and you can write in it once their app comes online and accepts it; the box you write in says "secret chat". It opens where you stopped reading, since reading messages starts their timers.
+
+- `:timer` sets how long new messages last once they've been seen, from a second to a week. Each message then shows a 🔥 and its countdown by its time, and disappears from both sides when it runs out.
+- Photos with a short timer, and view-once photos in other chats, show as `[Photo · Enter to view]`. `Enter` shows it; once it's downloaded, its timer starts and the sender is told it was opened. It's covered again once you move off it, switch windows or stop pressing keys for a while. Videos, GIFs and voice messages like that only play in another app, which would keep them, so they say to watch them in Telegram on your phone. `y` doesn't copy any of these.
+- `:key` shows the picture both apps draw from the chat's encryption key, and the key in numbers. If the other person sees the same in their app, nobody is in between. In a window too small for all of it, it asks for a bigger one rather than show part.
+- `:leave` ends the chat for both of you and deletes it from this computer (it asks first).
+- Links you send go without a preview, which Telegram's servers would make, seeing the link. Notifications say only "Secret chat: New message". Searching finds words and `has:`, but not `from:`, and messages can't be forwarded out.
+
+When someone else starts a secret chat with you, it goes to whichever of your devices accepts it first. tuigram leaves those to your phone, unless you tick **Take the ones others start here, not on your phone** in `?` > **Settings**. Telegram hears about the setting once you're logged in, so one could still be taken in the moments before; the status bar then says so. Since they live only on this computer, logging out, or deleting [your data folder](#your-data), deletes them for good.
 
 ## Themes
 
@@ -232,6 +245,7 @@ Sixteen `[palette]` colors make a whole theme: `bg`, `bg_alt`, `surface`, `overl
 | `success` | Notes that something worked | `green` |
 | `reply`, `edit` | The bar over the composer, and the message it's about | `cyan`, `orange` |
 | `activity` | "typing…" | `blue` |
+| `secret` | Secret chats and their 🔒 | `green` |
 | `attach` | Files waiting to be sent | `blue` |
 | `code` | Code in messages | `green` |
 | `own_bubble`, `other_bubble` | Your messages, and other people's | `bg` tinted `blue`, `surface` |
@@ -253,7 +267,7 @@ Everything lives in one folder on your machine (`tuigram --help` prints its path
 | Linux | `~/.local/share/tuigram` |
 | Windows | `%LOCALAPPDATA%\tuigram` |
 
-It holds your login session, API keys, downloaded files, settings and [your own themes](#themes). Deleting it removes your session from this computer. To end the session completely, go to **Settings → Devices** in another Telegram app.
+It holds your login session, [secret chats](#secret-chats), API keys, downloaded files, settings and [your own themes](#themes). Deleting it removes your session from this computer, and your secret chats for good. To end the session completely, go to **Settings → Devices** in another Telegram app.
 
 Environment variables:
 

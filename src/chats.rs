@@ -20,6 +20,7 @@ use tdlib_rs::types::{
 use crate::images::Thumbnail;
 use crate::messages::{Sender, decode_minithumbnail, without_spoilers};
 use crate::search;
+use crate::secret::Secret;
 use crate::text;
 
 pub struct Chat {
@@ -32,6 +33,8 @@ pub struct Chat {
     /// Your messages up to this id have been read: by the other person, or
     /// by anyone in a group.
     pub read_outbox: i64,
+    /// You read the messages up to this id.
+    read_inbox: i64,
     /// One-line summary of the last message, e.g. "You: see you at 5".
     pub preview: String,
     /// Where the chat is in each list it's in: the main list or the archive,
@@ -48,6 +51,11 @@ pub struct Chat {
     pub peer: Option<Peer>,
     /// How the chat notifies, which `m` changes the mute of.
     notifications: ChatNotificationSettings,
+    /// TDLib's id for the secret chat this is; see [`Chats::secret`].
+    pub secret_id: Option<i32>,
+    /// Seconds messages last: once seen in a secret chat, once sent in
+    /// others; 0 for as long as anyone keeps them.
+    auto_delete: i32,
 }
 
 /// A list of chats: the main one, the archive, or one of your folders.
@@ -239,6 +247,8 @@ pub struct Chats {
     presence: HashMap<i64, Presence>,
     /// User ids of bots, which have no last seen.
     bots: HashSet<i64>,
+    /// Secret chats, by TDLib's secret chat id.
+    secrets: HashMap<i32, Secret>,
 }
 
 /// When someone was last on Telegram, as far as their privacy settings
@@ -286,12 +296,17 @@ impl Chats {
             ChatType::Supergroup(s) => Some(Peer::Supergroup(s.supergroup_id)),
             ChatType::BasicGroup(b) => Some(Peer::BasicGroup(b.basic_group_id)),
         };
+        let secret_id = match &chat.r#type {
+            ChatType::Secret(s) => Some(s.secret_chat_id),
+            _ => None,
+        };
         let entry = Chat {
             title: text::clean(&chat.title),
             is_channel,
             is_private,
             unread: chat.unread_count,
             read_outbox: chat.last_read_outbox_message_id,
+            read_inbox: chat.last_read_inbox_message_id,
             preview: chat.last_message.as_ref().map(preview).unwrap_or_default(),
             positions: HashMap::new(),
             photo: chat.photo.as_ref().map(ChatPhoto::new),
@@ -299,6 +314,8 @@ impl Chats {
             activity: Vec::new(),
             peer,
             notifications: chat.notification_settings,
+            secret_id,
+            auto_delete: chat.message_auto_delete_time,
         };
         let entry = self.by_id.entry(chat.id).insert_entry(entry).into_mut();
         for position in &chat.positions {
@@ -361,6 +378,17 @@ impl Chats {
             chat.unread = unread;
             self.dirty = true;
         }
+    }
+
+    pub fn set_read_inbox(&mut self, chat_id: i64, message_id: i64) {
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            chat.read_inbox = message_id;
+        }
+    }
+
+    /// The last message you read in a chat.
+    pub fn read_inbox(&self, chat_id: i64) -> i64 {
+        self.by_id.get(&chat_id).map_or(0, |c| c.read_inbox)
     }
 
     pub fn set_read_outbox(&mut self, chat_id: i64, message_id: i64) {
@@ -712,6 +740,51 @@ impl Chats {
         }
     }
 
+    /// A secret chat's state, from `updateSecretChat`, which TDLib sends
+    /// before the chat itself.
+    pub fn set_secret(&mut self, secret_id: i32, secret: Secret) {
+        self.secrets.insert(secret_id, secret);
+    }
+
+    /// The secret chat this is, once TDLib said how it is.
+    pub fn secret(&self, chat_id: i64) -> Option<&Secret> {
+        let id = self.by_id.get(&chat_id)?.secret_id?;
+        self.secrets.get(&id)
+    }
+
+    /// Any secret chats are known, which logging out loses.
+    pub fn has_secret_chats(&self) -> bool {
+        !self.secrets.is_empty()
+    }
+
+    /// The chat is a secret chat, kept on this computer only.
+    pub fn is_secret(&self, chat_id: i64) -> bool {
+        self.by_id
+            .get(&chat_id)
+            .is_some_and(|c| c.secret_id.is_some())
+    }
+
+    /// How long messages last, from `updateChatMessageAutoDeleteTime`.
+    pub fn set_auto_delete(&mut self, chat_id: i64, seconds: i32) {
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            chat.auto_delete = seconds;
+        }
+    }
+
+    /// Seconds new messages in the chat last; 0 if they stay.
+    pub fn auto_delete(&self, chat_id: i64) -> i32 {
+        self.by_id.get(&chat_id).map_or(0, |c| c.auto_delete)
+    }
+
+    /// The person a chat with one person is with, secret or not: not
+    /// yourself, in Saved Messages.
+    pub fn person(&self, chat_id: i64) -> Option<i64> {
+        match self.by_id.get(&chat_id)?.peer? {
+            Peer::User(id) if !self.is_saved(chat_id) => Some(id),
+            _ => None,
+        }
+    }
+
     /// The chat is in the main list, not e.g. a public channel found with `s`.
     pub fn listed(&self, chat_id: i64) -> bool {
         self.in_list(chat_id, List::Main)
@@ -805,6 +878,7 @@ impl Chat {
             is_private: false,
             unread: 0,
             read_outbox: 0,
+            read_inbox: 0,
             preview: String::new(),
             positions,
             photo: None,
@@ -812,6 +886,8 @@ impl Chat {
             activity: Vec::new(),
             peer: None,
             notifications: ChatNotificationSettings::default(),
+            secret_id: None,
+            auto_delete: 0,
         }
     }
 }
@@ -896,6 +972,20 @@ fn labeled_text(content: &MessageContent, text: impl Fn(&FormattedText) -> Strin
         MessageContent::MessagePoll(m) => labeled("Poll", &m.poll.question),
         MessageContent::MessageLocation(_) => "[Location]".into(),
         MessageContent::MessageContact(_) => "[Contact]".into(),
+        MessageContent::MessageExpiredPhoto => "[Photo expired]".into(),
+        MessageContent::MessageExpiredVideo => "[Video expired]".into(),
+        MessageContent::MessageExpiredVideoNote => "[Video message expired]".into(),
+        MessageContent::MessageExpiredVoiceNote => "[Voice message expired]".into(),
+        MessageContent::MessageScreenshotTaken => "[Took a screenshot]".into(),
+        MessageContent::MessageChatSetMessageAutoDeleteTime(m) => {
+            match m.message_auto_delete_time {
+                0 => "[Turned the timer off]".into(),
+                secs => format!(
+                    "[Set messages to disappear after {}]",
+                    crate::secret::timer_words(secs)
+                ),
+            }
+        }
         _ => "[Message]".into(),
     }
 }

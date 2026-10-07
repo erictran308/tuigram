@@ -565,6 +565,9 @@ fn hike() -> OpenChat {
         reactions: Vec::new(),
         keyboard: None,
         pinned: false,
+        destruct: None,
+        hidden: None,
+        saveable: true,
     };
     let url = "https://trails.example.com/eagle-ridge";
     let link = msg(LEO, at(2, 19, 5), &format!("Here's the trail: {url}"));

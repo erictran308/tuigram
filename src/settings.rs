@@ -35,6 +35,10 @@ pub struct Settings {
     /// The chat list's share of the window's width, in percent. Ctrl-r
     /// changes it; see [`Settings::list_width`].
     pub chat_list_width: u16,
+    /// This computer takes the secret chats others start with you. One
+    /// lives on whichever of your devices accepts it first, so it's off
+    /// unless asked for, and they go to your phone.
+    pub accept_secret_chats: bool,
     /// Telegram API credentials entered on the login screen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<ApiKeys>,
@@ -51,6 +55,7 @@ impl Default for Settings {
             chat_gaps: true,
             chat_list_side: Side::Left,
             chat_list_width: DEFAULT_LIST_WIDTH,
+            accept_secret_chats: false,
             api_keys: None,
         }
     }
@@ -147,12 +152,13 @@ mod tests {
             chat_gaps: false,
             chat_list_side: Side::Right,
             chat_list_width: 40,
+            accept_secret_chats: true,
             api_keys: None,
         };
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40"
+            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40\naccept_secret_chats = true"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
 

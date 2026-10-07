@@ -8,7 +8,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -211,6 +211,9 @@ pub struct Found {
     pub total: i32,
     /// Pass as `from` to get the next page; 0 when there are no more.
     pub next_from: i64,
+    /// Or this, as `offset`, for a page of words found in a secret chat;
+    /// empty when there are no more.
+    pub next_offset: String,
 }
 
 /// Who a message can be deleted for. Depends on the chat type, your rights
@@ -460,6 +463,15 @@ pub struct Tg {
     client_id: i32,
     tx: Events,
     config: Arc<Config>,
+    /// Whether this session should take the secret chats others start, the
+    /// last thing asked, applied one request at a time.
+    accept: Arc<AcceptSecretChats>,
+}
+
+#[derive(Default)]
+struct AcceptSecretChats {
+    wanted: AtomicBool,
+    applying: tokio::sync::Mutex<()>,
 }
 
 impl Tg {
@@ -495,6 +507,7 @@ impl Tg {
             client_id,
             tx: Events { client_id, tx },
             config: Arc::new(config),
+            accept: Arc::default(),
         })
     }
 
@@ -510,6 +523,7 @@ impl Tg {
                 api_keys: None,
                 data_dir: std::env::temp_dir(),
             }),
+            accept: Arc::default(),
         }
     }
 
@@ -531,7 +545,7 @@ impl Tg {
                 true,          // use_file_database
                 true,          // use_chat_info_database
                 true,          // use_message_database: keeps history cached locally
-                false,         // use_secret_chats
+                true,          // use_secret_chats
                 keys.id,
                 keys.hash,
                 "en".into(),
@@ -649,15 +663,29 @@ impl Tg {
 
     /// Searches a chat's whole history for `ask`: its words, from whom,
     /// with what in it, and between which days. Results come newest first,
-    /// a page of up to `limit` from message `from` on (0 for the newest);
+    /// a page of up to `limit` from where the last page left off (`from`,
+    /// or in a `secret` chat maybe `offset`; nothing for the newest);
     /// `query` is the search as typed, to match the answer. TDLib looks up
     /// a username tuigram doesn't know, and the first page of a `before:`
     /// search starts at that day.
-    pub fn search_messages(&self, chat_id: i64, query: String, ask: Query, from: i64, limit: i32) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_messages(
+        &self,
+        chat_id: i64,
+        secret: bool,
+        query: String,
+        ask: Query,
+        from: i64,
+        offset: String,
+        limit: i32,
+    ) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
         tokio::spawn(async move {
-            let found = search_page(chat_id, &ask, from, limit, client_id).await;
+            let found = match secret && !ask.words.is_empty() {
+                true => secret_search_page(chat_id, &ask, offset, limit, client_id).await,
+                false => search_page(chat_id, &ask, from, limit, client_id).await,
+            };
             let found = match found {
                 Ok(found) => Some(found),
                 Err(why) => {
@@ -929,21 +957,32 @@ impl Tg {
     /// Sends a message, its Markdown made formatting (see [`markdown`]), as
     /// a reply to message `reply_to` if given. TDLib first reports it with a
     /// temporary id (`updateNewMessage`), then `updateMessageSendSucceeded`
-    /// or `…Failed`.
-    pub fn send_text(&self, chat_id: i64, text: String, reply_to: Option<i64>) {
-        self.send_formatted(chat_id, markdown(text), reply_to);
+    /// or `…Failed`. In a `secret` chat, links go without a preview: it
+    /// would be made on Telegram's servers, which would see the link.
+    pub fn send_text(&self, chat_id: i64, text: String, reply_to: Option<i64>, secret: bool) {
+        self.send_formatted(chat_id, markdown(text), reply_to, secret);
     }
 
     /// Sends text as it is, without making its Markdown formatting: a
     /// bot's reply button sends its words exactly.
     pub fn send_plain(&self, chat_id: i64, text: String, reply_to: Option<i64>) {
-        self.send_formatted(chat_id, plain(text), reply_to);
+        self.send_formatted(chat_id, plain(text), reply_to, false);
     }
 
-    fn send_formatted(&self, chat_id: i64, text: types::FormattedText, reply_to: Option<i64>) {
+    fn send_formatted(
+        &self,
+        chat_id: i64,
+        text: types::FormattedText,
+        reply_to: Option<i64>,
+        no_preview: bool,
+    ) {
+        let link_preview_options = no_preview.then(|| types::LinkPreviewOptions {
+            is_disabled: true,
+            ..Default::default()
+        });
         let content = enums::InputMessageContent::InputMessageText(types::InputMessageText {
             text,
-            link_preview_options: None,
+            link_preview_options,
             clear_draft: true,
         });
         let reply_to = reply_to.map(reply_to_message);
@@ -1388,6 +1427,100 @@ impl Tg {
         });
     }
 
+    /// Starts a secret chat with someone, then opens it. It waits for their
+    /// app to come online and accept it before anything can be sent.
+    pub fn start_secret_chat(&self, user_id: i64, request: String) {
+        let client_id = self.client_id;
+        self.find(request, async move {
+            let enums::Chat::Chat(chat) = functions::create_new_secret_chat(user_id, client_id)
+                .await
+                .map_err(|e| Missed::Said(e.message))?;
+            Ok((chat.id, None))
+        });
+    }
+
+    /// Ends a secret chat for both sides, unless it's no longer `open`, and
+    /// deletes its messages from this computer. TDLib then sends
+    /// `updateSecretChat` and takes it out of the list.
+    pub fn end_secret_chat(&self, chat_id: i64, secret_id: i32, open: bool) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let ended = async {
+                if open {
+                    functions::close_secret_chat(secret_id, client_id).await?;
+                }
+                functions::delete_chat_history(chat_id, true, false, client_id).await
+            };
+            let _ = match ended.await {
+                Ok(()) => tx.send(TgEvent::Left { chat_id }),
+                Err(e) => tx.send(TgEvent::Error(e.message)),
+            };
+        });
+    }
+
+    /// Sets how long new messages last: in a secret chat, once they're seen.
+    /// TDLib then sends `updateChatMessageAutoDeleteTime`, and a message
+    /// saying so.
+    pub fn set_timer(&self, chat_id: i64, seconds: i32) {
+        self.spawn(functions::set_chat_message_auto_delete_time(
+            chat_id,
+            seconds,
+            self.client_id,
+        ));
+    }
+
+    /// Tells TDLib a message's photo, video or voice message was opened:
+    /// its self-destruct timer starts, and the sender sees it was opened.
+    pub fn open_content(&self, chat_id: i64, message_id: i64) {
+        self.spawn(functions::open_message_content(
+            chat_id,
+            message_id,
+            self.client_id,
+        ));
+    }
+
+    /// Whether Telegram offers this session the secret chats others start.
+    /// One goes to whichever of your devices accepts it first, so a session
+    /// that takes them can keep them from your phone.
+    pub fn accept_secret_chats(&self, accept: bool) {
+        self.accept.wanted.store(accept, Ordering::Relaxed);
+        let state = Arc::clone(&self.accept);
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            // One at a time, each applying the latest wish, so a quick tick
+            // and untick can't end with an older one applied last.
+            let _applying = state.applying.lock().await;
+            let accept = state.wanted.load(Ordering::Relaxed);
+            let set = async {
+                let enums::Sessions::Sessions(sessions) =
+                    functions::get_active_sessions(client_id).await?;
+                match sessions.sessions.into_iter().find(|s| s.is_current) {
+                    Some(this) if this.can_accept_secret_chats != accept => {
+                        functions::toggle_session_can_accept_secret_chats(
+                            this.id, accept, client_id,
+                        )
+                        .await
+                    }
+                    _ => Ok(()),
+                }
+            };
+            if let Err(e) = set.await {
+                let what = if accept {
+                    "take"
+                } else {
+                    "leave to your phone"
+                };
+                let why = format!(
+                    "Couldn't {what} the secret chats others start: {}",
+                    e.message
+                );
+                let _ = tx.send(TgEvent::Error(why));
+            }
+        });
+    }
+
     /// Leaves a group or channel. TDLib then takes it out of the list.
     pub fn leave_chat(&self, chat_id: i64) {
         let tx = self.tx.clone();
@@ -1614,6 +1747,7 @@ async fn search_page(
                     ids: Vec::new(),
                     total: 0,
                     next_from: 0,
+                    next_offset: String::new(),
                 });
             }
             Err(e) => return Err(e.message),
@@ -1632,25 +1766,65 @@ async fn search_page(
     )
     .await
     .map_err(|e| e.message)?;
-    let mut next_from = found.next_from_message_id;
-    let mut ids = Vec::new();
-    for m in &found.messages {
-        // Newest first, so the first one before `after:` ends the search.
-        if ask.after.is_some_and(|after| m.date < after) {
-            next_from = 0;
-            break;
+    let mut page = Found {
+        ids: Vec::new(),
+        total: found.total_count,
+        next_from: found.next_from_message_id,
+        next_offset: String::new(),
+    };
+    page.keep_dates(ask, &found.messages);
+    Ok(page)
+}
+
+/// A page of words found in a secret chat, which TDLib searches its own
+/// way, from `offset` on (empty for the newest). It can't tell who sent
+/// them, nor start at a day.
+async fn secret_search_page(
+    chat_id: i64,
+    ask: &Query,
+    offset: String,
+    limit: i32,
+    client_id: i32,
+) -> Result<Found, String> {
+    let enums::FoundMessages::FoundMessages(found) = functions::search_secret_messages(
+        chat_id,
+        ask.words.clone(),
+        offset,
+        limit,
+        ask.has.map(Has::tdlib),
+        client_id,
+    )
+    .await
+    .map_err(|e| e.message)?;
+    let mut page = Found {
+        ids: Vec::new(),
+        total: found.total_count,
+        next_from: 0,
+        next_offset: found.next_offset,
+    };
+    page.keep_dates(ask, &found.messages);
+    Ok(page)
+}
+
+impl Found {
+    /// Keeps the messages of a page, newest first, sent between the days
+    /// `ask` gives; one from before `after:` ends the search.
+    fn keep_dates(&mut self, ask: &Query, messages: &[types::Message]) {
+        for m in messages {
+            if ask.after.is_some_and(|after| m.date < after) {
+                self.next_from = 0;
+                self.next_offset.clear();
+                break;
+            }
+            if ask.before.is_none_or(|before| m.date < before) {
+                self.ids.push(m.id);
+            }
         }
-        if ask.before.is_none_or(|before| m.date < before) {
-            ids.push(m.id);
+        // TDLib counts every date.
+        if ask.before.is_some() || ask.after.is_some() {
+            self.total = -1;
         }
     }
-    // TDLib counts every date.
-    let dated = ask.before.is_some() || ask.after.is_some();
-    Ok(Found {
-        ids,
-        total: if dated { -1 } else { found.total_count },
-        next_from,
-    })
 }
 
 fn user_sender(user_id: i64) -> enums::MessageSender {

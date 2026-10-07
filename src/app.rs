@@ -35,6 +35,7 @@ use crate::pins::{PinMenu, Pinned, PinnedMenu, Place};
 use crate::poll::{Vote, VoteMenu};
 use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search::{self, MessageSearch, Who};
+use crate::secret::{KeyView, Secret, SecretState, TimerMenu};
 use crate::settings::{self, Settings, Side};
 use crate::stickers::{self, Source, StickerPanel};
 use crate::text;
@@ -214,6 +215,16 @@ pub enum Confirmed {
     Leave(i64),
     /// Log out of Telegram on this computer.
     Logout,
+    /// Start a secret chat with this person, named `with`.
+    StartSecret {
+        user_id: i64,
+        with: String,
+    },
+    /// End this secret chat, and delete it from this computer.
+    EndSecret {
+        chat_id: i64,
+        secret_id: i32,
+    },
 }
 
 impl Confirmed {
@@ -225,6 +236,8 @@ impl Confirmed {
             Confirmed::Join(_) | Confirmed::JoinLink { .. } => "join",
             Confirmed::Leave(_) => "leave",
             Confirmed::Logout => "log out",
+            Confirmed::StartSecret { .. } => "start it",
+            Confirmed::EndSecret { .. } => "end it",
         }
     }
 }
@@ -238,6 +251,13 @@ const SAFE_TO_OPEN: &[&str] = &[
     "opus", "wav", "flac", "pdf", "txt", "md", "epub", "docx", "xlsx", "pptx", "odt", "ods", "odp",
     "zip", "rar", "7z", "tar", "gz", "tgz",
 ];
+
+/// The message holds media its sender wants seen only while it's open: its
+/// timer starts once it's opened, so it isn't handed to another app, which
+/// would keep it.
+fn opens_once(msg: &crate::messages::Msg) -> bool {
+    msg.destruct.is_some_and(|d| d.on_open)
+}
 
 /// Whether a file opens in a viewer or player, never as a program; see
 /// [`SAFE_TO_OPEN`].
@@ -333,8 +353,8 @@ pub enum HelpTab {
 
 /// The `?` popup: every keyboard shortcut, and the settings. On the settings
 /// tab, Enter or Space ticks a checkbox (notifications, gaps in the chat list
-/// and in message blocks, Normal mode after sending) or picks a theme, and
-/// saves it at once.
+/// and in message blocks, Normal mode after sending, taking secret chats) or
+/// picks a theme, and saves it at once.
 pub struct SettingsMenu {
     pub tab: HelpTab,
     /// First row shown on the shortcuts tab. Drawing keeps it in range.
@@ -361,9 +381,11 @@ impl SettingsMenu {
     pub const BLOCK_GAPS: usize = Self::LIST_RIGHT + 1;
     /// The "Normal mode after sending" row.
     pub const AFTER_SEND: usize = Self::BLOCK_GAPS + 1;
+    /// The "take secret chats others start" row.
+    pub const SECRET_CHATS: usize = Self::AFTER_SEND + 1;
     /// The first theme's row. The themes come last, since the user's own
     /// can make a long list.
-    pub const THEMES: usize = Self::AFTER_SEND + 1;
+    pub const THEMES: usize = Self::SECRET_CHATS + 1;
 
     /// Opens on `tab` with the cursor on the first setting.
     pub fn new(tab: HelpTab, settings: &Settings) -> Self {
@@ -527,24 +549,39 @@ impl Finding {
 /// typo can't log you out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
+    Key,
     Leave,
     Logout,
+    Secret,
+    Timer,
 }
 
 impl Command {
-    pub const ALL: [Command; 2] = [Command::Leave, Command::Logout];
+    pub const ALL: [Command; 5] = [
+        Command::Key,
+        Command::Leave,
+        Command::Logout,
+        Command::Secret,
+        Command::Timer,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
+            Command::Key => "key",
             Command::Leave => "leave",
             Command::Logout => "logout",
+            Command::Secret => "secret",
+            Command::Timer => "timer",
         }
     }
 
     pub fn about(self) -> &'static str {
         match self {
-            Command::Leave => "Leave this group or channel (asks first)",
+            Command::Key => "Show a secret chat's key, to compare with the other person's",
+            Command::Leave => "Leave this group or channel, or end a secret chat (asks first)",
             Command::Logout => "Log out of Telegram on this computer (asks first)",
+            Command::Secret => "Start a secret chat with this person (asks first)",
+            Command::Timer => "Set how long messages in a secret chat last once seen",
         }
     }
 
@@ -596,6 +633,10 @@ pub struct App {
     pub pin_menu: Option<PinMenu>,
     /// `gp`: the chat's pinned messages, to go to.
     pub pinned_menu: Option<PinnedMenu>,
+    /// `:timer`: how long messages in a secret chat last.
+    pub timer_menu: Option<TimerMenu>,
+    /// `:key`: a secret chat's key, to compare.
+    pub key_view: Option<KeyView>,
     /// `f` to forward a message, or `s` to find a chat to open.
     pub picker: Option<ChatPicker>,
     /// A chat being looked up to open. Opening another chat meanwhile
@@ -672,6 +713,9 @@ pub struct App {
     notify_since: i32,
     /// Unmuted chats with unread messages, shown in the window title.
     unread_chats: i32,
+    /// The message whose photo, shown only while open, the last frame
+    /// showed.
+    shown_viewing: Option<i64>,
     /// TDLib is logging out (`:logout`, the session ended elsewhere, or
     /// leaving a QR login), and a new client takes over once it has closed.
     relogin: bool,
@@ -715,6 +759,8 @@ impl App {
             notice: None,
             pin_menu: None,
             pinned_menu: None,
+            timer_menu: None,
+            key_view: None,
             picker: None,
             finding: None,
             completion: None,
@@ -753,6 +799,7 @@ impl App {
             notifications_sent: 0,
             notify_since: i32::MAX,
             unread_chats: 0,
+            shown_viewing: None,
             relogin: false,
             exit: false,
         };
@@ -800,6 +847,17 @@ impl App {
             {
                 self.selected = self.chats.ids().first().copied();
             }
+            self.cover_unseen();
+            // Sixel and iTerm2 pictures stay on screen until every cell of
+            // them is drawn over, which tmux may skip for blank ones.
+            let viewing = self.open.as_ref().and_then(|o| o.viewing);
+            if self.shown_viewing.is_some()
+                && viewing != self.shown_viewing
+                && self.images.paints_over()
+            {
+                let _ = terminal.clear();
+            }
+            self.shown_viewing = viewing;
             self.mark_seen();
             self.update_online();
             self.send_notification();
@@ -834,9 +892,23 @@ impl App {
 
             let deadline = self.quit_deadline;
             // Wakes up to take the toast down, to go offline when idle, to
-            // send notifications that had to wait, and to search Telegram
-            // once typing in the `s` picker pauses.
+            // send notifications that had to wait, to search Telegram once
+            // typing in the `s` picker pauses, and to count down messages
+            // that self-destruct.
+            let countdown = self
+                .open
+                .as_ref()
+                .and_then(|o| o.next_tick(SystemTime::now()))
+                .map(|left| Instant::now() + left);
+            // And to cover what's shown only while open, once you're away.
+            let away = self
+                .open
+                .as_ref()
+                .filter(|o| o.viewing.is_some())
+                .map(|_| self.last_input + self.away_after());
             let wake = [
+                countdown,
+                away,
                 self.toast.as_ref().map(|t| t.until),
                 self.online.then_some(self.last_input + IDLE_AFTER),
                 self.notifier.next_at(),
@@ -1027,6 +1099,16 @@ impl App {
                 }
             }
             TgEvent::Downloaded { file_id, path } => {
+                if let Some(open) = self.open.as_mut()
+                    && let Some((id, _)) = open.opening.filter(|&(_, f)| f == file_id)
+                {
+                    open.opening = None;
+                    // Not if the cursor left it before it could be seen.
+                    if path.is_some() && open.viewing == Some(id) {
+                        self.tg.open_content(open.chat_id, id);
+                        open.start_timer(id, SystemTime::now());
+                    }
+                }
                 if self.opening.remove(&file_id) {
                     match &path {
                         Some(path) => self.open_downloaded(path.clone()),
@@ -1130,7 +1212,11 @@ impl App {
             }
             TgEvent::Left { chat_id } => {
                 let title = self.chats.title(chat_id).unwrap_or_default().to_string();
-                self.show_toast("Left", &title);
+                if self.chats.is_secret(chat_id) {
+                    self.show_toast("Ended the secret chat", &format!("with {title}"));
+                } else {
+                    self.show_toast("Left", &title);
+                }
             }
             TgEvent::BotAnswer {
                 chat_id,
@@ -1174,6 +1260,7 @@ impl App {
             page,
             messages.into_iter().map(|m| (m.id, m.into())).collect(),
         );
+        open.go_to_unread();
         if open.messages.len() < MIN_LOADED {
             self.load_older_messages();
         }
@@ -1237,10 +1324,39 @@ impl App {
             Update::ChatPhoto(u) => self.chats.set_photo(u.chat_id, u.photo.as_ref()),
             Update::ChatAccentColors(u) => self.chats.set_accent(u.chat_id, u.accent_color_id),
             Update::AccentColors(u) => self.chats.set_accent_colors(&u.colors),
-            Update::ChatReadInbox(u) => self.chats.set_unread(u.chat_id, u.unread_count),
+            Update::ChatReadInbox(u) => {
+                self.chats.set_unread(u.chat_id, u.unread_count);
+                self.chats
+                    .set_read_inbox(u.chat_id, u.last_read_inbox_message_id);
+            }
             Update::ChatReadOutbox(u) => {
                 self.chats
                     .set_read_outbox(u.chat_id, u.last_read_outbox_message_id);
+                // Read, your messages' self-destruct timers start.
+                if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
+                    open.start_timers(true, u.last_read_outbox_message_id, SystemTime::now());
+                }
+            }
+            Update::SecretChat(u) => {
+                self.chats
+                    .set_secret(u.secret_chat.id, Secret::of(&u.secret_chat));
+                // A key compared must be the chat's key now.
+                if let Some(view) = &self.key_view
+                    && self
+                        .chats
+                        .secret(view.chat_id)
+                        .is_none_or(|s| s.key_hash != view.hash || s.state == SecretState::Closed)
+                {
+                    self.key_view = None;
+                }
+            }
+            Update::ChatMessageAutoDeleteTime(u) => self
+                .chats
+                .set_auto_delete(u.chat_id, u.message_auto_delete_time),
+            Update::MessageContentOpened(u) => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
+                    open.start_timer(u.message_id, SystemTime::now());
+                }
             }
             // TDLib drops the option, rather than setting it false, when
             // Premium ends.
@@ -1390,6 +1506,10 @@ impl App {
                 self.load_more_chats(List::Main);
                 // Even when they're off: they can be turned on any time.
                 self.tg.enable_notifications();
+                // Unless asked to, this computer doesn't take the secret
+                // chats others start, which then go to your phone.
+                self.tg
+                    .accept_secret_chats(self.settings.accept_secret_chats);
                 self.notify_since = unix_now();
                 return;
             }
@@ -1445,6 +1565,11 @@ impl App {
                     self.notice = None;
                 }
             }
+            Screen::Main if self.key_view.is_some() => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                    self.key_view = None;
+                }
+            }
             Screen::Main if self.settings_menu.is_some() => self.on_settings_key(key, ctrl),
             Screen::Main if self.delete_menu.is_some() => self.on_delete_key(key),
             Screen::Main if self.react_menu.is_some() => self.on_react_key(key, ctrl),
@@ -1452,6 +1577,7 @@ impl App {
             Screen::Main if self.button_menu.is_some() => self.on_button_key(key),
             Screen::Main if self.pin_menu.is_some() => self.on_pin_key(key),
             Screen::Main if self.pinned_menu.is_some() => self.on_pinned_key(key),
+            Screen::Main if self.timer_menu.is_some() => self.on_timer_key(key),
             Screen::Main if self.menu.is_some() => self.on_menu_key(key),
             Screen::Main if self.picker.is_some() => self.on_picker_key(key, ctrl),
             Screen::Main if self.resizing.is_some() => self.on_resize_key(key, ctrl),
@@ -2004,6 +2130,10 @@ impl App {
         let Some(open) = &self.open else {
             return;
         };
+        if let Some(why) = self.cant_send(open.chat_id) {
+            self.status = Some(why);
+            return;
+        }
         if self.chats.joined(open.chat_id) {
             self.focus = Focus::Input;
             return;
@@ -2029,6 +2159,17 @@ impl App {
         );
         confirm.badge = self.chats.badge(open.chat_id);
         self.confirm = Some(confirm);
+    }
+
+    /// Why nothing can be sent in a secret chat now: it waits for the
+    /// other person, or it ended.
+    fn cant_send(&self, chat_id: i64) -> Option<String> {
+        let secret = self.chats.secret(chat_id)?;
+        let name = self
+            .users
+            .get(&secret.user_id)
+            .map_or("them", String::as_str);
+        secret.cant_send(name)
     }
 
     fn leave_insert(&mut self) {
@@ -2066,12 +2207,21 @@ impl App {
             self.save_edit();
             return;
         }
+        let Some(chat_id) = self.open.as_ref().map(|o| o.chat_id) else {
+            return;
+        };
+        let cant_send = self.cant_send(chat_id);
+        let secret = self.chats.is_secret(chat_id);
         let Some(open) = self.open.as_mut() else {
             return;
         };
         let text = self.composer.lines().join("\n");
         let text = text.trim().to_string();
         if text.is_empty() && open.attachments.is_empty() {
+            return;
+        }
+        if let Some(why) = cant_send {
+            self.status = Some(why);
             return;
         }
         if let Some(changed) = open.attachments.iter().find(|a| a.swapped()) {
@@ -2083,7 +2233,7 @@ impl App {
         }
         let reply_to = open.reply.take().map(|r| r.id);
         if open.attachments.is_empty() {
-            self.tg.send_text(open.chat_id, text, reply_to);
+            self.tg.send_text(open.chat_id, text, reply_to, secret);
         } else {
             let as_files = open.as_files;
             let groups = attach::albums(&open.attachments, as_files)
@@ -2192,7 +2342,17 @@ impl App {
                 if self.open.is_none() || !submit || query.is_empty() {
                     return;
                 }
-                let ask = search::parse(&query).and_then(|ask| self.resolve_sender(ask));
+                let secret = self
+                    .open
+                    .as_ref()
+                    .is_some_and(|o| self.chats.is_secret(o.chat_id));
+                let ask = search::parse(&query)
+                    .and_then(|ask| match ask.from {
+                        // TDLib can't tell in a secret chat.
+                        Some(_) if secret => Err("from: doesn't work in secret chats".into()),
+                        _ => Ok(ask),
+                    })
+                    .and_then(|ask| self.resolve_sender(ask));
                 match ask {
                     Ok(ask) => {
                         if let Some(open) = self.open.as_mut() {
@@ -2215,8 +2375,11 @@ impl App {
             }
             PromptKind::Command if !submit || query.is_empty() => {}
             PromptKind::Command => match Command::parse(&query) {
+                Some(Command::Key) => self.show_key(),
                 Some(Command::Leave) => self.ask_to_leave(),
                 Some(Command::Logout) => self.ask_to_log_out(),
+                Some(Command::Secret) => self.ask_secret_chat(),
+                Some(Command::Timer) => self.open_timer_menu(),
                 None => self.status = Some(format!("Not a command: {query}")),
             },
         }
@@ -2240,6 +2403,8 @@ impl App {
         {
             open.seen = id;
             self.tg.view_messages(open.chat_id, vec![id]);
+            // Read, their self-destruct timers start.
+            open.start_timers(false, id, SystemTime::now());
         }
     }
 
@@ -2259,10 +2424,8 @@ impl App {
     /// messages aren't marked read, and do notify, while nobody is there.
     /// A window the terminal says has focus gets [`AWAY_AFTER`].
     fn watching(&self, chat_id: i64) -> bool {
-        let idle = self.idle();
         matches!(self.screen, Screen::Main)
-            && self.terminal_focused
-            && (idle < IDLE_AFTER || (self.focus_reported && idle < AWAY_AFTER))
+            && self.present()
             && matches!(self.focus, Focus::Messages | Focus::Input)
             && self.settings_menu.is_none()
             && self.open.as_ref().is_some_and(|o| {
@@ -2273,6 +2436,32 @@ impl App {
                     // isn't what's about to be on screen.
                     && !matches!(o.loading, Some(Page::Around(_)))
             })
+    }
+
+    /// What's shown only while open is covered once you look away, or go
+    /// away.
+    fn cover_unseen(&mut self) {
+        let looking = self.focus == Focus::Messages && self.present();
+        if let Some(open) = self.open.as_mut() {
+            open.cover_unless_viewed(looking);
+        }
+    }
+
+    /// Someone is at tuigram: its window has focus, and a key was pressed
+    /// recently enough (see [`App::watching`]).
+    fn present(&self) -> bool {
+        self.terminal_focused && self.idle() < self.away_after()
+    }
+
+    /// How long without a key counts as away: [`IDLE_AFTER`] where the
+    /// terminal never says when its window loses focus, [`AWAY_AFTER`]
+    /// where it does.
+    fn away_after(&self) -> Duration {
+        if self.focus_reported {
+            AWAY_AFTER
+        } else {
+            IDLE_AFTER
+        }
     }
 
     /// The user would see a new message in this chat without being told:
@@ -2304,15 +2493,53 @@ impl App {
     /// before tuigram started, are dropped.
     fn on_notifications(&mut self, update: UpdateNotificationGroup) {
         self.notifier.remove(&update.removed_notification_ids);
+        // A secret chat someone started was taken here, though the setting
+        // says not to: before it reached Telegram, or because it couldn't.
+        let taken = update
+            .added_notifications
+            .iter()
+            .any(|n| matches!(n.r#type, NotificationType::NewSecretChat));
+        if taken && !self.settings.accept_secret_chats {
+            let who = self.chats.title(update.chat_id).unwrap_or("Someone");
+            self.status = Some(format!(
+                "{who} started a secret chat, which this computer took anyway: :leave ends it"
+            ));
+        }
         if self.notify_with == Notifications::Off {
             return;
         }
         let chat_id = update.chat_id;
         for notification in update.added_notifications {
-            let NotificationType::NewMessage(new) = notification.r#type else {
-                continue;
-            };
             if notification.date < self.notify_since || self.sees(chat_id) {
+                continue;
+            }
+            let new = match notification.r#type {
+                NotificationType::NewMessage(new) => new,
+                // Someone started one, and this computer took it.
+                NotificationType::NewSecretChat => {
+                    let note = Note {
+                        id: notification.id,
+                        chat_id,
+                        chat: "Secret chat".into(),
+                        text: "Someone started a secret chat with you".into(),
+                        silent: notification.is_silent,
+                    };
+                    self.notifier.add(note, Instant::now());
+                    continue;
+                }
+                _ => continue,
+            };
+            // Notifications stay in the system's list, so a secret chat's
+            // say neither who nor what, as in Telegram's apps.
+            if self.chats.is_secret(chat_id) {
+                let note = Note {
+                    id: notification.id,
+                    chat_id,
+                    chat: "Secret chat".into(),
+                    text: "New message".into(),
+                    silent: notification.is_silent,
+                };
+                self.notifier.add(note, Instant::now());
                 continue;
             }
             let text = if new.show_preview {
@@ -2380,6 +2607,19 @@ impl App {
             self.status = Some("Open the group or channel to leave first".into());
             return;
         };
+        if let Some(secret_id) = chat.secret_id {
+            let title = self.chats.title(chat_id).unwrap_or_default();
+            self.confirm = Some(Confirm::new(
+                "End this secret chat?",
+                vec![
+                    format!("With {title}."),
+                    "Nothing more can be sent in it, by either of you,".into(),
+                    "and its messages are deleted from this computer.".into(),
+                ],
+                Confirmed::EndSecret { chat_id, secret_id },
+            ));
+            return;
+        }
         if chat.is_private {
             self.status = Some("A chat with one person can't be left".into());
             return;
@@ -2403,18 +2643,139 @@ impl App {
         self.confirm = Some(confirm);
     }
 
+    /// The chat a command is about: the selected one in the list, or else
+    /// the open one.
+    fn command_chat(&self) -> Option<i64> {
+        match self.focus {
+            Focus::Chats => self.selected,
+            _ => self.open.as_ref().map(|o| o.chat_id),
+        }
+    }
+
+    /// `:secret`: asks before starting a secret chat with the person the
+    /// chat the command is about is with.
+    fn ask_secret_chat(&mut self) {
+        let Some(user_id) = self.command_chat().and_then(|id| self.chats.person(id)) else {
+            self.status = Some("Open a chat with someone to start a secret chat with them".into());
+            return;
+        };
+        if self.chats.is_bot(user_id) {
+            self.status = Some("Bots can't be in secret chats".into());
+            return;
+        }
+        let with = self
+            .users
+            .get(&user_id)
+            .cloned()
+            .unwrap_or_else(|| "them".into());
+        self.confirm = Some(Confirm::new(
+            "Start a secret chat?",
+            vec![
+                format!("With {with}. It's end-to-end encrypted, and kept only"),
+                "on this computer and on the device of theirs that".into(),
+                "accepts it: your other devices won't have it.".into(),
+            ],
+            Confirmed::StartSecret { user_id, with },
+        ));
+        let badge = self.command_chat().and_then(|id| self.chats.badge(id));
+        if let Some(confirm) = self.confirm.as_mut() {
+            confirm.badge = badge;
+        }
+    }
+
+    /// The open secret chat, with its state, for `:key` and `:timer`, whose
+    /// popups go over it; or why there's none, said in the status bar.
+    fn open_secret_chat(&mut self) -> Option<(i64, Secret)> {
+        let found = self
+            .open
+            .as_ref()
+            .map(|o| o.chat_id)
+            .filter(|&id| self.chats.is_secret(id))
+            .and_then(|id| Some((id, self.chats.secret(id)?.clone())));
+        if found.is_none() {
+            self.status = Some("Open a secret chat first (:secret starts one)".into());
+        }
+        found
+    }
+
+    /// `:timer`: how long new messages in the secret chat last once seen.
+    fn open_timer_menu(&mut self) {
+        let Some((chat_id, _)) = self.open_secret_chat() else {
+            return;
+        };
+        if let Some(why) = self.cant_send(chat_id) {
+            self.status = Some(why);
+            return;
+        }
+        self.timer_menu = Some(TimerMenu::new(chat_id, self.chats.auto_delete(chat_id)));
+    }
+
+    /// The timer popup takes all keys while it's up.
+    fn on_timer_key(&mut self, key: KeyEvent) {
+        let Some(menu) = self.timer_menu.as_mut() else {
+            return;
+        };
+        let last = menu.choices.len() - 1;
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => menu.selected = (menu.selected + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
+            KeyCode::Char('g') => menu.selected = 0,
+            KeyCode::Char('G') => menu.selected = last,
+            KeyCode::Enter | KeyCode::Char('l') => {
+                let (chat_id, seconds) = (menu.chat_id, menu.choices[menu.selected]);
+                self.timer_menu = None;
+                if let Some(why) = self.cant_send(chat_id) {
+                    self.status = Some(why);
+                    return;
+                }
+                // Only if it changes: setting it again would send the chat a
+                // message saying so. Kept at once, so a second Enter before
+                // Telegram answers doesn't send another.
+                if seconds != self.chats.auto_delete(chat_id) {
+                    self.tg.set_timer(chat_id, seconds);
+                    self.chats.set_auto_delete(chat_id, seconds);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'h') => self.timer_menu = None,
+            _ => {}
+        }
+    }
+
+    /// `:key`: the secret chat's key, as a picture and in numbers, for both
+    /// sides to compare.
+    fn show_key(&mut self) {
+        let Some((chat_id, secret)) = self.open_secret_chat() else {
+            return;
+        };
+        let with = self.chats.title(chat_id).unwrap_or("them").to_string();
+        if crate::secret::key_picture(&secret.key_hash).is_none() {
+            self.status = Some(match secret.state {
+                SecretState::Pending => {
+                    format!("The key is made once {with} accepts the secret chat")
+                }
+                _ => "Telegram gave no key to compare for this chat".into(),
+            });
+            return;
+        }
+        self.key_view = Some(KeyView {
+            chat_id,
+            with,
+            hash: secret.key_hash,
+        });
+    }
+
     /// `:logout` asks first: Tab can put it in, and logging in again takes a
     /// code, and maybe the password.
     fn ask_to_log_out(&mut self) {
-        self.confirm = Some(Confirm::new(
-            "Log out?",
-            vec![
-                "This ends the session on Telegram and deletes what".into(),
-                "tuigram keeps on this computer. Logging in again".into(),
-                "takes a code, and your password if you have one.".into(),
-            ],
-            Confirmed::Logout,
-        ));
+        let mut lines: Vec<String> = vec![
+            "This ends the session on Telegram and deletes what".into(),
+            "tuigram keeps on this computer. Logging in again".into(),
+            "takes a code, and your password if you have one.".into(),
+        ];
+        if self.chats.has_secret_chats() {
+            lines.push("Your secret chats go too: they're kept only here.".into());
+        }
+        self.confirm = Some(Confirm::new("Log out?", lines, Confirmed::Logout));
     }
 
     /// `:logout`, once asked: ends the session on Telegram's side and
@@ -2451,6 +2812,8 @@ impl App {
         self.notice = None;
         self.pin_menu = None;
         self.pinned_menu = None;
+        self.timer_menu = None;
+        self.key_view = None;
         self.picker = None;
         self.finding = None;
         self.completion = None;
@@ -2504,10 +2867,18 @@ impl App {
             search.wanted = Some(index);
             if !search.loading {
                 search.loading = true;
-                let (query, ask, from) =
-                    (search.query.clone(), search.ask.clone(), search.next_from);
-                self.tg
-                    .search_messages(open.chat_id, query, ask, from, SEARCH_PAGE);
+                let (query, ask) = (search.query.clone(), search.ask.clone());
+                let (from, offset) = (search.next_from, search.next_offset.clone());
+                let secret = self.chats.is_secret(open.chat_id);
+                self.tg.search_messages(
+                    open.chat_id,
+                    secret,
+                    query,
+                    ask,
+                    from,
+                    offset,
+                    SEARCH_PAGE,
+                );
             }
         } else if search.results.is_empty() {
             self.status = Some(format!("No messages match \"{}\"", search.query));
@@ -2523,6 +2894,7 @@ impl App {
         let Some(open) = self.open.as_mut() else {
             return;
         };
+        open.unread_after = None;
         if open.messages.contains_key(&id) {
             open.selected = Some(id);
             // A jump still loading elsewhere would move the cursor away.
@@ -2543,6 +2915,7 @@ impl App {
         let Some(open) = self.open.as_mut() else {
             return;
         };
+        open.unread_after = None;
         open.selected = None;
         if open.at_newest {
             return;
@@ -2610,6 +2983,8 @@ impl App {
         self.button_menu = None;
         self.pin_menu = None;
         self.pinned_menu = None;
+        self.timer_menu = None;
+        self.key_view = None;
         if self.chats.in_list(chat_id, self.chats.shown()) && self.selected != Some(chat_id) {
             // The list's cursor goes to it, even if the filter hid it.
             if !self.chats.ids().contains(&chat_id) {
@@ -2629,7 +3004,13 @@ impl App {
         }
         self.tg.open_chat(chat_id);
         self.chats.opened(chat_id);
-        self.open = Some(OpenChat::new(chat_id));
+        let mut open = OpenChat::new(chat_id);
+        // Reading a secret chat's messages starts their timers: it opens
+        // where you stopped reading, not with all of them read at once.
+        if self.chats.is_secret(chat_id) && self.chats.get(chat_id).is_some_and(|c| c.unread > 0) {
+            open.unread_after = Some(self.chats.read_inbox(chat_id));
+        }
+        self.open = Some(open);
         self.composer = new_composer();
         self.load_older_messages();
         self.ask_pinned();
@@ -2638,7 +3019,13 @@ impl App {
     /// Asks for the open chat's pinned messages, again whenever one is
     /// pinned or unpinned.
     fn ask_pinned(&mut self) {
-        if let Some(open) = self.open.as_mut() {
+        // Nothing is pinned in a secret chat, and TDLib can't search one
+        // that way.
+        if let Some(open) = self
+            .open
+            .as_mut()
+            .filter(|o| !self.chats.is_secret(o.chat_id))
+        {
             open.pinned_asked += 1;
             self.tg.pinned_messages(open.chat_id, open.pinned_asked);
         }
@@ -2814,6 +3201,24 @@ impl App {
         let Some(open) = self.open.as_mut() else {
             return;
         };
+        // A photo shown only while open. Once it's downloaded, and can be
+        // seen, its timer starts and the sender is told it was opened; not
+        // for your own, nor one still on its way.
+        if let Some(id) = open.cursor_id()
+            && open.uncover(id)
+        {
+            let photo = open
+                .messages
+                .get(&id)
+                .filter(|m| !m.outgoing && m.state == SendState::Sent)
+                .and_then(|m| m.preview.as_ref())
+                .map(|p| p.file_id);
+            if let Some(file_id) = photo {
+                open.opening = Some((id, file_id));
+                self.tg.download(file_id);
+            }
+            return;
+        }
         if let Some(id) = open.cursor_id()
             && open.reveal_spoilers(id)
         {
@@ -2853,9 +3258,18 @@ impl App {
         let Some(msg) = open.cursor_id().and_then(|id| open.messages.get(&id)) else {
             return;
         };
-        let mut targets: Vec<Target> = msg.file.clone().map(Target::File).into_iter().collect();
+        // Media seen only while open (a voice message whose timer starts
+        // once it's played) isn't handed to another app, which keeps it.
+        let file = msg.file.clone().filter(|_| !opens_once(msg));
+        let mut targets: Vec<Target> = file.map(Target::File).into_iter().collect();
         targets.extend(msg.links.iter().cloned().map(Target::Link));
         match targets.len() {
+            0 if opens_once(msg) => {
+                self.status = Some(format!(
+                    "tuigram can't show this only while it's open: {}",
+                    crate::messages::ON_PHONE
+                ));
+            }
             0 => self.status = Some("Nothing to open in this message".into()),
             1 => self.open_target(targets.remove(0)),
             _ => {
@@ -3374,6 +3788,10 @@ impl App {
         let Some(open) = &self.open else {
             return;
         };
+        if self.chats.is_secret(open.chat_id) {
+            self.status = Some("Messages in secret chats can't be forwarded".into());
+            return;
+        }
         let Some((&id, msg)) = open
             .cursor_id()
             .and_then(|id| open.messages.get_key_value(&id))
@@ -3444,7 +3862,10 @@ impl App {
                     from, message_ids, ..
                 },
                 Choice::Chat(to),
-            ) => self.tg.forward(to, from, message_ids),
+            ) => match self.cant_send(to) {
+                Some(why) => self.status = Some(why),
+                None => self.tg.forward(to, from, message_ids),
+            },
             (Purpose::Forward { .. }, _) => {}
             (Purpose::Open, Choice::Chat(id)) => self.open_chat(id),
             (Purpose::Open, Choice::User(user_id)) => {
@@ -3642,6 +4063,10 @@ impl App {
         let Some(sticker) = panel.current().cloned() else {
             return;
         };
+        if let Some(why) = self.cant_send(panel.chat_id) {
+            self.status = Some(why);
+            return;
+        }
         let Some(open) = self.open.as_mut().filter(|o| o.chat_id == panel.chat_id) else {
             return;
         };
@@ -3771,6 +4196,8 @@ impl App {
             || self.notice.is_some()
             || self.pin_menu.is_some()
             || self.pinned_menu.is_some()
+            || self.timer_menu.is_some()
+            || self.key_view.is_some()
             || self.menu.is_some()
             || self.picker.is_some()
             || self.resizing.is_some()
@@ -3803,6 +4230,19 @@ impl App {
                         Confirmed::Join(chat_id) => self.tg.join_chat(chat_id),
                         Confirmed::Leave(chat_id) => self.tg.leave_chat(chat_id),
                         Confirmed::Logout => self.log_out(),
+                        Confirmed::StartSecret { user_id, with } => {
+                            let request = format!("a secret chat with {with}");
+                            self.finding = Some(Finding::new(&request));
+                            self.tg.start_secret_chat(user_id, request);
+                        }
+                        Confirmed::EndSecret { chat_id, secret_id } => {
+                            // One the other side ended can't be closed again.
+                            let open = self
+                                .chats
+                                .secret(chat_id)
+                                .is_some_and(|s| s.state != SecretState::Closed);
+                            self.tg.end_secret_chat(chat_id, secret_id, open)
+                        }
                         Confirmed::JoinLink { link, request } => {
                             self.finding = Some(Finding::new(&request));
                             self.tg.join_by_link(link, request);
@@ -3824,12 +4264,24 @@ impl App {
         let Some(msg) = open.cursor_id().and_then(|id| open.messages.get(&id)) else {
             return;
         };
+        if !msg.saveable {
+            self.status = Some(match msg.destruct {
+                Some(_) => "Self-destructing media can't be copied".into(),
+                None => "This chat doesn't allow copying its messages".into(),
+            });
+            return;
+        }
         let mut targets = Vec::new();
         if !msg.source_text.is_empty() {
             targets.push(Target::Text(msg.source_text.clone()));
         }
         targets.extend(msg.links.iter().cloned().map(Target::Link));
-        targets.extend(msg.file.clone().map(Target::File));
+        targets.extend(
+            msg.file
+                .clone()
+                .filter(|_| !opens_once(msg))
+                .map(Target::File),
+        );
         match targets.len() {
             0 => self.status = Some("Nothing to copy in this message".into()),
             1 => self.copy_target(targets.remove(0)),
@@ -3935,6 +4387,16 @@ impl App {
         if !editing && let Some(paths) = attach::pasted_paths(&text) {
             self.attach(paths, Some(text));
             return;
+        }
+        // In a secret chat, a paste meant for the message isn't sent to
+        // Telegram's servers as a sticker search: it goes in the message.
+        if self.focus == Focus::Input
+            && self
+                .open
+                .as_ref()
+                .is_some_and(|o| self.chats.is_secret(o.chat_id))
+        {
+            self.stickers = None;
         }
         if self.focus == Focus::Input
             && let Some(panel) = self.stickers.as_mut()
@@ -4169,6 +4631,10 @@ impl App {
             }
             SettingsMenu::BLOCK_GAPS => settings.block_gaps = !settings.block_gaps,
             SettingsMenu::AFTER_SEND => settings.normal_after_send = !settings.normal_after_send,
+            SettingsMenu::SECRET_CHATS => {
+                settings.accept_secret_chats = !settings.accept_secret_chats;
+                self.tg.accept_secret_chats(settings.accept_secret_chats);
+            }
             _ => return,
         }
         if let Err(e) = self.settings.save(&self.settings_path) {
@@ -4217,6 +4683,8 @@ impl App {
         let Some(open) = self.open.as_mut() else {
             return;
         };
+        // Moved by hand: no page loading later takes the cursor away.
+        open.unread_after = None;
         // `G` goes to the real newest message, not the newest loaded one.
         if delta == isize::MAX && !open.at_newest {
             self.jump_to_newest();
@@ -5094,7 +5562,9 @@ mod tests {
         let mut app = test_app("logout");
         let none = KeyModifiers::NONE;
         press(&mut app, KeyCode::Char(':'), none);
-        press(&mut app, KeyCode::BackTab, none);
+        press(&mut app, KeyCode::Char('l'), none);
+        press(&mut app, KeyCode::Char('o'), none);
+        press(&mut app, KeyCode::Tab, none);
         assert_eq!(app.prompt.as_ref().unwrap().query(), "logout");
         press(&mut app, KeyCode::Enter, none);
         let confirm = app.confirm.as_ref().expect("asks");
@@ -5564,5 +6034,343 @@ mod tests {
             !title.contains('\u{202e}'),
             "the sender's name is cleaned: {title:?}"
         );
+    }
+
+    /// Types a `:` command and runs it.
+    fn command(app: &mut App, name: &str) {
+        press(app, KeyCode::Char(':'), KeyModifiers::NONE);
+        for c in name.chars() {
+            press(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(app, KeyCode::Enter, KeyModifiers::NONE);
+    }
+
+    /// Adds a chat with Chardy, user 2: a plain one with id 500, or with
+    /// id 600 a secret one in `state`, and selects it in the list.
+    fn chat_with_chardy(app: &mut App, secret: Option<crate::secret::SecretState>) -> i64 {
+        let chat_id = if secret.is_some() { 600 } else { 500 };
+        let chat = app.chats.add_local(chat_id, "Chardy", None);
+        (chat.is_private, chat.peer) = (true, Some(Peer::User(2)));
+        if let Some(state) = secret {
+            chat.secret_id = Some(9);
+            let secret = Secret {
+                user_id: 2,
+                state,
+                outbound: true,
+                key_hash: Vec::new(),
+            };
+            app.chats.set_secret(9, secret);
+        }
+        app.users.insert(2, "Chardy".into());
+        app.chats.refresh();
+        app.focus = Focus::Chats;
+        app.selected = Some(chat_id);
+        chat_id
+    }
+
+    /// [`chat_with_chardy`], open: `:key` and `:timer` are about the open
+    /// chat, whatever the list's cursor is on.
+    fn open_chardy(app: &mut App, secret: Option<crate::secret::SecretState>) -> i64 {
+        let chat_id = chat_with_chardy(app, secret);
+        app.open = Some(OpenChat::new(chat_id));
+        app.selected = None;
+        chat_id
+    }
+
+    #[test]
+    fn secret_asks_before_starting_a_secret_chat_with_a_person_only() {
+        let mut app = test_app("secret-start");
+        chat_with_chardy(&mut app, None);
+        command(&mut app, "secret");
+        let confirm = app.confirm.take().expect("asks");
+        assert!(matches!(
+            &confirm.action,
+            Confirmed::StartSecret { user_id: 2, with } if with == "Chardy"
+        ));
+
+        app.chats.set_bot(2, true);
+        command(&mut app, "secret");
+        assert!(app.confirm.is_none());
+        assert_eq!(app.status.as_deref(), Some("Bots can't be in secret chats"));
+
+        // The open chat is a group.
+        app.focus = Focus::Messages;
+        command(&mut app, "secret");
+        assert!(app.confirm.is_none());
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.starts_with("Open a chat with someone"), "{status}");
+    }
+
+    #[test]
+    fn leave_in_a_secret_chat_asks_to_end_it() {
+        let mut app = test_app("secret-leave");
+        let chat_id = chat_with_chardy(&mut app, Some(crate::secret::SecretState::Ready));
+        command(&mut app, "leave");
+        let confirm = app.confirm.as_ref().expect("asks");
+        assert_eq!(confirm.title, "End this secret chat?");
+        assert!(matches!(
+            confirm.action,
+            Confirmed::EndSecret { chat_id: id, secret_id: 9 } if id == chat_id
+        ));
+    }
+
+    #[test]
+    fn timer_lists_the_timers_with_the_cursor_on_the_chats_own() {
+        use crate::secret::SecretState;
+        let mut app = test_app("secret-timer");
+        let chat_id = open_chardy(&mut app, Some(SecretState::Pending));
+        command(&mut app, "timer");
+        assert!(app.timer_menu.is_none(), "not until they accept it");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Waiting for Chardy to come online")
+        );
+
+        open_chardy(&mut app, Some(SecretState::Ready));
+        app.chats.set_auto_delete(chat_id, 30);
+        command(&mut app, "timer");
+        let at_30 = crate::secret::TIMERS.iter().position(|&t| t == 30).unwrap();
+        assert_eq!(app.timer_menu.as_ref().map(|m| m.selected), Some(at_30));
+        let rows = screen(&mut app).join("\n");
+        assert!(rows.contains("Self-destruct timer · Chardy"), "{rows}");
+        assert!(rows.contains("● 30 seconds"), "{rows}");
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        // The timer it has already: nothing to send.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.timer_menu.is_none());
+
+        // Not in a chat that isn't secret, even with the list's cursor on
+        // a secret one.
+        open_chardy(&mut app, None);
+        app.focus = Focus::Chats;
+        app.selected = Some(chat_id);
+        command(&mut app, "timer");
+        assert!(app.timer_menu.is_none());
+    }
+
+    #[test]
+    fn key_shows_the_secret_chats_key_once_there_is_one() {
+        use crate::secret::SecretState;
+        let mut app = test_app("secret-key");
+        open_chardy(&mut app, Some(SecretState::Pending));
+        command(&mut app, "key");
+        assert!(app.key_view.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("The key is made once Chardy accepts the secret chat")
+        );
+
+        let key = Secret {
+            user_id: 2,
+            state: SecretState::Ready,
+            outbound: true,
+            key_hash: (0..36).collect(),
+        };
+        app.chats.set_secret(9, key);
+        command(&mut app, "key");
+        assert!(app.key_view.is_some());
+        let rows = screen(&mut app).join("\n");
+        assert!(rows.contains("Encryption key · Chardy"), "{rows}");
+        assert!(rows.contains("00 01 02 03  04 05 06 07"), "{rows}");
+        assert!(rows.contains("If Chardy sees the same picture"), "{rows}");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.key_view.is_none());
+    }
+
+    #[test]
+    fn a_secret_chat_takes_no_message_until_accepted_and_none_forwarded_from_it() {
+        use crate::secret::SecretState;
+        let mut app = test_app("secret-write");
+        let chat_id = chat_with_chardy(&mut app, Some(SecretState::Pending));
+        let mut open = OpenChat::new(chat_id);
+        let id = app
+            .open
+            .as_ref()
+            .unwrap()
+            .messages
+            .keys()
+            .copied()
+            .next()
+            .unwrap();
+        let msg = app.open.as_mut().unwrap().messages.remove(&id).unwrap();
+        open.messages.insert(id, msg);
+        app.open = Some(open);
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(app.focus == Focus::Messages, "stays in Normal mode");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Waiting for Chardy to come online")
+        );
+
+        chat_with_chardy(&mut app, Some(SecretState::Closed));
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(app.status.as_deref(), Some("This secret chat has ended"));
+
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        assert!(app.picker.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Messages in secret chats can't be forwarded")
+        );
+    }
+
+    #[test]
+    fn y_copies_nothing_telegram_says_cant_be_saved() {
+        let mut app = test_app("secret-copy");
+        app.focus = Focus::Messages;
+        let id = plain_message(&mut app);
+        let open = app.open.as_mut().unwrap();
+        let msg = open.messages.get_mut(&id).unwrap();
+        msg.saveable = false;
+        msg.destruct = Some(crate::secret::Destruct {
+            after: 10,
+            on_open: true,
+            ends: None,
+        });
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.menu.is_none() && app.toast.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Self-destructing media can't be copied")
+        );
+    }
+
+    /// Adds a photo shown only while open, lasting 10 seconds once opened,
+    /// as the newest message of the open chat, under the cursor.
+    fn secret_photo(app: &mut App) -> i64 {
+        let open = app.open.as_mut().unwrap();
+        let id = open.newest_id().unwrap() + 1;
+        let mut photo = crate::messages::test_secret_photo(10);
+        photo.outgoing = false;
+        open.messages.insert(id, photo);
+        open.selected = None;
+        app.focus = Focus::Messages;
+        id
+    }
+
+    #[test]
+    fn a_photo_shown_only_while_open_is_covered_once_nobody_is_there() {
+        let mut app = test_app("secret-away");
+        let id = secret_photo(&mut app);
+        assert!(app.open.as_mut().unwrap().uncover(id));
+        app.cover_unseen();
+        assert_eq!(app.open.as_ref().unwrap().viewing, Some(id), "looked at");
+
+        // tmux without focus-events: a minute without a key is away.
+        app.last_input_wall = SystemTime::now() - (IDLE_AFTER + Duration::from_secs(1));
+        app.cover_unseen();
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.viewing, None);
+        assert!(open.messages[&id].preview.is_none(), "covered");
+    }
+
+    #[test]
+    fn the_sender_hears_a_photo_was_opened_only_if_it_was_seen() {
+        let mut app = test_app("secret-opened");
+        let id = secret_photo(&mut app);
+        let open = app.open.as_mut().unwrap();
+        open.uncover(id);
+        open.opening = Some((id, 20));
+        // The download failed: nothing was seen.
+        app.on_tg(TgEvent::Downloaded {
+            file_id: 20,
+            path: None,
+        });
+        assert_eq!(app.open.as_ref().unwrap().opening, None);
+
+        // The cursor left it before it came: covered, and nothing is told.
+        let open = app.open.as_mut().unwrap();
+        open.opening = Some((id, 20));
+        open.selected = Some(id - 1);
+        app.cover_unseen();
+        assert_eq!(app.open.as_ref().unwrap().opening, None);
+        app.on_tg(TgEvent::Downloaded {
+            file_id: 20,
+            path: Some("/nowhere/photo.jpg".into()),
+        });
+        let photo = &app.open.as_ref().unwrap().messages[&id];
+        assert!(
+            photo.destruct.is_some_and(|d| d.ends.is_none()),
+            "its timer didn't start"
+        );
+    }
+
+    #[test]
+    fn media_seen_only_while_open_is_never_handed_to_another_app() {
+        let mut app = test_app("secret-voice");
+        app.focus = Focus::Messages;
+        let id = plain_message(&mut app);
+        let msg = app.open.as_mut().unwrap().messages.get_mut(&id).unwrap();
+        msg.file = Some(MediaFile {
+            id: 30,
+            label: "Voice message".into(),
+            photo: false,
+        });
+        msg.links.clear();
+        msg.source_text.clear();
+        msg.destruct = Some(crate::secret::Destruct {
+            after: 30,
+            on_open: true,
+            ends: None,
+        });
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.opening.is_empty(), "not downloaded to open");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.ends_with(crate::messages::ON_PHONE), "{status}");
+        // Even where Telegram would let it be saved.
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.copying.is_empty());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Nothing to copy in this message")
+        );
+    }
+
+    #[test]
+    fn a_secret_chat_taken_although_the_setting_says_not_is_told() {
+        use tdlib_rs::enums::NotificationGroupType;
+        use tdlib_rs::types::Notification;
+        let mut app = test_app("secret-taken");
+        let chat_id = chat_with_chardy(&mut app, Some(crate::secret::SecretState::Ready));
+        let update = |app: &mut App| {
+            app.on_notifications(UpdateNotificationGroup {
+                notification_group_id: 1,
+                r#type: NotificationGroupType::SecretChat,
+                chat_id,
+                notification_settings_chat_id: chat_id,
+                notification_sound_id: 0,
+                total_count: 1,
+                added_notifications: vec![Notification {
+                    id: 1,
+                    date: unix_now(),
+                    is_silent: false,
+                    r#type: NotificationType::NewSecretChat,
+                }],
+                removed_notification_ids: Vec::new(),
+            });
+        };
+        update(&mut app);
+        let status = app.status.take().unwrap_or_default();
+        assert!(status.contains("Chardy started a secret chat"), "{status}");
+        assert!(status.contains(":leave ends it"), "{status}");
+
+        app.settings.accept_secret_chats = true;
+        update(&mut app);
+        assert_eq!(app.status, None, "taken as asked");
+    }
+
+    #[test]
+    fn logging_out_says_secret_chats_go_too() {
+        let mut app = test_app("secret-logout");
+        command(&mut app, "logout");
+        let lines = app.confirm.take().expect("asks").lines.join(" ");
+        assert!(!lines.contains("secret chats"), "{lines}");
+        chat_with_chardy(&mut app, Some(crate::secret::SecretState::Ready));
+        command(&mut app, "logout");
+        let lines = app.confirm.take().expect("asks").lines.join(" ");
+        assert!(lines.contains("Your secret chats go too"), "{lines}");
     }
 }
