@@ -281,7 +281,8 @@ fn show_scene(app: &mut App, scene: Scene) {
             app.react_menu = Some(menu);
         }
         Scene::Searching => {
-            let mut search = MessageSearch::new("trail".into());
+            let ask = crate::search::parse("trail").unwrap_or_default();
+            let mut search = MessageSearch::new("trail".into(), ask);
             search.results = vec![TRAILHEAD, TRAIL_LINK];
             search.current = Some(0);
             search.done = true;

@@ -435,7 +435,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         .as_ref()
         .filter(|p| p.kind == PromptKind::Command)
     {
-        draw_commands(frame, body, &prompt.query(), colors);
+        draw_commands(frame, body, &prompt.query(), prompt.tabbed.as_ref(), colors);
     }
     if let Some(prompt) = app.prompt.as_ref().filter(|p| !p.completions.is_empty()) {
         draw_completions(frame, body, &prompt.completions, colors);
@@ -1300,7 +1300,8 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
 /// The popup Enter opens on a bot's message: the message on a line, then
 /// its buttons as the bot laid them out, a row of the popup for each row of
 /// buttons, then the message's file and links. Buttons only Telegram's own
-/// apps can press are greyed out.
+/// apps can press are greyed out. Under them, what Enter does, in full: a
+/// button's words are cut to fit, and a reply button sends all of its own.
 fn draw_buttons(frame: &mut Frame, area: Rect, menu: &ButtonMenu, colors: &Colors) {
     let widest = menu
         .rows
@@ -1310,8 +1311,11 @@ fn draw_buttons(frame: &mut Frame, area: Rect, menu: &ButtonMenu, colors: &Color
         .max()
         .unwrap_or(0);
     let width = ((widest + 4).clamp(36, 76) as u16).min(area.width);
-    // Borders, the message and a gap, then the buttons.
-    let height = (menu.rows.len() as u16 + 4).min(area.height);
+    let about = menu.current().map_or(String::new(), |b| b.describe());
+    let about = messages::wrap(&about, usize::from(width.saturating_sub(5)).max(1));
+    let about_rows = about.len().min(MAX_ABOUT_ROWS) as u16;
+    // Borders, the message and a gap, the buttons, a gap and what Enter does.
+    let height = (menu.rows.len() as u16 + 5 + about_rows).min(area.height);
     let popup = center(area, width, height);
     let (title, keys) = if menu.reply {
         (" Reply buttons ", " `Enter` send · `Esc` close ")
@@ -1323,10 +1327,12 @@ fn draw_buttons(frame: &mut Frame, area: Rect, menu: &ButtonMenu, colors: &Color
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
-    let [snippet, _, list] = Layout::vertical([
+    let [snippet, _, list, _, below] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Length(about_rows),
     ])
     .areas(inner);
     frame.render_widget(
@@ -1339,6 +1345,22 @@ fn draw_buttons(frame: &mut Frame, area: Rect, menu: &ButtonMenu, colors: &Color
         ]),
         snippet,
     );
+    // The last row says there's more, rather than cutting it off silently.
+    let more = about.len() > MAX_ABOUT_ROWS;
+    let lines: Vec<Line> = about
+        .into_iter()
+        .take(MAX_ABOUT_ROWS)
+        .enumerate()
+        .map(|(i, (line, _))| {
+            let line = if more && i + 1 == MAX_ABOUT_ROWS {
+                format!("{line} …")
+            } else {
+                line
+            };
+            Line::from(format!(" {line}")).fg(colors.subtle)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), below);
     // Scrolled so the cursor's row shows.
     let shown = usize::from(list.height).max(1);
     let first = (menu.row + 1).saturating_sub(shown);
@@ -1368,6 +1390,9 @@ fn draw_buttons(frame: &mut Frame, area: Rect, menu: &ButtonMenu, colors: &Color
         frame.render_widget(Line::from(spans), area);
     }
 }
+
+/// Rows under the bot button popup's buttons for what Enter does.
+const MAX_ABOUT_ROWS: usize = 6;
 
 /// The `P` popup: the message, then how to pin it.
 fn draw_pin(frame: &mut Frame, area: Rect, menu: &PinMenu, colors: &Colors) {
@@ -1439,6 +1464,7 @@ fn draw_pinned(
     let title = format!(" Pinned messages ({}) ", open.pinned.len());
     let block = popup_block(title, " `Enter` go to · `P` unpin · `Esc` close ", colors);
     let inner = block.inner(popup);
+    let row = menu.row(&open.pinned);
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
@@ -1447,7 +1473,7 @@ fn draw_pinned(
         .iter()
         .enumerate()
         .map(|(i, pinned)| {
-            let bar = if i == menu.selected {
+            let bar = if Some(i) == row {
                 Span::from("▌").fg(colors.accent)
             } else {
                 Span::from(" ")
@@ -1468,7 +1494,7 @@ fn draw_pinned(
     frame.render_stateful_widget(
         List::new(items).highlight_style(Style::new().bg(colors.selection)),
         inner,
-        &mut ListState::default().with_selected(Some(menu.selected)),
+        &mut ListState::default().with_selected(row),
     );
 }
 
@@ -1834,13 +1860,13 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             " SEARCH ",
             colors.search,
             " /",
-            "  `Enter` search · `Esc` cancel ",
+            "  `Tab` filters: from: has: before: after: · `Enter` search · `Esc` cancel ",
         ),
         PromptKind::Command => (
             " COMMAND ",
             colors.command,
             " :",
-            "  `Enter` run · `Esc` cancel ",
+            "  `Tab` complete · `Enter` run · `Esc` cancel ",
         ),
         PromptKind::Attach => (
             " ATTACH ",
@@ -1865,8 +1891,19 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
 
 /// Every `:` command, over the bottom left corner while typing one. Names
 /// starting with what's typed so far stand out.
-fn draw_commands(frame: &mut Frame, area: Rect, typed: &str, colors: &Colors) {
-    let typed = typed.trim();
+fn draw_commands(
+    frame: &mut Frame,
+    area: Rect,
+    query: &str,
+    tabbed: Option<&(String, usize)>,
+    colors: &Colors,
+) {
+    // While Tab goes through them, the ones that start with what was typed
+    // stay lit, and the one put in is marked.
+    let (typed, tabbed) = match tabbed {
+        Some((typed, _)) => (typed.trim(), Some(query.trim())),
+        None => (query.trim(), None),
+    };
     let name_width = Command::ALL
         .iter()
         .map(|c| c.name().len())
@@ -1887,10 +1924,15 @@ fn draw_commands(frame: &mut Frame, area: Rect, typed: &str, colors: &Colors) {
             }
             spans.push(Span::from(format!("{}{padding}", &name[typed.len()..])).fg(colors.primary));
             spans.push(Span::from(format!("  {}", command.about())).fg(colors.subtle));
-            Line::from(spans)
+            let line = Line::from(spans);
+            if tabbed == Some(name) {
+                line.bg(colors.selection)
+            } else {
+                line
+            }
         })
         .collect();
-    let title = " Commands · type the full name ";
+    let title = " Commands · Tab completes ";
     let longest = lines
         .iter()
         .map(Line::width)
@@ -2031,6 +2073,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
                     "  `y` join · `n` or `Esc` cancel"
                 }
                 Some(Confirmed::Leave(_)) => "  `y` leave · `n` or `Esc` cancel",
+                Some(Confirmed::Logout) => "  `y` log out · `n` or `Esc` cancel",
                 _ => "  `y` open · `n` or `Esc` cancel",
             },
         ),
@@ -2065,12 +2108,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         _ if app.button_menu.as_ref().is_some_and(|m| m.reply) => (
             normal,
-            "  `h/j/k/l` choose · `Enter` send its words · `1-9` send by number · `Esc` close",
+            "  `h/j/k/l` choose · `Enter` send its words · `Esc` close",
         ),
-        _ if app.button_menu.is_some() => (
-            normal,
-            "  `h/j/k/l` choose · `Enter` press · `1-9` press by number · `Esc` close",
-        ),
+        _ if app.button_menu.is_some() => {
+            (normal, "  `h/j/k/l` choose · `Enter` press · `Esc` close")
+        }
         _ if app.picker.as_ref().is_some_and(ChatPicker::forwarding) => (
             normal,
             "  type a chat's name · `arrows` choose · `Enter` forward · `Esc` cancel",
@@ -3017,15 +3059,37 @@ mod tests {
     }
 
     #[test]
+    fn while_tab_goes_through_commands_the_one_put_in_is_marked() {
+        let colors = Colors::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        let tabbed = ("l".to_string(), 1);
+        terminal
+            .draw(|f| draw_commands(f, f.area(), "logout", Some(&tabbed), &colors))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows = buffer_rows(buf);
+        let row = |name| rows.iter().position(|r| r.contains(name)).unwrap() as u16;
+        let (leave, logout) = (row("leave"), row("logout"));
+        assert_eq!(buf[(5, logout)].bg, colors.selection);
+        assert_ne!(buf[(5, leave)].bg, colors.selection);
+        let x = column(&rows[leave as usize], "leave");
+        assert_eq!(
+            buf[(x + 2, leave)].fg,
+            colors.primary,
+            "still fits what was typed"
+        );
+    }
+
+    #[test]
     fn the_command_list_shows_every_command_and_marks_what_is_typed() {
         let colors = Colors::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
         terminal
-            .draw(|f| draw_commands(f, f.area(), "lo", &colors))
+            .draw(|f| draw_commands(f, f.area(), "lo", None, &colors))
             .unwrap();
         let buf = terminal.backend().buffer();
         let rows = buffer_rows(buf);
-        assert!(rows.iter().any(|r| r.contains("type the full name")));
+        assert!(rows.iter().any(|r| r.contains("Tab completes")));
         for command in Command::ALL {
             let y = rows
                 .iter()
@@ -3042,7 +3106,7 @@ mod tests {
         assert_eq!(buf[(x + 2, y)].fg, colors.primary, "rest of the name not");
 
         terminal
-            .draw(|f| draw_commands(f, f.area(), "x", &colors))
+            .draw(|f| draw_commands(f, f.area(), "x", None, &colors))
             .unwrap();
         let buf = terminal.backend().buffer();
         let rows = buffer_rows(buf);

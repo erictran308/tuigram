@@ -464,7 +464,8 @@ fn measure<'a>(
         .min(width)
         .saturating_sub(2)
         .max(1);
-    let query = open.search.as_ref().map_or("", |s| s.query.as_str());
+    // Only the words are found in the text, not the filters.
+    let query = open.search.as_ref().map_or("", |s| s.ask.words.as_str());
     // How far your messages have been read, for their ticks. None in
     // channels and Saved Messages, where nobody reads them.
     let read_outbox = names
@@ -2426,7 +2427,8 @@ mod tests {
     #[test]
     fn search_matches_are_highlighted_and_counted_in_the_title() {
         let mut open = sample();
-        let mut search = crate::search::MessageSearch::new("HELLO".into());
+        let ask = crate::search::parse("HELLO").unwrap();
+        let mut search = crate::search::MessageSearch::new("HELLO".into(), ask);
         search.results = vec![2];
         search.current = Some(0);
         open.search = Some(search);

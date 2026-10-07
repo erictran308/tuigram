@@ -27,7 +27,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Photos and stickers, inline.** Real images in kitty, Ghostty, WezTerm and iTerm2, and block-character previews in any other terminal.
 - **React with emoji.** `R` opens the emoji the chat allows, and `/` finds one by name (`heart`, `fire`, `+1`). `X` takes yours back.
 - **Send stickers.** `Tab` while writing opens your recent and favorite stickers and the sets you added, and `/` finds more by emoji or word.
-- **Search everything.** `/` in the chat list filters chats as you type. `/` inside a chat searches its entire history, and `n`/`N` jump between matches, highlighted where they appear.
+- **Search everything.** `/` in the chat list filters chats as you type. `/` inside a chat searches its entire history, and `n`/`N` jump between matches, highlighted where they appear. Narrow it down with `from:@alice`, `has:photo`, `before:2025-10-01` and `after:`.
 - **Find anyone.** `s` finds a chat by name, or anyone on Telegram by `@username` or `t.me` link: your contacts, public groups and channels, invite links (it asks before joining) and links to a message.
 - **Forward.** `f` sends the selected message, or a whole album, to another chat, with "Forwarded from" as in Telegram.
 - **Polls and link previews.** Polls show their answers, and how people voted once you have; `Enter` votes. Links show the page's title and a few lines of it, under the site they really go to, beside a small picture where the terminal shows images.
@@ -156,13 +156,13 @@ The status bar always shows the keys for where you are. The essentials:
 | `d` | Delete the selected message, for everyone or just you (asks first) |
 | `P` | Pin the selected message: in a chat with one person, for both of you or just you; in a group or channel, with or without a notification. On a pinned message, unpins it. Pinned messages show 📌 by their time, and the newest is in a bar over the chat |
 | `gp` | List the chat's pinned messages: `Enter` goes to one (`Ctrl-o` comes back), `P` unpins it |
-| `/` | Search chat names, or messages in the open chat |
+| `/` | Search chat names, or messages in the open chat. In a chat, filters go with the words: `from:@alice` (or `from:me`, or part of a name), `has:photo` (also `video`, `media`, `file`, `link`, `voice`, `gif`, `audio`), `before:2025-10-01` and `after:2025-09-01` (that day counts), e.g. `/from:@alice has:photo trail`. `Tab` finishes a filter's name and what it takes |
 | `n` / `N` | Next older / newer match |
 | `H` | Highlight a chat |
 | `p` / `m` | Pin the selected chat to the top, or mute it, on Telegram, so your phone shows the same; again to undo. Pinned chats show 📌, muted ones 🔕 and a grey unread count |
 | `s` | Find a chat or person: type a name, an `@username` or a `t.me` link, then `Enter` opens it. In a public group or channel you're not in, `i` asks to join |
 | `Ctrl-r` | Resize the panes: `h` / `l` move the line between them left / right, `=` puts it back as at first, `Enter` keeps it (also next time), `Esc` cancels |
-| `:` | Run a command, typed in full: `:leave` leaves the group or channel (asks first), `:logout` logs out of Telegram on this computer |
+| `:` | Run a command, typed in full (`Tab` completes the name, and goes on to the next one that fits): `:leave` leaves the group or channel (asks first), `:logout` logs out of Telegram on this computer (asks first) |
 | `?` | Every shortcut, plus settings and themes |
 | `q` | Quit |
 

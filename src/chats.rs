@@ -539,6 +539,11 @@ impl Chats {
         self.my_id = Some(id);
     }
 
+    /// Your own user id, once TDLib said.
+    pub fn my_id(&self) -> Option<i64> {
+        self.my_id
+    }
+
     /// True for the chat with yourself, which Telegram shows as Saved Messages.
     pub fn is_saved(&self, chat_id: i64) -> bool {
         self.my_id == Some(chat_id)
@@ -593,6 +598,18 @@ impl Chats {
     pub fn username(&self, chat_id: i64) -> Option<&str> {
         let peer = self.by_id.get(&chat_id)?.peer?;
         self.usernames.get(&peer).map(String::as_str)
+    }
+
+    /// The person with this @username (without the @), ignoring case, if
+    /// TDLib told about them. `None` if two people had it (one gave it up,
+    /// and TDLib hasn't said so yet), so TDLib is asked who has it now.
+    pub fn user_by_username(&self, username: &str) -> Option<i64> {
+        let mut found = self.usernames.iter().filter_map(|(peer, name)| match peer {
+            Peer::User(id) if name.eq_ignore_ascii_case(username) => Some(*id),
+            _ => None,
+        });
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
     }
 
     /// The @username of a person, without the @, whether or not you have a

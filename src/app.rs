@@ -34,7 +34,7 @@ use crate::picker::{self, ChatPicker, Choice, Purpose};
 use crate::pins::{PinMenu, Pinned, PinnedMenu, Place};
 use crate::poll::{Vote, VoteMenu};
 use crate::reactions::{self, ReactMenu, ReactionKind};
-use crate::search::{self, MessageSearch};
+use crate::search::{self, MessageSearch, Who};
 use crate::settings::{self, Settings, Side};
 use crate::stickers::{self, Source, StickerPanel};
 use crate::text;
@@ -212,6 +212,8 @@ pub enum Confirmed {
     },
     /// Leave this group or channel.
     Leave(i64),
+    /// Log out of Telegram on this computer.
+    Logout,
 }
 
 impl Confirmed {
@@ -222,6 +224,7 @@ impl Confirmed {
             Confirmed::Edit { .. } => "edit",
             Confirmed::Join(_) | Confirmed::JoinLink { .. } => "join",
             Confirmed::Leave(_) => "leave",
+            Confirmed::Logout => "log out",
         }
     }
 }
@@ -448,6 +451,10 @@ pub struct Prompt {
     /// What the last Tab found in the attach prompt, when it was more than
     /// one name. Typing clears it.
     pub completions: Vec<String>,
+    /// In the `:` prompt, Tab goes through the commands that start with
+    /// what was typed: this is what was typed, and which of them Tab put
+    /// in. Typing clears it.
+    pub tabbed: Option<(String, usize)>,
     /// The chat filter and cursor from before, which Esc puts back.
     previous_filter: String,
     previous_selected: Option<i64>,
@@ -456,6 +463,44 @@ pub struct Prompt {
 impl Prompt {
     pub fn query(&self) -> String {
         self.input.lines().concat()
+    }
+
+    /// What was typed before the Tabs that went through completions.
+    fn typed(&self) -> String {
+        match &self.tabbed {
+            Some((typed, _)) => typed.clone(),
+            None => self.query(),
+        }
+    }
+
+    /// Tab (`step` 1) or Shift-Tab (-1): puts in the next or previous of
+    /// `options`, the ways to finish what was typed, round the end, as vim
+    /// does. Enter still runs it.
+    fn tab(&mut self, step: isize, typed: String, options: Vec<String>) {
+        let at = self.tabbed.take().map(|(_, at)| at);
+        let count = options.len() as isize;
+        if count == 0 {
+            return;
+        }
+        let next = match at {
+            Some(at) => (at as isize + step).rem_euclid(count),
+            None if step > 0 => 0,
+            None => count - 1,
+        } as usize;
+        self.input = prompt_input(&options[next]);
+        self.tabbed = Some((typed, next));
+    }
+
+    /// Tab in the `:` prompt: the commands that start with what was typed.
+    fn complete_command(&mut self, step: isize) {
+        let typed = self.typed();
+        let options = Command::ALL
+            .into_iter()
+            .map(Command::name)
+            .filter(|name| name.starts_with(typed.trim()))
+            .map(String::from)
+            .collect();
+        self.tab(step, typed, options);
     }
 }
 
@@ -499,7 +544,7 @@ impl Command {
     pub fn about(self) -> &'static str {
         match self {
             Command::Leave => "Leave this group or channel (asks first)",
-            Command::Logout => "Log out of Telegram on this computer",
+            Command::Logout => "Log out of Telegram on this computer (asks first)",
         }
     }
 
@@ -1817,6 +1862,82 @@ impl App {
         };
     }
 
+    /// Whom Tab offers after `from:` in a search: you, then the @usernames
+    /// of the people whose messages are loaded, newest first.
+    fn search_people(&self) -> Vec<String> {
+        let mut people = vec!["me".to_string()];
+        let Some(open) = &self.open else {
+            return people;
+        };
+        for msg in open.messages.values().rev() {
+            if let Sender::User(id) = msg.sender
+                && !self.chats.is_saved(id)
+                && let Some(name) = self.chats.user_username(id)
+            {
+                let name = format!("@{name}");
+                if !people.contains(&name) {
+                    people.push(name);
+                }
+            }
+        }
+        people
+    }
+
+    /// Turns `from:me`, and `from:` a name or a username tuigram knows, into
+    /// who sent it; TDLib looks up other usernames.
+    fn resolve_sender(&self, mut ask: search::Query) -> Result<search::Query, String> {
+        let sender = match &ask.from {
+            Some(Who::Me) => {
+                let me = self.chats.my_id().ok_or("Your account isn't known yet")?;
+                Sender::User(me)
+            }
+            Some(Who::Username(name)) => match self.chats.user_by_username(name) {
+                Some(id) => Sender::User(id),
+                None => return Ok(ask),
+            },
+            Some(Who::Name(name)) => {
+                // Names are anyone's to pick, so one that only some of
+                // several match doesn't get to stand for them: a name
+                // matching all of it wins, else there must be just one.
+                let mut matching: Vec<(i64, &str)> = Vec::new();
+                for msg in self.open.iter().flat_map(|o| o.messages.values()) {
+                    let Sender::User(id) = msg.sender else {
+                        continue;
+                    };
+                    if let Some(n) = self.users.get(&id)
+                        && !search::find(n, name).is_empty()
+                        && !matching.iter().any(|&(seen, _)| seen == id)
+                    {
+                        matching.push((id, n));
+                    }
+                }
+                let exact: Vec<i64> = matching
+                    .iter()
+                    .filter(|(_, n)| n.to_lowercase() == name.to_lowercase())
+                    .map(|&(id, _)| id)
+                    .collect();
+                match (exact.as_slice(), matching.as_slice()) {
+                    ([id], _) | ([], [(id, _)]) => Sender::User(*id),
+                    ([], []) => {
+                        return Err(format!(
+                            "Nobody called {name} wrote in the messages loaded: try from:@username"
+                        ));
+                    }
+                    _ => {
+                        let names: Vec<&str> = matching.iter().map(|&(_, n)| n).take(3).collect();
+                        return Err(format!(
+                            "{name} could be {}: use from:@username",
+                            names.join(", ")
+                        ));
+                    }
+                }
+            }
+            Some(Who::Sender(_)) | None => return Ok(ask),
+        };
+        ask.from = Some(Who::Sender(sender));
+        Ok(ask)
+    }
+
     /// The commands of the open chat's bots that have `query` in them.
     fn command_items(&self, query: &str) -> Vec<Suggestion> {
         let Some(Commands::Known(list)) = self.open.as_ref().map(|o| &o.commands) else {
@@ -1994,6 +2115,7 @@ impl App {
             kind,
             input,
             completions: Vec::new(),
+            tabbed: None,
             previous_filter: self.chats.filter().to_string(),
             previous_selected: self.selected,
         });
@@ -2017,9 +2139,21 @@ impl App {
                 prompt.input = prompt_input(&completion.text);
                 prompt.completions = completion.matches;
             }
+            KeyCode::Tab if prompt.kind == PromptKind::Command => prompt.complete_command(1),
+            KeyCode::BackTab if prompt.kind == PromptKind::Command => prompt.complete_command(-1),
+            KeyCode::Tab | KeyCode::BackTab if prompt.kind == PromptKind::Messages => {
+                let step = if key.code == KeyCode::Tab { 1 } else { -1 };
+                let typed = prompt.typed();
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let options = search::complete(&typed, &self.search_people(), &today);
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.tab(step, typed, options);
+                }
+            }
             _ => {
                 prompt.input.input(key);
                 prompt.completions.clear();
+                prompt.tabbed = None;
                 self.on_prompt_edit();
             }
         }
@@ -2055,11 +2189,19 @@ impl App {
                 self.selected = prompt.previous_selected;
             }
             PromptKind::Messages => {
-                let Some(open) = self.open.as_mut().filter(|_| submit && !query.is_empty()) else {
+                if self.open.is_none() || !submit || query.is_empty() {
                     return;
-                };
-                open.search = Some(MessageSearch::new(query));
-                self.go_to_match(0);
+                }
+                let ask = search::parse(&query).and_then(|ask| self.resolve_sender(ask));
+                match ask {
+                    Ok(ask) => {
+                        if let Some(open) = self.open.as_mut() {
+                            open.search = Some(MessageSearch::new(query, ask));
+                        }
+                        self.go_to_match(0);
+                    }
+                    Err(why) => self.status = Some(why),
+                }
             }
             PromptKind::Attach if !submit || query.is_empty() => {}
             PromptKind::Attach => {
@@ -2074,7 +2216,7 @@ impl App {
             PromptKind::Command if !submit || query.is_empty() => {}
             PromptKind::Command => match Command::parse(&query) {
                 Some(Command::Leave) => self.ask_to_leave(),
-                Some(Command::Logout) => self.log_out(),
+                Some(Command::Logout) => self.ask_to_log_out(),
                 None => self.status = Some(format!("Not a command: {query}")),
             },
         }
@@ -2123,10 +2265,14 @@ impl App {
             && (idle < IDLE_AFTER || (self.focus_reported && idle < AWAY_AFTER))
             && matches!(self.focus, Focus::Messages | Focus::Input)
             && self.settings_menu.is_none()
-            && self
-                .open
-                .as_ref()
-                .is_some_and(|o| o.chat_id == chat_id && o.at_newest && o.selected.is_none())
+            && self.open.as_ref().is_some_and(|o| {
+                o.chat_id == chat_id
+                    && o.at_newest
+                    && o.selected.is_none()
+                    // Going to an older message: what arrives meanwhile
+                    // isn't what's about to be on screen.
+                    && !matches!(o.loading, Some(Page::Around(_)))
+            })
     }
 
     /// The user would see a new message in this chat without being told:
@@ -2257,8 +2403,23 @@ impl App {
         self.confirm = Some(confirm);
     }
 
-    /// `:logout`: ends the session on Telegram's side and deletes what TDLib
-    /// keeps on this computer. The login screen comes back once TDLib closes.
+    /// `:logout` asks first: Tab can put it in, and logging in again takes a
+    /// code, and maybe the password.
+    fn ask_to_log_out(&mut self) {
+        self.confirm = Some(Confirm::new(
+            "Log out?",
+            vec![
+                "This ends the session on Telegram and deletes what".into(),
+                "tuigram keeps on this computer. Logging in again".into(),
+                "takes a code, and your password if you have one.".into(),
+            ],
+            Confirmed::Logout,
+        ));
+    }
+
+    /// `:logout`, once asked: ends the session on Telegram's side and
+    /// deletes what TDLib keeps on this computer. The login screen comes
+    /// back once TDLib closes.
     fn log_out(&mut self) {
         self.tg.log_out();
         self.relogin = true;
@@ -2343,9 +2504,10 @@ impl App {
             search.wanted = Some(index);
             if !search.loading {
                 search.loading = true;
-                let (query, from) = (search.query.clone(), search.next_from);
+                let (query, ask, from) =
+                    (search.query.clone(), search.ask.clone(), search.next_from);
                 self.tg
-                    .search_messages(open.chat_id, query, from, SEARCH_PAGE);
+                    .search_messages(open.chat_id, query, ask, from, SEARCH_PAGE);
             }
         } else if search.results.is_empty() {
             self.status = Some(format!("No messages match \"{}\"", search.query));
@@ -2503,11 +2665,8 @@ impl App {
                 Pinned::new(id, &m.into())
             })
             .collect();
-        let count = open.pinned.len();
-        if count == 0 {
+        if open.pinned.is_empty() {
             self.pinned_menu = None;
-        } else if let Some(menu) = self.pinned_menu.as_mut() {
-            menu.selected = menu.selected.min(count - 1);
         }
     }
 
@@ -2561,7 +2720,9 @@ impl App {
                 self.pin_menu = None;
                 self.status = Some("You can't pin messages here".into());
             }
-            Some(true) => menu.allow(),
+            // A second answer (P pressed again) keeps the cursor.
+            Some(true) if menu.choices.is_empty() => menu.allow(),
+            Some(true) => {}
         }
     }
 
@@ -2606,11 +2767,10 @@ impl App {
         let Some(open) = &self.open else {
             return;
         };
-        if open.pinned.is_empty() {
+        self.pinned_menu = PinnedMenu::new(&open.pinned);
+        if self.pinned_menu.is_none() {
             self.status = Some("No pinned messages in this chat".into());
-            return;
         }
-        self.pinned_menu = Some(PinnedMenu::default());
     }
 
     /// The pinned messages popup takes all keys while it's up: Enter goes to
@@ -2620,13 +2780,12 @@ impl App {
             self.pinned_menu = None;
             return;
         };
-        let last = open.pinned.len().saturating_sub(1);
-        let current = open.pinned.get(menu.selected).map(|p| p.id);
+        let current = menu.current(&open.pinned).map(|p| p.id);
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => menu.selected = (menu.selected + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
-            KeyCode::Char('g') => menu.selected = 0,
-            KeyCode::Char('G') => menu.selected = last,
+            KeyCode::Char('j') | KeyCode::Down => menu.move_by(&open.pinned, 1),
+            KeyCode::Char('k') | KeyCode::Up => menu.move_by(&open.pinned, -1),
+            KeyCode::Char('g') => menu.move_by(&open.pinned, isize::MIN),
+            KeyCode::Char('G') => menu.move_by(&open.pinned, isize::MAX),
             KeyCode::Enter | KeyCode::Char('l') => {
                 self.pinned_menu = None;
                 if let Some(id) = current {
@@ -3122,12 +3281,7 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => menu.move_cols(1),
             KeyCode::Tab => menu.move_by(1),
             KeyCode::BackTab => menu.move_by(-1),
-            KeyCode::Char(c @ '1'..='9') => {
-                if menu.select(c as usize - '1' as usize) {
-                    self.press_button();
-                }
-            }
-            KeyCode::Enter => self.press_button(),
+            KeyCode::Enter if menu.shown.elapsed() >= CONFIRM_GRACE => self.press_button(),
             KeyCode::Esc | KeyCode::Char('q') => self.button_menu = None,
             _ => {}
         }
@@ -3648,6 +3802,7 @@ impl App {
                         Confirmed::Edit { id, text } => self.start_edit(id, text),
                         Confirmed::Join(chat_id) => self.tg.join_chat(chat_id),
                         Confirmed::Leave(chat_id) => self.tg.leave_chat(chat_id),
+                        Confirmed::Logout => self.log_out(),
                         Confirmed::JoinLink { link, request } => {
                             self.finding = Some(Finding::new(&request));
                             self.tg.join_by_link(link, request);
@@ -4683,6 +4838,123 @@ mod tests {
     }
 
     #[test]
+    fn tab_in_a_chats_search_finishes_filters_and_a_bad_one_says_why() {
+        let mut app = test_app("search-filters");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        let typed = |app: &App| app.prompt.as_ref().unwrap().query();
+        press(&mut app, KeyCode::Char('/'), none);
+        for c in "trail h".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(typed(&app), "trail has:");
+        for c in "ph".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(typed(&app), "trail has:photo");
+        for c in " from:".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(typed(&app), "trail has:photo from:me");
+
+        for c in " has:video".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(app.status.as_deref(), Some("Only one has: at a time"));
+        assert!(app.open.as_ref().unwrap().search.is_none(), "nothing asked");
+    }
+
+    #[test]
+    fn from_turns_me_a_name_or_a_known_username_into_a_sender() {
+        let mut app = test_app("search-from");
+        let resolve = |app: &App, typed: &str| {
+            let ask = search::parse(typed).unwrap();
+            app.resolve_sender(ask).map(|a| a.from)
+        };
+        let me = app.chats.my_id().unwrap();
+        assert_eq!(
+            resolve(&app, "from:me"),
+            Ok(Some(Who::Sender(Sender::User(me))))
+        );
+        // A sender of the loaded messages, by part of their name.
+        let (id, name) = app
+            .open
+            .as_ref()
+            .unwrap()
+            .messages
+            .values()
+            .find_map(|m| match m.sender {
+                Sender::User(id) if id != me => Some((id, app.users.get(&id)?.clone())),
+                _ => None,
+            })
+            .expect("someone else wrote");
+        let first = name.split_whitespace().next().unwrap().to_lowercase();
+        let found = resolve(&app, &format!("from:{first}"));
+        assert_eq!(found, Ok(Some(Who::Sender(Sender::User(id)))));
+        assert!(
+            resolve(&app, "from:Zelda")
+                .unwrap_err()
+                .starts_with("Nobody called Zelda")
+        );
+
+        app.chats.set_username(
+            Peer::User(id),
+            Some(&tdlib_rs::types::Usernames {
+                active_usernames: vec!["maya".into()],
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            resolve(&app, "from:@Maya"),
+            Ok(Some(Who::Sender(Sender::User(id))))
+        );
+        assert_eq!(
+            resolve(&app, "from:@stranger"),
+            Ok(Some(Who::Username("stranger".into()))),
+            "TDLib looks it up"
+        );
+    }
+
+    #[test]
+    fn tab_completes_a_command_and_goes_on_to_the_next_that_fits() {
+        let mut app = test_app("command-tab");
+        let none = KeyModifiers::NONE;
+        let typed = |app: &App| app.prompt.as_ref().unwrap().query();
+        press(&mut app, KeyCode::Char(':'), none);
+        press(&mut app, KeyCode::Char('l'), none);
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(typed(&app), "leave");
+        let rows = screen(&mut app).join("\n");
+        assert!(rows.contains("Commands · Tab completes"), "{rows}");
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(typed(&app), "logout");
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(typed(&app), "leave", "round the end");
+        press(&mut app, KeyCode::BackTab, none);
+        assert_eq!(typed(&app), "logout");
+
+        // Typing starts over from what's there.
+        for _ in 0.."logout".len() - 2 {
+            press(&mut app, KeyCode::Backspace, none);
+        }
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(typed(&app), "logout", "the only one with lo");
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(typed(&app), "logout");
+
+        app.prompt = None;
+        press(&mut app, KeyCode::Char(':'), none);
+        press(&mut app, KeyCode::Char('x'), none);
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(typed(&app), "x", "nothing fits");
+        assert!(app.prompt.is_some(), "and nothing ran");
+    }
+
+    #[test]
     fn gp_lists_the_pinned_messages_and_enter_goes_to_one() {
         let mut app = test_app("pinned");
         app.focus = Focus::Messages;
@@ -4786,7 +5058,17 @@ mod tests {
         let rows = screen(&mut app).join("\n");
         assert!(rows.contains(" Buttons "), "{rows}");
         assert!(rows.contains("Open link: example.com"), "{rows}");
+        assert!(
+            rows.contains("Games only run in Telegram's own apps"),
+            "what Enter does"
+        );
 
+        // A second Enter right after the first, or one held down, presses
+        // nothing.
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(app.status, None);
+        let ago = Instant::now() - CONFIRM_GRACE;
+        app.button_menu.as_mut().unwrap().shown = ago;
         press(&mut app, KeyCode::Enter, none);
         assert_eq!(
             app.status.as_deref(),
@@ -4799,11 +5081,38 @@ mod tests {
         let confirm = app.confirm.as_ref().expect("its words aren't its address");
         assert!(matches!(&confirm.action, Confirmed::OpenLink(u) if u == "https://shop.example/"));
 
-        // 1-9 press by number, counted through the rows.
+        // No number presses one: none are drawn.
         app.confirm = None;
         press(&mut app, KeyCode::Enter, none);
+        app.button_menu.as_mut().unwrap().shown = ago;
         press(&mut app, KeyCode::Char('2'), none);
-        assert!(app.confirm.is_some());
+        assert!(app.confirm.is_none() && app.button_menu.is_some());
+    }
+
+    #[test]
+    fn logout_asks_first_now_that_tab_can_put_it_in() {
+        let mut app = test_app("logout");
+        let none = KeyModifiers::NONE;
+        press(&mut app, KeyCode::Char(':'), none);
+        press(&mut app, KeyCode::BackTab, none);
+        assert_eq!(app.prompt.as_ref().unwrap().query(), "logout");
+        press(&mut app, KeyCode::Enter, none);
+        let confirm = app.confirm.as_ref().expect("asks");
+        assert!(matches!(confirm.action, Confirmed::Logout));
+        assert!(matches!(app.screen, Screen::Main), "still logged in");
+        press(&mut app, KeyCode::Char('n'), none);
+        assert!(app.confirm.is_none() && matches!(app.screen, Screen::Main));
+    }
+
+    #[test]
+    fn nothing_is_marked_read_while_a_jump_to_an_older_message_loads() {
+        let mut app = test_app("jump-read");
+        app.focus = Focus::Messages;
+        let chat = app.open.as_ref().unwrap().chat_id;
+        assert!(app.watching(chat));
+        // What arrives meanwhile would be inserted at the bottom, unseen.
+        app.open.as_mut().unwrap().loading = Some(Page::Around(3));
+        assert!(!app.watching(chat));
     }
 
     #[test]

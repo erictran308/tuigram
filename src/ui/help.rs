@@ -83,6 +83,14 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("a", "Attach a file by its path (Tab completes it)"),
             ("p", "Paste a photo, files or text from the clipboard"),
             ("/", "Search the whole chat"),
+            (
+                "from: has:",
+                "In a search: from:@alice, from:me or from:a name; has:photo (video, media, file, link, voice, gif, audio)",
+            ),
+            (
+                "before: after:",
+                "In a search: before:2025-10-01, after:2025-09-01 (that day counts)",
+            ),
             ("n / N", "Next older / newer match"),
             (
                 "Esc",
@@ -142,7 +150,6 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Enter",
                 "Press it: the bot answers, a link opens (asking first), a reply button sends its words",
             ),
-            ("1-9", "Press by number"),
             ("Esc / q", "Close"),
         ],
     ),
@@ -150,7 +157,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         "Search and command prompts",
         &[
             ("Enter", "Search, keep the chat filter, or run the command"),
-            ("Tab", "Complete the path of a file to attach"),
+            (
+                "Tab / Shift-Tab",
+                "Complete a command or a search filter (again for the next one), or the path of a file to attach",
+            ),
             ("Esc / Ctrl-c", "Cancel"),
         ],
     ),

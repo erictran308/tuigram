@@ -117,14 +117,87 @@ impl PinMenu {
 }
 
 /// The `gp` popup: the chat's pinned messages, newest first, to go to.
-#[derive(Default)]
+/// The cursor is kept on a message, not a row: pins come and go while it's
+/// open (anyone can pin), and `P` unpins for everyone.
 pub struct PinnedMenu {
-    pub selected: usize,
+    /// The message under the cursor.
+    message_id: i64,
+    /// Its row when last moved to, for `j` / `k` to go on from once it's
+    /// no longer pinned.
+    row: usize,
+}
+
+impl PinnedMenu {
+    /// On the newest pinned message; `None` without any.
+    pub fn new(pinned: &[Pinned]) -> Option<Self> {
+        let first = pinned.first()?;
+        Some(Self {
+            message_id: first.id,
+            row: 0,
+        })
+    }
+
+    /// The row of the message under the cursor; `None` once it's no longer
+    /// pinned, so Enter and `P` can't act on another one in its place.
+    pub fn row(&self, pinned: &[Pinned]) -> Option<usize> {
+        pinned.iter().position(|p| p.id == self.message_id)
+    }
+
+    /// The message under the cursor, while it's pinned.
+    pub fn current<'a>(&self, pinned: &'a [Pinned]) -> Option<&'a Pinned> {
+        pinned.get(self.row(pinned)?)
+    }
+
+    /// Down (`delta` > 0) or up the list, from where the cursor is or was.
+    pub fn move_by(&mut self, pinned: &[Pinned], delta: isize) {
+        let from = self.row(pinned).unwrap_or(self.row);
+        let row = from
+            .saturating_add_signed(delta)
+            .min(pinned.len().saturating_sub(1));
+        if let Some(p) = pinned.get(row) {
+            (self.message_id, self.row) = (p.id, row);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pinned(ids: &[i64]) -> Vec<Pinned> {
+        ids.iter()
+            .map(|&id| Pinned {
+                id,
+                sender: Sender::User(1),
+                outgoing: false,
+                date: 0,
+                snippet: format!("message {id}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_list_cursor_stays_on_its_message_as_pins_come_and_go() {
+        let list = pinned(&[9, 7, 5]);
+        let mut menu = PinnedMenu::new(&list).unwrap();
+        menu.move_by(&list, 1);
+        assert_eq!(menu.current(&list).unwrap().id, 7);
+
+        // Someone pins another message, which goes on top.
+        let list = pinned(&[12, 9, 7, 5]);
+        assert_eq!(menu.current(&list).unwrap().id, 7, "not 9, now in its row");
+        // And someone unpins it: nothing under the cursor to unpin.
+        let list = pinned(&[12, 9, 5]);
+        assert_eq!(menu.current(&list), None);
+        assert_eq!(menu.row(&list), None);
+        menu.move_by(&list, 1);
+        assert_eq!(
+            menu.current(&list).unwrap().id,
+            5,
+            "down from the row it was in"
+        );
+        assert!(PinnedMenu::new(&[]).is_none());
+    }
 
     #[test]
     fn the_choices_fit_the_chat_and_start_on_the_gentle_one() {

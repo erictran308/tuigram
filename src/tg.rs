@@ -19,7 +19,9 @@ use tokio::sync::mpsc::error::SendError;
 
 use crate::chats::{Badge, List, Peer};
 use crate::config::{ApiKeys, Config};
+use crate::messages::Sender;
 use crate::reactions::{self, Available, ReactionKind};
+use crate::search::{Has, Query, Who};
 use crate::stickers::{Source, Sticker};
 
 pub enum TgEvent {
@@ -645,32 +647,21 @@ impl Tg {
         });
     }
 
-    /// Searches the whole chat for messages with `query`, newest first,
-    /// starting from `from` (0 = the newest message).
-    pub fn search_messages(&self, chat_id: i64, query: String, from: i64, limit: i32) {
+    /// Searches a chat's whole history for `ask`: its words, from whom,
+    /// with what in it, and between which days. Results come newest first,
+    /// a page of up to `limit` from message `from` on (0 for the newest);
+    /// `query` is the search as typed, to match the answer. TDLib looks up
+    /// a username tuigram doesn't know, and the first page of a `before:`
+    /// search starts at that day.
+    pub fn search_messages(&self, chat_id: i64, query: String, ask: Query, from: i64, limit: i32) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
         tokio::spawn(async move {
-            let result = functions::search_chat_messages(
-                chat_id,
-                None,
-                query.clone(),
-                None,
-                from,
-                0,
-                limit,
-                None,
-                client_id,
-            )
-            .await;
-            let found = match result {
-                Ok(enums::FoundChatMessages::FoundChatMessages(f)) => Some(Found {
-                    ids: f.messages.iter().map(|m| m.id).collect(),
-                    total: f.total_count,
-                    next_from: f.next_from_message_id,
-                }),
-                Err(e) => {
-                    let _ = tx.send(TgEvent::Error(e.message));
+            let found = search_page(chat_id, &ask, from, limit, client_id).await;
+            let found = match found {
+                Ok(found) => Some(found),
+                Err(why) => {
+                    let _ = tx.send(TgEvent::Error(why));
                     None
                 }
             };
@@ -1588,6 +1579,86 @@ impl Upload {
             }
         }
     }
+}
+
+/// A page of a message search; see [`Tg::search_messages`].
+async fn search_page(
+    chat_id: i64,
+    ask: &Query,
+    mut from: i64,
+    limit: i32,
+    client_id: i32,
+) -> Result<Found, String> {
+    let sender = match &ask.from {
+        Some(Who::Sender(Sender::User(user_id))) => Some(user_sender(*user_id)),
+        Some(Who::Sender(Sender::Chat(chat_id))) => Some(chat_sender(*chat_id)),
+        // A private chat's id is the person's; groups and channels have
+        // negative ones, and post as themselves.
+        Some(Who::Username(name)) => match public_chat(name, client_id).await? {
+            id if id > 0 => Some(user_sender(id)),
+            id => Some(chat_sender(id)),
+        },
+        // The app makes these a sender first.
+        Some(Who::Me | Who::Name(_)) | None => None,
+    };
+    let mut offset = 0;
+    if from == 0
+        && let Some(before) = ask.before
+    {
+        // The last message before the day, and one newer match than it in
+        // case TDLib leaves it out: anything too new is dropped below.
+        match functions::get_chat_message_by_date(chat_id, before, client_id).await {
+            Ok(enums::Message::Message(m)) => (from, offset) = (m.id, -1),
+            Err(e) if e.code == 404 => {
+                return Ok(Found {
+                    ids: Vec::new(),
+                    total: 0,
+                    next_from: 0,
+                });
+            }
+            Err(e) => return Err(e.message),
+        }
+    }
+    let enums::FoundChatMessages::FoundChatMessages(found) = functions::search_chat_messages(
+        chat_id,
+        None,
+        ask.words.clone(),
+        sender,
+        from,
+        offset,
+        limit,
+        ask.has.map(Has::tdlib),
+        client_id,
+    )
+    .await
+    .map_err(|e| e.message)?;
+    let mut next_from = found.next_from_message_id;
+    let mut ids = Vec::new();
+    for m in &found.messages {
+        // Newest first, so the first one before `after:` ends the search.
+        if ask.after.is_some_and(|after| m.date < after) {
+            next_from = 0;
+            break;
+        }
+        if ask.before.is_none_or(|before| m.date < before) {
+            ids.push(m.id);
+        }
+    }
+    // TDLib counts every date.
+    let dated = ask.before.is_some() || ask.after.is_some();
+    Ok(Found {
+        ids,
+        total: if dated { -1 } else { found.total_count },
+        next_from,
+    })
+}
+
+fn user_sender(user_id: i64) -> enums::MessageSender {
+    enums::MessageSender::User(types::MessageSenderUser { user_id })
+}
+
+fn chat_sender(chat_id: i64) -> enums::MessageSender {
+    enums::MessageSender::Chat(types::MessageSenderChat { chat_id })
 }
 
 /// The chat with a username, or why there's none.

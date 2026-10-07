@@ -3,8 +3,10 @@
 //! bubble shows them, and Enter on it lists them to press.
 
 use tdlib_rs::enums::{InlineKeyboardButtonType, KeyboardButtonType, ReplyMarkup};
+use tokio::time::Instant;
 
-use crate::messages::{Link, MediaFile, link_host, one_line, same_place, web_url};
+use crate::messages::{Link, MediaFile, link_host, one_line, web_url};
+use crate::text;
 
 /// What pressing a button does.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,8 +14,8 @@ pub enum Press {
     /// Sends this data to the bot, which may answer with a note, an alert
     /// or a link, and often changes its message.
     Callback(String),
-    /// Opens a web link. Its words are the button's, not its address, so
-    /// it asks first unless they spell it out.
+    /// Opens a web link, asking first: a button's words are cut to fit, so
+    /// even ones that look like the address may not be all of it.
     Open(Link),
     /// Opens a `tg:` link in tuigram, if it leads to a chat.
     Telegram(String),
@@ -39,6 +41,26 @@ impl Button {
     /// Enter on it does something in tuigram.
     pub fn works(&self) -> bool {
         !matches!(self.press, Press::Unsupported(_))
+    }
+
+    /// What Enter on it does, in full, for under the popup's buttons: their
+    /// words are cut to fit, and a reply button sends all of its own.
+    pub fn describe(&self) -> String {
+        match &self.press {
+            Press::Callback(_) => {
+                format!("Presses \"{}\": the bot decides what happens", self.label)
+            }
+            Press::Open(link) => {
+                let host = link_host(&link.url).unwrap_or_else(|| link.url.clone());
+                format!("Opens {} in your browser, asking first", one_line(&host))
+            }
+            Press::Telegram(url) => format!("Opens {url} in tuigram"),
+            Press::User(_) => format!("Opens your chat with {}", self.label),
+            Press::Copy(text) => format!("Copies: {text}"),
+            Press::Send(text) => format!("Sends as you: {text}"),
+            Press::File(file) => format!("Opens {}", file.label),
+            Press::Unsupported(why) => (*why).to_string(),
+        }
     }
 }
 
@@ -117,14 +139,16 @@ fn reply_button(label: String, kind: &KeyboardButtonType) -> Button {
 /// out, or a `tg:` link. Anything else (a local file, an app's scheme)
 /// can't be pressed.
 fn link(label: &str, url: &str) -> Press {
-    if url.trim().to_ascii_lowercase().starts_with("tg:") {
-        return Press::Telegram(url.trim().to_string());
+    let url = text::clean(url);
+    let url = url.trim();
+    if url.to_ascii_lowercase().starts_with("tg:") && !url.contains(char::is_whitespace) {
+        return Press::Telegram(url.to_string());
     }
     match web_url(url) {
-        Some(url) => {
-            let disguise = (!same_place(label, &url)).then(|| label.to_string());
-            Press::Open(Link { url, disguise })
-        }
+        Some(url) => Press::Open(Link {
+            url,
+            disguise: Some(label.to_string()),
+        }),
         None => Press::Unsupported("This button's link isn't a web address"),
     }
 }
@@ -140,6 +164,9 @@ pub struct ButtonMenu {
     /// The cursor: a row, and a button in it.
     pub row: usize,
     pub col: usize,
+    /// When it came up. Enter in the first moments was pressed twice, or
+    /// held, so it doesn't press anything.
+    pub shown: Instant,
 }
 
 impl ButtonMenu {
@@ -171,6 +198,7 @@ impl ButtonMenu {
             rows,
             row: 0,
             col: 0,
+            shown: Instant::now(),
         }
     }
 
@@ -208,17 +236,15 @@ impl ButtonMenu {
         self.rows[..self.row].iter().map(Vec::len).sum::<usize>() + self.col
     }
 
-    /// Puts the cursor on button `index`, counted through the rows. False
-    /// if there's no such button.
-    pub fn select(&mut self, mut index: usize) -> bool {
+    /// Puts the cursor on button `index`, counted through the rows.
+    fn select(&mut self, mut index: usize) {
         for (row, buttons) in self.rows.iter().enumerate() {
             if index < buttons.len() {
                 (self.row, self.col) = (row, index);
-                return true;
+                return;
             }
             index -= buttons.len();
         }
-        false
     }
 
     fn clamp(&mut self) {
@@ -290,7 +316,14 @@ mod tests {
         let Press::Open(plain) = &row(2)[0].press else {
             panic!("a link");
         };
-        assert_eq!(plain.disguise, None, "its words are its address");
+        assert!(
+            plain.disguise.is_some(),
+            "even words that look like the address may be cut off"
+        );
+        assert_eq!(
+            row(2)[0].describe(),
+            "Opens example.com in your browser, asking first"
+        );
         assert!(!row(3)[0].works(), "only web links");
         assert_eq!(
             row(3)[1].press,
@@ -346,8 +379,28 @@ mod tests {
         assert_eq!(menu.current().unwrap().label, "1", "round the end");
         menu.move_by(-1);
         assert_eq!(menu.index(), 4);
-        assert!(menu.select(1));
+        menu.select(1);
         assert_eq!(menu.current().unwrap().label, "2");
-        assert!(!menu.select(5));
+        menu.select(5);
+        assert_eq!(menu.current().unwrap().label, "2", "no such button");
+    }
+
+    #[test]
+    fn under_the_buttons_it_says_in_full_what_enter_does() {
+        let reply = Button {
+            label: "Yes".into(),
+            press: Press::Send("Yes, and everything after it".into()),
+        };
+        assert_eq!(
+            reply.describe(),
+            "Sends as you: Yes, and everything after it"
+        );
+        let tg = link("Chat", "tg://resolve?domain=x\u{202e}");
+        assert_eq!(
+            tg,
+            Press::Telegram("tg://resolve?domain=x".into()),
+            "cleaned"
+        );
+        assert!(matches!(link("Chat", "tg://x y"), Press::Unsupported(_)));
     }
 }

@@ -177,8 +177,11 @@ fn photo_size(path: &Path, bytes: u64) -> Option<(u32, u32)> {
         return None;
     }
     let (width, height) = image::image_dimensions(path).ok()?;
-    let (long, short) = (width.max(height), width.min(height));
-    let fits = short > 0 && width + height <= PHOTO_MAX_SIDES && long <= short * PHOTO_MAX_RATIO;
+    // In u64: a crafted header's sides can add up past u32.
+    let (long, short) = (u64::from(width.max(height)), u64::from(width.min(height)));
+    let fits = short > 0
+        && long + short <= u64::from(PHOTO_MAX_SIDES)
+        && long <= short * u64::from(PHOTO_MAX_RATIO);
     fits.then_some((width, height))
 }
 
