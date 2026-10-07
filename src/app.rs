@@ -42,6 +42,7 @@ use crate::text;
 use crate::tg::{Deletable, EditText, Found, Invite, Missed, Page, Tagged, Tg, TgEvent};
 use crate::theme::{Colors, Themes};
 use crate::ui;
+use crate::voice::{Happened, Player, VoiceEvent};
 
 /// Chats requested per `loadChats` call.
 const CHAT_PAGE: i32 = 50;
@@ -148,6 +149,12 @@ impl Login {
 /// Something in a message that Enter opens or `y` copies.
 pub enum Target {
     File(MediaFile),
+    /// Message `message_id`'s voice, which tuigram plays itself; only ever
+    /// opened. It names its message: the cursor may have moved since.
+    Voice {
+        message_id: i64,
+        file: MediaFile,
+    },
     Link(Link),
     /// The whole text or caption; only copied.
     Text(String),
@@ -156,7 +163,7 @@ pub enum Target {
 impl Target {
     pub fn label(&self) -> &str {
         match self {
-            Target::File(file) => &file.label,
+            Target::File(file) | Target::Voice { file, .. } => &file.label,
             Target::Link(link) => &link.url,
             Target::Text(_) => "Whole message",
         }
@@ -257,6 +264,27 @@ const SAFE_TO_OPEN: &[&str] = &[
 /// would keep it.
 fn opens_once(msg: &crate::messages::Msg) -> bool {
     msg.destruct.is_some_and(|d| d.on_open)
+}
+
+/// The file Enter may open from `msg`. Media seen only while open (a voice
+/// message whose timer starts once it's played) isn't handed to another
+/// app, which would keep it; a voice message tuigram plays itself is fine.
+fn openable_file(msg: &crate::messages::Msg) -> Option<&MediaFile> {
+    msg.file
+        .as_ref()
+        .filter(|_| !opens_once(msg) || msg.voice.is_some())
+}
+
+/// Opening message `id`'s `file`: its voice plays here, anything else opens
+/// in its app.
+fn file_target(id: i64, msg: &crate::messages::Msg, file: MediaFile) -> Target {
+    match msg.voice.as_ref().filter(|v| v.file_id == file.id) {
+        Some(_) => Target::Voice {
+            message_id: id,
+            file,
+        },
+        None => Target::File(file),
+    }
 }
 
 /// Whether a file opens in a viewer or player, never as a program; see
@@ -611,6 +639,8 @@ pub struct App {
     /// The message being written. Cleared when switching chats.
     pub composer: TextArea<'static>,
     pub images: Images,
+    /// Plays voice messages.
+    pub player: Player,
     /// Files being downloaded to open in their default app when done.
     pub opening: HashSet<i32>,
     clipboard: Clipboard,
@@ -726,6 +756,7 @@ impl App {
     pub fn new(
         tg: Tg,
         images: Images,
+        player: Player,
         clipboard: Clipboard,
         settings: Settings,
         settings_path: PathBuf,
@@ -746,6 +777,7 @@ impl App {
             open: None,
             composer: new_composer(),
             images,
+            player,
             opening: HashSet::new(),
             clipboard,
             copying: HashMap::new(),
@@ -826,6 +858,7 @@ impl App {
         mut events: UnboundedReceiver<Tagged>,
         mut image_events: UnboundedReceiver<ImageEvent>,
         mut clipboard: UnboundedReceiver<ClipboardEvent>,
+        mut voice_events: UnboundedReceiver<VoiceEvent>,
     ) -> Result<()> {
         let mut keys = EventStream::new();
         let mut signals = quit_signals();
@@ -893,13 +926,14 @@ impl App {
             let deadline = self.quit_deadline;
             // Wakes up to take the toast down, to go offline when idle, to
             // send notifications that had to wait, to search Telegram once
-            // typing in the `s` picker pauses, and to count down messages
-            // that self-destruct.
+            // typing in the `s` picker pauses, to count down messages that
+            // self-destruct, and to follow a voice message playing.
             let countdown = self
                 .open
                 .as_ref()
                 .and_then(|o| o.next_tick(SystemTime::now()))
                 .map(|left| Instant::now() + left);
+            let playing = self.player.next_tick().map(|soon| Instant::now() + soon);
             // And to cover what's shown only while open, once you're away.
             let away = self
                 .open
@@ -908,6 +942,7 @@ impl App {
                 .map(|_| self.last_input + self.away_after());
             let wake = [
                 countdown,
+                playing,
                 away,
                 self.toast.as_ref().map(|t| t.until),
                 self.online.then_some(self.last_input + IDLE_AFTER),
@@ -928,6 +963,7 @@ impl App {
                 }
                 Some(event) = image_events.recv() => self.images.on_built(event),
                 Some(event) = clipboard.recv() => self.on_clipboard(event),
+                Some(event) = voice_events.recv() => self.on_voice(event),
                 Some(event) = keys.next(), if failed.is_none() => match event {
                     Ok(event) => self.on_terminal_event(event),
                     Err(e) => {
@@ -1124,6 +1160,21 @@ impl App {
                             self.copy_downloaded(file, path)
                         }
                         None => self.status = Some("Download failed".into()),
+                    }
+                }
+                if self.player.waits_for(file_id) {
+                    match &path {
+                        // Not to an empty room: playing it tells the sender,
+                        // and one that plays once would be gone unheard.
+                        Some(_) if !self.present() => {
+                            self.player.stop();
+                            self.status = Some("Voice message downloaded: Enter plays it".into());
+                        }
+                        Some(path) => self.player.start(PathBuf::from(path)),
+                        None => {
+                            self.player.stop();
+                            self.status = Some("Download failed".into());
+                        }
                     }
                 }
                 self.images.on_downloaded(file_id, path);
@@ -1355,6 +1406,7 @@ impl App {
                 .set_auto_delete(u.chat_id, u.message_auto_delete_time),
             Update::MessageContentOpened(u) => {
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
+                    open.set_opened(u.message_id);
                     open.start_timer(u.message_id, SystemTime::now());
                 }
             }
@@ -1457,6 +1509,12 @@ impl App {
                 }
             }
             Update::DeleteMessages(u) if u.is_permanent => {
+                if u.message_ids
+                    .iter()
+                    .any(|&id| self.player.is_on(u.chat_id, id))
+                {
+                    self.player.stop();
+                }
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
                     open.remove(&u.message_ids);
                     if self
@@ -2802,6 +2860,7 @@ impl App {
         self.focus = Focus::Chats;
         self.composer = new_composer();
         self.images.forget_files();
+        self.player.stop();
         self.opening.clear();
         self.copying.clear();
         self.menu = None;
@@ -2997,6 +3056,8 @@ impl App {
             return;
         }
         self.set_typing(false);
+        // A voice message plays in its own chat, where it shows playing.
+        self.player.stop();
         // TDLib only sends some updates (e.g. for channels) while a chat is open.
         if let Some(old) = self.open.take() {
             self.tg.close_chat(old.chat_id);
@@ -3195,8 +3256,9 @@ impl App {
     }
 
     /// Enter on a message: shows its spoilers first, as a tap does in
-    /// Telegram; votes in a poll; lists a bot's buttons; else opens its file
-    /// or link right away, or shows a menu when there's more than one.
+    /// Telegram; pauses or plays on the voice message playing; votes in a
+    /// poll; lists a bot's buttons; else opens its file or link (playing a
+    /// voice message) right away, or shows a menu when there's more than one.
     fn open_selected_message(&mut self) {
         let Some(open) = self.open.as_mut() else {
             return;
@@ -3224,6 +3286,12 @@ impl App {
         {
             return;
         }
+        if let Some(id) = open.cursor_id()
+            && self.player.is_on(open.chat_id, id)
+        {
+            self.player.toggle();
+            return;
+        }
         if let Some((&id, msg)) = open
             .cursor_id()
             .and_then(|id| open.messages.get_key_value(&id))
@@ -3247,7 +3315,7 @@ impl App {
                         id,
                         msg.snippet(),
                         keyboard,
-                        msg.file.as_ref(),
+                        openable_file(msg),
                         &msg.links,
                     ));
                 }
@@ -3255,13 +3323,14 @@ impl App {
             }
             return;
         }
-        let Some(msg) = open.cursor_id().and_then(|id| open.messages.get(&id)) else {
+        let Some((&id, msg)) = open
+            .cursor_id()
+            .and_then(|id| open.messages.get_key_value(&id))
+        else {
             return;
         };
-        // Media seen only while open (a voice message whose timer starts
-        // once it's played) isn't handed to another app, which keeps it.
-        let file = msg.file.clone().filter(|_| !opens_once(msg));
-        let mut targets: Vec<Target> = file.map(Target::File).into_iter().collect();
+        let file = openable_file(msg).map(|file| file_target(id, msg, file.clone()));
+        let mut targets: Vec<Target> = file.into_iter().collect();
         targets.extend(msg.links.iter().cloned().map(Target::Link));
         match targets.len() {
             0 if opens_once(msg) => {
@@ -3727,7 +3796,19 @@ impl App {
                     .press_button(chat_id, message_id, data, button.label);
             }
             Press::Open(link) => self.open_target(Target::Link(link)),
-            Press::File(file) => self.open_target(Target::File(file)),
+            Press::File(file) => {
+                // By the menu's message, not the cursor's, which may have
+                // moved. One that's no longer loaded isn't guessed at.
+                let target = self
+                    .open
+                    .as_ref()
+                    .and_then(|o| o.messages.get(&message_id))
+                    .map(|msg| file_target(message_id, msg, file));
+                match target {
+                    Some(target) => self.open_target(target),
+                    None => self.status = Some("That message isn't loaded any more".into()),
+                }
+            }
             Press::Telegram(url) => {
                 self.finding = Some(Finding::new(&url));
                 self.tg.find_link(url.clone(), url);
@@ -4102,6 +4183,7 @@ impl App {
     /// Files open in their default app once downloaded; links in the browser.
     fn open_target(&mut self, target: Target) {
         match target {
+            Target::Voice { message_id, file } => self.play_voice(message_id, file.id),
             Target::File(file) => {
                 // TDLib answers at once if the file is already downloaded.
                 if self.opening.insert(file.id) {
@@ -4121,6 +4203,33 @@ impl App {
             Target::Link(link) => self.open_link_outside(link),
             Target::Text(_) => {}
         }
+    }
+
+    /// Plays voice message `message_id` of the open chat, or pauses it if
+    /// it's the one playing.
+    fn play_voice(&mut self, message_id: i64, file_id: i32) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        if self.player.is_on(open.chat_id, message_id) {
+            self.player.toggle();
+            return;
+        }
+        // Not downloaded only to be refused.
+        let size = open
+            .messages
+            .get(&message_id)
+            .and_then(|m| m.voice.as_ref())
+            .map_or(0, |v| v.size);
+        if size > crate::voice::MAX_FILE {
+            self.status = Some("Can't play this voice message: it's too long".into());
+            return;
+        }
+        // Decided now, while it's surely loaded: it may not be once it plays.
+        let tell = open.tells(message_id);
+        self.player.play(open.chat_id, message_id, file_id, tell);
+        // TDLib answers at once if it's downloaded already.
+        self.tg.download(file_id);
     }
 
     /// Opens a link in the browser, asking first if its words say something
@@ -4308,6 +4417,8 @@ impl App {
                 }
                 return;
             }
+            // Only ever played.
+            Target::Voice { .. } => return,
         };
         match self.clipboard.copy_text(&text) {
             Ok(Copied::System) => self.show_toast("Copied", &text),
@@ -4326,6 +4437,30 @@ impl App {
         match self.clipboard.copy_file(Path::new(path)) {
             Ok(()) => self.show_toast("Copied", &file.label),
             Err(e) => self.status = Some(format!("Couldn't copy: {e}")),
+        }
+    }
+
+    /// Word from the voice message playing.
+    fn on_voice(&mut self, event: VoiceEvent) {
+        let Some(news) = self.player.on_event(event) else {
+            return;
+        };
+        match news.happened {
+            // As in Telegram's apps, the sender sees it was played once it
+            // is, and one that self-destructs once played starts its timer;
+            // even if it's no longer loaded, so it can't be played again
+            // unannounced.
+            Happened::Started if news.tell => {
+                self.tg.open_content(news.chat_id, news.message_id);
+                if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == news.chat_id) {
+                    open.set_opened(news.message_id);
+                    open.start_timer(news.message_id, SystemTime::now());
+                }
+            }
+            Happened::Started | Happened::Ended => {}
+            Happened::Failed(why) => {
+                self.status = Some(format!("Can't play this voice message: {why}"));
+            }
         }
     }
 
@@ -4785,6 +4920,7 @@ impl App {
     }
 
     fn quit(&mut self) {
+        self.player.stop();
         if self.quit_deadline.is_some() {
             // Second press: stop waiting for TDLib.
             self.exit = true;
@@ -6327,6 +6463,139 @@ mod tests {
             app.status.as_deref(),
             Some("Nothing to copy in this message")
         );
+    }
+
+    /// The message under the cursor, made someone else's voice message, not
+    /// played yet, whose file is 30.
+    fn voice_message(app: &mut App) -> (i64, i64) {
+        let id = plain_message(app);
+        let open = app.open.as_mut().unwrap();
+        let msg = open.messages.get_mut(&id).unwrap();
+        msg.outgoing = false;
+        msg.links.clear();
+        msg.file = Some(MediaFile {
+            id: 30,
+            label: "Voice message".into(),
+            photo: false,
+        });
+        msg.voice = Some(crate::voice::Voice {
+            file_id: 30,
+            size: 0,
+            duration: 1,
+            levels: Vec::new(),
+            ogg: true,
+            listened: false,
+        });
+        (open.chat_id, id)
+    }
+
+    #[test]
+    fn enter_pauses_the_voice_message_playing_and_plays_it_on() {
+        let mut app = test_app("voice-pause");
+        app.focus = Focus::Messages;
+        let (chat_id, id) = voice_message(&mut app);
+        // As Enter starts it, without asking TDLib for the file.
+        app.player.play(chat_id, id, 30, true);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.player.playback(chat_id).unwrap().paused);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.player.playback(chat_id).unwrap().paused);
+    }
+
+    #[test]
+    fn a_voice_message_plays_once_downloaded_says_why_it_cant_and_stops_if_deleted() {
+        let mut app = test_app("voice-download");
+        let (tx, mut rx) = unbounded_channel();
+        app.player = Player::new(tx, crate::voice::Output::Nowhere);
+        let (chat_id, id) = voice_message(&mut app);
+
+        app.player.play(chat_id, id, 30, true);
+        app.on_tg(TgEvent::Downloaded {
+            file_id: 30,
+            path: None,
+        });
+        assert_eq!(app.status.take().as_deref(), Some("Download failed"));
+        assert!(!app.player.is_on(chat_id, id));
+
+        // Downloaded once nobody is there: it waits for Enter, unplayed and
+        // unannounced.
+        app.player.play(chat_id, id, 30, true);
+        app.terminal_focused = false;
+        app.on_tg(TgEvent::Downloaded {
+            file_id: 30,
+            path: Some("/nonexistent/voice.ogg".into()),
+        });
+        assert!(!app.player.is_on(chat_id, id));
+        assert_eq!(
+            app.status.take().as_deref(),
+            Some("Voice message downloaded: Enter plays it")
+        );
+        app.terminal_focused = true;
+
+        app.player.play(chat_id, id, 30, true);
+        let path = std::env::temp_dir().join("tuigram-test-voice-download.ogg");
+        std::fs::write(&path, b"<html>").unwrap();
+        app.on_tg(TgEvent::Downloaded {
+            file_id: 30,
+            path: Some(path.to_string_lossy().into_owned()),
+        });
+        app.on_voice(rx.blocking_recv().unwrap());
+        assert_eq!(
+            app.status.take().as_deref(),
+            Some("Can't play this voice message: it isn't an Ogg file")
+        );
+        assert!(!app.player.is_on(chat_id, id));
+
+        app.player.play(chat_id, id, 30, true);
+        let deleted = tdlib_rs::types::UpdateDeleteMessages {
+            chat_id,
+            message_ids: vec![id],
+            is_permanent: true,
+            from_cache: false,
+        };
+        app.on_tg(TgEvent::Update(Box::new(Update::DeleteMessages(deleted))));
+        assert!(!app.player.is_on(chat_id, id), "stopped");
+    }
+
+    #[test]
+    fn playing_your_own_voice_message_tells_nobody() {
+        let mut app = test_app("voice-own");
+        let (chat_id, id) = voice_message(&mut app);
+        let open = app.open.as_mut().unwrap();
+        open.messages.get_mut(&id).unwrap().outgoing = true;
+        let tell = open.tells(id);
+        assert!(!tell);
+        app.player.play(chat_id, id, 30, tell);
+        // No request is made: a detached client would fail the test.
+        app.on_voice(app.player.event(Happened::Started));
+        assert!(app.player.is_on(chat_id, id), "still playing");
+    }
+
+    #[test]
+    fn a_voice_message_picked_from_a_menu_is_the_one_enter_was_on() {
+        let mut app = test_app("voice-menu");
+        app.focus = Focus::Messages;
+        let (_, id) = voice_message(&mut app);
+        let msg = app.open.as_mut().unwrap().messages.get_mut(&id).unwrap();
+        msg.links = vec![Link {
+            url: "https://x.dev".into(),
+            disguise: None,
+        }];
+        // Seen only while open, as a view-once voice message is.
+        msg.destruct = Some(crate::secret::Destruct {
+            after: 0,
+            on_open: true,
+            ends: None,
+        });
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let menu = app.menu.as_ref().expect("the voice message and its link");
+        // Played from the menu as that message, wherever the cursor has gone
+        // meanwhile; never opened as a file in another app.
+        assert!(
+            matches!(&menu.targets[0], Target::Voice { message_id, file } if *message_id == id && file.id == 30),
+            "names its message"
+        );
+        assert!(app.opening.is_empty());
     }
 
     #[test]

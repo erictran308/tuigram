@@ -24,6 +24,7 @@ use crate::search::MessageSearch;
 use crate::secret::Destruct;
 use crate::text;
 use crate::tg::Page;
+use crate::voice::Voice;
 
 /// Download the smallest size at least this big (TDLib's "x", ~800px), sharp
 /// enough for a bubble on a high-DPI screen without fetching the original.
@@ -224,6 +225,8 @@ pub struct Msg {
     /// Telegram lets it be saved: not in a chat that protects its content,
     /// nor media with a self-destruct timer. `y` copies only what can be.
     pub saveable: bool,
+    /// A voice message, which Enter plays.
+    pub voice: Option<Voice>,
 }
 
 /// A photo or video its sender wants seen only while it's open (view once,
@@ -333,6 +336,7 @@ impl Msg {
         std::mem::swap(&mut self.card, &mut body.card);
         std::mem::swap(&mut self.editable, &mut body.editable);
         std::mem::swap(&mut self.formatted, &mut body.formatted);
+        std::mem::swap(&mut self.voice, &mut body.voice);
     }
 }
 
@@ -643,6 +647,7 @@ struct Body {
     formatted: bool,
     /// The media shown only while it's open, when it's that.
     hidden: Option<Hidden>,
+    voice: Option<Voice>,
 }
 
 /// The message as the bubble shows it. A photo or video shown only while
@@ -699,6 +704,7 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
         editable: Editable::No,
         formatted: false,
         hidden: None,
+        voice: None,
     };
     let file = |id: i32, label: String| {
         Some(MediaFile {
@@ -801,6 +807,12 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             body.file = file(m.voice_note.voice.id, "Voice message".into());
             body.editable = Editable::Caption { above: false };
             source = Some(&m.caption);
+            let voice = Voice::new(&m.voice_note, m.is_listened);
+            // One tuigram plays shows its waveform, with the caption under it.
+            if voice.ogg {
+                body.text = m.caption.text.clone();
+                body.voice = Some(voice);
+            }
         }
         C::MessageVideoNote(m) => body.file = file(m.video_note.video.id, "Video message".into()),
         C::MessagePoll(m) => {
@@ -1013,7 +1025,7 @@ pub fn link_host(url: &str) -> Option<String> {
 }
 
 /// `1:05`, or `1:02:05` past an hour.
-fn duration(seconds: i32) -> String {
+pub fn duration(seconds: i32) -> String {
     let (h, m, s) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
     if h > 0 {
         format!("{h}:{m:02}:{s:02}")
@@ -1076,6 +1088,7 @@ impl From<Message> for Msg {
             destruct,
             hidden: body.hidden,
             saveable: message.can_be_saved,
+            voice: body.voice,
         }
     }
 }
@@ -1665,6 +1678,24 @@ impl OpenChat {
             {
                 destruct.start(now);
             }
+        }
+    }
+
+    /// Playing voice message `id` is to tell its sender: it's someone
+    /// else's, sent, and not played before.
+    pub fn tells(&self, id: i64) -> bool {
+        self.messages.get(&id).is_some_and(|msg| {
+            !msg.outgoing
+                && msg.state == SendState::Sent
+                && msg.voice.as_ref().is_some_and(|v| !v.listened)
+        })
+    }
+
+    /// Message `id` was opened, here or elsewhere: a voice message counts
+    /// as played.
+    pub fn set_opened(&mut self, id: i64) {
+        if let Some(voice) = self.messages.get_mut(&id).and_then(|m| m.voice.as_mut()) {
+            voice.listened = true;
         }
     }
 
@@ -2342,6 +2373,7 @@ mod tests {
                     destruct: None,
                     hidden: None,
                     saveable: true,
+                    voice: None,
                 };
                 (id, msg)
             })
@@ -2595,6 +2627,56 @@ mod tests {
 
     /// A chat whose newest message, 3, is a photo shown only while open,
     /// lasting `after` seconds once opened (0 for view once).
+    fn voice_note(mime: &str, caption: &str) -> MessageContent {
+        MessageContent::MessageVoiceNote(types::MessageVoiceNote {
+            voice_note: types::VoiceNote {
+                duration: 7,
+                mime_type: mime.into(),
+                ..Default::default()
+            },
+            caption: types::FormattedText {
+                text: caption.into(),
+                entities: Vec::new(),
+            },
+            is_listened: false,
+        })
+    }
+
+    #[test]
+    fn a_voice_message_tuigram_plays_has_a_waveform_and_others_open_elsewhere() {
+        let ogg = body(&voice_note("audio/ogg", "hey"));
+        assert_eq!(ogg.text, "hey", "the waveform says what it is");
+        let voice = ogg.voice.expect("played here");
+        assert_eq!((voice.duration, voice.listened), (7, false));
+        assert!(ogg.file.is_some(), "y still copies it");
+
+        let mp3 = body(&voice_note("audio/mpeg", "hey"));
+        assert!(mp3.voice.is_none());
+        assert_eq!(mp3.text, "[Voice message] hey");
+        assert!(mp3.file.is_some(), "opened in another app");
+    }
+
+    #[test]
+    fn only_someone_elses_voice_message_played_for_the_first_time_tells_them() {
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page([1, 2, 3, 4]));
+        for (id, msg) in &mut open.messages {
+            let mut voice = body(&voice_note("audio/ogg", "")).voice.unwrap();
+            voice.listened = *id == 4;
+            msg.voice = Some(voice);
+        }
+        open.messages.get_mut(&2).unwrap().outgoing = true;
+        open.messages.get_mut(&3).unwrap().state = SendState::Pending;
+        assert!(open.tells(1), "theirs, sent, not played");
+        assert!(!open.tells(2), "yours");
+        assert!(!open.tells(3), "not sent yet");
+        assert!(!open.tells(4), "played before");
+        assert!(!open.tells(9), "not loaded");
+        // Played, here or on your phone: once is enough.
+        open.set_opened(1);
+        assert!(!open.tells(1));
+    }
+
     fn chat_with_secret_photo(after: i32) -> OpenChat {
         let mut open = OpenChat::new(1);
         open.add_page(Page::Latest, page([1, 2]));

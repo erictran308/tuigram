@@ -26,6 +26,7 @@ use crate::reactions::{self, Reaction};
 use crate::search;
 use crate::secret::{self, SecretState};
 use crate::theme::Colors;
+use crate::voice::{self, Playback, Voice};
 
 /// Bubbles take at most this share of the pane width.
 const BUBBLE_WIDTH_PERCENT: usize = 75;
@@ -145,6 +146,7 @@ pub fn draw(
     covered: bool,
     colors: &Colors,
     block_gaps: bool,
+    playing: Option<Playback>,
 ) {
     let chat = names.chats.get(open.chat_id);
     let secret = names.chats.secret(open.chat_id);
@@ -266,6 +268,7 @@ pub fn draw(
         font,
         images.draws_photos(),
         colors,
+        playing,
     );
 
     let height = body.height as usize;
@@ -477,7 +480,8 @@ fn scroll_top(
 /// Measures every loaded message and works out where each goes. With
 /// `gaps`, messages in a block have a row of their bubble's background
 /// between them. Link previews get their picture only with `thumbnails`:
-/// half blocks are too coarse for one a few cells big.
+/// half blocks are too coarse for one a few cells big. `playing` is the
+/// voice message playing, if it's in this chat.
 #[allow(clippy::too_many_arguments)]
 fn measure<'a>(
     open: &'a OpenChat,
@@ -488,6 +492,7 @@ fn measure<'a>(
     font: FontSize,
     thumbnails: bool,
     colors: &Colors,
+    playing: Option<Playback>,
 ) -> Laid<'a> {
     // Text width inside a bubble, after one column of padding each side.
     let max_text = (width * BUBBLE_WIDTH_PERCENT / 100)
@@ -614,8 +619,12 @@ fn measure<'a>(
             .and_then(|card| card.image.as_ref())
             .filter(|_| thumbnails);
         let card_image = card_photo.map(|p| (p, thumbnail_cells(p, font)));
+        let voice = msg.voice.as_ref().map(|v| {
+            let playback = playing.filter(|p| p.message_id == id);
+            VoiceRow::new(v, msg.outgoing, playback, max_text)
+        });
         let bubble = Bubble::new(
-            msg, caption, header, photo, card_image, meta, chips, matches, max_text,
+            msg, caption, header, photo, voice, card_image, meta, chips, matches, max_text,
         );
         // Messages in a row from one sender form a block, with no gap between
         // them. Not in channels, where every post has the same sender, and
@@ -674,8 +683,13 @@ fn measure<'a>(
         }
         // A link preview's picture sits after its bar, under the text.
         if let Some((photo, (cols, rows))) = m.bubble.card_image {
+            let voice_rows = usize::from(m.bubble.voice.is_some());
             laid.photos.push(PhotoSlot {
-                line: bubble_start + m.bubble.header.rows() + photo_rows + m.bubble.text.len(),
+                line: bubble_start
+                    + m.bubble.header.rows()
+                    + photo_rows
+                    + voice_rows
+                    + m.bubble.text.len(),
                 x: (bubble_x + 3) as u16,
                 cols,
                 rows,
@@ -750,7 +764,9 @@ fn layout(
     font: FontSize,
     colors: &Colors,
 ) -> (Vec<Line<'static>>, Vec<Placed>, Vec<PhotoSlot>) {
-    let mut laid = measure(open, names, show_names, gaps, width, font, true, colors);
+    let mut laid = measure(
+        open, names, show_names, gaps, width, font, true, colors, None,
+    );
     let placed = laid.placed.clone();
     let photos = std::mem::take(&mut laid.photos);
     let total = laid.total;
@@ -1017,11 +1033,76 @@ fn keyboard_rows(keyboard: Option<&Keyboard>) -> usize {
     }
 }
 
+/// A voice message's row: ▶ (▌▌ while it plays), its waveform, and its
+/// length, or how much has played; then a dot if you haven't played it.
+struct VoiceRow {
+    playing: bool,
+    bars: String,
+    /// Columns of the waveform heard, while it's playing or paused.
+    heard: Option<usize>,
+    time: String,
+    unheard: bool,
+}
+
+impl VoiceRow {
+    fn new(voice: &Voice, outgoing: bool, playback: Option<Playback>, max: usize) -> Self {
+        let length = crate::messages::duration(voice.duration);
+        // As long as the length, so the bubble keeps its width.
+        let time = match playback {
+            Some(p) => {
+                let at = crate::messages::duration(p.at.as_secs().min(i32::MAX as u64) as i32);
+                format!("{at:>0$}", length.width())
+            }
+            None => length,
+        };
+        let unheard = !outgoing && !voice.listened;
+        let around = 4 + time.width() + if unheard { 2 } else { 0 };
+        let columns = voice.columns().min(max.saturating_sub(around)).max(1);
+        let heard = playback.map(|p| {
+            let part = p.at.as_secs_f64() / f64::from(voice.duration.max(1));
+            ((part * columns as f64) as usize).min(columns)
+        });
+        Self {
+            playing: playback.is_some_and(|p| !p.paused),
+            bars: voice::bars(&voice.levels, columns),
+            heard,
+            time,
+            unheard,
+        }
+    }
+
+    fn width(&self) -> usize {
+        4 + self.bars.chars().count() + self.time.width() + if self.unheard { 2 } else { 0 }
+    }
+
+    fn spans(self, style: Style, faded: Color, accent: Color) -> Vec<Span<'static>> {
+        let icon = if self.playing { "▌▌" } else { "▶ " };
+        let heard = self.heard.unwrap_or(0);
+        let split = self
+            .bars
+            .char_indices()
+            .nth(heard)
+            .map_or(self.bars.len(), |(i, _)| i);
+        let mut spans = vec![
+            Span::styled(format!("{icon} "), style.fg(accent)),
+            Span::styled(self.bars[..split].to_string(), style.fg(accent)),
+            Span::styled(self.bars[split..].to_string(), style.fg(faded)),
+            Span::styled(format!(" {}", self.time), style.fg(faded)),
+        ];
+        if self.unheard {
+            spans.push(Span::styled(" •", style.fg(accent)));
+        }
+        spans
+    }
+}
+
 /// Where a bubble's time goes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetaAt {
     /// After the last line of text.
     Text,
+    /// After a voice message's waveform, with no text under it.
+    Voice,
     /// After the last row of reactions.
     Reactions,
     /// On a row of its own.
@@ -1041,6 +1122,8 @@ struct Bubble<'a> {
     header: Header,
     /// Columns and rows of the photo.
     photo: Option<(u16, u16)>,
+    /// A voice message's waveform, under the photo's place.
+    voice: Option<VoiceRow>,
     /// The time, or the send status. `None` inside an album, which has one
     /// time at the bottom.
     meta: Option<String>,
@@ -1071,6 +1154,7 @@ impl<'a> Bubble<'a> {
         caption: Option<&'a Msg>,
         header: Header,
         photo: Option<(u16, u16)>,
+        voice: Option<VoiceRow>,
         card_image: Option<(&'a Preview, (u16, u16))>,
         meta: Option<String>,
         chips: Vec<Vec<Chip>>,
@@ -1078,9 +1162,11 @@ impl<'a> Bubble<'a> {
         max_text: usize,
     ) -> Self {
         let source = caption.map_or("", |c| c.text.as_str());
-        // A photo inside an album has no row under it at all, and one with
-        // reactions has its time beside them.
-        let text = if source.is_empty() && (meta.is_none() || !chips.is_empty()) {
+        // A photo inside an album has no row under it at all, one with
+        // reactions has its time beside them, and a voice message beside
+        // its waveform.
+        let text = if source.is_empty() && (meta.is_none() || !chips.is_empty() || voice.is_some())
+        {
             Vec::new()
         } else {
             wrap(source, max_text)
@@ -1097,13 +1183,16 @@ impl<'a> Bubble<'a> {
         let meta_w = meta.as_ref().map_or(0, |m| m.width());
         // The time goes beside the last row of reactions, else the last line
         // of text, if it fits. Under a link preview it has a row of its own.
-        let last_w = match chips.last() {
-            Some(row) => chips_width(row),
-            None => text.last().map_or(0, |(l, _)| l.width()),
+        let last_w = match (chips.last(), text.last(), &voice) {
+            (Some(row), _, _) => chips_width(row),
+            (None, Some((l, _)), _) => l.width(),
+            (None, None, Some(voice)) => voice.width(),
+            (None, None, None) => 0,
         };
         let meta_at = match () {
             _ if meta.is_none() || last_w + META_GAP + meta_w > max_text => MetaAt::Own,
             _ if chips.is_empty() && !card.is_empty() => MetaAt::Own,
+            _ if chips.is_empty() && text.is_empty() && voice.is_some() => MetaAt::Voice,
             _ if chips.is_empty() => MetaAt::Text,
             _ => MetaAt::Reactions,
         };
@@ -1111,6 +1200,7 @@ impl<'a> Bubble<'a> {
         let mut width = text
             .iter()
             .map(|(l, _)| l.width())
+            .chain(voice.as_ref().map(VoiceRow::width))
             .chain(chips.iter().map(|row| chips_width(row)))
             .chain(card.iter().map(|(l, _)| card_indent + l.width()))
             .max()
@@ -1156,6 +1246,7 @@ impl<'a> Bubble<'a> {
                 quote,
             },
             photo,
+            voice,
             meta,
             chips,
             matches,
@@ -1171,6 +1262,7 @@ impl<'a> Bubble<'a> {
     fn height(&self) -> usize {
         self.header.rows()
             + self.photo.map_or(0, |(_, rows)| usize::from(rows))
+            + usize::from(self.voice.is_some())
             + self.text.len()
             + self.card.len()
             + self.chips.len()
@@ -1209,6 +1301,7 @@ impl<'a> Bubble<'a> {
             revealed,
             header,
             photo,
+            voice,
             meta,
             chips,
             matches,
@@ -1284,6 +1377,19 @@ impl<'a> Bubble<'a> {
             for _ in 0..rows {
                 let blank = " ".repeat(usize::from(cols));
                 out.push(row(vec![Span::styled(blank, style)], usize::from(cols)));
+            }
+        }
+        if let Some(voice) = voice {
+            let w = voice.width();
+            let mut spans = voice.spans(style, faded, colors.accent);
+            if meta_at == MetaAt::Voice
+                && let Some(meta) = &meta
+            {
+                spans.push(Span::styled(" ".repeat(inner - w - meta_w), style));
+                spans.push(Span::styled(meta.clone(), meta_style));
+                out.push(row(spans, inner));
+            } else {
+                out.push(row(spans, w));
             }
         }
         let count = text.len();
@@ -1606,6 +1712,7 @@ mod tests {
             destruct: None,
             hidden: None,
             saveable: true,
+            voice: None,
         }
     }
 
@@ -1635,6 +1742,16 @@ mod tests {
         focused: bool,
         images: &mut Images,
     ) -> ratatui::buffer::Buffer {
+        render_playing(open, chats, focused, images, None)
+    }
+
+    fn render_playing(
+        open: &mut OpenChat,
+        chats: &Chats,
+        focused: bool,
+        images: &mut Images,
+        playing: Option<Playback>,
+    ) -> ratatui::buffer::Buffer {
         let users = HashMap::new();
         let names = Names {
             users: &users,
@@ -1653,6 +1770,7 @@ mod tests {
                     false,
                     &Colors::default(),
                     Settings::default().block_gaps,
+                    playing,
                 )
             })
             .unwrap();
@@ -2084,6 +2202,7 @@ mod tests {
                         covered,
                         &colors,
                         true,
+                        None,
                     )
                 })
                 .unwrap();
@@ -2920,6 +3039,120 @@ mod tests {
             rows.iter()
                 .any(|r| r.contains("▌") && r.contains("message 0 ")),
             "cursor marks it"
+        );
+    }
+    fn voice_message(outgoing: bool, caption: &str) -> Msg {
+        Msg {
+            voice: Some(Voice {
+                file_id: 9,
+                size: 0,
+                duration: 7,
+                levels: vec![0, 8, 16, 31, 16, 8, 0, 4],
+                ogg: true,
+                listened: false,
+            }),
+            ..msg(outgoing, 1_790_086_500, caption)
+        }
+    }
+
+    fn rows_of(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_voice_message_shows_its_waveform_and_length_with_the_time_beside_them() {
+        let mut open = sample();
+        open.messages.insert(5, voice_message(false, ""));
+        let rows = render(&mut open, false);
+        let row = rows.iter().find(|r| r.contains('▶')).unwrap();
+        let time = Local
+            .timestamp_opt(1_790_086_500, 0)
+            .unwrap()
+            .format("%H:%M")
+            .to_string();
+        assert!(row.contains("█") && row.contains("0:07 •"), "{row}");
+        assert!(row.contains(&time), "on one row: {row}");
+
+        // Played: no dot. Yours: none either, whoever played it.
+        open.messages
+            .get_mut(&5)
+            .unwrap()
+            .voice
+            .as_mut()
+            .unwrap()
+            .listened = true;
+        open.messages.insert(6, voice_message(true, ""));
+        let rows = render(&mut open, false);
+        let voices: Vec<&String> = rows.iter().filter(|r| r.contains('▶')).collect();
+        assert_eq!(voices.len(), 2);
+        assert!(voices.iter().all(|r| !r.contains('•')), "{voices:?}");
+    }
+
+    #[test]
+    fn a_voice_messages_caption_goes_under_its_waveform() {
+        let mut open = sample();
+        open.messages
+            .insert(5, voice_message(false, "listen to this"));
+        let rows = render(&mut open, false);
+        let waveform = rows.iter().position(|r| r.contains('▶')).unwrap();
+        assert!(rows[waveform + 1].contains("listen to this"), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_voice_message_playing_shows_how_far_it_got() {
+        let mut open = sample();
+        open.messages.insert(5, voice_message(false, ""));
+        let playing = |at: f64, paused| Playback {
+            message_id: 5,
+            at: std::time::Duration::from_secs_f64(at),
+            paused,
+        };
+        let draw = |open: &mut OpenChat, playback| {
+            render_playing(
+                open,
+                &Chats::default(),
+                false,
+                &mut images(),
+                Some(playback),
+            )
+        };
+        let colors = Colors::default();
+        let buf = draw(&mut open, playing(3.5, false));
+        let rows = rows_of(&buf);
+        let y = rows
+            .iter()
+            .position(|r| r.contains("▌▌"))
+            .expect("pause shown");
+        let row = &rows[y];
+        assert!(row.contains("0:03"), "{row}");
+        assert!(
+            !row.contains("0:07"),
+            "the time played replaces the length: {row}"
+        );
+        // Half of it heard: the first bars in the accent color, the rest
+        // faded.
+        let bars: Vec<u16> = (0..buf.area.width)
+            .filter(|&x| ('▁'..='█').any(|c| buf[(x, y as u16)].symbol() == c.to_string()))
+            .collect();
+        let accent = bars
+            .iter()
+            .filter(|&&x| buf[(x, y as u16)].fg == colors.accent);
+        assert_eq!(accent.count(), bars.len() / 2, "{row}");
+
+        let rows = rows_of(&draw(&mut open, playing(3.5, true)));
+        assert!(rows.iter().any(|r| r.contains("▶ ") && r.contains("0:03")));
+        let rows = rows_of(&draw(
+            &mut open,
+            Playback {
+                message_id: 4,
+                ..playing(1.0, false)
+            },
+        ));
+        assert!(
+            !rows.iter().any(|r| r.contains("▌▌")),
+            "only on its own message"
         );
     }
 }

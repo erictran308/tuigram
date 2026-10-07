@@ -40,6 +40,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Jump back.** `Ctrl-o` goes back to the chat you were in before, as in vim, and `Ctrl-i` forward again.
 - **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, **bold**, *italic*, `code` and spoilers (hidden until `Enter`), reactions under them, ✓ / ✓✓ when yours are sent and read, date separators, "typing…" while someone writes to you, when they were last seen, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app. Telegram links (`t.me/…`) open right in tuigram: the chat, the message, or an invite, which asks before joining.
+- **Voice messages.** They show their waveform and length. `Enter` plays one right in tuigram and pauses it, and the sender sees you listened, as in Telegram.
 - **Send photos and files.** Drop them on the window, paste a screenshot with `p`, or type a path with `a` (Tab completes it). Photos show in the composer before they go, what you write goes with them as the caption, and several photos go as one album.
 - **Notifications.** New messages pop up as system notifications while you're in another window, and the window title counts your unread chats. Telegram's mute settings apply.
 - **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord and Rosé Pine themes or [your own](#themes), and highlights that make your important chats stand out.
@@ -117,7 +118,7 @@ Swap the file name for your computer's:
 | Windows, ARM64 | [`tuigram-aarch64-pc-windows-msvc.zip`](https://github.com/erictran308/tuigram/releases/latest/download/tuigram-aarch64-pc-windows-msvc.zip) |
 
 - **Windows:** download the `.zip`, unzip it, and run `tuigram.exe` from Windows Terminal.
-- **Linux:** needs Ubuntu 24.04, Debian 13, Fedora 40 or newer, plus libc++: `sudo apt install libc++1` (Fedora: `sudo dnf install libcxx`).
+- **Linux:** needs Ubuntu 24.04, Debian 13, Fedora 40 or newer, plus libc++: `sudo apt install libc++1` (Fedora: `sudo dnf install libcxx`). Voice messages play through ALSA's libasound, which desktops have; without it, everything else still works.
 - **macOS:** if you downloaded the file in a browser instead, macOS blocks the app. Run `xattr -d com.apple.quarantine tuigram` once to allow it.
 
 If `tuigram` isn't found afterwards, add `~/.local/bin` to your `PATH`. Each file comes with a signed record of the commit it was built from; to check one, run `gh attestation verify <file> --repo erictran308/tuigram`.
@@ -165,7 +166,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `j` / `k` | Move down / up |
 | `gg` / `G` | Jump to top / bottom |
 | `Ctrl-d` / `Ctrl-u` | Half a page down / up |
-| `Enter` / `l` | Open a chat, or the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens). On a message with spoilers, `Enter` shows them first; on a poll, it votes; on a bot's message, it lists its buttons, then the message's file and links (`h/j/k/l` choose, `Enter` presses); a `t.me` link opens in tuigram |
+| `Enter` / `l` | Open a chat, or the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens). On a message with spoilers, `Enter` shows them first; on a voice message, it plays it in tuigram, and pauses it; on a poll, it votes; on a bot's message, it lists its buttons, then the message's file and links (`h/j/k/l` choose, `Enter` presses); a `t.me` link opens in tuigram |
 | `Tab` / `Shift-Tab` | In the chat list: your next / previous folder, in Telegram's order, then the archive. With folders, they're tabs over the list, each with its count of unread chats |
 | `h` / `Esc` | Back to the chat list. To have the list on the right, tick **On the right side of the window** in `?` > **Settings**; `h` and `l` then swap, to follow the screen |
 | `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line. `@name` or `:emoji` shows suggestions, and so does `/` starting a message (the bots' commands); `Tab` puts one in. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
@@ -222,7 +223,7 @@ Like Telegram Desktop, tuigram shows you as online while its window is focused a
 A secret chat is end-to-end encrypted: only you and the other person can read it, and it lives only on the two devices it was made on, not in Telegram's cloud. In a chat with someone, type `:secret` to start one with them. It shows in the list with a 🔒 on green (which a name can't fake), beside your usual chat with them, and you can write in it once their app comes online and accepts it; the box you write in says "secret chat". It opens where you stopped reading, since reading messages starts their timers.
 
 - `:timer` sets how long new messages last once they've been seen, from a second to a week. Each message then shows a 🔥 and its countdown by its time, and disappears from both sides when it runs out.
-- Photos with a short timer, and view-once photos in other chats, show as `[Photo · Enter to view]`. `Enter` shows it; once it's downloaded, its timer starts and the sender is told it was opened. It's covered again once you move off it, switch windows or stop pressing keys for a while. Videos, GIFs and voice messages like that only play in another app, which would keep them, so they say to watch them in Telegram on your phone. `y` doesn't copy any of these.
+- Photos with a short timer, and view-once photos in other chats, show as `[Photo · Enter to view]`. `Enter` shows it; once it's downloaded, its timer starts and the sender is told it was opened. It's covered again once you move off it, switch windows or stop pressing keys for a while. Voice messages like that play in tuigram itself, and their timer starts once they do. Videos and GIFs like that only play in another app, which would keep them, so they say to watch them in Telegram on your phone. `y` doesn't copy any of these.
 - `:key` shows the picture both apps draw from the chat's encryption key, and the key in numbers. If the other person sees the same in their app, nobody is in between. In a window too small for all of it, it asks for a bigger one rather than show part.
 - `:leave` ends the chat for both of you and deletes it from this computer (it asks first).
 - Links you send go without a preview, which Telegram's servers would make, seeing the link. Notifications say only "Secret chat: New message". Searching finds words and `has:`, but not `from:`, and messages can't be forwarded out.
@@ -314,6 +315,7 @@ Copy `.env.example` to `.env` to keep a separate development session (for exampl
 
 - [TDLib](https://github.com/tdlib/td) through [tdlib-rs](https://github.com/FedericoBruzzone/tdlib-rs)
 - [ratatui](https://ratatui.rs) and [ratatui-image](https://github.com/benjajaja/ratatui-image)
+- Voice messages decoded with a trimmed copy of [opus-decoder](https://crates.io/crates/opus-decoder) (ported from [libopus](https://opus-codec.org)), and played through [cpal](https://github.com/RustAudio/cpal) on macOS and Windows, ALSA on Linux
 - Colors from [Catppuccin](https://catppuccin.com), [Tokyo Night](https://github.com/folke/tokyonight.nvim), [Dracula](https://draculatheme.com), [Gruvbox](https://github.com/morhetz/gruvbox), [Nord](https://www.nordtheme.com) and [Rosé Pine](https://rosepinetheme.com)
 
 ## License

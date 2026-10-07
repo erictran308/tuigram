@@ -60,7 +60,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-d / Ctrl-u", "Half a page newer / older"),
             (
                 "Enter",
-                "Show spoilers, view a photo shown only while open, vote in a poll, list a bot's buttons, or open the photo, file or link",
+                "Show spoilers, view a photo shown only while open, play or pause a voice message, vote in a poll, list a bot's buttons, or open the photo, file or link",
             ),
             ("y", "Copy the text, a link, or the photo or file"),
             ("r", "Reply"),

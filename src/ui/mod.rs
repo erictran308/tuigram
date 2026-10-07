@@ -431,6 +431,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 Constraint::Length(rows + 2),
             ])
             .areas(chat_area);
+            let playing = app.player.playback(open.chat_id);
             messages::draw(
                 frame,
                 history,
@@ -441,6 +442,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 popup_over_chat,
                 colors,
                 app.settings.block_gaps,
+                playing,
             );
             if let Some(panel) = panel {
                 stickers::draw(frame, panel_area, panel, &mut app.images, colors);
@@ -2351,7 +2353,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages if searching => (
             normal,
-            "  `n/N` older/newer match · `Esc` end search · `/` search again · `j/k` newer/older · `Enter` open media · `r` reply · `i` write · `h` back",
+            "  `n/N` older/newer match · `Esc` end search · `/` search again · `j/k` newer/older · `Enter` open/play media · `r` reply · `i` write · `h` back",
         ),
         Focus::Messages if editing => (
             normal,
@@ -2363,11 +2365,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages if replying => (
             normal,
-            "  `i` write reply · `Esc` cancel reply · `r` reply to selected instead · `j/k` newer/older · `Enter` open media · `h` back",
+            "  `i` write reply · `Esc` cancel reply · `r` reply to selected instead · `j/k` newer/older · `Enter` open/play media · `h` back",
         ),
         Focus::Messages => (
             normal,
-            "  `j/k` newer/older · `y` copy · `r` reply · `f` forward · `R` react · `X` unreact · `e` edit · `d` delete · `P` pin · `gp` pinned · `Enter` open media · `i` write · `a` attach · `p` paste · `/` search · `s` find anyone · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            "  `j/k` newer/older · `y` copy · `r` reply · `f` forward · `R` react · `X` unreact · `e` edit · `d` delete · `P` pin · `gp` pinned · `Enter` open/play media · `i` write · `a` attach · `p` paste · `/` search · `s` find anyone · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         _ if picking && app.stickers.as_ref().is_some_and(|p| p.query.is_some()) => (
             sticker,
@@ -3175,6 +3177,7 @@ mod tests {
             destruct: None,
             hidden: None,
             saveable: true,
+            voice: None,
         };
         let mut open = OpenChat::new(1);
         open.messages.insert(1, msg(None));

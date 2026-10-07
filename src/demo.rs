@@ -37,6 +37,7 @@ use crate::secret::{Destruct, KeyView, Secret, SecretState};
 use crate::settings::Settings;
 use crate::tg::Tg;
 use crate::ui;
+use crate::voice::{Output, Player};
 
 // People, by user id. A private chat has the other person's id, and Saved
 // Messages has yours.
@@ -213,6 +214,8 @@ pub(crate) fn demo_app(tg: Tg, images: Images, dir: &Path) -> App {
     let mut app = App::new(
         tg,
         images,
+        // The demo plays nothing, and tests must make no sound.
+        Player::new(unbounded_channel().0, Output::Nowhere),
         // The demo never pastes, so nothing is saved there.
         Clipboard::new(clipboard_tx, dir.join("outbox")),
         settings,
@@ -661,6 +664,7 @@ fn msg(sender: i64, date: i32, text: &str) -> Msg {
         destruct: None,
         hidden: None,
         saveable: true,
+        voice: None,
     }
 }
 

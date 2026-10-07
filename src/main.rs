@@ -9,6 +9,7 @@ mod demo;
 mod images;
 mod messages;
 mod notify;
+mod opus;
 mod picker;
 mod pins;
 mod poll;
@@ -16,12 +17,14 @@ mod reactions;
 mod search;
 mod secret;
 mod settings;
+mod sound;
 mod stickers;
 mod text;
 mod tg;
 mod theme;
 mod tmux;
 mod ui;
+mod voice;
 
 use std::io::{Write, stdout};
 
@@ -62,8 +65,8 @@ async fn main() -> Result<()> {
     // The title shows unread chats while tuigram runs, then goes back.
     notify::send(notify::SAVE_TITLE);
     notify::send(&notify::title(0));
-    // A panic, on any thread but an image decoder's (which is caught there),
-    // ends the app: the terminal is put back, then
+    // A panic, on any thread but an image decoder's or the voice player's
+    // (caught there), ends the app: the terminal is put back, then
     // the message is printed without control characters, since it can quote
     // text from a message. Carrying on after a background thread died would
     // leave the screen restored under a running app.
@@ -108,8 +111,19 @@ async fn main() -> Result<()> {
     let images = images::Images::new(picker, image_tx);
     let (clipboard_tx, clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
     let clipboard = clipboard::Clipboard::new(clipboard_tx, outbox);
-    let result = app::App::new(tg, images, clipboard, settings, settings_path, env_keys)
-        .run(&mut terminal, rx, image_rx, clipboard_rx)
+    let (voice_tx, voice_rx) = tokio::sync::mpsc::unbounded_channel();
+    let player = voice::Player::new(voice_tx, voice::Output::Speakers);
+    let app = app::App::new(
+        tg,
+        images,
+        player,
+        clipboard,
+        settings,
+        settings_path,
+        env_keys,
+    );
+    let result = app
+        .run(&mut terminal, rx, image_rx, clipboard_rx, voice_rx)
         .await;
 
     if enhanced {
