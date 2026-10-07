@@ -14,7 +14,7 @@ Written in Rust on [TDLib](https://github.com/tdlib/td), the library behind Tele
 **[Download for macOS, Linux or Windows](#get-started)** and log in. Nothing to set up.<br>
 With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 
-<img src="docs/screenshot.png" alt="tuigram: the chat list with photos, unread counts and someone typing, beside a group chat with a photo, a link and a reply">
+<img src="docs/hero.png" alt="tuigram: the chat list with folder tabs, photos, unread counts and a secret chat, beside a group chat with a pinned message, a photo with reactions and a reply">
 
 </div>
 
@@ -24,6 +24,7 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 
 - **Your real account, not a bot.** Log in by scanning a QR code with Telegram on your phone, or with your phone number and the code Telegram sends, plus your two-step password if you have one, just like the official apps.
 - **Vim all the way.** Normal mode to move around (`j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u`), `i` to write, `Esc` to stop. Your hands never leave the keyboard.
+- **Secret chats.** `:secret` starts an end-to-end encrypted chat with someone, kept only on this computer and their device. `:timer` makes messages self-destruct, with a 🔥 countdown beside them, and `:key` shows the key's picture to compare with theirs. [More below](#secret-chats).
 - **Photos and stickers, inline.** Real images in kitty, Ghostty, WezTerm and iTerm2, and block-character previews in any other terminal.
 - **React with emoji.** `R` opens the emoji the chat allows, and `/` finds one by name (`heart`, `fire`, `+1`). `X` takes yours back.
 - **Send stickers.** `Tab` while writing opens your recent and favorite stickers and the sets you added, and `/` finds more by emoji or word.
@@ -37,7 +38,6 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Bot buttons.** A bot's buttons show under its message. `Enter` lists them to press: the bot answers, a link opens (asking first), and a reply button sends its words.
 - **Pinned messages.** `P` pins a message (for both of you or just you, with or without notifying a group) or unpins it. A bar over the chat shows the newest pinned message, and `gp` lists them all to jump to.
 - **Jump back.** `Ctrl-o` goes back to the chat you were in before, as in vim, and `Ctrl-i` forward again.
-- **Secret chats.** `:secret` starts an end-to-end encrypted chat with someone, kept only on this computer and their device. `:timer` makes messages self-destruct, with a 🔥 countdown beside them, and `:key` shows the key's picture to compare with theirs. [More below](#secret-chats).
 - **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, **bold**, *italic*, `code` and spoilers (hidden until `Enter`), reactions under them, ✓ / ✓✓ when yours are sent and read, date separators, "typing…" while someone writes to you, when they were last seen, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo, video, file or link to open it in your default app. Telegram links (`t.me/…`) open right in tuigram: the chat, the message, or an invite, which asks before joining.
 - **Send photos and files.** Drop them on the window, paste a screenshot with `p`, or type a path with `a` (Tab completes it). Photos show in the composer before they go, what you write goes with them as the caption, and several photos go as one album.
@@ -47,6 +47,30 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Careful with what others send.** A file that could run a program, or a link whose text hides where it really goes, asks before opening.
 
 <table>
+  <tr>
+    <td><img src="docs/secret-chat.png" alt="A secret chat: a lock on green before its name, a 30-second self-destruct timer in its title, a countdown by each message's time, a photo covered until Enter, and 'secret chat' on the composer"></td>
+    <td><img src="docs/encryption-key.png" alt="The :key popup: the secret chat's key as a picture of colored squares and as numbers, to compare with the other person's app"></td>
+  </tr>
+  <tr>
+    <td align="center">Secret chats: messages count down 🔥 and disappear, photos stay covered until <code>Enter</code></td>
+    <td align="center"><code>:key</code> shows the key Telegram's apps draw, to check nobody is in between</td>
+  </tr>
+  <tr>
+    <td><img src="docs/rich-messages.png" alt="A trip chat: a link preview with the site, title, description and picture, a forwarded message, bold, code and a hidden spoiler, and a poll with its results"></td>
+    <td><img src="docs/bot-buttons.png" alt="A bot's message with rows of buttons under it, and the popup Enter opens to press one, saying what it does"></td>
+  </tr>
+  <tr>
+    <td align="center">Link previews, polls, formatting, spoilers and forwards</td>
+    <td align="center">A bot's buttons, pressed from the keyboard</td>
+  </tr>
+  <tr>
+    <td><img src="docs/reactions.png" alt="The R popup: a grid of emoji to react with, the one under the cursor named"></td>
+    <td><img src="docs/search.png" alt="A search through a chat with a from: filter, its matches highlighted and counted in the title"></td>
+  </tr>
+  <tr>
+    <td align="center">React with <code>R</code>, or find an emoji by name with <code>/</code></td>
+    <td align="center">Search a chat's whole history, with <code>from:</code>, <code>has:</code> and dates</td>
+  </tr>
   <tr>
     <td><img src="docs/replying.png" alt="Replying to a message in Insert mode: the reply bar over the composer, and the message being answered marked in the chat"></td>
     <td><img src="docs/shortcuts.png" alt="The ? popup listing every keyboard shortcut, grouped by where it works"></td>

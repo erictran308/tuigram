@@ -1,10 +1,11 @@
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Wrap,
+    ScrollbarOrientation, ScrollbarState, Widget, Wrap,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -147,6 +148,28 @@ fn hint_spans(hints: &str, text: Style, colors: &Colors) -> Vec<Span<'static>> {
         .filter(|(_, part)| !part.is_empty())
         .map(|(i, part)| Span::styled(part.to_string(), if i % 2 == 1 { key } else { text }))
         .collect()
+}
+
+/// What a popup draws first: `Clear` over its area, and a blank in place
+/// of a two-column character just left of it that it cuts in half (an
+/// emoji in a name, a chat's 🔒). ratatui takes a cell after such a
+/// character to be its second half, and never draws there, so the
+/// character would show over the popup's border.
+struct Cover;
+
+impl Widget for Cover {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        Clear.render(area, buf);
+        if area.x <= buf.area.x {
+            return;
+        }
+        for y in area.top()..area.bottom() {
+            let cell = &mut buf[(area.x - 1, y)];
+            if cell.symbol().width() > 1 {
+                cell.set_symbol(" ");
+            }
+        }
+    }
 }
 
 /// A popup's own background, and the theme's text color: `Clear` resets
@@ -549,7 +572,7 @@ fn draw_toast(frame: &mut Frame, toast: &Toast, colors: &Colors) {
             Line::from(format!("   {}", truncate(&toast.detail, inner_width))).fg(colors.subtle),
         );
     }
-    frame.render_widget(Clear, rect);
+    frame.render_widget(Cover, rect);
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
@@ -565,7 +588,7 @@ fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors
         colors,
     );
     let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
 
     let [message, _, list] = Layout::vertical([
@@ -673,7 +696,7 @@ fn draw_suggestions(frame: &mut Frame, composer: Rect, completion: &Completion, 
             }
         })
         .collect();
-    frame.render_widget(Clear, rect);
+    frame.render_widget(Cover, rect);
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
@@ -699,7 +722,7 @@ fn draw_vote(frame: &mut Frame, area: Rect, menu: &VoteMenu, colors: &Colors) {
     };
     let block = popup_block(" Vote ", keys, colors);
     let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
 
     let [question, _, list] = Layout::vertical([
@@ -800,7 +823,7 @@ fn draw_picker(
     }
     let block = popup_block(Line::from(title), keys, colors);
     let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
 
     let [about, search, _, list] = Layout::vertical([
@@ -980,7 +1003,7 @@ fn draw_react(
     };
     let block = popup_block(" React ", &keys, colors);
     let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
 
     let [top, _, grid, _, name, hint_row] = Layout::vertical([
@@ -1129,7 +1152,7 @@ fn draw_settings(
     };
     let block = popup_block(tabs, keys, colors);
     let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
     if menu.tab == HelpTab::Shortcuts {
         help::draw(frame, inner, &mut menu.scroll, colors);
@@ -1336,7 +1359,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
             Line::styled(format!(" {}", truncate(verdict, room)), style),
         );
     }
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -1367,7 +1390,7 @@ fn draw_buttons(frame: &mut Frame, area: Rect, menu: &ButtonMenu, colors: &Color
     };
     let block = popup_block(title, keys, colors);
     let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
 
     let [snippet, _, list, _, below] = Layout::vertical([
@@ -1445,7 +1468,7 @@ fn draw_pin(frame: &mut Frame, area: Rect, menu: &PinMenu, colors: &Colors) {
     let popup = center(area, width, rows + 4);
     let block = popup_block(" Pin message ", " `Enter` pin · `Esc` cancel ", colors);
     let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
 
     let [message, _, list] = Layout::vertical([
@@ -1512,7 +1535,7 @@ fn draw_timer(
     );
     let block = popup_block(title, " `Enter` set · `Esc` cancel ", colors);
     let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
     let [about, _, list] = Layout::vertical([
         Constraint::Length(1),
@@ -1579,7 +1602,7 @@ fn draw_key(frame: &mut Frame, area: Rect, key: &KeyView, colors: &Colors) {
         let text = " Make the window bigger to compare the key.";
         let popup = center(area, (text.width() as u16 + 3).min(area.width), 3);
         let block = popup_block(" Encryption key ", " `Enter` close ", colors);
-        frame.render_widget(Clear, popup);
+        frame.render_widget(Cover, popup);
         frame.render_widget(Paragraph::new(text).block(block), popup);
         return;
     }
@@ -1587,7 +1610,7 @@ fn draw_key(frame: &mut Frame, area: Rect, key: &KeyView, colors: &Colors) {
     let title = format!(" Encryption key · {} ", truncate(&key.with, text_width / 2));
     let block = popup_block(title, " `Enter` close ", colors);
     let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
     let [art, _, words] = Layout::vertical([
         Constraint::Length(art_rows),
@@ -1639,7 +1662,7 @@ fn draw_pinned(
     let block = popup_block(title, " `Enter` go to · `P` unpin · `Esc` close ", colors);
     let inner = block.inner(popup);
     let row = menu.row(&open.pinned);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
 
     let items: Vec<ListItem> = open
@@ -1685,7 +1708,7 @@ fn draw_notice(frame: &mut Frame, area: Rect, notice: &Notice, colors: &Colors) 
     let popup = center(area, width, height);
     let title = format!(" {} ", truncate(&notice.title, text_width));
     let block = popup_block(title, " `Enter` OK ", colors);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -1765,7 +1788,7 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
         .block(block)
         .highlight_style(Style::new().bg(colors.selection));
     // Clear first: the popup must cover text and photos underneath.
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_stateful_widget(
         list,
         popup,
@@ -2135,7 +2158,7 @@ fn draw_commands(
         .border_style(Style::new().fg(colors.accent))
         .style(popup_style(colors));
     // Clear first: the popup must cover text and photos underneath.
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -2179,7 +2202,7 @@ fn draw_completions(frame: &mut Frame, area: Rect, names: &[String], colors: &Co
         .border_style(Style::new().fg(colors.accent))
         .style(popup_style(colors));
     // Clear first: the popup must cover text and photos underneath.
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Cover, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -2532,6 +2555,24 @@ mod tests {
         (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    #[test]
+    fn a_popup_cutting_an_emoji_in_half_still_draws_its_edge() {
+        let area = Rect::new(0, 0, 12, 3);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(2, 1, "🔒 Alice", Style::new());
+        // The popup's left border falls on the lock's second column.
+        let popup = Rect::new(3, 0, 8, 3);
+        Cover.render(popup, &mut buf);
+        Block::bordered().render(popup, &mut buf);
+        assert_eq!(buf[(2, 1)].symbol(), " ", "the cut lock is blanked");
+        let sent = Buffer::empty(area).diff(&buf);
+        assert!(
+            sent.iter()
+                .any(|&(x, y, cell)| (x, y) == (3, 1) && cell.symbol() == "│"),
+            "the border is drawn there"
+        );
     }
 
     #[test]

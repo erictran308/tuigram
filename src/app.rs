@@ -6365,12 +6365,13 @@ mod tests {
     #[test]
     fn logging_out_says_secret_chats_go_too() {
         let mut app = test_app("secret-logout");
-        command(&mut app, "logout");
-        let lines = app.confirm.take().expect("asks").lines.join(" ");
-        assert!(!lines.contains("secret chats"), "{lines}");
-        chat_with_chardy(&mut app, Some(crate::secret::SecretState::Ready));
+        // The demo's chats have one with Alex.
         command(&mut app, "logout");
         let lines = app.confirm.take().expect("asks").lines.join(" ");
         assert!(lines.contains("Your secret chats go too"), "{lines}");
+        app.chats = Chats::default();
+        command(&mut app, "logout");
+        let lines = app.confirm.take().expect("asks").lines.join(" ");
+        assert!(!lines.contains("secret chats"), "{lines}");
     }
 }

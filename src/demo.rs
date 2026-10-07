@@ -4,11 +4,11 @@
 //! The photos are drawn here and written to a temporary folder, removed on
 //! exit.
 //!
-//! Keys: 1–6 or Tab / Shift-Tab switch scenes, t / T change the theme, q
-//! quits.
+//! Keys: 1–9, 0 or Tab / Shift-Tab switch scenes, t / T change the theme,
+//! q quits.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{Local, TimeZone};
@@ -21,15 +21,19 @@ use tdlib_rs::types::{ChatFolderInfo, ChatFolderName, FormattedText, MessageSend
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::app::{self, App, Focus, HelpTab, Screen, SettingsMenu};
-use crate::chats::{Chat, ChatPhoto, Chats, List};
+use crate::buttons::{Button, ButtonMenu, Keyboard, Press};
+use crate::chats::{Chat, ChatPhoto, Chats, List, Peer, Presence};
 use crate::clipboard::Clipboard;
 use crate::images::Images;
 use crate::messages::{
-    Editable, Link, Msg, OpenChat, Preview, Replied, ReplyTo, SendState, Sender,
+    Card, Editable, Format, Link, Msg, OpenChat, Origin, Preview, Replied, ReplyTo, SendState,
+    Sender, Styled,
 };
 use crate::pins::Pinned;
+use crate::poll::{Answer, Poll};
 use crate::reactions::{ReactMenu, Reaction, ReactionKind};
 use crate::search::MessageSearch;
+use crate::secret::{Destruct, KeyView, Secret, SecretState};
 use crate::settings::Settings;
 use crate::tg::Tg;
 use crate::ui;
@@ -43,6 +47,7 @@ const PRIYA: i64 = 4;
 const ALEX: i64 = 5;
 const MOM: i64 = 6;
 const DAD: i64 = 7;
+const TRAIL_BOT: i64 = 8;
 
 // Group and channel chats.
 const HIKE: i64 = -101;
@@ -51,6 +56,10 @@ const RUSTACEANS: i64 = -103;
 const TOKYO: i64 = -104;
 const BOOK_CLUB: i64 = -105;
 const DESIGN: i64 = -106;
+/// The secret chat with Alex, beside the usual one.
+const SECRET_ALEX: i64 = -201;
+/// TDLib's id for that secret chat.
+const ALEX_SECRET_ID: i32 = 1;
 
 // Folders, by id.
 const FRIENDS: i32 = 1;
@@ -66,34 +75,49 @@ const MOM_PHOTO: i32 = 5;
 /// The sunrise photo's size, for its shape on screen.
 const SUNRISE_SIZE: (u32, u32) = (1280, 853);
 
-// Messages in the open chat, by id.
+// Messages in the hike chat, by id.
 const SUNNY: i64 = 1;
 const DRIVE: i64 = 5;
 const PICK_UP: i64 = 7;
 const TRAILHEAD: i64 = 6;
 const TRAIL_LINK: i64 = 3;
+/// The trail bot's answer, with its buttons.
+const CONDITIONS: i64 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scene {
-    /// Reading the open chat in Normal mode.
+    /// Reading the hike chat in Normal mode.
     Reading,
     /// Insert mode, answering a message.
     Replying,
     /// The `R` popup, picking a reaction.
     Reacting,
-    /// A `/` search through the chat, matches highlighted.
+    /// A `/` search through the chat with a filter, matches highlighted.
     Searching,
+    /// The trip chat: a link preview, a poll, formatting, a forward.
+    Planning,
+    /// A bot's message with its buttons, and Enter's popup of them.
+    Bot,
+    /// A secret chat: self-destruct timers and a view-once photo.
+    Secret,
+    /// The `:key` popup over the secret chat.
+    Key,
     /// The `?` popup on its settings tab.
     Settings,
     /// The `?` popup on its shortcuts tab.
     Shortcuts,
 }
 
-const SCENES: [Scene; 6] = [
+/// In order of their keys: 1 to 9, then 0.
+const SCENES: [Scene; 10] = [
     Scene::Reading,
     Scene::Replying,
     Scene::Reacting,
     Scene::Searching,
+    Scene::Planning,
+    Scene::Bot,
+    Scene::Secret,
+    Scene::Key,
     Scene::Settings,
     Scene::Shortcuts,
 ];
@@ -202,6 +226,7 @@ pub(crate) fn demo_app(tg: Tg, images: Images, dir: &Path) -> App {
         (LEO, "Leo Park"),
         (PRIYA, "Priya Nair"),
         (ALEX, "Alex Rivera"),
+        (TRAIL_BOT, "Trail Bot"),
     ] {
         app.users.insert(id, name.into());
     }
@@ -222,7 +247,8 @@ fn on_key(app: &mut App, scene: &mut usize, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return false,
         KeyCode::Char('c') if ctrl => return false,
-        KeyCode::Char(c @ '1'..='6') => *scene = c as usize - '1' as usize,
+        KeyCode::Char('0') => *scene = SCENES.len() - 1,
+        KeyCode::Char(c @ '1'..='9') => *scene = c as usize - '1' as usize,
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => *scene = next(*scene, 1),
         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => *scene = next(*scene, -1),
         KeyCode::Char('t') => change_theme(app, 1),
@@ -255,13 +281,22 @@ fn show_scene(app: &mut App, scene: Scene) {
         _ => None,
     };
     app.react_menu = None;
-    let Some(open) = app.open.as_mut() else {
-        return;
+    app.button_menu = None;
+    app.key_view = None;
+    let chat = match scene {
+        Scene::Planning => TOKYO,
+        Scene::Bot => TRAIL_BOT,
+        Scene::Secret | Scene::Key => SECRET_ALEX,
+        _ => HIKE,
     };
-    open.selected = None;
-    open.scroll = None;
-    open.reply = None;
-    open.search = None;
+    // Built again each time, so the countdowns start over.
+    let mut open = match chat {
+        TOKYO => tokyo(),
+        TRAIL_BOT => trail_bot(),
+        SECRET_ALEX => secret_chat(),
+        _ => hike(),
+    };
+    app.selected = Some(chat);
     match scene {
         Scene::Replying => {
             open.reply = open
@@ -281,16 +316,38 @@ fn show_scene(app: &mut App, scene: Scene) {
             app.react_menu = Some(menu);
         }
         Scene::Searching => {
-            let ask = crate::search::parse("trail").unwrap_or_default();
-            let mut search = MessageSearch::new("trail".into(), ask);
-            search.results = vec![TRAILHEAD, TRAIL_LINK];
+            let query = "from:@leo trail";
+            let ask = crate::search::parse(query).unwrap_or_default();
+            let mut search = MessageSearch::new(query.into(), ask);
+            search.results = vec![TRAIL_LINK];
             search.current = Some(0);
             search.done = true;
             open.search = Some(search);
-            open.selected = Some(TRAILHEAD);
+            open.selected = Some(TRAIL_LINK);
         }
-        Scene::Reading | Scene::Settings | Scene::Shortcuts => {}
+        Scene::Bot => {
+            open.selected = Some(CONDITIONS);
+            if let Some(msg) = open.messages.get(&CONDITIONS)
+                && let Some(keyboard) = &msg.keyboard
+            {
+                let mut menu =
+                    ButtonMenu::new(CONDITIONS, msg.snippet(), keyboard, None, &msg.links);
+                menu.col = 1;
+                app.button_menu = Some(menu);
+            }
+        }
+        Scene::Key => {
+            app.key_view = Some(KeyView {
+                chat_id: SECRET_ALEX,
+                with: "Alex Rivera".into(),
+                hash: demo_key(),
+            });
+        }
+        // On the photo, whose key the status bar shows first.
+        Scene::Secret => open.selected = Some(43),
+        Scene::Reading | Scene::Planning | Scene::Settings | Scene::Shortcuts => {}
     }
+    app.open = Some(open);
 }
 
 /// The popup, with the cursor on the theme in use.
@@ -343,6 +400,16 @@ fn fill_chats(chats: &mut Chats) {
         "You: On my way!",
     )
     .read_outbox = 8;
+    let secret = add(
+        chats,
+        SECRET_ALEX,
+        "Alex Rivera",
+        photo(ALEX_PHOTO),
+        "You: Got it, deleting my note",
+    );
+    secret.is_private = true;
+    secret.peer = Some(Peer::User(ALEX));
+    secret.secret_id = Some(ALEX_SECRET_ID);
     let alex = add(
         chats,
         ALEX,
@@ -352,6 +419,7 @@ fn fill_chats(chats: &mut Chats) {
     );
     alex.is_private = true;
     alex.unread = 2;
+    alex.peer = Some(Peer::User(ALEX));
     let news = add(
         chats,
         TERMINAL_WEEKLY,
@@ -362,6 +430,15 @@ fn fill_chats(chats: &mut Chats) {
     news.is_channel = true;
     news.unread = 48;
     add(chats, MOM, "Mom", photo(MOM_PHOTO), "Call me when you land").is_private = true;
+    let bot = add(
+        chats,
+        TRAIL_BOT,
+        "Trail Bot",
+        None,
+        "Eagle Ridge · Saturday: dry and open",
+    );
+    bot.is_private = true;
+    bot.peer = Some(Peer::User(TRAIL_BOT));
     let rust = add(
         chats,
         RUSTACEANS,
@@ -383,7 +460,7 @@ fn fill_chats(chats: &mut Chats) {
         TOKYO,
         "Tokyo Trip",
         photo(TOKYO_PHOTO),
-        "Booked the ryokan for three nights",
+        "You: Friday, then the onsen on Saturday",
     );
     add(
         chats,
@@ -408,9 +485,23 @@ fn fill_chats(chats: &mut Chats) {
         (BOOK_CLUB, 5),
         (DESIGN, 2),
         (DAD, 5),
+        (TRAIL_BOT, 3),
     ] {
         chats.set_accent(id, accent);
     }
+    // The secret chat with Alex, ready, its messages lasting 30 seconds
+    // once seen. Alex is online; the trail bot is a bot.
+    let secret = Secret {
+        user_id: ALEX,
+        state: SecretState::Ready,
+        outbound: true,
+        key_hash: demo_key(),
+    };
+    chats.set_secret(ALEX_SECRET_ID, secret);
+    chats.set_auto_delete(SECRET_ALEX, 30);
+    chats.set_read_outbox(SECRET_ALEX, 44);
+    chats.set_presence(ALEX, Presence::Online(i32::MAX));
+    chats.set_bot(TRAIL_BOT, true);
     chats.set_action(ALEX, &user(ALEX), &ChatAction::Typing);
     chats.set_action(HIKE, &user(MAYA), &ChatAction::Typing);
     chats.set_highlighted(&[MOM]);
@@ -429,7 +520,7 @@ fn fill_chats(chats: &mut Chats) {
         ..ChatFolderInfo::default()
     };
     chats.set_folders(&[folder(FRIENDS, "Friends"), folder(WORK, "Work")], 0);
-    for id in [HIKE, ALEX, MOM, TOKYO, DAD] {
+    for id in [HIKE, SECRET_ALEX, ALEX, MOM, TOKYO, DAD] {
         chats.add_local_to(List::Folder(FRIENDS), id);
     }
     for id in [TERMINAL_WEEKLY, RUSTACEANS, DESIGN] {
@@ -533,15 +624,17 @@ fn reactions(list: &[(&str, i32, bool)]) -> Vec<Reaction> {
         .collect()
 }
 
-/// The open chat: planning a hike over two days.
-fn hike() -> OpenChat {
-    let at = |day, hour, min| {
-        Local
-            .with_ymd_and_hms(2026, 10, day, hour, min, 0)
-            .single()
-            .map_or(0, |t| t.timestamp() as i32)
-    };
-    let msg = |sender, date, text: &str| Msg {
+/// A time in the first days of October 2026, the demo's weekend.
+fn at(day: u32, hour: u32, min: u32) -> i32 {
+    Local
+        .with_ymd_and_hms(2026, 10, day, hour, min, 0)
+        .single()
+        .map_or(0, |t| t.timestamp() as i32)
+}
+
+/// A plain text message.
+fn msg(sender: i64, date: i32, text: &str) -> Msg {
+    Msg {
         sender: Sender::User(sender),
         outgoing: sender == ME,
         date,
@@ -568,15 +661,42 @@ fn hike() -> OpenChat {
         destruct: None,
         hidden: None,
         saveable: true,
-    };
-    let url = "https://trails.example.com/eagle-ridge";
-    let link = msg(LEO, at(2, 19, 5), &format!("Here's the trail: {url}"));
-    let start = link.text.len() - url.len();
-    let link = Msg {
+    }
+}
+
+/// A message whose text ends with a link.
+fn with_link(sender: i64, date: i32, text: &str, url: &str) -> Msg {
+    let msg = msg(sender, date, &format!("{text}{url}"));
+    let start = msg.text.len() - url.len();
+    Msg {
         links: vec![Link::from(url)],
-        link_ranges: std::iter::once(start..link.text.len()).collect(),
-        ..link
-    };
+        link_ranges: std::iter::once(start..msg.text.len()).collect(),
+        ..msg
+    }
+}
+
+/// Formatting for the parts of `text` given, in order.
+fn styled(text: &str, parts: &[(&str, Format)]) -> Vec<Styled> {
+    parts
+        .iter()
+        .filter_map(|&(part, format)| {
+            let start = text.find(part)?;
+            Some(Styled {
+                range: start..start + part.len(),
+                format,
+            })
+        })
+        .collect()
+}
+
+/// The hike chat: planning a hike over two days.
+fn hike() -> OpenChat {
+    let link = with_link(
+        LEO,
+        at(2, 19, 5),
+        "Here's the trail: ",
+        "https://trails.example.com/eagle-ridge",
+    );
     let sunrise = Msg {
         preview: Some(Preview {
             file_id: SUNRISE,
@@ -630,6 +750,232 @@ fn hike() -> OpenChat {
         open.pinned = vec![Pinned::new(TRAIL_LINK, link)];
     }
     open
+}
+
+/// The trip chat: a link preview with its picture, a forward, formatting
+/// with a spoiler, and a poll you voted in, answered.
+fn tokyo() -> OpenChat {
+    let ryokan = Msg {
+        card: Some(Card {
+            host: "ryokan.example.jp".into(),
+            title: "Hakone Ginyu: open-air baths over the valley".into(),
+            description: "Rooms with a private bath and a view of the mountains, \
+                15 minutes from Hakone-Yumoto station."
+                .into(),
+            image: Some(Preview {
+                file_id: TOKYO_PHOTO,
+                width: 320,
+                height: 320,
+                thumbnail: None,
+                sticker: false,
+            }),
+        }),
+        reactions: reactions(&[("😍", 3, true)]),
+        ..with_link(
+            PRIYA,
+            at(3, 20, 2),
+            "Found the ryokan for our last nights: ",
+            "https://ryokan.example.jp/hakone",
+        )
+    };
+    let rail = Msg {
+        forwarded: Some(Origin::Hidden("Japan Rail News".into())),
+        ..msg(
+            MAYA,
+            at(3, 20, 6),
+            "JR Pass prices go up on 1 November: buy yours before then",
+        )
+    };
+    let flights_text = "Flights are booked! We land at HND 06:40, and I got us an upgrade";
+    let flights = Msg {
+        styles: styled(
+            flights_text,
+            &[
+                (
+                    "booked",
+                    Format {
+                        bold: true,
+                        ..Format::default()
+                    },
+                ),
+                (
+                    "HND 06:40",
+                    Format {
+                        code: true,
+                        ..Format::default()
+                    },
+                ),
+                (
+                    "and I got us an upgrade",
+                    Format {
+                        spoiler: true,
+                        ..Format::default()
+                    },
+                ),
+            ],
+        ),
+        ..msg(LEO, at(3, 20, 9), flights_text)
+    };
+    let answer = |text: &str, voters, percent, chosen| Answer {
+        text: text.into(),
+        voters,
+        percent,
+        chosen,
+    };
+    let poll = Poll {
+        question: "Which day for teamLab Planets?".into(),
+        answers: vec![
+            answer("Thursday", 1, 17, false),
+            answer("Friday", 4, 67, true),
+            answer("Saturday", 1, 17, false),
+        ],
+        voters: 6,
+        several: false,
+        quiz: false,
+        correct: None,
+        anonymous: false,
+        closed: false,
+    };
+    let vote = Msg {
+        editable: Editable::No,
+        poll: Some(poll.clone()),
+        ..msg(MAYA, at(3, 20, 12), &poll.text())
+    };
+    let friday = Msg {
+        reply_to: Some(ReplyTo {
+            message_id: Some(24),
+            quote: None,
+        }),
+        ..msg(ME, at(3, 20, 15), "Friday, then the onsen on Saturday")
+    };
+    let mut open = OpenChat::new(TOKYO);
+    open.all_loaded = true;
+    open.messages.extend([
+        (21, ryokan),
+        (22, rail),
+        (23, flights),
+        (24, vote),
+        (25, friday),
+    ]);
+    open
+}
+
+/// A bot's answer with its buttons, to a command you sent it.
+fn trail_bot() -> OpenChat {
+    let text = "Eagle Ridge · Saturday\n\
+        Sunny, 14°C, a light wind from the west\n\
+        Trail: dry and open, 9.4 km loop\n\
+        Sunrise 07:12 · Sunset 18:31";
+    let button = |label: &str, press| Button {
+        label: label.into(),
+        press,
+    };
+    let callback = |data: &str| Press::Callback(data.into());
+    let map = Link {
+        url: "https://trails.example.com/eagle-ridge/map".into(),
+        disguise: Some("Trail map".into()),
+    };
+    let conditions = Msg {
+        styles: styled(
+            text,
+            &[(
+                "Eagle Ridge · Saturday",
+                Format {
+                    bold: true,
+                    ..Format::default()
+                },
+            )],
+        ),
+        keyboard: Some(Keyboard {
+            rows: vec![
+                vec![
+                    button("Today", callback("today")),
+                    button("Saturday", callback("sat")),
+                    button("Sunday", callback("sun")),
+                ],
+                vec![
+                    button("Trail map", Press::Open(map)),
+                    button("Tell me if it rains", callback("rain")),
+                ],
+            ],
+            reply: false,
+        }),
+        ..msg(TRAIL_BOT, at(2, 20, 14), text)
+    };
+    let mut open = OpenChat::new(TRAIL_BOT);
+    open.all_loaded = true;
+    open.messages.extend([
+        (31, msg(ME, at(2, 20, 14), "/conditions Eagle Ridge")),
+        (CONDITIONS, conditions),
+    ]);
+    open
+}
+
+/// The secret chat with Alex: messages that self-destruct 30 seconds after
+/// they're seen, counting down, and a photo shown only while it's open.
+fn secret_chat() -> OpenChat {
+    let now = SystemTime::now();
+    let timer = |left: u64| Destruct {
+        after: 30,
+        on_open: false,
+        ends: (left > 0).then(|| now + Duration::from_secs(left)),
+    };
+    let lasting = |sender, date, text: &str, left| Msg {
+        destruct: Some(timer(left)),
+        ..msg(sender, date, text)
+    };
+    let photo = Msg {
+        destruct: Some(Destruct {
+            after: 10,
+            on_open: true,
+            ends: None,
+        }),
+        editable: Editable::No,
+        saveable: false,
+        ..msg(ALEX, at(3, 8, 3), "[Photo · Enter to view]\nthe key box")
+    };
+    let mut open = OpenChat::new(SECRET_ALEX);
+    open.all_loaded = true;
+    open.messages.extend([
+        (
+            41,
+            msg(
+                ALEX,
+                at(3, 8, 1),
+                "[Set messages to disappear after 30 seconds]",
+            ),
+        ),
+        (
+            42,
+            lasting(
+                ALEX,
+                at(3, 8, 2),
+                "The cabin's door code, for Saturday:",
+                14,
+            ),
+        ),
+        (43, photo),
+        (
+            44,
+            lasting(ALEX, at(3, 8, 3), "4729, the box is left of the door", 23),
+        ),
+        (45, lasting(ME, at(3, 8, 4), "Got it, deleting my note", 0)),
+    ]);
+    open
+}
+
+/// A made-up key for the secret chat, 36 bytes as TDLib gives them.
+fn demo_key() -> Vec<u8> {
+    let mut x: u32 = 0x2f99_c9d5;
+    (0..36)
+        .map(|_| {
+            // A small xorshift: random-looking, the same every time.
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 24) as u8
+        })
+        .collect()
 }
 
 type Color = [u8; 3];
@@ -785,7 +1131,29 @@ mod tests {
         assert!(has(&screen, "fire  :fire:"));
 
         show_scene(&mut app, Scene::Searching);
-        assert!(has(&rows(&mut app), "/trail 1 of 2"));
+        assert!(has(&rows(&mut app), "/from:@leo trail 1 of 1"));
+
+        show_scene(&mut app, Scene::Planning);
+        let screen = rows(&mut app);
+        assert!(has(&screen, "ryokan.example.jp"), "{screen:#?}");
+        assert!(has(&screen, "Forwarded from Japan Rail News"));
+        assert!(has(&screen, "Which day for teamLab Planets?"));
+        assert!(has(&screen, "⠿"), "the spoiler stays hidden");
+
+        show_scene(&mut app, Scene::Bot);
+        let screen = rows(&mut app);
+        assert!(has(&screen, "Trail Bot · bot"), "{screen:#?}");
+        assert!(has(&screen, "Tell me if it rains"));
+        assert!(has(&screen, "the bot decides what happens"), "the popup");
+
+        show_scene(&mut app, Scene::Secret);
+        let screen = rows(&mut app);
+        assert!(has(&screen, "secret chat"), "{screen:#?}");
+        assert!(has(&screen, "Enter to view"));
+        assert!(has(&screen, "4729"));
+
+        show_scene(&mut app, Scene::Key);
+        assert!(has(&rows(&mut app), "Encryption key · Alex Rivera"));
 
         show_scene(&mut app, Scene::Settings);
         assert!(has(&rows(&mut app), "Catppuccin Mocha"));
@@ -801,6 +1169,11 @@ mod tests {
 
         assert!(on_key(&mut app, &mut scene, press(KeyCode::Char('2'))));
         assert_eq!(SCENES[scene], Scene::Replying);
+        assert!(on_key(&mut app, &mut scene, press(KeyCode::Char('0'))));
+        assert_eq!(SCENES[scene], Scene::Shortcuts, "0 is the last");
+        assert!(on_key(&mut app, &mut scene, press(KeyCode::Char('7'))));
+        assert_eq!(app.selected, Some(SECRET_ALEX), "the list follows");
+        assert!(on_key(&mut app, &mut scene, press(KeyCode::Char('2'))));
         assert!(on_key(&mut app, &mut scene, press(KeyCode::BackTab)));
         assert!(on_key(&mut app, &mut scene, press(KeyCode::BackTab)));
         assert_eq!(SCENES[scene], Scene::Shortcuts, "wraps around");
