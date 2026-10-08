@@ -26,6 +26,7 @@ mod theme;
 mod tmux;
 mod topics;
 mod ui;
+mod viewer;
 mod voice;
 
 use std::io::{Write, stdout};

@@ -1812,6 +1812,7 @@ mod tests {
             source_text: text.into(),
             preview: None,
             file: None,
+            photo: None,
             links: Vec::new(),
             link_ranges: Vec::new(),
             styles: Vec::new(),

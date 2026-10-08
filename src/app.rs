@@ -43,6 +43,7 @@ use crate::tg::{Deletable, EditText, Found, Invite, Missed, Page, Tagged, Tg, Tg
 use crate::theme::{Colors, Themes};
 use crate::topics::Forum;
 use crate::ui;
+use crate::viewer::{self, PhotoView};
 use crate::voice::{Happened, Player, VoiceEvent};
 
 /// Chats requested per `loadChats` call.
@@ -156,6 +157,11 @@ pub enum Target {
         message_id: i64,
         file: MediaFile,
     },
+    /// Message `message_id`'s photo, which opens in the viewer.
+    Photo {
+        message_id: i64,
+        file: MediaFile,
+    },
     Link(Link),
     /// The whole text or caption; only copied.
     Text(String),
@@ -164,7 +170,9 @@ pub enum Target {
 impl Target {
     pub fn label(&self) -> &str {
         match self {
-            Target::File(file) | Target::Voice { file, .. } => &file.label,
+            Target::File(file) | Target::Voice { file, .. } | Target::Photo { file, .. } => {
+                &file.label
+            }
             Target::Link(link) => &link.url,
             Target::Text(_) => "Whole message",
         }
@@ -276,15 +284,21 @@ fn openable_file(msg: &crate::messages::Msg) -> Option<&MediaFile> {
         .filter(|_| !opens_once(msg) || msg.voice.is_some())
 }
 
-/// Opening message `id`'s `file`: its voice plays here, anything else opens
-/// in its app.
+/// Opening message `id`'s `file`: its voice plays here, its photo shows in
+/// the viewer, anything else opens in its app.
 fn file_target(id: i64, msg: &crate::messages::Msg, file: MediaFile) -> Target {
-    match msg.voice.as_ref().filter(|v| v.file_id == file.id) {
-        Some(_) => Target::Voice {
+    if msg.voice.as_ref().is_some_and(|v| v.file_id == file.id) {
+        Target::Voice {
             message_id: id,
             file,
-        },
-        None => Target::File(file),
+        }
+    } else if msg.photo.as_ref().is_some_and(|p| p.file_id == file.id) {
+        Target::Photo {
+            message_id: id,
+            file,
+        }
+    } else {
+        Target::File(file)
     }
 }
 
@@ -684,6 +698,8 @@ pub struct App {
     pub timer_menu: Option<TimerMenu>,
     /// `:key`: a secret chat's key, to compare.
     pub key_view: Option<KeyView>,
+    /// Enter on a photo: it, as big as the window allows.
+    pub photo_view: Option<PhotoView>,
     /// `f` to forward a message, or `s` to find a chat to open.
     pub picker: Option<ChatPicker>,
     /// A chat being looked up to open. Opening another chat meanwhile
@@ -766,6 +782,9 @@ pub struct App {
     /// The message whose photo, shown only while open, the last frame
     /// showed.
     shown_viewing: Option<i64>,
+    /// The photo the last frame showed in the viewer, by file id, and the
+    /// size it was zoomed to.
+    shown_in_viewer: Option<(i32, Option<usize>)>,
     /// TDLib is logging out (`:logout`, the session ended elsewhere, or
     /// leaving a QR login), and a new client takes over once it has closed.
     relogin: bool,
@@ -814,6 +833,7 @@ impl App {
             pinned_menu: None,
             timer_menu: None,
             key_view: None,
+            photo_view: None,
             picker: None,
             finding: None,
             completion: None,
@@ -854,6 +874,7 @@ impl App {
             notify_since: i32::MAX,
             unread_chats: 0,
             shown_viewing: None,
+            shown_in_viewer: None,
             relogin: false,
             exit: false,
         };
@@ -904,15 +925,19 @@ impl App {
             }
             self.cover_unseen();
             // Sixel and iTerm2 pictures stay on screen until every cell of
-            // them is drawn over, which tmux may skip for blank ones.
+            // them is drawn over, which tmux may skip for blank ones: the
+            // viewer's photo once it closes, changes size or makes way for
+            // another, and the bubbles' under its blank edges once it opens.
             let viewing = self.open.as_ref().and_then(|o| o.viewing);
-            if self.shown_viewing.is_some()
-                && viewing != self.shown_viewing
+            let in_viewer = self.photo_view.as_ref().map(|v| (v.photo.file_id, v.zoom));
+            if ((self.shown_viewing.is_some() && viewing != self.shown_viewing)
+                || in_viewer != self.shown_in_viewer)
                 && self.images.paints_over()
             {
                 let _ = terminal.clear();
             }
             self.shown_viewing = viewing;
+            self.shown_in_viewer = in_viewer;
             self.mark_seen();
             self.update_online();
             self.send_notification();
@@ -1052,6 +1077,11 @@ impl App {
                     prompt.input.insert_str(text.replace(['\r', '\n'], " "));
                 }
                 self.on_prompt_edit();
+            }
+            // Files attached and Insert mode under the photo, out of sight,
+            // would go out with the next Enter or two.
+            Event::Paste(_) if self.photo_view.is_some() => {
+                self.status = Some("Close the photo to paste".into());
             }
             Event::Paste(text) if matches!(self.focus, Focus::Input | Focus::Messages) => {
                 self.on_paste(text)
@@ -1594,6 +1624,15 @@ impl App {
             Update::MessageContent(u) => {
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
                     open.set_content(u.message_id, &u.new_content);
+                    // Edited to another photo, or to no photo at all.
+                    let msg = open.messages.get(&u.message_id);
+                    if self
+                        .photo_view
+                        .as_ref()
+                        .is_some_and(|v| v.lost(u.chat_id, u.message_id, msg))
+                    {
+                        self.photo_view = None;
+                    }
                 }
             }
             Update::MessageEdited(u) => {
@@ -1637,6 +1676,13 @@ impl App {
                     .unwrap_or_default();
                 for id in stale {
                     self.ask_topic(id);
+                }
+                if self
+                    .photo_view
+                    .as_ref()
+                    .is_some_and(|v| u.message_ids.iter().any(|&id| v.lost(u.chat_id, id, None)))
+                {
+                    self.photo_view = None;
                 }
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
                     open.remove(&u.message_ids);
@@ -1751,6 +1797,7 @@ impl App {
                     self.key_view = None;
                 }
             }
+            Screen::Main if self.photo_view.is_some() => self.on_viewer_key(key),
             Screen::Main if self.settings_menu.is_some() => self.on_settings_key(key, ctrl),
             Screen::Main if self.delete_menu.is_some() => self.on_delete_key(key),
             Screen::Main if self.react_menu.is_some() => self.on_react_key(key, ctrl),
@@ -2631,6 +2678,7 @@ impl App {
             && self.present()
             && matches!(self.focus, Focus::Messages | Focus::Input)
             && self.settings_menu.is_none()
+            && self.photo_view.is_none()
             && self.open.as_ref().is_some_and(|o| {
                 o.chat_id == chat_id
                     && o.at_newest
@@ -2673,6 +2721,10 @@ impl App {
     /// In a forum, only the topic open is being read: `topic` is the one
     /// the message is in.
     fn sees(&self, chat_id: i64, topic: Option<i32>) -> bool {
+        // The photo viewer hides every chat.
+        if self.photo_view.is_some() {
+            return false;
+        }
         if self.focus_reported {
             self.terminal_focused
         } else {
@@ -3049,6 +3101,7 @@ impl App {
         self.pinned_menu = None;
         self.timer_menu = None;
         self.key_view = None;
+        self.photo_view = None;
         self.picker = None;
         self.finding = None;
         self.completion = None;
@@ -3377,6 +3430,7 @@ impl App {
         self.pinned_menu = None;
         self.timer_menu = None;
         self.key_view = None;
+        self.photo_view = None;
     }
 
     /// Leaves the chat open, or the forum shown, telling TDLib.
@@ -3745,6 +3799,11 @@ impl App {
         let Some(msg) = open.messages.get(&message_id) else {
             return;
         };
+        // Nor under the photo viewer, where the composer is out of sight.
+        if self.photo_view.is_some() {
+            self.status = Some("The edit came while a photo was open: e edits again".into());
+            return;
+        }
         // Without it as Markdown, it's edited as plain text, which loses
         // any formatting.
         let (text, loses) = match text {
@@ -4552,6 +4611,7 @@ impl App {
     fn open_target(&mut self, target: Target) {
         match target {
             Target::Voice { message_id, file } => self.play_voice(message_id, file.id),
+            Target::Photo { message_id, file } => self.view_photo(message_id, file),
             Target::File(file) => {
                 // TDLib answers at once if the file is already downloaded.
                 if self.opening.insert(file.id) {
@@ -4570,6 +4630,109 @@ impl App {
             }
             Target::Link(link) => self.open_link_outside(link),
             Target::Text(_) => {}
+        }
+    }
+
+    /// Shows message `message_id`'s photo in the viewer; one that's no
+    /// longer loaded opens in its app, as `o` in the viewer would.
+    fn view_photo(&mut self, message_id: i64, file: MediaFile) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let view = match open.messages.get(&message_id) {
+            Some(msg) => PhotoView::of(open.chat_id, message_id, msg),
+            None => {
+                self.open_target(Target::File(file));
+                return;
+            }
+        };
+        let Some(view) = view else {
+            self.status = Some("This photo can't be shown here".into());
+            return;
+        };
+        // The cursor stays on it rather than following new messages: what
+        // arrives meanwhile is hidden under the photo, so it isn't marked
+        // read, and an Enter after closing it isn't on something unseen.
+        if open.selected.is_none() {
+            open.selected = Some(message_id);
+        }
+        self.photo_view = Some(view);
+    }
+
+    /// The photo viewer takes all keys while it's up.
+    fn on_viewer_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.photo_view.as_mut() else {
+            return;
+        };
+        // Ctrl-o, out of habit for going back, isn't `o`, which hands the
+        // photo to another app.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('h') | KeyCode::Left => self.view_next_photo(false),
+            KeyCode::Char('l') | KeyCode::Right => self.view_next_photo(true),
+            KeyCode::Char('j' | '+' | '=') => view.zoom_in(),
+            KeyCode::Char('k' | '-') => view.zoom_out(),
+            // It closes first: the app comes up over tuigram anyway, and a
+            // warning about the file mustn't come up under the photo.
+            // What Telegram says can't be saved isn't handed to an app that
+            // can save it: it's shown here instead.
+            KeyCode::Char('o') if view.cant_copy.is_some() => {
+                self.status = Some("This photo can't be saved, so it opens only here".into());
+            }
+            KeyCode::Char('o') => {
+                let file = view.file.clone();
+                self.photo_view = None;
+                self.open_target(Target::File(file));
+            }
+            KeyCode::Char('y') => match view.cant_copy {
+                Some(why) => self.status = Some(why.into()),
+                None => {
+                    let file = view.file.clone();
+                    self.copy_target(Target::File(file));
+                }
+            },
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => self.photo_view = None,
+            _ => {}
+        }
+    }
+
+    /// `h` / `l` in the viewer: the photo before or after the one shown,
+    /// among the messages loaded. Past those, more are loaded, for `h` or
+    /// `l` again.
+    fn view_next_photo(&mut self, newer: bool) {
+        let Some(view) = &self.photo_view else {
+            return;
+        };
+        let Some(open) = self.open.as_ref().filter(|o| o.chat_id == view.chat_id) else {
+            return;
+        };
+        let id = view.message_id;
+        let photo =
+            |(&id, msg): (&i64, &crate::messages::Msg)| PhotoView::of(open.chat_id, id, msg);
+        let next = match newer {
+            true => open.messages.range(id + 1..).find_map(photo),
+            false => open.messages.range(..id).rev().find_map(photo),
+        };
+        if next.is_some() {
+            self.photo_view = next;
+            return;
+        }
+        match (newer, open.all_loaded, open.at_newest) {
+            (false, false, _) => {
+                self.status = Some("Loading older messages…".into());
+                self.load_older_messages();
+            }
+            (true, _, false) => {
+                self.status = Some("Loading newer messages…".into());
+                self.load_newer_messages();
+            }
+            (false, true, _) => self.status = Some("No older photos in this chat".into()),
+            (true, _, true) => self.status = Some("No newer photos in this chat".into()),
         }
     }
 
@@ -4675,6 +4838,7 @@ impl App {
             || self.pinned_menu.is_some()
             || self.timer_menu.is_some()
             || self.key_view.is_some()
+            || self.photo_view.is_some()
             || self.menu.is_some()
             || self.picker.is_some()
             || self.resizing.is_some()
@@ -4741,11 +4905,8 @@ impl App {
         let Some(msg) = open.cursor_id().and_then(|id| open.messages.get(&id)) else {
             return;
         };
-        if !msg.saveable {
-            self.status = Some(match msg.destruct {
-                Some(_) => "Self-destructing media can't be copied".into(),
-                None => "This chat doesn't allow copying its messages".into(),
-            });
+        if let Some(why) = viewer::cant_copy(msg) {
+            self.status = Some(why.into());
             return;
         }
         let mut targets = Vec::new();
@@ -4778,7 +4939,7 @@ impl App {
         let text = match target {
             Target::Text(text) => text,
             Target::Link(link) => link.url,
-            Target::File(file) => {
+            Target::File(file) | Target::Photo { file, .. } => {
                 let id = file.id;
                 if self.copying.insert(id, file).is_none() {
                     self.tg.download(id);
@@ -4941,6 +5102,11 @@ impl App {
         // where an Enter meant to open one would send it.
         if !matches!(self.focus, Focus::Messages | Focus::Input) {
             self.status = Some("The paste came after you left the messages: p pastes again".into());
+            return;
+        }
+        // Nor under the photo viewer, out of sight.
+        if self.photo_view.is_some() {
+            self.status = Some("The paste came while a photo was open: p pastes again".into());
             return;
         }
         match pasted.content {
@@ -7035,6 +7201,310 @@ mod tests {
             listened: false,
         });
         (open.chat_id, id)
+    }
+
+    /// Makes the cursor's message a photo: file 40 in its bubble, 41 at its
+    /// largest.
+    fn photo_message(app: &mut App) -> (i64, i64) {
+        let id = plain_message(app);
+        make_photo(app, id, 40);
+        (app.open.as_ref().unwrap().chat_id, id)
+    }
+
+    /// Makes message `id` a photo: file `file_id` in its bubble, the next
+    /// one at its largest.
+    fn make_photo(app: &mut App, id: i64, file_id: i32) {
+        let open = app.open.as_mut().unwrap();
+        let msg = open.messages.get_mut(&id).unwrap();
+        msg.links.clear();
+        let preview = |file_id, width, height| crate::messages::Preview {
+            file_id,
+            width,
+            height,
+            thumbnail: None,
+            sticker: false,
+        };
+        msg.preview = Some(preview(file_id, 800, 600));
+        msg.photo = Some(preview(file_id + 1, 2560, 1920));
+        msg.file = Some(MediaFile {
+            id: file_id + 1,
+            label: "Photo".into(),
+            photo: true,
+        });
+    }
+
+    #[test]
+    fn h_and_l_in_the_viewer_go_to_the_photo_before_and_after_it() {
+        let mut app = test_app("viewer-next");
+        let none = KeyModifiers::NONE;
+        let open = app.open.as_mut().unwrap();
+        // Everything is loaded: nothing is asked of TDLib.
+        open.all_loaded = true;
+        open.at_newest = true;
+        let (chat_id, ids) = (
+            open.chat_id,
+            open.messages.keys().copied().collect::<Vec<_>>(),
+        );
+        // Not next to each other, and the newer one the newest.
+        let (older, newer) = (ids[1], ids[ids.len() - 1]);
+        assert!(ids.len() > 3);
+        make_photo(&mut app, older, 50);
+        make_photo(&mut app, newer, 60);
+        let open = app.open.as_ref().unwrap();
+        app.photo_view = PhotoView::of(chat_id, newer, &open.messages[&newer]);
+        let shown = |app: &App| app.photo_view.as_ref().map(|v| v.message_id);
+
+        press(&mut app, KeyCode::Char('k'), none);
+        press(&mut app, KeyCode::Char('h'), none);
+        assert_eq!(
+            shown(&app),
+            Some(older),
+            "past the messages that aren't photos"
+        );
+        assert_eq!(app.photo_view.as_ref().unwrap().zoom, None, "unzoomed");
+        press(&mut app, KeyCode::Char('h'), none);
+        assert_eq!(shown(&app), Some(older));
+        assert_eq!(app.status.as_deref(), Some("No older photos in this chat"));
+        press(&mut app, KeyCode::Right, none);
+        assert_eq!(shown(&app), Some(newer));
+        press(&mut app, KeyCode::Char('l'), none);
+        assert_eq!(shown(&app), Some(newer));
+        assert_eq!(app.status.as_deref(), Some("No newer photos in this chat"));
+    }
+
+    #[test]
+    fn j_and_k_in_the_viewer_zoom_out_and_back_in_never_past_filling_the_window() {
+        let mut app = test_app("viewer-zoom");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        photo_message(&mut app);
+        press(&mut app, KeyCode::Enter, none);
+        let zoom = |app: &App| app.photo_view.as_ref().unwrap().zoom;
+        // A big photo opens filling the window: there's no more to zoom in.
+        screen(&mut app);
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_eq!(zoom(&app), None);
+        press(&mut app, KeyCode::Char('k'), none);
+        assert_eq!(zoom(&app), Some(viewer::SIZES.len() - 2));
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Char('-'), none);
+        }
+        assert_eq!(zoom(&app), Some(0));
+        let rows = screen(&mut app);
+        assert!(rows[0].contains("Photo · 25% · loading…"), "{rows:#?}");
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Char('j'), none);
+        }
+        assert_eq!(zoom(&app), Some(viewer::SIZES.len() - 1));
+        assert!(screen(&mut app)[0].contains("Photo · 100%"));
+    }
+
+    #[test]
+    fn enter_on_a_photo_shows_it_in_the_viewer_not_in_another_app() {
+        let mut app = test_app("viewer-enter");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        let (chat_id, id) = photo_message(&mut app);
+        press(&mut app, KeyCode::Enter, none);
+        let view = app.photo_view.as_ref().expect("the viewer is up");
+        assert_eq!((view.chat_id, view.message_id), (chat_id, id));
+        assert_eq!(view.photo.file_id, 41, "at its largest");
+        assert_eq!(view.stand_in.as_ref().map(|p| p.file_id), Some(40));
+        assert!(app.opening.is_empty(), "nothing waits for another app");
+        assert!(app.busy(), "a download finishing won't pop up over it");
+
+        // It takes the keys.
+        press(&mut app, KeyCode::Char('k'), none);
+        assert_eq!(app.open.as_ref().unwrap().selected, Some(id));
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.photo_view.is_some(), "Ctrl-o isn't o");
+        assert!(app.opening.is_empty());
+        for close in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Enter] {
+            assert!(app.photo_view.is_some());
+            press(&mut app, close, none);
+            assert!(app.photo_view.is_none(), "{close:?} closes it");
+            press(&mut app, KeyCode::Enter, none);
+        }
+    }
+
+    #[test]
+    fn what_arrives_while_a_photo_is_open_is_neither_marked_read_nor_kept_quiet() {
+        let mut app = test_app("viewer-unseen");
+        app.focus = Focus::Messages;
+        let open = app.open.as_mut().unwrap();
+        let (chat_id, newest) = (open.chat_id, open.newest_id().unwrap());
+        make_photo(&mut app, newest, 40);
+        // Following new messages, as when a photo just came in.
+        let open = app.open.as_mut().unwrap();
+        open.selected = None;
+        open.at_newest = true;
+        assert!(app.watching(chat_id));
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.photo_view.is_some());
+        assert_eq!(
+            app.open.as_ref().unwrap().selected,
+            Some(newest),
+            "the cursor stays on the photo"
+        );
+        assert!(!app.watching(chat_id));
+        app.open.as_mut().unwrap().selected = None;
+        assert!(!app.watching(chat_id), "the photo hides the chat");
+        assert!(!app.sees(chat_id, None), "so it's notified");
+        app.focus_reported = true;
+        assert!(!app.sees(chat_id, None), "even in a focused window");
+    }
+
+    #[test]
+    fn pastes_and_late_edits_wait_until_the_photo_is_closed() {
+        let mut app = test_app("viewer-paste");
+        app.focus = Focus::Messages;
+        let (chat_id, id) = photo_message(&mut app);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let file = std::env::temp_dir().join("tuigram-test-viewer-paste.txt");
+        std::fs::write(&file, b"notes").unwrap();
+        app.on_terminal_event(Event::Paste(file.to_string_lossy().into_owned()));
+        assert_eq!(
+            app.status.take().as_deref(),
+            Some("Close the photo to paste")
+        );
+        let place = app.open.as_ref().unwrap().place();
+        app.on_pasted(Pasted {
+            place,
+            content: Ok(Paste::Text("the screenshot".into())),
+        });
+        assert!(app.status.take().is_some());
+        app.on_editable(chat_id, id, Some(true), None);
+        assert!(app.status.take().is_some());
+        assert!(app.focus == Focus::Messages, "not Insert mode under it");
+        assert!(app.composer.is_empty());
+        assert!(app.open.as_ref().unwrap().attachments.is_empty());
+        assert!(app.open.as_ref().unwrap().editing.is_none());
+    }
+
+    #[test]
+    fn the_viewer_never_takes_a_photo_shown_only_while_open() {
+        let mut app = test_app("viewer-once");
+        app.focus = Focus::Messages;
+        let (_, id) = photo_message(&mut app);
+        let open = app.open.as_mut().unwrap();
+        open.messages.get_mut(&id).unwrap().destruct = Some(crate::secret::Destruct {
+            after: 10,
+            on_open: true,
+            ends: None,
+        });
+        let file = open.messages[&id].file.clone().unwrap();
+        app.view_photo(id, file);
+        assert!(app.photo_view.is_none());
+        assert!(app.opening.is_empty(), "nor hands it to another app");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("This photo can't be shown here")
+        );
+    }
+
+    #[test]
+    fn o_in_the_viewer_closes_it_and_opens_the_photo_in_its_app_as_enter_did() {
+        let mut app = test_app("viewer-o");
+        app.focus = Focus::Messages;
+        photo_message(&mut app);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        // As if TDLib was asked for it already: a detached client can't be.
+        app.opening.insert(41);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+        assert!(app.photo_view.is_none());
+        assert!(app.opening.contains(&41), "opens once downloaded");
+        // A file that could run code still asks first.
+        app.on_tg(TgEvent::Downloaded {
+            file_id: 41,
+            path: Some("/nonexistent/photo.exe".into()),
+        });
+        assert!(matches!(
+            app.confirm.as_ref().map(|c| &c.action),
+            Some(Confirmed::OpenFile(_))
+        ));
+    }
+
+    #[test]
+    fn y_and_o_in_the_viewer_hand_on_nothing_telegram_says_cant_be_saved() {
+        let mut app = test_app("viewer-y");
+        app.focus = Focus::Messages;
+        let (_, id) = photo_message(&mut app);
+        let open = app.open.as_mut().unwrap();
+        open.messages.get_mut(&id).unwrap().saveable = false;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("This chat doesn't allow copying its messages")
+        );
+        assert!(app.copying.is_empty());
+        assert!(app.photo_view.is_some(), "still up");
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("This photo can't be saved, so it opens only here")
+        );
+        assert!(app.opening.is_empty(), "not handed to an app that saves it");
+        assert!(app.photo_view.is_some());
+    }
+
+    #[test]
+    fn the_viewer_closes_once_its_message_is_deleted_or_edited_to_another_photo() {
+        let mut app = test_app("viewer-gone");
+        app.focus = Focus::Messages;
+        let (chat_id, id) = photo_message(&mut app);
+        let deleted = |message_ids| {
+            Update::DeleteMessages(tdlib_rs::types::UpdateDeleteMessages {
+                chat_id,
+                message_ids,
+                is_permanent: true,
+                from_cache: false,
+            })
+        };
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        app.on_tg(TgEvent::Update(Box::new(deleted(vec![id + 1000]))));
+        assert!(app.photo_view.is_some(), "another message went");
+        app.on_tg(TgEvent::Update(Box::new(deleted(vec![id]))));
+        assert!(app.photo_view.is_none());
+
+        let (_, id) = photo_message(&mut app);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let edited = tdlib_rs::types::UpdateMessageContent {
+            chat_id,
+            message_id: id,
+            new_content: tdlib_rs::enums::MessageContent::MessageText(
+                tdlib_rs::types::MessageText {
+                    text: tdlib_rs::types::FormattedText {
+                        text: "no photo now".into(),
+                        ..Default::default()
+                    },
+                    link_preview: None,
+                    link_preview_options: None,
+                },
+            ),
+        };
+        app.on_tg(TgEvent::Update(Box::new(Update::MessageContent(edited))));
+        assert!(app.photo_view.is_none());
+    }
+
+    #[test]
+    fn the_viewer_covers_the_chats_and_messages_and_says_its_keys() {
+        let mut app = test_app("viewer-draw");
+        app.focus = Focus::Messages;
+        photo_message(&mut app);
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        let title = app.chats.title(chat_id).unwrap().to_string();
+        assert!(screen(&mut app).iter().any(|r| r.contains(&title)));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let rows = screen(&mut app);
+        assert!(rows[0].contains("Photo · loading…"), "{rows:#?}");
+        assert!(!rows.iter().any(|r| r.contains(&title)), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("Loading…")), "{rows:#?}");
+        assert!(
+            rows[rows.len() - 1].contains("o open in its app · y copy"),
+            "{rows:#?}"
+        );
     }
 
     #[test]

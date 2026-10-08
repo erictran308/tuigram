@@ -91,6 +91,19 @@ impl Preview {
         })
     }
 
+    /// A photo's largest size, for the viewer. Without the blurry
+    /// thumbnail: the bubble's photo stands in until it's ready.
+    fn largest(photo: &types::Photo) -> Option<Self> {
+        let size = largest(photo)?;
+        Some(Self {
+            file_id: size.photo.id,
+            width: size.width.max(1) as u32,
+            height: size.height.max(1) as u32,
+            thumbnail: None,
+            sticker: false,
+        })
+    }
+
     /// Static stickers are WebP images themselves. Animated ones (TGS, WebM)
     /// show their still thumbnail.
     fn from_sticker(sticker: &types::Sticker) -> Option<Self> {
@@ -185,6 +198,9 @@ pub struct Msg {
     pub preview: Option<Preview>,
     /// The file Enter opens: the full photo, the video, the document…
     pub file: Option<MediaFile>,
+    /// A photo at its largest, the same file as `file`: Enter shows it in
+    /// the viewer.
+    pub photo: Option<Preview>,
     /// Web links in the text or caption, in order, without duplicates.
     pub links: Vec<Link>,
     /// Byte ranges of `text` that are links, to underline.
@@ -333,6 +349,7 @@ impl Msg {
         std::mem::swap(&mut self.source_text, &mut body.source_text);
         std::mem::swap(&mut self.preview, &mut body.preview);
         std::mem::swap(&mut self.file, &mut body.file);
+        std::mem::swap(&mut self.photo, &mut body.photo);
         std::mem::swap(&mut self.links, &mut body.links);
         std::mem::swap(&mut self.link_ranges, &mut body.link_ranges);
         std::mem::swap(&mut self.styles, &mut body.styles);
@@ -642,6 +659,7 @@ struct Body {
     source_text: String,
     preview: Option<Preview>,
     file: Option<MediaFile>,
+    photo: Option<Preview>,
     links: Vec<Link>,
     link_ranges: Vec<Range<usize>>,
     styles: Vec<Styled>,
@@ -700,6 +718,7 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
         source_text: String::new(),
         preview: None,
         file: None,
+        photo: None,
         links: Vec::new(),
         link_ranges: Vec::new(),
         styles: Vec::new(),
@@ -757,15 +776,14 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             if body.preview.is_some() {
                 body.text = m.caption.text.clone();
             }
-            // One shown only while open is shown here, not handed to
-            // another app that keeps it.
-            body.file = largest(&m.photo)
-                .filter(|_| !m.is_secret)
-                .map(|s| MediaFile {
-                    id: s.photo.id,
-                    label: "Photo".into(),
-                    photo: true,
-                });
+            // One shown only while open is shown in its bubble, not in the
+            // viewer, nor handed to another app that keeps it.
+            body.photo = Preview::largest(&m.photo).filter(|_| !m.is_secret);
+            body.file = body.photo.as_ref().map(|p| MediaFile {
+                id: p.file_id,
+                label: "Photo".into(),
+                photo: true,
+            });
             source = Some(&m.caption);
         }
         C::MessageVideo(m) => {
@@ -1074,6 +1092,7 @@ impl From<Message> for Msg {
             source_text: body.source_text,
             preview: body.preview,
             file: body.file,
+            photo: body.photo,
             links: body.links,
             link_ranges: body.link_ranges,
             styles: body.styles,
@@ -1875,6 +1894,37 @@ mod tests {
     }
 
     #[test]
+    fn photos_show_a_smaller_size_in_the_bubble_and_the_largest_in_the_viewer() {
+        let size = |id, width, height| types::PhotoSize {
+            r#type: "x".into(),
+            photo: types::File {
+                id,
+                ..Default::default()
+            },
+            width,
+            height,
+            progressive_sizes: Vec::new(),
+        };
+        let content = MessageContent::MessagePhoto(types::MessagePhoto {
+            photo: types::Photo {
+                sizes: vec![size(1, 320, 240), size(2, 800, 600), size(3, 2560, 1920)],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let body = body(&content);
+        assert_eq!(body.preview.map(|p| p.file_id), Some(2));
+        let photo = body.photo.expect("the viewer has a photo to show");
+        assert_eq!((photo.file_id, photo.width, photo.height), (3, 2560, 1920));
+        assert!(photo.thumbnail.is_none(), "the bubble's photo stands in");
+        assert_eq!(
+            body.file.map(|f| (f.id, f.photo)),
+            Some((3, true)),
+            "o opens the same file"
+        );
+    }
+
+    #[test]
     fn videos_with_clip_thumbnails_fall_back_to_a_label() {
         let body = body(&video(ThumbnailFormat::Mpeg4, ""));
         assert!(body.preview.is_none());
@@ -2373,6 +2423,7 @@ mod tests {
                     source_text: format!("message {id}"),
                     preview: None,
                     file: None,
+                    photo: None,
                     links: Vec::new(),
                     link_ranges: Vec::new(),
                     styles: Vec::new(),
@@ -2717,6 +2768,7 @@ mod tests {
         assert_eq!(photo.text, "for you");
         assert_eq!(photo.preview.as_ref().map(|p| p.file_id), Some(20));
         assert!(photo.file.is_none(), "not handed to an app that keeps it");
+        assert!(photo.photo.is_none(), "nor to the viewer");
         assert!(!open.uncover(3), "already open");
 
         open.cover_unless_viewed(true);

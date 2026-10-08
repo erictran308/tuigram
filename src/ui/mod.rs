@@ -63,6 +63,7 @@ mod messages;
 mod qr;
 mod stickers;
 mod topics;
+mod viewer;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let colors = app.colors;
@@ -406,6 +407,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         // The settings popup, the command list and toasts can reach over it;
         // a toast only when the list is on the right, where toasts go.
         covered: app.settings_menu.is_some()
+            || app.photo_view.is_some()
             || (app.toast.is_some() && app.settings.chat_list_side == Side::Right)
             || app
                 .prompt
@@ -443,6 +445,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         || app.pinned_menu.is_some()
         || app.timer_menu.is_some()
         || app.key_view.is_some()
+        || app.photo_view.is_some()
         || app.picker.is_some()
         || app.confirm.is_some()
         || app.settings_menu.is_some()
@@ -595,6 +598,9 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             chats: &app.chats,
         };
         draw_picker(frame, chat_area, picker, &names, colors);
+    }
+    if let Some(view) = &mut app.photo_view {
+        viewer::draw(frame, body, view, &mut app.images, colors);
     }
     if let Some(confirm) = &app.confirm {
         draw_confirm(frame, chat_area, confirm, colors);
@@ -2380,6 +2386,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             "  `j/k` choose · `Enter` set the timer · `Esc` cancel",
         ),
         _ if app.key_view.is_some() => (normal, "  `Enter` or `Esc` close"),
+        _ if app.photo_view.is_some() => (
+            normal,
+            "  `h/l` older/newer photo · `j/k` zoom in/out · `o` open in its app · `y` copy · `Enter` or `Esc` close",
+        ),
         _ if app.pinned_menu.is_some() => (
             normal,
             "  `j/k` choose · `Enter` go to it · `P` unpin it · `Esc` close",
@@ -2484,6 +2494,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         || app.pinned_menu.is_some()
         || app.timer_menu.is_some()
         || app.key_view.is_some()
+        || app.photo_view.is_some()
         || app.picker.is_some()
         || app.confirm.is_some();
     let mut context = match &app.open {
@@ -3267,6 +3278,7 @@ mod tests {
             source_text: "text".into(),
             preview: None,
             file: None,
+            photo: None,
             links: Vec::new(),
             link_ranges: Vec::new(),
             styles: Vec::new(),

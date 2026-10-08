@@ -82,6 +82,18 @@ const MAX_BUILDING: usize = 4;
 /// Encoded photos kept for the open chat; the least recently drawn go first.
 const MAX_READY: usize = 200;
 
+/// More cells than any photo in a bubble (40 × 16): only the photo viewer
+/// asks for photos this big.
+const LARGE_CELLS: u32 = 40 * 16;
+
+/// Of those, at most this many are kept. Each can take tens of MB (kitty's
+/// keeps all it sent), and the viewer shows one at a time.
+const MAX_LARGE: usize = 4;
+
+fn large(key: &Key) -> bool {
+    u32::from(key.cols) * u32::from(key.rows) > LARGE_CELLS
+}
+
 thread_local! {
     /// Set while this thread decodes another user's image.
     static DECODING: Cell<bool> = const { Cell::new(false) };
@@ -254,6 +266,27 @@ impl Images {
         Some(image)
     }
 
+    /// Like [`get`](Self::get), but only the photo itself, not its blurry
+    /// thumbnail.
+    pub fn sharp(&mut self, photo: &Preview, cols: u16, rows: u16) -> Option<&SlicedProtocol> {
+        let key = Key {
+            file_id: photo.file_id,
+            cols,
+            rows,
+            thumbnail: false,
+            avatar: false,
+        };
+        let frame = self.frame;
+        let (image, used) = self.ready.get_mut(&key)?;
+        *used = frame;
+        Some(image)
+    }
+
+    /// The photo's file is downloaded.
+    pub fn downloaded(&self, photo: &Preview) -> bool {
+        matches!(self.files.get(&photo.file_id), Some(FileState::Ready(_)))
+    }
+
     /// True when the photo can't be shown: its download or decode failed.
     pub fn is_broken(&self, photo: &Preview) -> bool {
         matches!(self.files.get(&photo.file_id), Some(FileState::Failed))
@@ -419,6 +452,17 @@ impl Images {
     }
 
     fn add_ready(&mut self, key: Key, image: SlicedProtocol) {
+        while large(&key)
+            && self.ready.keys().filter(|k| large(k)).count() >= MAX_LARGE
+            && let Some(oldest) = self
+                .ready
+                .iter()
+                .filter(|(k, _)| large(k))
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(&k, _)| k)
+        {
+            self.ready.remove(&oldest);
+        }
         if self.ready.len() >= MAX_READY
             && let Some(oldest) = self
                 .ready
@@ -556,6 +600,27 @@ mod tests {
         let edge = alpha(6, 7);
         assert!(edge > 0 && edge < 255, "a soft edge: {edge}");
         assert_eq!(circle(&photo, 0, 44).dimensions(), (0, 44), "no panic");
+    }
+
+    #[test]
+    fn only_a_few_window_sized_photos_are_kept() {
+        let tx = tokio::sync::mpsc::unbounded_channel().0;
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        let at = |file_id, cols| Key {
+            file_id,
+            cols,
+            rows: 50,
+            thumbnail: false,
+            avatar: false,
+        };
+        for file_id in 0..10 {
+            images.insert_ready(at(file_id, 4), image::RgbImage::new(4, 4).into());
+            images.insert_ready(at(file_id, 200), image::RgbImage::new(4, 4).into());
+        }
+        let large = images.ready.keys().filter(|k| k.cols == 200).count();
+        assert_eq!(large, MAX_LARGE);
+        let small = images.ready.keys().filter(|k| k.cols == 4).count();
+        assert_eq!(small, 10, "bubbles' photos aren't touched");
     }
 
     fn key(file_id: i32) -> Key {

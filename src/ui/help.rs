@@ -77,7 +77,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-d / Ctrl-u", "Half a page newer / older"),
             (
                 "Enter",
-                "Show spoilers, view a photo shown only while open, play or pause a voice message, vote in a poll, list a bot's buttons, or open the photo, file or link",
+                "Show spoilers, view a photo shown only while open, play or pause a voice message, vote in a poll, list a bot's buttons, show the photo, or open the file or link",
             ),
             ("y", "Copy the text, a link, or the photo or file"),
             ("r", "Reply"),
@@ -159,6 +159,19 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Enter", "Send the sticker, or the reply"),
             ("/", "Find stickers by emoji or word"),
             ("Tab / Esc", "Back to writing"),
+        ],
+    ),
+    (
+        "Photo viewer",
+        &[
+            ("h / l", "The photo before / after it in the chat"),
+            (
+                "j / k",
+                "Zoom in / out (also + / -), up to filling the window",
+            ),
+            ("o", "Open the photo in your computer's viewer"),
+            ("y", "Copy the photo"),
+            ("Enter / Esc / q", "Close"),
         ],
     ),
     (
