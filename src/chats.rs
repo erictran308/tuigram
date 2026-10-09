@@ -31,6 +31,9 @@ pub struct Chat {
     /// A one-on-one chat, where only the other person can be typing.
     pub is_private: bool,
     pub unread: i32,
+    /// Unread messages that mention you or answer yours, which `gm` goes
+    /// through.
+    pub mentions: i32,
     /// Your messages up to this id have been read: by the other person, or
     /// by anyone in a group.
     pub read_outbox: i64,
@@ -38,6 +41,9 @@ pub struct Chat {
     read_inbox: i64,
     /// One-line summary of the last message, e.g. "You: see you at 5".
     pub preview: String,
+    /// The id of the chat's newest message; 0 if it has none, or it isn't
+    /// known.
+    last_message: i64,
     /// Where the chat is in each list it's in: the main list or the archive,
     /// and any of your folders.
     positions: HashMap<List, Position>,
@@ -309,9 +315,11 @@ impl Chats {
             is_channel,
             is_private,
             unread: chat.unread_count,
+            mentions: chat.unread_mention_count,
             read_outbox: chat.last_read_outbox_message_id,
             read_inbox: chat.last_read_inbox_message_id,
             preview: chat.last_message.as_ref().map(preview).unwrap_or_default(),
+            last_message: chat.last_message.as_ref().map_or(0, |m| m.id),
             positions: HashMap::new(),
             photo: chat.photo.as_ref().map(ChatPhoto::new),
             accent: chat.accent_color_id,
@@ -343,6 +351,7 @@ impl Chats {
     ) {
         if let Some(chat) = self.by_id.get_mut(&chat_id) {
             chat.preview = message.map(preview).unwrap_or_default();
+            chat.last_message = message.map_or(0, |m| m.id);
             for position in positions {
                 chat.set_position(position);
                 self.dirty = true;
@@ -391,10 +400,24 @@ impl Chats {
         }
     }
 
+    /// How many unread messages mention you, from
+    /// `updateChatUnreadMentionCount` and `updateMessageMentionRead`.
+    pub fn set_mentions(&mut self, chat_id: i64, count: i32) {
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            chat.mentions = count;
+        }
+    }
+
     pub fn set_read_inbox(&mut self, chat_id: i64, message_id: i64) {
         if let Some(chat) = self.by_id.get_mut(&chat_id) {
             chat.read_inbox = message_id;
         }
+    }
+
+    /// The id of a chat's newest message; 0 if it has none, or it isn't
+    /// known.
+    pub fn last_message(&self, chat_id: i64) -> i64 {
+        self.by_id.get(&chat_id).map_or(0, |c| c.last_message)
     }
 
     /// The last message you read in a chat.
@@ -633,6 +656,12 @@ impl Chats {
         };
     }
 
+    /// Telegram's word on a person, whether or not you have a chat with
+    /// them.
+    pub fn user_badge(&self, user_id: i64) -> Option<Badge> {
+        self.badges.get(&Peer::User(user_id)).copied()
+    }
+
     /// The @username of a chat, without the @.
     pub fn username(&self, chat_id: i64) -> Option<&str> {
         let peer = self.by_id.get(&chat_id)?.peer?;
@@ -718,6 +747,15 @@ impl Chats {
         self.bots.contains(&user_id)
     }
 
+    /// What to say about anyone, as for a chat with them: that they're a
+    /// bot, or when they were last on Telegram, if TDLib told.
+    pub fn user_seen(&self, user_id: i64) -> Option<Seen> {
+        if self.bots.contains(&user_id) {
+            return Some(Seen::Bot);
+        }
+        self.presence.get(&user_id).copied().map(Seen::Person)
+    }
+
     /// What to say about the person a one-on-one chat is with; `None` for
     /// groups, channels and Saved Messages.
     pub fn seen(&self, chat_id: i64) -> Option<Seen> {
@@ -727,10 +765,7 @@ impl Chats {
         let Some(Peer::User(user_id)) = self.by_id.get(&chat_id)?.peer else {
             return None;
         };
-        if self.bots.contains(&user_id) {
-            return Some(Seen::Bot);
-        }
-        self.presence.get(&user_id).copied().map(Seen::Person)
+        self.user_seen(user_id)
     }
 
     /// Whether you're in a group or channel, from `updateSupergroup`.
@@ -906,9 +941,11 @@ impl Chat {
             is_channel: false,
             is_private: false,
             unread: 0,
+            mentions: 0,
             read_outbox: 0,
             read_inbox: 0,
             preview: String::new(),
+            last_message: 0,
             positions,
             photo: None,
             accent: 0,

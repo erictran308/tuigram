@@ -125,25 +125,30 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
             };
             let gap = Span::from(" ".repeat(indent.into()));
             let muted = chats.muted(id);
-            // The unread count, grey for a muted chat as in Telegram; else
+            // The unread count, grey for a muted chat as in Telegram, after
+            // an @ while some mention you, which a mute doesn't grey; else
             // a pin for a pinned one.
-            let badge = if chat.unread > 0 {
+            let mut badges = Vec::new();
+            if chat.mentions > 0 {
+                badges.push(Span::from(" @ ").fg(colors.bg).bg(colors.primary));
+            }
+            if chat.unread > 0 {
+                if !badges.is_empty() {
+                    badges.push(Span::from(" "));
+                }
                 let bg = if muted { colors.muted } else { colors.primary };
-                Span::from(format!(" {} ", chat.unread))
-                    .fg(colors.bg)
-                    .bg(bg)
-            } else if chats.pinned(id) {
-                Span::from(PINNED)
-            } else {
-                Span::from("")
-            };
+                let count = Span::from(format!(" {} ", chat.unread));
+                badges.push(count.fg(colors.bg).bg(bg));
+            } else if badges.is_empty() && chats.pinned(id) {
+                badges.push(Span::from(PINNED));
+            }
             let title = chats.title(id).unwrap_or_default();
             let mark = chats.badge(id);
             let mark_w = mark.map_or(0, |m| m.mark().width());
             let mute_w = if muted { MUTED.width() } else { 0 };
             let secret = chats.is_secret(id);
             let lock_w = if secret { LOCK_WIDTH } else { 0 };
-            let badge_w = badge.content.width();
+            let badge_w: usize = badges.iter().map(|b| b.content.width()).sum();
             let title = truncate(
                 title,
                 width.saturating_sub(lock_w + badge_w + mark_w + mute_w + 1),
@@ -162,7 +167,7 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
                 first.push(Span::from(MUTED).fg(colors.muted));
             }
             first.push(Span::from(" ".repeat(pad)));
-            first.push(badge);
+            first.extend(badges);
             // Highlighted by hand too, so the blank row below stays blank.
             let row_style = if is_selected {
                 Style::new().bg(colors.selection)
@@ -460,6 +465,40 @@ mod tests {
         assert!(rows[quiet].contains("Quiet 🔕"), "{rows:#?}");
         let x = rows[quiet].chars().position(|c| c == '4').unwrap() as u16;
         assert_eq!(buf[(x, quiet as u16)].bg, colors.muted, "a grey count");
+    }
+
+    #[test]
+    fn a_chat_that_mentions_you_shows_an_at_before_its_count_even_muted() {
+        use tdlib_rs::types::ChatNotificationSettings;
+        let mut chats = Chats::default();
+        let chat = chats.add_local(1, "Team", None);
+        (chat.unread, chat.mentions) = (5, 2);
+        chats.set_notifications(
+            1,
+            ChatNotificationSettings {
+                mute_for: 3600,
+                ..ChatNotificationSettings::default()
+            },
+        );
+        chats.refresh();
+        let colors = Colors::default();
+        let buf = render(
+            &list(&chats, None),
+            &mut images(ProtocolType::Halfblocks),
+            40,
+            10,
+        );
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let y = rows.iter().position(|r| r.contains("Team")).unwrap();
+        assert!(rows[y].trim_end().ends_with(" @   5 │"), "{rows:#?}");
+        let at = rows[y].chars().position(|c| c == '@').unwrap() as u16;
+        assert_eq!(
+            buf[(at, y as u16)].bg,
+            colors.primary,
+            "a mute doesn't grey it"
+        );
     }
 
     fn render(list: &ChatList, images: &mut Images, width: u16, height: u16) -> Buffer {

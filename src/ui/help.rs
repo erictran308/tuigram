@@ -16,8 +16,15 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         "Everywhere",
         &[
             ("?", "This help, and settings"),
-            (":", "Type a command: secret, key, timer, leave or logout"),
+            (
+                ":",
+                "Type a command: info, secret, key, timer, leave or logout",
+            ),
             ("s", "Find a chat or person: a name, @username or t.me link"),
+            (
+                "I",
+                "What the chat is, and who's in it: Enter on someone writes to them",
+            ),
             ("H", "Highlight or unhighlight the selected chat"),
             (
                 "Ctrl-o / Ctrl-i",
@@ -39,9 +46,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-d / Ctrl-u", "Half a page down / up"),
             (
                 "Enter / l",
-                "Open the chat (Enter / h with the list on the right)",
+                "Open the chat, at its first unread message (Enter / h with the list on the right)",
             ),
             ("i", "Open the chat and write"),
+            ("gm", "Open the chat at a message that mentions you"),
             (
                 "Tab / Shift-Tab",
                 "Next / previous folder, then the archive",
@@ -92,6 +100,14 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("P", "Pin the message (asks how), or unpin it"),
             ("gp", "Pinned messages: Enter goes to one, P unpins it"),
             ("gd", "Go to the message a reply answers"),
+            (
+                "gu",
+                "Go to the first unread message, under the \"Unread messages\" line",
+            ),
+            (
+                "gm / gM",
+                "Go to the oldest unread message that mentions you or answers yours (@ in the chat list), and seeing it reads it; once you've seen them all, to the one before / after the cursor",
+            ),
             (
                 "Tab",
                 "Forward again, as Ctrl-i (most terminals send Ctrl-i as Tab)",

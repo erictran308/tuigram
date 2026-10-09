@@ -347,7 +347,8 @@ pub struct Colors {
     /// Background of the highlighted row in a list.
     pub selection: Color,
     pub popup_bg: Color,
-    /// Unread badges, the NORMAL label, the Saved Messages title.
+    /// Unread badges and the line over unread messages, the NORMAL label,
+    /// the Saved Messages title.
     pub primary: Color,
     /// Titles of chats you highlighted with `H`.
     pub highlighted: Color,

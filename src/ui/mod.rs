@@ -59,6 +59,7 @@ fn lock_spans(colors: &Colors) -> [Span<'static>; 2] {
 
 mod chat_list;
 mod help;
+mod info;
 mod messages;
 mod qr;
 mod stickers;
@@ -446,6 +447,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         || app.timer_menu.is_some()
         || app.key_view.is_some()
         || app.photo_view.is_some()
+        || app.chat_info.is_some()
         || app.picker.is_some()
         || app.confirm.is_some()
         || app.settings_menu.is_some()
@@ -574,6 +576,13 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     }
     if let Some(key) = &app.key_view {
         draw_key(frame, chat_area, key, colors);
+    }
+    if let Some(chat_info) = &app.chat_info {
+        let names = messages::Names {
+            users: &app.users,
+            chats: &app.chats,
+        };
+        info::draw(frame, chat_area, chat_info, &names, colors);
     }
     if let (Some(menu), Some(open)) = (&app.pinned_menu, &app.open) {
         let names = messages::Names {
@@ -2386,6 +2395,17 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             "  `j/k` choose · `Enter` set the timer · `Esc` cancel",
         ),
         _ if app.key_view.is_some() => (normal, "  `Enter` or `Esc` close"),
+        _ if app
+            .chat_info
+            .as_ref()
+            .is_some_and(|i| !i.members.is_empty()) =>
+        {
+            (
+                normal,
+                "  `j/k` move · `Enter` write to them · `g/G` first/last · `Esc` close",
+            )
+        }
+        _ if app.chat_info.is_some() => (normal, "  `Esc` close"),
         _ if app.photo_view.is_some() => (
             normal,
             "  `h/l` older/newer photo · `j/k` zoom in/out · `o` open in its app · `y` copy · `Enter` or `Esc` close",
@@ -2415,15 +2435,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Chats if !app.chats.tabs().is_empty() => (
             normal,
-            "  `j/k` move · `Enter` open · `i` write · `Tab/Shift-Tab` folders · `/` search · `s` find anyone · `p` pin · `m` mute · `Ctrl-o/i` back/forward · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            "  `j/k` move · `Enter` open · `i` write · `Tab/Shift-Tab` folders · `/` search · `s` find anyone · `p` pin · `m` mute · `I` info · `Ctrl-o/i` back/forward · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         Focus::Chats => (
             normal,
-            "  `j/k` move · `Enter` open · `i` write · `/` search · `s` find anyone · `p` pin · `m` mute · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            "  `j/k` move · `Enter` open · `i` write · `/` search · `s` find anyone · `p` pin · `m` mute · `I` info · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         Focus::Topics => (
             normal,
-            "  `j/k` move · `Enter` open · `i` write · `h` back · `s` find anyone · `Ctrl-o/i` back/forward · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            "  `j/k` move · `Enter` open · `i` write · `h` back · `s` find anyone · `I` info · `Ctrl-o/i` back/forward · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         Focus::Messages if searching => (
             normal,
@@ -2443,7 +2463,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages => (
             normal,
-            "  `j/k` newer/older · `y` copy · `r` reply · `f` forward · `R` react · `X` unreact · `e` edit · `d` delete · `P` pin · `gp` pinned · `Enter` open/play media · `i` write · `a` attach · `p` paste · `/` search · `s` find anyone · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            "  `j/k` newer/older · `y` copy · `r` reply · `f` forward · `R` react · `X` unreact · `e` edit · `d` delete · `P` pin · `gp` pinned · `gu/gm/gM` unread/mention · `Enter` open/play media · `i` write · `a` attach · `p` paste · `/` search · `s` find anyone · `I` info · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         _ if picking && app.stickers.as_ref().is_some_and(|p| p.query.is_some()) => (
             sticker,
@@ -2495,12 +2515,16 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         || app.timer_menu.is_some()
         || app.key_view.is_some()
         || app.photo_view.is_some()
+        || app.chat_info.is_some()
         || app.picker.is_some()
         || app.confirm.is_some();
     let mut context = match &app.open {
         Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open, &app.jumps),
         _ => Vec::new(),
     };
+    if app.focus == Focus::Messages && !popup && app.unread_mentions() > 0 {
+        context.insert(0, "`gm` mention");
+    }
     if let Some(open) = &app.open
         && matches!(app.focus, Focus::Messages | Focus::Input)
         && !popup
@@ -3300,6 +3324,8 @@ mod tests {
             saveable: true,
             voice: None,
             service: None,
+            mention: false,
+            unplayed: false,
         };
         let mut open = OpenChat::new(1);
         open.messages.insert(1, msg(None));

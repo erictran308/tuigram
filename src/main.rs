@@ -7,6 +7,7 @@ mod complete;
 mod config;
 mod demo;
 mod images;
+mod info;
 mod messages;
 mod notify;
 mod opus;

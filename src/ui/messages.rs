@@ -350,7 +350,7 @@ pub fn draw(
 
 /// "online", "last seen 5 minutes ago", "bot"… for a chat's title, and
 /// whether they're online. `now` is a unix timestamp.
-fn seen_label(seen: Seen, now: i64) -> (String, bool) {
+pub(super) fn seen_label(seen: Seen, now: i64) -> (String, bool) {
     let presence = match seen {
         Seen::Bot => return ("bot".into(), false),
         Seen::Person(presence) => presence,
@@ -557,6 +557,8 @@ fn measure<'a>(
     let mut prev_day = None;
     let mut prev_sender = None;
     let mut prev_sticker = false;
+    // "Unread messages" goes over the first one, once it's loaded.
+    let first_unread = open.unread_line.and_then(|read| open.first_unread(read));
     let messages: Vec<(i64, &Msg)> = open.messages.iter().map(|(&id, m)| (id, m)).collect();
     let albums = albums(&messages);
     for ((id, msg), album) in messages.into_iter().zip(albums) {
@@ -566,6 +568,11 @@ fn measure<'a>(
             prev_sender = None;
             time.map_or(String::new(), |t| t.format(" %a %-d %b %Y ").to_string())
         });
+        // Like a date, it breaks a block: the sender is named again.
+        let unread = Some(id) == first_unread;
+        if unread {
+            prev_sender = None;
+        }
 
         // Like Telegram: name only on the first of several messages in a row.
         let name = (show_names && prev_sender != Some(msg.sender)).then(|| {
@@ -689,6 +696,7 @@ fn measure<'a>(
         measured.push(Measured {
             id,
             separator,
+            unread,
             joined,
             bubble,
             service,
@@ -712,6 +720,7 @@ fn measure<'a>(
         placed: Vec::with_capacity(measured.len()),
         photos: Vec::new(),
         total: 0,
+        width,
     };
     let mut day = 0;
     for (m, inner) in measured.into_iter().zip(widths) {
@@ -722,6 +731,9 @@ fn measure<'a>(
         let mut bubble_start = start + usize::from(!m.joined || gaps);
         if m.separator.is_some() {
             bubble_start += 1 + usize::from(start > 0);
+        }
+        if m.unread {
+            bubble_start += 1 + usize::from(start > 0 && m.separator.is_none());
         }
         let msg = m.bubble.msg;
         // Rows are right-aligned for own messages, so measure from the right.
@@ -777,6 +789,8 @@ struct Laid<'a> {
     photos: Vec<PhotoSlot>,
     /// Rows in all.
     total: usize,
+    /// Columns the messages have.
+    width: usize,
 }
 
 impl Laid<'_> {
@@ -802,11 +816,18 @@ impl Laid<'_> {
                 continue;
             }
             let mut lines = Vec::with_capacity(placed.end - placed.start);
+            let dated = m.separator.is_some();
             if let Some(label) = m.separator {
                 if placed.start > 0 {
                     lines.push(Line::default());
                 }
                 lines.push(Line::from(label).fg(colors.muted).centered());
+            }
+            if m.unread {
+                if placed.start > 0 && !dated {
+                    lines.push(Line::default());
+                }
+                lines.push(unread_line(self.width, colors));
             }
             // Inside a block the gap keeps the bubble's background, so the
             // messages read as one block but still apart.
@@ -895,12 +916,29 @@ struct Measured<'a> {
     id: i64,
     /// The date to show above it, when it's the first message of a day.
     separator: Option<String>,
+    /// "Unread messages" goes over it: it's the first unread one.
+    unread: bool,
     /// Whether it continues the block above, with no gap between.
     joined: bool,
     bubble: Bubble<'a>,
     /// A service message's sentence, wrapped, drawn in the middle instead of
     /// the bubble.
     service: Option<Vec<Line<'static>>>,
+}
+
+/// The line over the first unread message, across the pane, on a
+/// background of its own: a sender's name over a sticker has none, and a
+/// bubble is never as wide, so neither can pass for it.
+fn unread_line(width: usize, colors: &Colors) -> Line<'static> {
+    const LABEL: &str = " Unread messages ";
+    let side = width.saturating_sub(LABEL.width());
+    let style = Style::new().fg(colors.primary).bg(colors.selection);
+    let rule = |n| Span::styled("─".repeat(n), style);
+    Line::from(vec![
+        rule(side / 2),
+        Span::styled(LABEL, style.bold()),
+        rule(side - side / 2),
+    ])
 }
 
 /// A service message's sentence, wrapped: tuigram's own words muted, like a
@@ -1834,6 +1872,8 @@ mod tests {
             saveable: true,
             voice: None,
             service: None,
+            mention: false,
+            unplayed: false,
         }
     }
 
@@ -1916,6 +1956,45 @@ mod tests {
         );
         open.messages.insert(4, msg(true, day2 + 60, "ok"));
         open
+    }
+
+    #[test]
+    fn unread_messages_start_under_a_line_that_says_so() {
+        let mut open = sample();
+        let line = |rows: &[String]| rows.iter().position(|r| r.contains("Unread messages"));
+        assert_eq!(line(&render(&mut open, true)), None);
+
+        // The first unread one starts a day: the date, then the line.
+        open.unread_line = Some(1);
+        let rows = render(&mut open, true);
+        let at = line(&rows).unwrap();
+        assert!(rows[at - 1].contains("2026"), "{rows:#?}");
+        // A gap, then whom it's from, named again.
+        assert!(rows[at + 2].contains("Unknown"), "{rows:#?}");
+        assert!(rows[at + 3].contains("a much longer"), "{rows:#?}");
+        assert!(rows[at].contains("─── Unread messages ───"), "{rows:#?}");
+        // On a background no sender's row has, across the pane.
+        let buf = render_buffer(&mut open, true, &mut images());
+        let colors = Colors::default();
+        for x in [2, 30, 57] {
+            assert_eq!(buf[(x, at as u16)].bg, colors.selection);
+        }
+
+        // Within a day, a blank row above it, and none over your own.
+        open.messages
+            .insert(5, msg(false, 1_790_086_520, "and one more"));
+        open.unread_line = Some(4);
+        let rows = render(&mut open, true);
+        let at = line(&rows).unwrap();
+        assert!(
+            rows[at - 1].trim_matches(['│', ' ']).is_empty(),
+            "{rows:#?}"
+        );
+        assert!(rows[at + 2].contains("Unknown"), "{rows:#?}");
+        assert!(rows[at + 3].contains("and one more"), "{rows:#?}");
+        open.messages.remove(&5);
+        open.unread_line = Some(3);
+        assert_eq!(line(&render(&mut open, true)), None, "only yours after it");
     }
 
     #[test]

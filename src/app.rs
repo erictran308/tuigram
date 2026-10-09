@@ -25,6 +25,7 @@ use crate::clipboard::{Clipboard, ClipboardEvent, Copied, Decoded, Paste, Pasted
 use crate::complete::{self, Commands, Completion, Kind, Suggestion};
 use crate::config::{self, ApiKeys};
 use crate::images::{ImageEvent, Images};
+use crate::info::ChatInfo;
 use crate::messages::{
     Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState, Sender, link_host, one_line,
     web_url,
@@ -39,9 +40,9 @@ use crate::secret::{KeyView, Secret, SecretState, TimerMenu};
 use crate::settings::{self, Settings, Side};
 use crate::stickers::{self, Source, StickerPanel};
 use crate::text;
-use crate::tg::{Deletable, EditText, Found, Invite, Missed, Page, Tagged, Tg, TgEvent};
+use crate::tg::{Deletable, EditText, Found, Invite, Mentions, Missed, Page, Tagged, Tg, TgEvent};
 use crate::theme::{Colors, Themes};
-use crate::topics::Forum;
+use crate::topics::{self, Forum};
 use crate::ui;
 use crate::viewer::{self, PhotoView};
 use crate::voice::{Happened, Player, VoiceEvent};
@@ -593,6 +594,7 @@ impl Finding {
 /// typo can't log you out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
+    Info,
     Key,
     Leave,
     Logout,
@@ -601,7 +603,8 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 5] = [
+    pub const ALL: [Command; 6] = [
+        Command::Info,
         Command::Key,
         Command::Leave,
         Command::Logout,
@@ -611,6 +614,7 @@ impl Command {
 
     pub fn name(self) -> &'static str {
         match self {
+            Command::Info => "info",
             Command::Key => "key",
             Command::Leave => "leave",
             Command::Logout => "logout",
@@ -621,6 +625,7 @@ impl Command {
 
     pub fn about(self) -> &'static str {
         match self {
+            Command::Info => "Show what this chat is, and who's in it (also I)",
             Command::Key => "Show a secret chat's key, to compare with the other person's",
             Command::Leave => "Leave this group or channel, or end a secret chat (asks first)",
             Command::Logout => "Log out of Telegram on this computer (asks first)",
@@ -700,6 +705,8 @@ pub struct App {
     pub key_view: Option<KeyView>,
     /// Enter on a photo: it, as big as the window allows.
     pub photo_view: Option<PhotoView>,
+    /// `I`: what a chat is, and who's in it.
+    pub chat_info: Option<ChatInfo>,
     /// `f` to forward a message, or `s` to find a chat to open.
     pub picker: Option<ChatPicker>,
     /// A chat being looked up to open. Opening another chat meanwhile
@@ -834,6 +841,7 @@ impl App {
             timer_menu: None,
             key_view: None,
             photo_view: None,
+            chat_info: None,
             picker: None,
             finding: None,
             completion: None,
@@ -1083,6 +1091,11 @@ impl App {
             Event::Paste(_) if self.photo_view.is_some() => {
                 self.status = Some("Close the photo to paste".into());
             }
+            // And under the info, where Esc would leave Insert mode, ready
+            // to send them.
+            Event::Paste(_) if self.chat_info.is_some() => {
+                self.status = Some("Close the info to paste".into());
+            }
             Event::Paste(text) if matches!(self.focus, Focus::Input | Focus::Messages) => {
                 self.on_paste(text)
             }
@@ -1148,6 +1161,7 @@ impl App {
                     // A forum's topics start with its first page; the cursor
                     // may already be near the end of a short one.
                     self.ask_topics();
+                    self.topic_known();
                 }
             }
             TgEvent::Topic {
@@ -1160,6 +1174,7 @@ impl App {
                         Some(topic) => forum.upsert(&topic),
                         None => forum.not_found(topic_id),
                     }
+                    self.topic_known();
                 }
             }
             TgEvent::Replied {
@@ -1378,6 +1393,36 @@ impl App {
                     self.confirm_invite(link, request, invite);
                 }
             }
+            TgEvent::Mentions {
+                chat_id,
+                topic,
+                ask,
+                ids,
+            } => self.on_mentions((chat_id, topic), ask, ids),
+            TgEvent::ChatInfo { chat_id, about } => {
+                if let Some(info) = self
+                    .chat_info
+                    .as_mut()
+                    .filter(|i| i.chat_id == chat_id && i.about.is_none())
+                {
+                    match about {
+                        Some(about) => info.set_about(*about),
+                        // Why is in the status bar.
+                        None => info.failed = true,
+                    }
+                    self.ask_members();
+                }
+            }
+            TgEvent::ChatMembers {
+                chat_id,
+                offset,
+                members,
+            } => {
+                if let Some(info) = self.chat_info.as_mut().filter(|i| i.chat_id == chat_id) {
+                    info.add_page(offset, members);
+                    self.ask_members();
+                }
+            }
         }
     }
 
@@ -1406,6 +1451,7 @@ impl App {
         // message near it instead, so the view stays.
         if let Page::Around(target) = page
             && open.topic.is_some()
+            && open.unread_after.is_none()
             && !messages.iter().any(|m| m.id == target)
         {
             self.status = Some("That message isn't in this topic".into());
@@ -1415,6 +1461,15 @@ impl App {
             page,
             messages.into_iter().map(|m| (m.id, m.into())).collect(),
         );
+        let newest = match open.topic {
+            Some(topic) => self
+                .forum
+                .as_ref()
+                .and_then(|f| f.get(topic))
+                .map_or(0, |t| t.newest()),
+            None => self.chats.last_message(open.chat_id),
+        };
+        open.reached(newest);
         open.go_to_unread();
         if open.messages.len() < MIN_LOADED {
             self.load_older_messages();
@@ -1490,6 +1545,21 @@ impl App {
                 self.chats.set_unread(u.chat_id, u.unread_count);
                 self.chats
                     .set_read_inbox(u.chat_id, u.last_read_inbox_message_id);
+            }
+            Update::ChatUnreadMentionCount(u) => {
+                self.chats.set_mentions(u.chat_id, u.unread_mention_count);
+                // Read all at once, elsewhere: TDLib may not say so of each.
+                if u.unread_mention_count == 0
+                    && let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id)
+                {
+                    open.messages.values_mut().for_each(|m| m.mention = false);
+                }
+            }
+            Update::MessageMentionRead(u) => {
+                self.chats.set_mentions(u.chat_id, u.unread_mention_count);
+                if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
+                    open.set_mention_read(u.message_id);
+                }
             }
             Update::ChatReadOutbox(u) => {
                 self.chats
@@ -1806,6 +1876,7 @@ impl App {
             Screen::Main if self.pin_menu.is_some() => self.on_pin_key(key),
             Screen::Main if self.pinned_menu.is_some() => self.on_pinned_key(key),
             Screen::Main if self.timer_menu.is_some() => self.on_timer_key(key),
+            Screen::Main if self.chat_info.is_some() => self.on_info_key(key, ctrl),
             Screen::Main if self.menu.is_some() => self.on_menu_key(key),
             Screen::Main if self.picker.is_some() => self.on_picker_key(key, ctrl),
             Screen::Main if self.resizing.is_some() => self.on_resize_key(key, ctrl),
@@ -1995,6 +2066,17 @@ impl App {
                 self.resizing = Some(Resizing::List(self.settings.chat_list_width));
             }
             (_, KeyCode::Char('g')) => self.pending_g = true,
+            // From the chats or a forum's topics: opens the one under the
+            // cursor first, rather than mute it (`m`).
+            (Focus::Chats | Focus::Topics, KeyCode::Char('m')) if pending_g => {
+                match self.focus {
+                    Focus::Chats => self.open_selected_chat(),
+                    _ => self.open_selected_topic(),
+                }
+                if self.focus == Focus::Messages {
+                    self.go_to_mention(true);
+                }
+            }
             (_, KeyCode::Char('q')) => self.quit(),
             (_, KeyCode::Char('H')) => self.toggle_highlight(),
             (_, KeyCode::Char('?')) => {
@@ -2060,6 +2142,10 @@ impl App {
             (Focus::Messages, KeyCode::Char('y')) => self.copy_selected(),
             (Focus::Messages, KeyCode::Char('a')) => self.open_prompt(PromptKind::Attach),
             (Focus::Messages, KeyCode::Char('p')) if pending_g => self.open_pinned_menu(),
+            (Focus::Messages, KeyCode::Char('u')) if pending_g => self.go_to_unread(),
+            (Focus::Messages, KeyCode::Char('m')) if pending_g => self.go_to_mention(true),
+            (Focus::Messages, KeyCode::Char('M')) if pending_g => self.go_to_mention(false),
+            (_, KeyCode::Char('I')) => self.open_chat_info(),
             (Focus::Messages, KeyCode::Char('p')) => self.paste_clipboard(),
             (Focus::Messages, KeyCode::Char('P')) => self.toggle_pin_message(),
             (Focus::Messages, KeyCode::Char('t')) if ctrl => self.toggle_as_files(),
@@ -2625,6 +2711,7 @@ impl App {
             }
             PromptKind::Command if !submit || query.is_empty() => {}
             PromptKind::Command => match Command::parse(&query) {
+                Some(Command::Info) => self.open_chat_info(),
                 Some(Command::Key) => self.show_key(),
                 Some(Command::Leave) => self.ask_to_leave(),
                 Some(Command::Logout) => self.ask_to_log_out(),
@@ -2638,24 +2725,55 @@ impl App {
     /// Sends a read receipt for the newest incoming message once you can
     /// see it: the chat pane and the terminal window have focus, and the view
     /// is on the newest message (see [`App::watching`]). Viewing it marks the
-    /// whole chat as read.
+    /// whole chat as read. A message that mentions you, or answers yours,
+    /// is read once the cursor is on it with nothing over the chat, as
+    /// Telegram's apps read it once it's on screen, and the chat up to it;
+    /// not in a secret chat, where that would start the timers of the
+    /// unread messages before it, unseen.
     fn mark_seen(&mut self) {
-        let watched = self.open.as_ref().map(|o| o.chat_id);
-        if !watched.is_some_and(|id| self.watching(id)) {
+        let Some(chat_id) = self.open.as_ref().map(|o| o.chat_id) else {
             return;
-        }
+        };
+        let watching = self.watching(chat_id);
+        let mention = self.mention_seen();
         let Some(open) = self.open.as_mut() else {
             return;
         };
         let newest = open.messages.iter().rev().find(|(_, m)| !m.outgoing);
-        if let Some((&id, _)) = newest
+        if watching
+            && let Some((&id, _)) = newest
             && id > open.seen
         {
             open.seen = id;
+            // Viewing it reads its mention too.
+            open.set_mention_read(id);
             self.tg.view_messages(open.chat_id, open.topic, vec![id]);
             // Read, their self-destruct timers start.
             open.start_timers(false, id, SystemTime::now());
         }
+        if let Some(id) = mention {
+            open.set_mention_read(id);
+            open.seen = open.seen.max(id);
+            self.tg.view_messages(open.chat_id, open.topic, vec![id]);
+        }
+    }
+
+    /// The message under the cursor, when it mentions you unseen and is in
+    /// front of you: the keys are in the chat, with nothing over it, and
+    /// it's not a secret chat (see [`App::mark_seen`]).
+    fn mention_seen(&self) -> Option<i64> {
+        let open = self.open.as_ref()?;
+        if !self.looking_at(open.chat_id)
+            || self.busy()
+            || self.focus != Focus::Messages
+            || self.chats.is_secret(open.chat_id)
+        {
+            return None;
+        }
+        let id = open.cursor_id()?;
+        let msg = open.messages.get(&id)?;
+        (msg.mention && !msg.unplayed && !msg.outgoing && msg.state == SendState::Sent)
+            .then_some(id)
     }
 
     /// How long since the last key, by whichever clock says longer: the
@@ -2674,25 +2792,40 @@ impl App {
     /// messages aren't marked read, and do notify, while nobody is there.
     /// A window the terminal says has focus gets [`AWAY_AFTER`].
     fn watching(&self, chat_id: i64) -> bool {
+        self.looking_at(chat_id)
+            && self
+                .open
+                .as_ref()
+                .is_some_and(|o| o.at_newest && o.selected.is_none())
+    }
+
+    /// The chat's messages are in front of the user, wherever the cursor
+    /// is in them: [`App::watching`], but for being on the newest.
+    fn looking_at(&self, chat_id: i64) -> bool {
         matches!(self.screen, Screen::Main)
             && self.present()
             && matches!(self.focus, Focus::Messages | Focus::Input)
             && self.settings_menu.is_none()
             && self.photo_view.is_none()
+            // As tall as the pane, over the newest messages.
+            && self.chat_info.is_none()
             && self.open.as_ref().is_some_and(|o| {
                 o.chat_id == chat_id
-                    && o.at_newest
-                    && o.selected.is_none()
                     // Going to an older message: what arrives meanwhile
                     // isn't what's about to be on screen.
                     && !matches!(o.loading, Some(Page::Around(_)))
+                    // A topic opened from a link opens at its first unread
+                    // message once TDLib says where that is.
+                    && o.topic.is_none_or(|t| {
+                        self.forum.as_ref().is_some_and(|f| f.get(t).is_some())
+                    })
             })
     }
 
     /// What's shown only while open is covered once you look away, or go
     /// away.
     fn cover_unseen(&mut self) {
-        let looking = self.focus == Focus::Messages && self.present();
+        let looking = self.focus == Focus::Messages && self.present() && self.chat_info.is_none();
         if let Some(open) = self.open.as_mut() {
             open.cover_unless_viewed(looking);
         }
@@ -3102,6 +3235,7 @@ impl App {
         self.timer_menu = None;
         self.key_view = None;
         self.photo_view = None;
+        self.chat_info = None;
         self.picker = None;
         self.finding = None;
         self.completion = None;
@@ -3207,7 +3341,9 @@ impl App {
         };
         open.unread_after = None;
         open.selected = None;
-        if open.at_newest {
+        // A page around an older message on its way would take the view
+        // away again.
+        if open.at_newest && !matches!(open.loading, Some(Page::Around(_))) {
             return;
         }
         open.messages.clear();
@@ -3248,11 +3384,11 @@ impl App {
         let here = self.here();
         match self.jumps.go(back, here) {
             Some(to) => {
-                if self
+                let entered = self
                     .open
                     .as_ref()
-                    .is_none_or(|o| o.place() != (to.chat_id, to.topic))
-                {
+                    .is_none_or(|o| o.place() != (to.chat_id, to.topic));
+                if entered {
                     self.enter_chat(to.chat_id);
                     if let Some(topic) = to.topic {
                         self.enter_topic(topic);
@@ -3269,6 +3405,10 @@ impl App {
                 self.focus = Focus::Messages;
                 match to.message_id {
                     Some(id) => self.jump_to_message(id),
+                    // Just opened, it's at its first unread message, or
+                    // the newest if there's none: what came in since you
+                    // left isn't read unseen.
+                    None if entered => {}
                     None => self.jump_to_newest(),
                 }
             }
@@ -3300,10 +3440,12 @@ impl App {
         self.tg.open_chat(chat_id);
         self.chats.opened(chat_id);
         let mut open = OpenChat::new(chat_id);
-        // Reading a secret chat's messages starts their timers: it opens
-        // where you stopped reading, not with all of them read at once.
-        if self.chats.is_secret(chat_id) && self.chats.get(chat_id).is_some_and(|c| c.unread > 0) {
-            open.unread_after = Some(self.chats.read_inbox(chat_id));
+        // With unread messages, it opens at the first of them, as in
+        // Telegram, and nothing is read until you get to the newest. (In a
+        // secret chat, reading them all at once would also start their
+        // timers.)
+        if self.chats.get(chat_id).is_some_and(|c| c.unread > 0) {
+            open.open_at_unread(self.chats.read_inbox(chat_id));
         }
         self.show_messages(open);
     }
@@ -3364,7 +3506,46 @@ impl App {
         self.leave_messages();
         let mut open = OpenChat::new(chat_id);
         open.topic = Some(topic_id);
+        // At its first unread message, as a chat opens. One not loaded yet
+        // does once TDLib says how it is (`App::topic_known`).
+        if let Some(read) = self
+            .forum
+            .as_ref()
+            .and_then(|f| f.get(topic_id))
+            .filter(|t| t.unread > 0)
+            .map(|t| t.read_inbox())
+        {
+            open.open_at_unread(read);
+        }
         self.show_messages(open);
+    }
+
+    /// The topic open was opened before TDLib said how it is (from a link,
+    /// or Ctrl-o into a forum): now that it has, it goes to its first
+    /// unread message, unless the cursor went somewhere already. Nothing
+    /// was read meanwhile (`App::looking_at`).
+    fn topic_known(&mut self) {
+        let Some(open) = self.open.as_mut().filter(|o| {
+            o.unread_line.is_none()
+                && o.selected.is_none()
+                && o.seen == 0
+                && !matches!(o.loading, Some(Page::Around(_)))
+        }) else {
+            return;
+        };
+        let Some(read) = open
+            .topic
+            .and_then(|id| self.forum.as_ref()?.get(id))
+            .filter(|t| t.unread > 0)
+            .map(|t| t.read_inbox())
+        else {
+            return;
+        };
+        open.open_at_unread(read);
+        match open.first_page() {
+            Page::Latest => {}
+            page => self.load_page(page),
+        }
     }
 
     /// Enter on a topic in the pane.
@@ -3431,6 +3612,7 @@ impl App {
         self.timer_menu = None;
         self.key_view = None;
         self.photo_view = None;
+        self.chat_info = None;
     }
 
     /// Leaves the chat open, or the forum shown, telling TDLib.
@@ -3457,10 +3639,24 @@ impl App {
     }
 
     fn show_messages(&mut self, open: OpenChat) {
+        let page = open.first_page();
         self.open = Some(open);
         self.composer = new_composer();
-        self.load_older_messages();
+        match page {
+            Page::Latest => self.load_older_messages(),
+            page => self.load_page(page),
+        }
         self.ask_pinned();
+    }
+
+    /// Asks for a page of the open chat's history, which replaces any
+    /// request on its way.
+    fn load_page(&mut self, page: Page) {
+        if let Some(open) = self.open.as_mut() {
+            open.loading = Some(page);
+            self.tg
+                .load_history(open.chat_id, open.topic, page, HISTORY_PAGE);
+        }
     }
 
     /// Asks for the open chat's pinned messages, again whenever one is
@@ -3802,6 +3998,10 @@ impl App {
         // Nor under the photo viewer, where the composer is out of sight.
         if self.photo_view.is_some() {
             self.status = Some("The edit came while a photo was open: e edits again".into());
+            return;
+        }
+        if self.chat_info.is_some() {
+            self.status = Some("The edit came while the info was open: e edits again".into());
             return;
         }
         // Without it as Markdown, it's edited as plain text, which loses
@@ -4607,6 +4807,216 @@ impl App {
         }
     }
 
+    /// `gu`: to the first unread message, where "Unread messages" shows,
+    /// or the first unread one now if none were when the chat opened,
+    /// loading the history around it if needed. Ctrl-o comes back.
+    fn go_to_unread(&mut self) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let unread_now = match open.topic {
+            Some(topic) => self
+                .forum
+                .as_ref()
+                .and_then(|f| f.get(topic))
+                .filter(|t| t.unread > 0)
+                .map(|t| t.read_inbox()),
+            None => self
+                .chats
+                .get(open.chat_id)
+                .filter(|c| c.unread > 0)
+                .map(|_| self.chats.read_inbox(open.chat_id)),
+        };
+        let Some(read) = open.unread_line.or(unread_now) else {
+            self.status = Some("No unread messages".into());
+            return;
+        };
+        // Just opened, and already on its way there.
+        if open.unread_after == Some(read) && matches!(open.loading, Some(Page::Around(_))) {
+            return;
+        }
+        if let Some(here) = self.here() {
+            self.jumps.leave(here);
+        }
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        open.unread_after = Some(read);
+        if open.unread_loaded(read) {
+            // A jump still loading elsewhere would move the cursor away.
+            if matches!(open.loading, Some(Page::Around(_))) {
+                open.loading = None;
+            }
+            open.go_to_unread();
+            open.unread_after = None;
+            return;
+        }
+        // The page replaces the loaded messages when it arrives, and the
+        // cursor goes to the first unread one in it. With nothing read yet,
+        // from the first message.
+        self.load_page(Page::Around(read.max(1)));
+    }
+
+    /// `gm` (`older`): to the oldest message that mentions you, or answers
+    /// one of yours, that you haven't seen; seeing it there reads it (see
+    /// [`App::mark_seen`]), so `gm` again goes on to the next. Once you've
+    /// seen them all, to the one before the cursor, so `gm` goes back
+    /// through them; `gM` to the one after it. TDLib is asked which they
+    /// are.
+    fn go_to_mention(&mut self, older: bool) {
+        let unread = self.unread_mentions() > 0;
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let from = open.cursor_id().unwrap_or(0);
+        let ask = match (older, unread) {
+            (true, true) => Mentions::Unread,
+            (true, false) => Mentions::Before(from),
+            // On the newest, following new ones: none can be newer.
+            (false, _) if open.selected.is_none() && open.at_newest => {
+                self.status = Some("No newer mentions".into());
+                return;
+            }
+            (false, _) => Mentions::After(from),
+        };
+        open.mentions_asked = Some(ask);
+        let general = self.forum.as_ref().map_or(topics::GENERAL, |f| f.general());
+        self.tg.mentions(open.chat_id, open.topic, general, ask);
+    }
+
+    /// Messages in the open chat, or topic, that mention you or answer
+    /// yours, unseen: what `gm` goes through.
+    pub fn unread_mentions(&self) -> i32 {
+        let Some(open) = &self.open else {
+            return 0;
+        };
+        match open.topic {
+            Some(topic) => self
+                .forum
+                .as_ref()
+                .and_then(|f| f.get(topic))
+                .map_or(0, |t| t.mentions),
+            None => self.chats.get(open.chat_id).map_or(0, |c| c.mentions),
+        }
+    }
+
+    /// TDLib's answer for `gm` or `gM`: the cursor goes to the mention it
+    /// asked for, unless the keys went elsewhere meanwhile. Ctrl-o comes
+    /// back.
+    fn on_mentions(&mut self, place: (i64, Option<i32>), ask: Mentions, ids: Option<Vec<i64>>) {
+        let Some(open) = self
+            .open
+            .as_mut()
+            .filter(|o| o.place() == place && o.mentions_asked == Some(ask))
+        else {
+            return;
+        };
+        open.mentions_asked = None;
+        // After an error, TDLib's message is in the status bar.
+        let Some(ids) = ids else {
+            return;
+        };
+        if self.busy() || self.focus != Focus::Messages {
+            return;
+        }
+        let Some(to) = ask.pick(&ids) else {
+            self.status = Some(
+                match ask {
+                    Mentions::Unread => "No unread mentions",
+                    Mentions::Before(0) => "Nobody mentioned you here",
+                    Mentions::Before(_) => "No older mentions",
+                    Mentions::After(_) => "No newer mentions",
+                }
+                .into(),
+            );
+            return;
+        };
+        if let Some(here) = self.here() {
+            self.jumps.leave(here);
+        }
+        self.jump_to_message(to);
+    }
+
+    /// `I` or `:info`: what the chat under the cursor is, or the one open,
+    /// and who's in it.
+    fn open_chat_info(&mut self) {
+        let Some(chat_id) = self.info_chat() else {
+            self.status = Some("No chat selected".into());
+            return;
+        };
+        let Some(peer) = self.chats.get(chat_id).and_then(|c| c.peer) else {
+            return;
+        };
+        self.chat_info = Some(ChatInfo::new(chat_id));
+        self.tg.chat_info(chat_id, peer);
+    }
+
+    /// The chat `I` is about: the one under the cursor in the chat list,
+    /// else the one open.
+    fn info_chat(&self) -> Option<i64> {
+        match self.focus {
+            Focus::Chats => self.selected,
+            Focus::Topics => self.forum.as_ref().map(|f| f.chat_id),
+            Focus::Messages | Focus::Input => self.open.as_ref().map(|o| o.chat_id),
+        }
+    }
+
+    /// The `I` popup takes all keys while it's up: they go through the
+    /// members, and Enter writes to the one under the cursor.
+    fn on_info_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let Some(info) = self.chat_info.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => info.move_cursor(1),
+            KeyCode::Char('k') | KeyCode::Up => info.move_cursor(-1),
+            KeyCode::Char('d') if ctrl => info.move_cursor(HALF_PAGE),
+            KeyCode::Char('u') if ctrl => info.move_cursor(-HALF_PAGE),
+            KeyCode::Char('g') => info.move_cursor(isize::MIN),
+            KeyCode::Char('G') => info.move_cursor(isize::MAX),
+            KeyCode::Enter => self.write_to_member(),
+            KeyCode::Esc | KeyCode::Char('q' | 'I') => self.chat_info = None,
+            _ => {}
+        }
+        self.ask_members();
+    }
+
+    /// Asks for the next page of a supergroup's members in the `I` popup,
+    /// when one is wanted.
+    fn ask_members(&mut self) {
+        if let Some(info) = self.chat_info.as_mut()
+            && let Some((supergroup_id, offset)) = info.page_to_ask()
+        {
+            self.tg.chat_members(info.chat_id, supergroup_id, offset);
+        }
+    }
+
+    /// Enter on a member in the `I` popup: opens your chat with them,
+    /// creating it if there's none, or the channel posting in the group.
+    fn write_to_member(&mut self) {
+        let Some(who) = self
+            .chat_info
+            .as_ref()
+            .and_then(|i| i.current())
+            .map(|m| m.who)
+        else {
+            return;
+        };
+        self.chat_info = None;
+        match who {
+            Sender::User(user_id) => {
+                let name = self
+                    .users
+                    .get(&user_id)
+                    .cloned()
+                    .unwrap_or_else(|| "them".into());
+                self.finding = Some(Finding::new(&name));
+                self.tg.find_private_chat(user_id, name);
+            }
+            Sender::Chat(chat_id) => self.open_chat(chat_id),
+        }
+    }
+
     /// Files open in their default app once downloaded; links in the browser.
     fn open_target(&mut self, target: Target) {
         match target {
@@ -4839,6 +5249,7 @@ impl App {
             || self.timer_menu.is_some()
             || self.key_view.is_some()
             || self.photo_view.is_some()
+            || self.chat_info.is_some()
             || self.menu.is_some()
             || self.picker.is_some()
             || self.resizing.is_some()
@@ -5109,6 +5520,10 @@ impl App {
             self.status = Some("The paste came while a photo was open: p pastes again".into());
             return;
         }
+        if self.chat_info.is_some() {
+            self.status = Some("The paste came while the info was open: p pastes again".into());
+            return;
+        }
         match pasted.content {
             Ok(Paste::Files(paths)) => {
                 // Copied files have absolute paths; anything else would be
@@ -5359,7 +5774,8 @@ impl App {
         // Moved by hand: no page loading later takes the cursor away.
         open.unread_after = None;
         // `G` goes to the real newest message, not the newest loaded one.
-        if delta == isize::MAX && !open.at_newest {
+        if delta == isize::MAX && (!open.at_newest || matches!(open.loading, Some(Page::Around(_))))
+        {
             self.jump_to_newest();
             return;
         }
@@ -7660,5 +8076,232 @@ mod tests {
         command(&mut app, "logout");
         let lines = app.confirm.take().expect("asks").lines.join(" ");
         assert!(!lines.contains("secret chats"), "{lines}");
+    }
+
+    /// The open chat's message ids, oldest first.
+    fn message_ids(app: &App) -> Vec<i64> {
+        app.open
+            .as_ref()
+            .unwrap()
+            .messages
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn gu_goes_to_the_first_unread_message_and_ctrl_o_comes_back() {
+        let mut app = test_app("unread");
+        app.focus = Focus::Messages;
+        let (none, ctrl) = (KeyModifiers::NONE, KeyModifiers::CONTROL);
+        let cursor = |app: &App| app.open.as_ref().unwrap().selected;
+
+        press(&mut app, KeyCode::Char('g'), none);
+        press(&mut app, KeyCode::Char('u'), none);
+        assert_eq!(app.status.as_deref(), Some("No unread messages"));
+
+        // Opened with the second message the last one read.
+        let ids = message_ids(&app);
+        let read = ids[1];
+        let open = app.open.as_mut().unwrap();
+        open.unread_line = Some(read);
+        let first = open.first_unread(read).unwrap();
+        press(&mut app, KeyCode::Char('g'), none);
+        press(&mut app, KeyCode::Char('u'), none);
+        assert_eq!(cursor(&app), Some(first));
+        press(&mut app, KeyCode::Char('o'), ctrl);
+        assert_eq!(cursor(&app), None, "back on the newest");
+    }
+
+    #[test]
+    fn gm_goes_to_the_oldest_unread_mention_which_seeing_reads() {
+        let mut app = test_app("mentions");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        let chat = app.open.as_ref().unwrap().chat_id;
+        let ids = message_ids(&app);
+        let (older, newer) = (ids[1], ids[3]);
+        let cursor = |app: &App| app.open.as_ref().unwrap().selected;
+
+        // On the newest, following new ones, nothing is newer.
+        press(&mut app, KeyCode::Char('g'), none);
+        press(&mut app, KeyCode::Char('M'), none);
+        assert_eq!(app.status.as_deref(), Some("No newer mentions"));
+
+        // `gm` asks TDLib, which tests can't: what it asked is set here.
+        app.chats.set_mentions(chat, 2);
+        for id in [older, newer] {
+            let open = app.open.as_mut().unwrap();
+            open.messages.get_mut(&id).unwrap().mention = true;
+        }
+        app.open.as_mut().unwrap().mentions_asked = Some(Mentions::Unread);
+        // An answer for another chat, or to another question, moves nothing.
+        app.on_mentions((chat + 1, None), Mentions::Unread, Some(vec![newer]));
+        app.on_mentions((chat, None), Mentions::Before(0), Some(vec![newer]));
+        assert_eq!(cursor(&app), None);
+        app.on_mentions((chat, None), Mentions::Unread, Some(vec![newer, older]));
+        assert_eq!(cursor(&app), Some(older));
+        assert!(app.jumps.can_go_back(), "Ctrl-o comes back");
+        // Once more, nobody asked.
+        app.on_mentions((chat, None), Mentions::Unread, Some(vec![newer]));
+        assert_eq!(cursor(&app), Some(older));
+
+        // On screen, with nothing over it, it's read.
+        assert_eq!(app.mention_seen(), Some(older));
+        assert!(app.open.as_ref().unwrap().messages[&newer].mention);
+
+        // Seen ones, from the cursor back, or on.
+        app.open.as_mut().unwrap().mentions_asked = Some(Mentions::Before(older));
+        app.on_mentions((chat, None), Mentions::Before(older), Some(vec![]));
+        assert_eq!(app.status.as_deref(), Some("No older mentions"));
+        app.open.as_mut().unwrap().mentions_asked = Some(Mentions::After(older));
+        app.on_mentions(
+            (chat, None),
+            Mentions::After(older),
+            Some(vec![newer, older]),
+        );
+        assert_eq!(cursor(&app), Some(newer));
+    }
+
+    #[test]
+    fn gm_picks_the_oldest_unseen_mention_or_the_nearest_one_before_or_after() {
+        // Newest first, as TDLib finds them; a page from a message has it too.
+        let found = [90, 70, 50, 30];
+        assert_eq!(Mentions::Unread.pick(&found), Some(30));
+        assert_eq!(Mentions::Before(0).pick(&found), Some(90), "the newest");
+        assert_eq!(Mentions::Before(70).pick(&found), Some(50));
+        assert_eq!(Mentions::After(70).pick(&found), Some(90));
+        assert_eq!(Mentions::After(90).pick(&found), None);
+        assert_eq!(Mentions::Before(30).pick(&found), None);
+    }
+
+    #[test]
+    fn a_mention_is_not_read_under_a_popup_while_away_or_in_a_secret_chat() {
+        let mut app = test_app("mentions-unseen");
+        app.focus = Focus::Messages;
+        let id = message_ids(&app)[2];
+        let open = app.open.as_mut().unwrap();
+        open.selected = Some(id);
+        open.messages.get_mut(&id).unwrap().mention = true;
+        assert_eq!(app.mention_seen(), Some(id));
+
+        app.chat_info = Some(ChatInfo::new(1));
+        assert_eq!(app.mention_seen(), None, "a popup is over it");
+        app.chat_info = None;
+        app.terminal_focused = false;
+        assert_eq!(app.mention_seen(), None, "nobody is there");
+        app.terminal_focused = true;
+        app.focus = Focus::Input;
+        assert_eq!(app.mention_seen(), None, "writing");
+        app.focus = Focus::Messages;
+        app.open.as_mut().unwrap().loading = Some(Page::Around(id));
+        assert_eq!(app.mention_seen(), None, "on its way elsewhere");
+        app.open.as_mut().unwrap().loading = None;
+        // Seeing a voice message isn't playing it.
+        app.open
+            .as_mut()
+            .unwrap()
+            .messages
+            .get_mut(&id)
+            .unwrap()
+            .unplayed = true;
+        assert_eq!(app.mention_seen(), None, "not played");
+
+        // Read all at once on another device.
+        let chat = app.open.as_ref().unwrap().chat_id;
+        app.on_update(Update::ChatUnreadMentionCount(
+            tdlib_rs::types::UpdateChatUnreadMentionCount {
+                chat_id: chat,
+                unread_mention_count: 0,
+            },
+        ));
+        assert!(!app.open.as_ref().unwrap().messages[&id].mention);
+
+        // In a secret chat it would start the timers of what's before it.
+        let mut app = test_app("mentions-secret");
+        open_chardy(&mut app, Some(SecretState::Ready));
+        app.focus = Focus::Messages;
+        let open = app.open.as_mut().unwrap();
+        open.add_page(Page::Latest, crate::messages::tests::page([1, 2, 3]));
+        open.messages.get_mut(&2).unwrap().mention = true;
+        open.selected = Some(2);
+        assert_eq!(app.mention_seen(), None);
+    }
+
+    #[test]
+    fn nothing_is_read_under_the_info_popup_or_in_a_topic_not_known_yet() {
+        let mut app = test_app("info-read");
+        app.focus = Focus::Messages;
+        let chat = app.open.as_ref().unwrap().chat_id;
+        assert!(app.watching(chat));
+        // It's as tall as the pane, over the newest messages.
+        app.chat_info = Some(ChatInfo::new(chat));
+        assert!(!app.watching(chat));
+        app.chat_info = None;
+
+        // A topic opened from a link opens at its first unread message once
+        // TDLib says where that is; nothing is read before.
+        crate::demo::show_forum(&mut app);
+        app.focus = Focus::Messages;
+        let (forum, topic) = app.open.as_ref().unwrap().place();
+        assert!(app.watching(forum), "a topic that's loaded");
+        app.open.as_mut().unwrap().topic = topic.map(|t| t + 100);
+        assert!(!app.watching(forum));
+    }
+
+    #[test]
+    fn i_is_about_the_chat_under_the_cursor_or_the_one_open_and_goes_down_its_members() {
+        let mut app = test_app("info");
+        let none = KeyModifiers::NONE;
+        app.focus = Focus::Chats;
+        let listed = app.selected.unwrap();
+        assert_eq!(app.info_chat(), Some(listed));
+        app.focus = Focus::Messages;
+        let open = app.open.as_ref().map(|o| o.chat_id);
+        assert_eq!(app.info_chat(), open);
+
+        // TDLib's answer; a basic group's members come with it.
+        app.chat_info = Some(ChatInfo::new(listed));
+        assert!(app.busy(), "it takes the keys");
+        let member = |id| crate::info::Member {
+            who: Sender::User(id),
+            role: crate::info::Role::Member,
+            title: String::new(),
+        };
+        let about = crate::info::About {
+            roster: crate::info::Roster::All((1..=3).map(member).collect()),
+            ..Default::default()
+        };
+        app.on_tg(TgEvent::ChatInfo {
+            chat_id: listed + 1,
+            about: None,
+        });
+        assert!(!app.chat_info.as_ref().unwrap().failed, "another chat's");
+        app.on_tg(TgEvent::ChatInfo {
+            chat_id: listed,
+            about: Some(Box::new(about)),
+        });
+        let current = |app: &App| app.chat_info.as_ref().unwrap().current().map(|m| m.who);
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_eq!(current(&app), Some(Sender::User(2)));
+        press(&mut app, KeyCode::Char('G'), none);
+        assert_eq!(current(&app), Some(Sender::User(3)));
+        press(&mut app, KeyCode::Char('g'), none);
+        assert_eq!(current(&app), Some(Sender::User(1)));
+        let rows = screen(&mut app);
+        assert!(rows.iter().any(|r| r.contains("Members (3)")), "{rows:#?}");
+        // Files dropped on it would leave Insert mode under it.
+        let file = std::env::temp_dir().join("tuigram-test-info-drop.txt");
+        std::fs::write(&file, "notes").unwrap();
+        app.on_terminal_event(Event::Paste(file.display().to_string()));
+        assert!(app.focus == Focus::Messages, "not Insert mode");
+        assert!(app.open.as_ref().unwrap().attachments.is_empty());
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.chat_info.is_none());
+        assert!(app.focus == Focus::Messages);
+
+        crate::demo::show_forum(&mut app);
+        app.focus = Focus::Topics;
+        assert_eq!(app.info_chat(), app.forum.as_ref().map(|f| f.chat_id));
     }
 }

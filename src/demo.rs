@@ -696,6 +696,8 @@ fn msg(sender: i64, date: i32, text: &str) -> Msg {
         saveable: true,
         voice: None,
         service: None,
+        mention: false,
+        unplayed: false,
     }
 }
 

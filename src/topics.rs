@@ -82,6 +82,16 @@ impl Topic {
         new
     }
 
+    /// The id of its newest message that was sent; 0 if not known.
+    pub fn newest(&self) -> i64 {
+        self.newest
+    }
+
+    /// The last message read in it, before the unread ones.
+    pub fn read_inbox(&self) -> i64 {
+        self.read_inbox
+    }
+
     /// A topic made up for the demo and tests.
     pub fn local(id: i32, name: &str, color: u32, unread: i32, preview: &str) -> Self {
         Self {
@@ -229,7 +239,8 @@ impl Forum {
         Arrived::of(message, self.topic_of(message))
     }
 
-    fn general(&self) -> i32 {
+    /// The id of the General topic.
+    pub fn general(&self) -> i32 {
         self.topics
             .iter()
             .find(|t| t.general)

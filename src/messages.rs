@@ -24,7 +24,7 @@ use crate::search::MessageSearch;
 use crate::secret::Destruct;
 use crate::service::Service;
 use crate::text;
-use crate::tg::Page;
+use crate::tg::{Mentions, Page};
 use crate::voice::Voice;
 
 /// Download the smallest size at least this big (TDLib's "x", ~800px), sharp
@@ -247,6 +247,12 @@ pub struct Msg {
     /// What happened in the chat, when it's a service message: drawn in the
     /// middle, like a date, not in a bubble.
     pub service: Option<Service>,
+    /// It mentions you, or answers one of yours, and you haven't seen it:
+    /// `gm` goes to it, and seeing it reads it.
+    pub mention: bool,
+    /// A voice or video message nobody has played here: seeing it isn't
+    /// playing it, so its mention isn't read until it's played.
+    pub unplayed: bool,
 }
 
 /// A photo or video its sender wants seen only while it's open (view once,
@@ -1114,6 +1120,12 @@ impl From<Message> for Msg {
             saveable: message.can_be_saved,
             voice: body.voice,
             service,
+            mention: message.contains_unread_mention,
+            unplayed: match &message.content {
+                MessageContent::MessageVoiceNote(m) => !m.is_listened,
+                MessageContent::MessageVideoNote(m) => !m.is_viewed,
+                _ => false,
+            },
         }
     }
 }
@@ -1189,11 +1201,18 @@ pub struct OpenChat {
     /// That message, and its photo's file, until the photo is downloaded:
     /// only then is the sender told it was opened, and its timer started.
     pub opening: Option<(i64, i32)>,
-    /// In a secret chat opened with unread messages, the last one read:
-    /// the cursor goes to the first after it once it's loaded, since
-    /// reading them starts their self-destruct timers, and nothing is read
-    /// until the cursor gets to the newest.
+    /// The last message read before the first unread one the cursor is
+    /// on its way to, once it's loaded: in a chat opened with unread
+    /// messages, which opens there as in Telegram (in a secret chat, reading
+    /// them all at once would also start their self-destruct timers), and
+    /// after `gu`. Nothing is read until the cursor gets to the newest.
     pub unread_after: Option<i64>,
+    /// The last message read when the chat or topic was opened with unread
+    /// messages: "Unread messages" shows over the first after it, and `gu`
+    /// goes there, until it's left.
+    pub unread_line: Option<i64>,
+    /// What `gm` or `gM` asked TDLib for, while the answer is on its way.
+    pub mentions_asked: Option<Mentions>,
 }
 
 impl OpenChat {
@@ -1222,6 +1241,8 @@ impl OpenChat {
             viewing: None,
             opening: None,
             unread_after: None,
+            unread_line: None,
+            mentions_asked: None,
         }
     }
 
@@ -1682,25 +1703,85 @@ impl OpenChat {
         }
     }
 
-    /// A secret chat opened with unread messages: the cursor goes to the
-    /// first unread one loaded, until it's found. Not when that's the
-    /// newest, which is on screen anyway.
+    /// Opens at the first message after `read`, the last one read: nothing
+    /// counts as followed, so nothing is read, until a page reaches the
+    /// newest message and the cursor gets there.
+    pub fn open_at_unread(&mut self, read: i64) {
+        self.unread_line = Some(read);
+        self.unread_after = Some(read);
+        self.at_newest = false;
+    }
+
+    /// The first page of history to load: around where you read to, for a
+    /// chat that opens at its first unread message, else the newest. With
+    /// nothing read yet, the newest too, and older pages until the first.
+    pub fn first_page(&self) -> Page {
+        match self.unread_after {
+            Some(read) if read > 0 => Page::Around(read),
+            _ => Page::Latest,
+        }
+    }
+
+    /// The chat's newest message is `newest` (0 if it isn't known): once
+    /// the loaded messages reach it, new ones join them. A page around an
+    /// older message, or of newer ones, may well get there.
+    pub fn reached(&mut self, newest: i64) {
+        if newest > 0 && self.newest_id().is_some_and(|n| n >= newest) {
+            self.at_newest = true;
+        }
+    }
+
+    /// The loaded messages reach back to message `read`, or to the first
+    /// message of the chat.
+    fn reaches(&self, read: i64) -> bool {
+        self.all_loaded || self.oldest_id().is_some_and(|o| o <= read)
+    }
+
+    /// The loaded messages are where the first unread one after message
+    /// `read` is: they reach back to it, and on past it, or to the newest.
+    pub fn unread_loaded(&self, read: i64) -> bool {
+        self.reaches(read) && (self.at_newest || self.messages.range(read + 1..).next().is_some())
+    }
+
+    /// The first message someone else sent after message `read`, once the
+    /// loaded messages are known to reach back to it: the first unread one.
+    pub fn first_unread(&self, read: i64) -> Option<i64> {
+        if !self.reaches(read) {
+            return None;
+        }
+        self.messages
+            .range(read + 1..)
+            .find(|(_, m)| !m.outgoing)
+            .map(|(&id, _)| id)
+    }
+
+    /// On the way to the first unread message (a secret chat opened with
+    /// unread ones, or `gu`): the cursor goes there once it's loaded. Not
+    /// when that's the newest, which is on screen anyway, following new
+    /// ones.
     pub fn go_to_unread(&mut self) {
         let Some(read) = self.unread_after else {
             return;
         };
-        let Some(first) = self.messages.range(read + 1..).map(|(&id, _)| id).next() else {
+        if self.messages.range(read + 1..).next().is_none() {
             return;
-        };
-        let found = self.all_loaded || self.oldest_id().is_some_and(|o| o <= read);
-        self.selected = match () {
-            _ if found && self.at_newest && Some(first) == self.newest_id() => None,
-            _ if found => Some(first),
+        }
+        if !self.reaches(read) {
             // Maybe older still: as far as is loaded, for now.
-            _ => self.oldest_id(),
-        };
-        if found {
-            self.unread_after = None;
+            self.selected = self.oldest_id();
+            return;
+        }
+        // Only your own after it: the newest, then.
+        let first = self.first_unread(read).or(self.newest_id());
+        self.selected = first.filter(|&id| !(self.at_newest && Some(id) == self.newest_id()));
+        self.unread_after = None;
+    }
+
+    /// TDLib's `updateMessageMentionRead`: message `id` no longer mentions
+    /// you unseen.
+    pub fn set_mention_read(&mut self, id: i64) {
+        if let Some(msg) = self.messages.get_mut(&id) {
+            msg.mention = false;
         }
     }
 
@@ -1732,7 +1813,11 @@ impl OpenChat {
     /// Message `id` was opened, here or elsewhere: a voice message counts
     /// as played.
     pub fn set_opened(&mut self, id: i64) {
-        if let Some(voice) = self.messages.get_mut(&id).and_then(|m| m.voice.as_mut()) {
+        let Some(msg) = self.messages.get_mut(&id) else {
+            return;
+        };
+        msg.unplayed = false;
+        if let Some(voice) = msg.voice.as_mut() {
             voice.listened = true;
         }
     }
@@ -1761,12 +1846,17 @@ impl OpenChat {
             }
             self.pinned.retain(|p| p.id != *id);
             self.messages.remove(id);
-            if self.selected == Some(*id) {
-                self.selected = None;
-            }
             if self.reply.as_ref().is_some_and(|r| r.id == *id) {
                 self.reply = None;
             }
+        }
+        // The cursor goes to the message after the one deleted, else the
+        // one before, not back to following the newest: that would read
+        // what's between, unseen, and start its timers in a secret chat.
+        if let Some(gone) = self.selected.filter(|id| !self.messages.contains_key(id)) {
+            let next = self.messages.range(gone..).next();
+            let near = next.or_else(|| self.messages.range(..gone).next_back());
+            self.selected = near.map(|(&id, _)| id);
         }
     }
 
@@ -1836,7 +1926,7 @@ pub fn test_secret_photo(after: i32) -> Msg {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn video(format: ThumbnailFormat, caption: &str) -> MessageContent {
@@ -2412,7 +2502,7 @@ mod tests {
     }
 
     /// A page of plain messages with these ids.
-    pub(super) fn page(ids: impl IntoIterator<Item = i64>) -> Vec<(i64, Msg)> {
+    pub(crate) fn page(ids: impl IntoIterator<Item = i64>) -> Vec<(i64, Msg)> {
         ids.into_iter()
             .map(|id| {
                 let msg = Msg {
@@ -2445,6 +2535,8 @@ mod tests {
                     saveable: true,
                     voice: None,
                     service: None,
+                    mention: false,
+                    unplayed: false,
                 };
                 (id, msg)
             })
@@ -2855,6 +2947,83 @@ mod tests {
         open.go_to_unread();
         assert_eq!(open.selected, Some(3));
         assert_eq!(open.unread_after, None);
+    }
+
+    #[test]
+    fn the_first_unread_message_is_the_first_from_someone_else_once_loaded_back_to_it() {
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page(6..=9));
+        open.messages.get_mut(&7).unwrap().outgoing = true;
+        assert_eq!(open.first_unread(6), Some(8), "not your own");
+        assert_eq!(open.first_unread(3), None, "maybe older still");
+        assert!(!open.unread_loaded(3));
+        assert!(open.unread_loaded(6));
+
+        // `gu` loads the messages around it, and goes to it once they're in.
+        open.unread_after = Some(3);
+        open.add_page(Page::Around(3), page(1..=5));
+        open.go_to_unread();
+        assert_eq!(open.selected, Some(4));
+        assert_eq!(open.unread_after, None);
+        assert!(!open.at_newest);
+    }
+
+    #[test]
+    fn a_chat_with_unread_messages_opens_at_the_first_and_knows_when_it_reaches_the_newest() {
+        let mut open = OpenChat::new(1);
+        assert_eq!(open.first_page(), Page::Latest);
+        open.unread_after = Some(0);
+        assert_eq!(open.first_page(), Page::Latest, "nothing read yet");
+        open.unread_after = Some(5);
+        assert_eq!(open.first_page(), Page::Around(5));
+
+        // The page around it reaches the newest message: new ones join it,
+        // and the cursor waits on the first unread one.
+        open.add_page(Page::Around(5), page(1..=9));
+        assert!(!open.at_newest);
+        open.reached(12);
+        assert!(!open.at_newest, "not that far");
+        open.reached(0);
+        assert!(!open.at_newest, "nor when the newest isn't known");
+        open.reached(9);
+        assert!(open.at_newest);
+        open.go_to_unread();
+        assert_eq!(open.selected, Some(6));
+
+        // Only the newest unread: it's on screen, followed, read at once.
+        let mut open = OpenChat::new(1);
+        open.unread_after = Some(8);
+        open.add_page(Page::Around(8), page(1..=9));
+        open.reached(9);
+        open.go_to_unread();
+        assert_eq!(open.selected, None);
+    }
+
+    #[test]
+    fn deleting_the_message_under_the_cursor_moves_it_to_the_next_not_the_newest() {
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page(1..=5));
+        open.selected = Some(3);
+        open.remove(&[3, 4]);
+        assert_eq!(
+            open.selected,
+            Some(5),
+            "following the newest would read them"
+        );
+        open.remove(&[5]);
+        assert_eq!(open.selected, Some(2), "else the one before");
+        open.selected = None;
+        open.remove(&[2]);
+        assert_eq!(open.selected, None, "following stays following");
+    }
+
+    #[test]
+    fn a_chat_opened_at_unread_follows_nothing_until_a_page_reaches_the_newest() {
+        let mut open = OpenChat::new(1);
+        open.open_at_unread(5);
+        assert!(!open.at_newest, "what arrives meanwhile isn't taken");
+        assert_eq!((open.unread_line, open.unread_after), (Some(5), Some(5)));
+        assert_eq!(open.first_page(), Page::Around(5));
     }
 
     #[test]

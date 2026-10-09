@@ -39,6 +39,8 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Bot buttons.** A bot's buttons show under its message. `Enter` lists them to press: the bot answers, a link opens (asking first), and a reply button sends its words.
 - **Pinned messages.** `P` pins a message (for both of you or just you, with or without notifying a group) or unpins it. A bar over the chat shows the newest pinned message, and `gp` lists them all to jump to.
 - **Jump back.** `Ctrl-o` goes back to the chat you were in before, as in vim, and `Ctrl-i` forward again.
+- **Catch up.** Chats open at the first message you haven't read, under a line that says so, as in Telegram, and nothing is marked read until you get to the newest. `gu` jumps back to that line. Chats where someone mentioned you or answered you show an `@`, and `gm` goes to each of those messages in turn, then back through the ones you'd already seen (`gM` goes forward).
+- **Who's who.** `I` shows what a chat is: a person's username, phone and bio, or a group's description and its members, with when they were last seen and who the admins are. `Enter` on someone opens your chat with them.
 - **Feels like Telegram.** Message bubbles with yours on the right, sender names in color, **bold**, *italic*, `code` and spoilers (hidden until `Enter`), reactions under them, ✓ / ✓✓ when yours are sent and read, date separators, "typing…" while someone writes to you, when they were last seen, and unread chats on top.
 - **Open anything.** Press `Enter` on a photo to see it as big as the window allows, right in tuigram: `h` / `l` go through the chat's photos, `j` / `k` zoom in and out, and `o` opens it in your default app, or on a video, file or link to open it in your default app. Telegram links (`t.me/…`) open right in tuigram: the chat, the message, or an invite, which asks before joining.
 - **Voice messages.** They show their waveform and length. `Enter` plays one right in tuigram and pauses it, and the sender sees you listened, as in Telegram.
@@ -167,7 +169,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `j` / `k` | Move down / up |
 | `gg` / `G` | Jump to top / bottom |
 | `Ctrl-d` / `Ctrl-u` | Half a page down / up |
-| `Enter` / `l` | Open a chat (a forum shows its topics: `Enter` opens one); show a photo as big as the window allows (`h` / `l` the one before / after it, `j` / `k` zoom in / out, up to filling the window, `o` opens it in your default app and `y` copies it, unless the chat doesn't allow saving, `Esc` closes it); or open the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens). On a message with spoilers, `Enter` shows them first; on a voice message, it plays it in tuigram, and pauses it; on a poll, it votes; on a bot's message, it lists its buttons, then the message's file and links (`h/j/k/l` choose, `Enter` presses); a `t.me` link opens in tuigram |
+| `Enter` / `l` | Open a chat, at its first unread message if it has some (a forum shows its topics: `Enter` opens one); show a photo as big as the window allows (`h` / `l` the one before / after it, `j` / `k` zoom in / out, up to filling the window, `o` opens it in your default app and `y` copies it, unless the chat doesn't allow saving, `Esc` closes it); or open the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens). On a message with spoilers, `Enter` shows them first; on a voice message, it plays it in tuigram, and pauses it; on a poll, it votes; on a bot's message, it lists its buttons, then the message's file and links (`h/j/k/l` choose, `Enter` presses); a `t.me` link opens in tuigram |
 | `Tab` / `Shift-Tab` | In the chat list: your next / previous folder, in Telegram's order, then the archive. With folders, they're tabs over the list, each with its count of unread chats |
 | `h` / `Esc` | Back to the chat list, or from a topic to its forum's topics. To have the list on the right, tick **On the right side of the window** in `?` > **Settings**; `h` and `l` then swap, to follow the screen |
 | `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line. `@name` or `:emoji` shows suggestions, and so does `/` starting a message (the bots' commands); `Tab` puts one in. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
@@ -179,6 +181,9 @@ The status bar always shows the keys for where you are. The essentials:
 | `R` | React to the selected message: pick an emoji, or type `/` and its name (`heart`, `+1`); `Enter` on one of yours takes it back |
 | `X` | Take back all your reactions to the selected message, without the popup |
 | `gd` | Go to the message a reply answers |
+| `gu` | Go back to the first unread message, under the "Unread messages" line (`Ctrl-o` comes back). Chats open there anyway |
+| `gm` / `gM` | Go to the oldest message that mentions you or answers yours and that you haven't seen; seeing it reads it, so `gm` again goes to the next. Chats with some show `@` in the list. Once you've seen them all, `gm` goes back through the ones before the cursor, and `gM` on to the ones after it |
+| `I` | What the chat is: a person's username, phone and bio, or a group's or channel's description and members (`j` / `k` go through them, `Enter` opens your chat with one). Also `:info` |
 | `Ctrl-o` / `Ctrl-i` | Back to the chat you left, or the reply `gd` left, as in vim / forward again. Most terminals send `Ctrl-i` as `Tab`: in a chat, `Tab` goes forward too, and in the chat list it switches folders |
 | `d` | Delete the selected message, for everyone or just you (asks first) |
 | `P` | Pin the selected message: in a chat with one person, for both of you or just you; in a group or channel, with or without a notification. On a pinned message, unpins it. Pinned messages show 📌 by their time, and the newest is in a bar over the chat |
@@ -189,7 +194,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `p` / `m` | Pin the selected chat to the top, or mute it, on Telegram, so your phone shows the same; again to undo. Pinned chats show 📌, muted ones 🔕 and a grey unread count |
 | `s` | Find a chat or person: type a name, an `@username` or a `t.me` link, then `Enter` opens it. In a public group or channel you're not in, `i` asks to join |
 | `Ctrl-r` | Resize the panes: `h` / `l` move the line between them left / right, `=` puts it back as at first, `Enter` keeps it (also next time), `Esc` cancels. In a forum's topics, it resizes their pane |
-| `:` | Run a command, typed in full (`Tab` completes the name, and goes on to the next one that fits): `:leave` leaves the group or channel, or ends a secret chat (asks first), `:logout` logs out of Telegram on this computer (asks first), and `:secret`, `:key` and `:timer` for [secret chats](#secret-chats) |
+| `:` | Run a command, typed in full (`Tab` completes the name, and goes on to the next one that fits): `:leave` leaves the group or channel, or ends a secret chat (asks first), `:logout` logs out of Telegram on this computer (asks first), `:info` shows what the chat is and who's in it, and `:secret`, `:key` and `:timer` for [secret chats](#secret-chats) |
 | `?` | Every shortcut, plus settings and themes |
 | `q` | Quit |
 
@@ -263,7 +268,7 @@ Sixteen `[palette]` colors make a whole theme: `bg`, `bg_alt`, `surface`, `overl
 | `accent` | The pane in use, cursors, popups | `accent` |
 | `selection` | The selected row | `surface` |
 | `popup_bg` | Popups | `bg_alt` |
-| `primary` | Unread counts, NORMAL, Saved Messages | `blue` |
+| `primary` | Unread counts, the "Unread messages" line, NORMAL, Saved Messages | `blue` |
 | `highlighted` | Chats you highlighted with `H` | `orange` |
 | `insert`, `command`, `search` | INSERT, COMMAND and SEARCH; search matches | `green`, `purple`, `yellow` |
 | `error` | Errors, messages that failed to send, deleting | `red` |

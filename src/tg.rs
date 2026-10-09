@@ -19,6 +19,7 @@ use tokio::sync::mpsc::error::SendError;
 
 use crate::chats::{Badge, List, Peer};
 use crate::config::{ApiKeys, Config};
+use crate::info::{self, About, Member};
 use crate::messages::Sender;
 use crate::reactions::{self, Available, ReactionKind};
 use crate::search::{Has, Query, Who};
@@ -180,6 +181,27 @@ pub enum TgEvent {
         link: String,
         invite: Invite,
     },
+    /// Messages in a chat, or a forum's topic, that mention you or answer
+    /// yours, as `ask` asked for them, for `gm` and `gM`; `None` if TDLib
+    /// couldn't say.
+    Mentions {
+        chat_id: i64,
+        topic: Option<i32>,
+        ask: Mentions,
+        ids: Option<Vec<i64>>,
+    },
+    /// What a chat is, for the `I` popup; `None` if TDLib couldn't say.
+    ChatInfo {
+        chat_id: i64,
+        about: Option<Box<About>>,
+    },
+    /// A page of a supergroup's or channel's members from `offset` on, for
+    /// the `I` popup; `None` if TDLib couldn't send it.
+    ChatMembers {
+        chat_id: i64,
+        offset: i32,
+        members: Option<Vec<Member>>,
+    },
 }
 
 /// Where a chat looked up to open leads: the chat, and in a forum maybe a
@@ -242,6 +264,31 @@ pub enum Page {
     Around(i64),
 }
 
+/// Which messages that mention you, or answer yours, `gm` and `gM` ask
+/// for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mentions {
+    /// The ones you haven't seen.
+    Unread,
+    /// Seen or not, older than this message; 0 for the newest of all.
+    Before(i64),
+    /// Seen or not, newer than this message.
+    After(i64),
+}
+
+impl Mentions {
+    /// Where the answer goes, of the messages TDLib found: the oldest
+    /// unseen one, or the nearest one before or after.
+    pub fn pick(self, ids: &[i64]) -> Option<i64> {
+        let ids = ids.iter().copied();
+        match self {
+            Mentions::Unread => ids.min(),
+            Mentions::Before(from) => ids.filter(|&id| from == 0 || id < from).max(),
+            Mentions::After(from) => ids.filter(|&id| id > from).min(),
+        }
+    }
+}
+
 /// Messages matching a search, newest first.
 pub struct Found {
     pub ids: Vec<i64>,
@@ -277,6 +324,9 @@ const PINNED_PAGES: usize = 5;
 
 /// Stickers a search in the sticker panel asks for.
 const STICKER_SEARCH_LIMIT: i32 = 100;
+/// Mentions `gm` and `gM` ask for at once, TDLib's most: `gm` goes to
+/// the oldest unseen one.
+const MENTIONS_PAGE: i32 = 100;
 /// Members an `@` completion asks for.
 const MEMBER_SEARCH_LIMIT: i32 = 20;
 /// Contacts a search in the `s` picker asks for.
@@ -799,6 +849,143 @@ impl Tg {
                 topic,
                 request,
                 messages: Some(messages),
+            });
+        });
+    }
+
+    /// Asks for messages that mention you, or answer yours, in a chat or
+    /// one of a forum's topics: those you haven't seen, or a page of all of
+    /// them from a message on, older or newer. The answer is
+    /// [`TgEvent::Mentions`].
+    /// `general` is the forum's General topic, where messages TDLib names
+    /// no topic for are.
+    pub fn mentions(&self, chat_id: i64, topic: Option<i32>, general: i32, ask: Mentions) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        // A negative offset adds that many messages newer than `from`.
+        let (filter, from, offset) = match ask {
+            Mentions::Unread => (enums::SearchMessagesFilter::UnreadMention, 0, 0),
+            Mentions::Before(id) => (enums::SearchMessagesFilter::Mention, id, 0),
+            Mentions::After(id) => (enums::SearchMessagesFilter::Mention, id, 1 - MENTIONS_PAGE),
+        };
+        tokio::spawn(async move {
+            let search = |topic| {
+                functions::search_chat_messages(
+                    chat_id,
+                    forum_topic(topic),
+                    String::new(),
+                    None,
+                    from,
+                    offset,
+                    MENTIONS_PAGE,
+                    Some(filter.clone()),
+                    client_id,
+                )
+            };
+            // TDLib may not narrow these filters to a topic: then the
+            // forum's are asked for, and the topic's kept.
+            let mut result = search(topic).await;
+            if result.is_err() && topic.is_some() {
+                result = search(None).await;
+            }
+            let ids = match result {
+                Ok(enums::FoundChatMessages::FoundChatMessages(found)) => Some(
+                    found
+                        .messages
+                        .iter()
+                        .filter(|m| topic.is_none_or(|t| topic_of(m, general) == t))
+                        .map(|m| m.id)
+                        .collect(),
+                ),
+                Err(e) => {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    None
+                }
+            };
+            let _ = tx.send(TgEvent::Mentions {
+                chat_id,
+                topic,
+                ask,
+                ids,
+            });
+        });
+    }
+
+    /// Asks what a chat is, as [`TgEvent::ChatInfo`]: a person's profile, or
+    /// a group's or channel's description, with a basic group's members.
+    pub fn chat_info(&self, chat_id: i64, peer: Peer) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let about = match peer {
+                Peer::User(id) => match functions::get_user(id, client_id).await {
+                    Ok(enums::User::User(user)) => {
+                        let full = functions::get_user_full_info(id, client_id).await;
+                        let full = full.ok().map(|enums::UserFullInfo::UserFullInfo(f)| f);
+                        Ok(About::of_user(&user, full.as_ref()))
+                    }
+                    Err(e) => Err(e),
+                },
+                Peer::BasicGroup(id) => match functions::get_basic_group(id, client_id).await {
+                    Ok(enums::BasicGroup::BasicGroup(group)) => {
+                        let full = functions::get_basic_group_full_info(id, client_id).await;
+                        let full = full
+                            .ok()
+                            .map(|enums::BasicGroupFullInfo::BasicGroupFullInfo(f)| f);
+                        Ok(About::of_basic_group(&group, full.as_ref()))
+                    }
+                    Err(e) => Err(e),
+                },
+                Peer::Supergroup(id) => match functions::get_supergroup(id, client_id).await {
+                    Ok(enums::Supergroup::Supergroup(group)) => {
+                        let full = functions::get_supergroup_full_info(id, client_id).await;
+                        let full = full
+                            .ok()
+                            .map(|enums::SupergroupFullInfo::SupergroupFullInfo(f)| f);
+                        Ok(About::of_supergroup(&group, full.as_ref()))
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+            let about = match about {
+                Ok(about) => Some(Box::new(about)),
+                Err(e) => {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    None
+                }
+            };
+            let _ = tx.send(TgEvent::ChatInfo { chat_id, about });
+        });
+    }
+
+    /// Fetches a page of a supergroup's or channel's members, the most
+    /// recently active first, as [`TgEvent::ChatMembers`]. TDLib sends the
+    /// users first.
+    pub fn chat_members(&self, chat_id: i64, supergroup_id: i64, offset: i32) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let result = functions::get_supergroup_members(
+                supergroup_id,
+                None,
+                offset,
+                info::MEMBERS_PAGE,
+                client_id,
+            )
+            .await;
+            let members = match result {
+                Ok(enums::ChatMembers::ChatMembers(page)) => {
+                    Some(page.members.iter().filter_map(Member::of).collect())
+                }
+                Err(e) => {
+                    let _ = tx.send(TgEvent::Error(e.message));
+                    None
+                }
+            };
+            let _ = tx.send(TgEvent::ChatMembers {
+                chat_id,
+                offset,
+                members,
             });
         });
     }
@@ -1976,6 +2163,14 @@ impl Found {
         if ask.before.is_some() || ask.after.is_some() {
             self.total = -1;
         }
+    }
+}
+
+/// The forum topic a message is in: `general` for one TDLib gives none.
+fn topic_of(message: &types::Message, general: i32) -> i32 {
+    match &message.topic_id {
+        Some(enums::MessageTopic::Forum(t)) => t.forum_topic_id,
+        _ => general,
     }
 }
 
