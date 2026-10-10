@@ -23,6 +23,7 @@ mod service;
 mod settings;
 mod sound;
 mod stickers;
+mod term;
 mod text;
 mod tg;
 mod theme;
@@ -67,7 +68,7 @@ async fn main() -> Result<()> {
     clipboard::clean_outbox(&outbox);
     let tg = tg::Tg::start(config, tx).await?;
 
-    let mut terminal = ratatui::init();
+    let mut terminal = term::init();
     // The title shows unread chats while tuigram runs, then goes back.
     notify::send(notify::SAVE_TITLE);
     notify::send(&notify::title(0));

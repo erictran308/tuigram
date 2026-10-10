@@ -6,7 +6,6 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use ratatui::DefaultTerminal;
 use ratatui::style::Style;
 use ratatui_textarea::{DataCursor, TextArea};
 use tdlib_rs::enums::{
@@ -40,6 +39,7 @@ use crate::search::{self, MessageSearch, Who};
 use crate::secret::{KeyView, Secret, SecretState, TimerMenu};
 use crate::settings::{self, Settings, Side};
 use crate::stickers::{self, Source, StickerPanel};
+use crate::term::Terminal;
 use crate::text;
 use crate::tg::{Deletable, EditText, Found, Invite, Mentions, Missed, Page, Tagged, Tg, TgEvent};
 use crate::theme::{Colors, Corners, Themes};
@@ -975,7 +975,7 @@ impl App {
 
     pub async fn run(
         mut self,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut Terminal,
         mut events: UnboundedReceiver<Tagged>,
         mut image_events: UnboundedReceiver<ImageEvent>,
         mut clipboard: UnboundedReceiver<ClipboardEvent>,

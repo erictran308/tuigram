@@ -183,7 +183,7 @@ async fn show(dir: &Path) -> Result<()> {
         photos.push((file_id, path.to_string_lossy().into_owned()));
     }
 
-    let mut terminal = ratatui::init();
+    let mut terminal = crate::term::init();
     crate::tmux::save();
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     let (image_tx, mut image_rx) = unbounded_channel();
