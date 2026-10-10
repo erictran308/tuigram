@@ -29,6 +29,8 @@ const PHOTO_ROWS: u16 = 2;
 const MIN_WIDTH_FOR_PHOTOS: u16 = 24;
 /// After a muted chat's name.
 const MUTED: &str = " 🔕";
+/// After the name of a chat the MTProto proxy in use put in the list.
+const SPONSORED: &str = " proxy sponsor";
 /// On the right of a pinned chat with nothing unread.
 const PINNED: &str = "📌";
 /// In place of the count of a chat marked as unread, with nothing in it
@@ -166,14 +168,19 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
             let mark = chats.badge(id);
             let mark_w = mark.map_or(0, |m| m.mark().width());
             let mute_w = if muted { MUTED.width() } else { 0 };
+            // Like Telegram's verdict, the title is cut to leave room for
+            // it, so a long one can't hide it.
+            let sponsored = chats.sponsored(id);
+            let sponsored_w = if sponsored { SPONSORED.width() } else { 0 };
             let secret = chats.is_secret(id);
             let lock_w = if secret { LOCK_WIDTH } else { 0 };
             let badge_w: usize = badges.iter().map(|b| b.content.width()).sum();
             let title = truncate(
                 title,
-                width.saturating_sub(lock_w + badge_w + mark_w + mute_w + 1),
+                width.saturating_sub(lock_w + badge_w + mark_w + sponsored_w + mute_w + 1),
             );
-            let pad = width.saturating_sub(lock_w + title.width() + mark_w + mute_w + badge_w);
+            let pad = width
+                .saturating_sub(lock_w + title.width() + mark_w + sponsored_w + mute_w + badge_w);
             let style = title_style(chats, id, colors).bold();
             let mut first = vec![bar.clone(), gap.clone()];
             if secret {
@@ -182,6 +189,9 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
             first.extend(highlight(&title, filter, style, colors));
             if let Some(mark) = mark {
                 first.push(super::badge_span(mark, colors));
+            }
+            if sponsored {
+                first.push(Span::from(SPONSORED).fg(colors.muted));
             }
             if muted {
                 first.push(Span::from(MUTED).fg(colors.muted));
@@ -431,6 +441,50 @@ mod tests {
             rows.iter().any(|r| r.contains("Telegram SCAM")),
             "{rows:#?}"
         );
+    }
+
+    #[test]
+    fn a_chat_the_proxy_put_in_the_list_says_so_however_long_its_name() {
+        use tdlib_rs::enums::{ChatList, ChatSource};
+        use tdlib_rs::types::ChatPosition;
+        let mut chats = Chats::default();
+        chats.add_local(1, "Friends", None);
+        chats.add_local(2, &"Free Fast VPN News ".repeat(4), None);
+        let sponsored = ChatPosition {
+            list: ChatList::Main,
+            order: 5000,
+            is_pinned: false,
+            source: Some(ChatSource::MtprotoProxy),
+        };
+        chats.set_position(2, &sponsored);
+        chats.refresh();
+        let colors = Colors::default();
+        let buf = render(
+            &list(&chats, None),
+            &mut images(ProtocolType::Halfblocks),
+            40,
+            10,
+        );
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let y = rows
+            .iter()
+            .position(|r| r.contains("proxy sponsor"))
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        assert!(rows[y].contains("Free Fast"), "{rows:#?}");
+        let x = (0..buf.area.width)
+            .find(|&x| buf[(x, y as u16)].symbol() == "p")
+            .unwrap();
+        assert_eq!(buf[(x, y as u16)].fg, colors.muted);
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("proxy sponsor")).count(),
+            1,
+            "only that one: {rows:#?}"
+        );
+        // It isn't one of yours, to forward to or find in your chats.
+        assert_eq!(chats.matching(""), [1]);
+        assert!(chats.listed(1) && !chats.listed(2));
     }
 
     #[test]

@@ -13,6 +13,9 @@ const TELEGRAM_HOSTS: [&str; 3] = ["t.me", "telegram.me", "telegram.dog"];
 const MAX_HOST: usize = 253;
 /// More than any MTProto secret, or a user name or password, needs.
 const MAX_SECRET: usize = 512;
+/// The longest site a fake-TLS secret can pose as, as in TDLib
+/// (`ProxySecret::MAX_DOMAIN_LENGTH`).
+const MAX_SECRET_DOMAIN: usize = 182;
 
 /// What a link says to use, or why it can't be used.
 pub fn parse(link: &str) -> Result<Proxy, String> {
@@ -60,7 +63,7 @@ pub fn parse(link: &str) -> Result<Proxy, String> {
                 return Err("The link has no secret".into());
             }
             ProxyType::Mtproto(ProxyTypeMtproto {
-                secret: secret_text(secret)?,
+                secret: mtproto_secret(secret)?,
             })
         }
         Kind::Socks5 => ProxyType::Socks5(ProxyTypeSocks5 {
@@ -209,6 +212,43 @@ fn secret_text(text: String) -> Result<String, String> {
     Ok(text)
 }
 
+/// An MTProto proxy's secret, if TDLib would take it
+/// (`ProxySecret::from_link`): hex, base64url or base64 of 16 bytes, of
+/// 0xdd and 16 bytes, or of 0xee, 16 bytes and the site it poses as.
+/// Refused here, the reason is said before anything connects; refused by
+/// TDLib, its proxies would stay as they were.
+fn mtproto_secret(text: String) -> Result<String, String> {
+    use base64::Engine;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    // TDLib takes base64url with or without its padding.
+    const URL_SAFE: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    let text = secret_text(text)?;
+    let bytes = hex(&text)
+        .or_else(|| URL_SAFE.decode(&text).ok())
+        .or_else(|| base64::engine::general_purpose::STANDARD.decode(&text).ok())
+        .ok_or("The proxy's secret isn't hex or base64")?;
+    match (bytes.len(), bytes.first()) {
+        (16, _) | (17, Some(0xdd)) => Ok(text),
+        (18.., Some(0xee)) if bytes.len() <= 17 + MAX_SECRET_DOMAIN => Ok(text),
+        _ => Err("The proxy's secret isn't one Telegram's proxies use".into()),
+    }
+}
+
+/// `text` read as hex digits, two to a byte.
+fn hex(text: &str) -> Option<Vec<u8>> {
+    let digits: Vec<u8> = text
+        .chars()
+        .map(|c| c.to_digit(16).map(|d| d as u8))
+        .collect::<Option<_>>()?;
+    digits
+        .len()
+        .is_multiple_of(2)
+        .then(|| digits.chunks(2).map(|p| p[0] << 4 | p[1]).collect())
+}
+
 /// Undoes `%XX` escapes, and `+` for a space as forms write it.
 fn decode(text: &str) -> Result<String, String> {
     let bytes = text.as_bytes();
@@ -241,6 +281,9 @@ fn decode(text: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// A fake-TLS secret posing as example.com.
+    const SECRET: &str = "ee0123456789abcdef0123456789abcdef6578616d706c652e636f6d";
+
     fn socks(username: &str, password: &str) -> ProxyType {
         ProxyType::Socks5(ProxyTypeSocks5 {
             username: username.into(),
@@ -269,18 +312,19 @@ mod tests {
     #[test]
     fn telegrams_proxy_links_are_read_wherever_they_come_from() {
         for link in [
-            "https://t.me/proxy?server=1.2.3.4&port=443&secret=ee0123abcd",
-            "t.me/proxy?port=443&secret=ee0123abcd&server=1.2.3.4",
-            "tg://proxy?server=1.2.3.4&port=443&secret=ee0123abcd",
-            "https://www.telegram.me/proxy/?server=1.2.3.4&port=443&secret=ee0123abcd#x",
+            format!("https://t.me/proxy?server=1.2.3.4&port=443&secret={SECRET}"),
+            format!("t.me/proxy?port=443&secret={SECRET}&server=1.2.3.4"),
+            format!("tg://proxy?server=1.2.3.4&port=443&secret={SECRET}"),
+            format!("https://www.telegram.me/proxy/?server=1.2.3.4&port=443&secret={SECRET}#x"),
         ] {
+            let link = link.as_str();
             let proxy = parse(link).unwrap();
             assert_eq!(proxy.server, "1.2.3.4", "{link}");
             assert_eq!(proxy.port, 443);
             let ProxyType::Mtproto(m) = &proxy.r#type else {
                 panic!("{link}");
             };
-            assert_eq!(m.secret, "ee0123abcd");
+            assert_eq!(m.secret, SECRET);
             assert!(is_link(link));
         }
         let proxy = parse("https://t.me/socks?server=h.example&port=1080&user=a&pass=b").unwrap();
@@ -303,5 +347,49 @@ mod tests {
         assert!(why("tg://proxy?port=443&secret=ee").contains("no server"));
         assert!(why("socks5://a%0Ab@host:1080").contains("can't be used"));
         assert!(why("socks5://a%zzb@host:1080").contains("two hex digits"));
+    }
+
+    #[test]
+    fn an_mtproto_secret_is_taken_only_as_tdlib_would_take_it() {
+        use base64::Engine;
+        let link = |secret: &str| format!("tg://proxy?server=1.2.3.4&port=443&secret={secret}");
+        let plain = "0123456789abcdef0123456789ABCDEF";
+        let fake_tls = hex(SECRET).unwrap();
+        let base64url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&fake_tls);
+        let padded = base64::engine::general_purpose::URL_SAFE.encode(&fake_tls);
+        let base64 = base64::engine::general_purpose::STANDARD.encode(&fake_tls);
+        let base64 = base64
+            .replace('+', "%2B")
+            .replace('/', "%2F")
+            .replace('=', "%3D");
+        for secret in [
+            plain,
+            &format!("dd{plain}"),
+            SECRET,
+            &base64url,
+            &padded,
+            &base64,
+        ] {
+            assert!(parse(&link(secret)).is_ok(), "{secret}");
+        }
+
+        let why = |secret: &str| parse(&link(secret)).unwrap_err();
+        assert!(why("ee0123abcd").contains("isn't one"), "too short");
+        assert!(
+            why(&format!("ab{plain}")).contains("isn't one"),
+            "17 bytes, not dd"
+        );
+        assert!(
+            why(&format!("dd{plain}00")).contains("isn't one"),
+            "18 bytes, not ee"
+        );
+        let site = "ab".repeat(MAX_SECRET_DOMAIN);
+        assert!(parse(&link(&format!("ee{plain}{site}"))).is_ok());
+        assert!(
+            why(&format!("ee{plain}{site}ab")).contains("isn't one"),
+            "too long"
+        );
+        assert!(why("not a secret!").contains("isn't hex or base64"));
+        assert_eq!(hex("+1"), None, "a sign isn't a digit");
     }
 }

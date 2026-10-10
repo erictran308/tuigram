@@ -304,9 +304,9 @@ Where Telegram is blocked, tuigram can connect through a proxy. Type `:proxy` an
 - `http://host:3128`
 - a Telegram proxy link: `https://t.me/proxy?server=…&port=…&secret=…`, or `t.me/socks?…`
 
-`Enter` on a proxy link in a message asks to use it, naming the server. A proxy sees your IP address and when you use Telegram, but not your messages, which are encrypted to Telegram's servers.
+`Enter` on a proxy link in a message asks to use it, naming the server. A proxy sees your IP address and when you use Telegram, but not your messages, which are encrypted to Telegram's servers. An MTProto proxy can also put a channel it promotes in your chat list, marked "proxy sponsor".
 
-To log in through one, set it before starting tuigram: `TG_PROXY=socks5://host:1080 tuigram`, or `proxy = "socks5://host:1080"` in `settings.toml` (in [your data folder](#your-data)). `TG_PROXY` wins over the saved one. The status bar says "Connecting…" or "Waiting for network…" while Telegram can't be reached.
+To log in through one, set it before starting tuigram: `TG_PROXY=socks5://host:1080 tuigram`, or `proxy = "socks5://host:1080"` in `settings.toml` (in [your data folder](#your-data)). `TG_PROXY` wins over the saved one. If the proxy set can't be used, tuigram says why and doesn't connect at all until it's fixed. The status bar says "Connecting…" or "Waiting for network…" while Telegram can't be reached.
 
 ## Your data
 

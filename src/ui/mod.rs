@@ -247,10 +247,10 @@ fn draw_login(frame: &mut Frame, login: &Login, connection: Option<&str>, colors
     }
     // A build from source points to the ready-made app, which needs no key.
     let source_build = config::built_in_keys().is_none();
-    let help_rows = if matches!(login.step, LoginStep::ApiId) && source_build {
-        4
-    } else {
-        3
+    let help_rows = match login.step {
+        LoginStep::ApiId if source_build => 4,
+        LoginStep::BadProxy { .. } => 4,
+        _ => 3,
     };
     let area = center(frame.area(), 64, 9 + help_rows);
     let block = bordered(colors)
@@ -323,6 +323,13 @@ fn draw_login(frame: &mut Frame, login: &Login, connection: Option<&str>, colors
             format!("Open this link on a logged-in device: {link}"),
         ),
         LoginStep::Unsupported(why) => ("Can't log in here".into(), (*why).into()),
+        LoginStep::BadProxy { from, why } => (
+            format!("Can't use {from}"),
+            format!(
+                "{why}. Fix it, then start tuigram again. Until then it doesn't connect, \
+                 rather than connect without the proxy."
+            ),
+        ),
     };
     frame.render_widget(Line::from(title).bold(), prompt);
     frame.render_widget(

@@ -11,7 +11,7 @@ use ratatui::style::Style;
 use ratatui_textarea::{DataCursor, TextArea};
 use tdlib_rs::enums::{
     AuthenticationCodeType, AuthorizationState, ChatMemberStatus, ConnectionState, MessageSender,
-    MessageTopic, NotificationType, OptionValue, Update, UserType,
+    MessageTopic, NotificationType, OptionValue, ProxyType, Update, UserType,
 };
 use tdlib_rs::types::{Message, Proxy, UpdateNotificationGroup};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -113,6 +113,13 @@ pub enum LoginStep {
     },
     /// A state this client can't finish; the text says what to do instead.
     Unsupported(&'static str),
+    /// The proxy set (`from`: `TG_PROXY` or settings.toml) can't be used,
+    /// for this reason. TDLib isn't started, so nothing connects without
+    /// it, and only quitting is left.
+    BadProxy {
+        from: &'static str,
+        why: String,
+    },
 }
 
 pub struct Login {
@@ -145,6 +152,7 @@ impl Login {
                 | LoginStep::LoggingOut
                 | LoginStep::OtherDevice { .. }
                 | LoginStep::Unsupported(_)
+                | LoginStep::BadProxy { .. }
         )
     }
 }
@@ -1834,12 +1842,23 @@ impl App {
     }
 
     fn on_auth_state(&mut self, state: AuthorizationState) {
+        // TDLib got no parameters past a proxy that can't be used, so
+        // nothing should come but its closing; if anything does, the
+        // screen still says why tuigram doesn't connect.
+        if let Screen::Login(login) = &self.screen
+            && matches!(login.step, LoginStep::BadProxy { .. })
+            && !matches!(
+                state,
+                AuthorizationState::Closing | AuthorizationState::Closed
+            )
+        {
+            return;
+        }
         let step = match state {
             AuthorizationState::WaitTdlibParameters => match self.api_keys() {
                 Some((source, keys)) => {
                     self.keys_source = Some(source);
-                    let proxy = self.proxy_setting();
-                    self.tg.set_tdlib_parameters(keys, proxy);
+                    self.start_tdlib(keys);
                     return;
                 }
                 None => LoginStep::ApiId,
@@ -2020,12 +2039,12 @@ impl App {
                     // starts with the saved one.
                     self.relogin = true;
                     self.tg.close(None);
+                    self.screen = login_screen(LoginStep::Connecting);
                 } else {
                     self.keys_source = Some(KeySource::Saved);
-                    let proxy = self.proxy_setting();
-                    self.tg.set_tdlib_parameters(keys, proxy);
+                    self.screen = login_screen(LoginStep::Connecting);
+                    self.start_tdlib(keys);
                 }
-                self.screen = login_screen(LoginStep::Connecting);
                 return;
             }
             _ => {}
@@ -2043,7 +2062,8 @@ impl App {
             | LoginStep::ApiId
             | LoginStep::ApiHash { .. }
             | LoginStep::OtherDevice { .. }
-            | LoginStep::Unsupported(_) => {}
+            | LoginStep::Unsupported(_)
+            | LoginStep::BadProxy { .. } => {}
         }
     }
 
@@ -6118,27 +6138,27 @@ impl App {
         }
     }
 
-    /// The proxy to connect through, from `TG_PROXY` or the settings, or
-    /// none (`Some(None)`). One that can't be used is said, and `None`
-    /// leaves TDLib's proxies as they were rather than connect directly,
-    /// which may be what the proxy was there to avoid.
-    fn proxy_setting(&mut self) -> Option<Option<Proxy>> {
-        let (link, from) = match (self.tg.env_proxy(), &self.settings.proxy) {
-            (Some(link), _) => (link.to_string(), "TG_PROXY"),
-            (None, Some(link)) => (link.clone(), "The proxy in settings.toml"),
-            (None, None) => return Some(None),
-        };
-        match proxy::parse(&link) {
-            Ok(proxy) => Some(Some(proxy)),
-            Err(why) => {
-                let said = format!("{from} isn't used: {why}");
-                if let Screen::Login(login) = &mut self.screen {
-                    login.error = Some(said.clone());
-                }
-                self.status = Some(said);
-                None
-            }
+    /// Starts TDLib with `keys` and the proxy set. If that proxy can't be
+    /// used, the login screen says why and TDLib isn't started: on a new
+    /// database, or after logging out, it has no proxy of its own, and
+    /// would connect directly, which may be what the proxy was there to
+    /// avoid.
+    fn start_tdlib(&mut self, keys: ApiKeys) {
+        match self.proxy_setting() {
+            Ok(proxy) => self.tg.set_tdlib_parameters(keys, proxy),
+            Err((from, why)) => self.screen = login_screen(LoginStep::BadProxy { from, why }),
         }
+    }
+
+    /// The proxy to connect through, from `TG_PROXY` or the settings, or
+    /// none; else where the one that can't be used is set, and why not.
+    fn proxy_setting(&self) -> Result<Option<Proxy>, (&'static str, String)> {
+        let (link, from) = match (self.tg.env_proxy(), &self.settings.proxy) {
+            (Some(link), _) => (link, "TG_PROXY"),
+            (None, Some(link)) => (link.as_str(), "the proxy in settings.toml"),
+            (None, None) => return Ok(None),
+        };
+        proxy::parse(link).map(Some).map_err(|why| (from, why))
     }
 
     /// `:proxy`: the proxy's link in the prompt, to change, or empty for
@@ -6191,15 +6211,23 @@ impl App {
         }
         match proxy::parse(link) {
             Ok(proxy) => {
+                let mut lines = vec![
+                    format!("Proxy:         {}", proxy::kind(&proxy)),
+                    "tuigram would connect to Telegram through it. It sees your IP address \
+                     and when you use Telegram, not your messages."
+                        .into(),
+                ];
+                if matches!(proxy.r#type, ProxyType::Mtproto(_)) {
+                    lines.push(
+                        "It can also put a channel it promotes in your chat list, marked \
+                         \"proxy sponsor\"."
+                            .into(),
+                    );
+                }
+                lines.push("`:proxy` changes it, or goes back to connecting directly.".into());
                 let mut confirm = Confirm::new(
                     "Use this proxy?",
-                    vec![
-                        format!("Proxy:         {}", proxy::kind(&proxy)),
-                        "tuigram would connect to Telegram through it. It sees your IP \
-                         address and when you use Telegram, not your messages."
-                            .into(),
-                        "`:proxy` changes it, or goes back to connecting directly.".into(),
-                    ],
+                    lines,
                     Confirmed::UseProxy(link.to_string()),
                 );
                 confirm.site = Some(Site::server(proxy::address(&proxy)));
@@ -7825,6 +7853,7 @@ mod tests {
         let confirm = app.confirm.as_ref().expect("asks first");
         assert_eq!(confirm.lines[0], "Proxy:         SOCKS5");
         assert_eq!(confirm.site.as_ref().unwrap().host, "10.0.0.1:1080");
+        assert!(!confirm.lines.iter().any(|l| l.contains("proxy sponsor")));
         assert_eq!(saved(), None, "not before `y`");
         answer(&mut app);
         assert_eq!(saved().as_deref(), Some("socks5://10.0.0.1:1080"));
@@ -7859,6 +7888,73 @@ mod tests {
         type_in(&mut app, "");
         assert!(app.confirm.is_none());
         assert!(app.status.as_deref().unwrap().contains("directly"));
+    }
+
+    #[test]
+    fn a_proxy_set_that_cant_be_used_keeps_tdlib_from_starting_and_says_why() {
+        let bad_proxy = |app: &App| match &app.screen {
+            Screen::Login(login) => match &login.step {
+                LoginStep::BadProxy { from, why } => Some((*from, why.clone())),
+                _ => None,
+            },
+            Screen::Main => None,
+        };
+        let keys = ApiKeys {
+            id: 1,
+            hash: "0123456789abcdef0123456789abcdef".into(),
+        };
+
+        // Started with a saved key.
+        let mut app = test_app("proxy-unusable");
+        app.settings.api_keys = Some(keys.clone());
+        app.settings.proxy = Some("socks5://10.0.0.1".into());
+        app.screen = login_screen(LoginStep::Connecting);
+        app.on_auth_state(AuthorizationState::WaitTdlibParameters);
+        let (from, why) = bad_proxy(&app).expect("TDLib isn't started");
+        assert_eq!(from, "the proxy in settings.toml");
+        assert!(why.contains("no port"), "{why}");
+        let said = |app: &mut App| {
+            let rows = screen(app);
+            let words: Vec<&str> = rows
+                .iter()
+                .flat_map(|r| r.split_whitespace())
+                .filter(|w| w != &"│")
+                .collect();
+            words.join(" ")
+        };
+        let rows = said(&mut app);
+        assert!(
+            rows.contains("Can't use the proxy in settings.toml"),
+            "{rows}"
+        );
+        assert!(rows.contains("The link has no port"), "{rows}");
+        assert!(rows.contains("start tuigram again"), "{rows}");
+        // Nothing takes the screen from it, and Ctrl-c still quits.
+        app.on_auth_state(AuthorizationState::WaitPhoneNumber);
+        assert!(bad_proxy(&app).is_some());
+        assert!(said(&mut app).contains("The link has no port"));
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.quit_deadline.is_some());
+
+        // Started with a key typed in.
+        let mut app = test_app("proxy-unusable-typed-key");
+        app.settings.api_keys = None;
+        app.settings.proxy = Some("ftp://10.0.0.1:21".into());
+        app.screen = login_screen(LoginStep::ApiHash { id: 1 });
+        for c in keys.hash.chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let (_, why) = bad_proxy(&app).expect("TDLib isn't started");
+        assert!(why.starts_with("Not a proxy link"), "{why}");
+
+        // One that can be used starts it.
+        let mut app = test_app("proxy-usable");
+        app.settings.api_keys = Some(keys);
+        app.settings.proxy = Some("socks5://10.0.0.1:1080".into());
+        app.screen = login_screen(LoginStep::Connecting);
+        app.on_auth_state(AuthorizationState::WaitTdlibParameters);
+        assert!(bad_proxy(&app).is_none());
     }
 
     #[test]
@@ -7902,7 +7998,9 @@ mod tests {
     fn a_proxy_link_names_the_end_of_a_long_server_and_says_what_it_sees() {
         let mut app = test_app("proxy-long-host");
         let server = "proxy.my-vpn-provider.com.cdn-relay-node-77.attacker.example";
-        let url = format!("https://t.me/proxy?server={server}&port=443&secret=ee0123abcd");
+        let url = format!(
+            "https://t.me/proxy?server={server}&port=443&secret=ee0123456789abcdef0123456789abcdef6578616d706c652e636f6d"
+        );
         app.open_target(Target::Link(Link {
             url,
             disguise: Some("MyVPN proxy".into()),
@@ -7931,9 +8029,36 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_an_mtproto_proxy_sponsors_is_marked_in_the_list() {
+        let mut app = test_app("proxy-sponsor");
+        app.focus = Focus::Chats;
+        let (_, chat_id) = two_chats(&app);
+        let title = app.chats.title(chat_id).unwrap().to_string();
+        let position = tdlib_rs::types::ChatPosition {
+            list: tdlib_rs::enums::ChatList::Main,
+            order: 9_000_000,
+            is_pinned: false,
+            source: Some(tdlib_rs::enums::ChatSource::MtprotoProxy),
+        };
+        app.on_update(Update::ChatPosition(tdlib_rs::types::UpdateChatPosition {
+            chat_id,
+            position,
+        }));
+        let rows = screen(&mut app);
+        let marked: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains("proxy sponsor"))
+            .collect();
+        assert_eq!(marked.len(), 1, "{rows:#?}");
+        // The name is cut to leave room for it.
+        let first_word = title.split(' ').next().unwrap();
+        assert!(marked[0].contains(first_word), "{rows:#?}");
+    }
+
+    #[test]
     fn a_proxy_link_in_a_message_asks_first_naming_the_proxy() {
         let mut app = test_app("proxy-link");
-        let url = "https://t.me/proxy?server=1.2.3.4&port=443&secret=ee0123abcd";
+        let url = "https://t.me/proxy?server=1.2.3.4&port=443&secret=ee0123456789abcdef0123456789abcdef6578616d706c652e636f6d";
         app.open_target(Target::Link(Link {
             url: url.into(),
             disguise: Some("free fast proxy".into()),
@@ -7942,6 +8067,13 @@ mod tests {
         let confirm = app.confirm.as_ref().expect("asks first");
         assert_eq!(confirm.lines[0], "Proxy:         MTProto");
         assert_eq!(confirm.site.as_ref().unwrap().host, "1.2.3.4:443");
+        assert!(
+            confirm
+                .lines
+                .iter()
+                .any(|l| l.contains("\"proxy sponsor\"")),
+            "it can put a channel in the list"
+        );
         assert!(matches!(&confirm.action, Confirmed::UseProxy(u) if u == url));
         let rows = screen(&mut app);
         assert!(rows[19].contains("y use it"), "{:?}", rows[19]);

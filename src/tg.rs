@@ -635,10 +635,9 @@ impl Tg {
     }
 
     /// Starts TDLib with its parameters, then sets its proxy: `proxy` is
-    /// the one to use, or none (`Some(None)`); `None` leaves TDLib's as
-    /// they were. In that order, since TDLib keeps its proxies in the
-    /// database the parameters open.
-    pub fn set_tdlib_parameters(&self, keys: ApiKeys, proxy: Option<Option<types::Proxy>>) {
+    /// the one to use, or `None` to connect directly. In that order, since
+    /// TDLib keeps its proxies in the database the parameters open.
+    pub fn set_tdlib_parameters(&self, keys: ApiKeys, proxy: Option<types::Proxy>) {
         let config = Arc::clone(&self.config);
         let client_id = self.client_id;
         self.spawn(async move {
@@ -661,10 +660,7 @@ impl Tg {
                 client_id,
             )
             .await?;
-            match proxy {
-                Some(proxy) => use_proxy(proxy, client_id).await,
-                None => Ok(()),
-            }
+            use_proxy(proxy, client_id).await
         });
     }
 

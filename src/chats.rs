@@ -9,8 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use tdlib_rs::enums::{
-    ChatAction, ChatList, ChatType, MessageContent, MessageSender, NotificationSettingsScope,
-    UserStatus,
+    ChatAction, ChatList, ChatSource, ChatType, MessageContent, MessageSender,
+    NotificationSettingsScope, UserStatus,
 };
 use tdlib_rs::types::{
     self, AccentColor, ChatFolderInfo, ChatNotificationSettings, ChatPhotoInfo, ChatPosition,
@@ -105,6 +105,8 @@ struct Position {
     order: i64,
     /// Pinned to the top of the list.
     pinned: bool,
+    /// Put there by the MTProto proxy in use (`chatSourceMtprotoProxy`).
+    sponsored: bool,
 }
 
 /// A tab over the chat list: a folder, all chats, or the archive.
@@ -140,9 +142,16 @@ impl Chat {
             let place = Position {
                 order: position.order,
                 pinned: position.is_pinned,
+                sponsored: matches!(position.source, Some(ChatSource::MtprotoProxy)),
             };
             self.positions.insert(list, place);
         }
+    }
+
+    /// Put in a list by the MTProto proxy in use, whose owner promotes it:
+    /// not a chat you joined.
+    pub fn sponsored(&self) -> bool {
+        self.positions.values().any(|p| p.sponsored)
     }
 
     /// Pins the chat in a list it's in, or unpins it, for tests.
@@ -898,22 +907,28 @@ impl Chats {
         }
     }
 
-    /// The chat is in the main list, not e.g. a public channel found with `s`.
+    /// The chat is in the main list, not e.g. a public channel found with
+    /// `s`, or one the proxy put there.
     pub fn listed(&self, chat_id: i64) -> bool {
-        self.in_list(chat_id, List::Main)
+        self.in_list(chat_id, List::Main) && !self.sponsored(chat_id)
+    }
+
+    /// The MTProto proxy in use put the chat in the list, to promote it.
+    pub fn sponsored(&self, chat_id: i64) -> bool {
+        self.by_id.get(&chat_id).is_some_and(Chat::sponsored)
     }
 
     /// Chats in the main list whose name or username contains `query`, in
     /// Telegram's order (pinned, then by the last message), for the chat
-    /// picker. Unread chats don't go first, unlike in the list. An empty
-    /// query matches them all.
+    /// picker. Unread chats don't go first, unlike in the list, and one the
+    /// proxy put there isn't one of yours. An empty query matches them all.
     pub fn matching(&self, query: &str) -> Vec<i64> {
         let query = query.trim();
         let username = query.strip_prefix('@').unwrap_or(query);
         let mut ids: Vec<i64> = self
             .by_id
             .iter()
-            .filter(|(_, chat)| chat.order(List::Main) != 0)
+            .filter(|(_, chat)| chat.order(List::Main) != 0 && !chat.sponsored())
             .map(|(&id, _)| id)
             .filter(|&id| {
                 username.is_empty()
@@ -965,6 +980,7 @@ impl Chats {
                 Position {
                     order,
                     pinned: false,
+                    sponsored: false,
                 },
             );
             self.dirty = true;
@@ -981,6 +997,7 @@ impl Chat {
                 let place = Position {
                     order,
                     pinned: false,
+                    sponsored: false,
                 };
                 (list, place)
             })
