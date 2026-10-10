@@ -7,6 +7,7 @@
 use std::ffi::{CStr, CString, c_char};
 use std::future::Future;
 use std::path::Path;
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -672,17 +673,30 @@ impl Tg {
         self.client_id
     }
 
-    /// Starts TDLib with its parameters, then sets its proxy: `proxy` is
-    /// the one to use, or `None` to connect directly. In that order, since
-    /// TDLib keeps its proxies in the database the parameters open. The
-    /// proxy's change is numbered as by [`Tg::use_proxy`].
+    /// Starts TDLib with its parameters and the proxy: `proxy` is the one
+    /// to use, or `None` to connect directly, numbered as by
+    /// [`Tg::use_proxy`]. TDLib holds requests about proxies and the
+    /// network until it has its parameters, then runs them before anything
+    /// can connect (`Td::init_options_and_network`), so they go first: the
+    /// network off, then the proxy. The network comes back on only once
+    /// the proxy is in place, so nothing connects without it, even if
+    /// TDLib refuses it.
     pub fn set_tdlib_parameters(&self, keys: ApiKeys, proxy: Option<types::Proxy>) -> u64 {
-        let number = self.proxy.ask(proxy);
+        let number = self.proxy.ask(proxy.clone());
         let wishes = Arc::clone(&self.proxy);
         let config = Arc::clone(&self.config);
         let tx = self.tx.clone();
         let client_id = self.client_id;
         self.task(async move {
+            // Changes asked for meanwhile wait for this one.
+            let mut applied = wishes.applying.lock().await;
+            let none = Some(enums::NetworkType::None);
+            let mut offline = pin!(functions::set_network_type(none, client_id));
+            let mut chosen = pin!(choose_proxy(proxy.clone(), client_id));
+            // A request goes out when it's first polled: these go now, in
+            // this order, and are answered once TDLib has started.
+            let _ = futures::poll!(offline.as_mut());
+            let _ = futures::poll!(chosen.as_mut());
             let dir = |name: &str| config.data_dir.join(name).to_string_lossy().into_owned();
             let started = functions::set_tdlib_parameters(
                 false,
@@ -702,10 +716,22 @@ impl Tg {
                 client_id,
             )
             .await;
-            match started {
-                Ok(()) => apply_proxy(&wishes, &tx, client_id).await,
-                Err(e) => drop(tx.send(TgEvent::Error(e.message))),
+            if let Err(e) = started {
+                let _ = tx.send(TgEvent::Error(e.message));
+                return;
             }
+            let result = async {
+                offline.await?;
+                chosen.await?;
+                // Only the proxy chosen is kept (`proxy_steps`).
+                use_proxy(proxy, client_id).await?;
+                // What TDLib takes when it's told nothing.
+                let other = Some(enums::NetworkType::Other);
+                functions::set_network_type(other, client_id).await
+            };
+            let result = result.await.map_err(|e| e.message);
+            *applied = number;
+            let _ = tx.send(TgEvent::ProxyApplied { number, result });
         });
         number
     }
@@ -2374,6 +2400,16 @@ async fn apply_proxy(wishes: &ProxyWishes, tx: &Events, client_id: i32) {
     let result = use_proxy(proxy, client_id).await.map_err(|e| e.message);
     *applied = number;
     let _ = tx.send(TgEvent::ProxyApplied { number, result });
+}
+
+/// Makes `proxy` the one TDLib connects through, or none. TDLib reuses
+/// one it has already (`ConnectionCreator::add_proxy`), so this needn't ask
+/// which it has first, which it couldn't answer before it has started.
+async fn choose_proxy(proxy: Option<types::Proxy>, client_id: i32) -> Result<(), types::Error> {
+    match proxy {
+        Some(proxy) => functions::add_proxy(proxy, true, client_id).await.map(drop),
+        None => functions::disable_proxy(client_id).await,
+    }
 }
 
 /// What [`use_proxy`] does first.

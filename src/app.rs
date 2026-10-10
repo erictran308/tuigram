@@ -6318,18 +6318,14 @@ impl App {
         self.proxy_changes.retain(|&n, _| n > number);
         match (change, result) {
             (ProxyChange::Start, Ok(())) => {}
-            // TDLib is started, connecting with what it had: on the login
-            // screen, nobody logs in through that.
-            (ProxyChange::Start, Err(why)) => match &self.screen {
-                Screen::Login(_) => {
-                    let from = self.proxy_source();
-                    self.screen = login_screen(LoginStep::BadProxy { from, why });
-                }
-                Screen::Main => {
-                    let from = self.proxy_source();
-                    self.status = Some(format!("Telegram's library refused {from}: {why}"));
-                }
-            },
+            // TDLib started with its network off, which stays off: logged
+            // in or not, only quitting is left, as for a link tuigram can't
+            // read. The main screen goes, and with it read receipts and
+            // being online.
+            (ProxyChange::Start, Err(why)) => {
+                let from = self.proxy_source();
+                self.screen = login_screen(LoginStep::BadProxy { from, why });
+            }
             (ProxyChange::Set(link), Ok(())) => {
                 let proxy = link.as_deref().and_then(|l| proxy::parse(l).ok());
                 self.settings.proxy = link;
@@ -8027,12 +8023,13 @@ mod tests {
         );
 
         // Refused at startup, on the login screen: nobody logs in without it.
+        app.settings.proxy = Some(link(1084));
         let keys = ApiKeys {
             id: 1,
             hash: "0123456789abcdef0123456789abcdef".into(),
         };
         app.screen = login_screen(LoginStep::Connecting);
-        app.start_tdlib(keys);
+        app.start_tdlib(keys.clone());
         let start = *app.proxy_changes.keys().next_back().unwrap();
         answer(&mut app, start, Err("Unsupported proxy secret".into()));
         let Screen::Login(login) = &app.screen else {
@@ -8045,6 +8042,23 @@ mod tests {
             app.settings.proxy,
             Some(link(1084)),
             "startup saves nothing"
+        );
+
+        // Logged in already: the main screen goes too, as TDLib's network
+        // stays off.
+        app.screen = Screen::Main;
+        app.start_tdlib(keys);
+        let start = *app.proxy_changes.keys().next_back().unwrap();
+        answer(&mut app, start, Err("Unsupported proxy secret".into()));
+        app.on_auth_state(AuthorizationState::Ready);
+        let Screen::Login(login) = &app.screen else {
+            panic!("the main screen is gone");
+        };
+        assert!(matches!(login.step, LoginStep::BadProxy { .. }));
+        let rows = screen(&mut app).concat();
+        assert!(
+            rows.contains("Can't use the proxy in settings.toml"),
+            "{rows}"
         );
     }
 
