@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ratatui::style::Color;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::text;
 
@@ -324,6 +324,8 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
         names,
         qr_dark: role("qr_dark", QR_DARK)?,
         qr_light: role("qr_light", QR_LIGHT)?,
+        rounded: true,
+        pills: false,
     };
     match set.keys().next() {
         Some(name) => Err(format!("there is no color called {name:?} to set")),
@@ -391,6 +393,54 @@ pub struct Colors {
     /// The QR code on the login screen.
     pub qr_dark: Color,
     pub qr_light: Color,
+    /// Boxes have round corners (`╭`). Not a theme's to pick: it depends
+    /// on the terminal's font, so [`crate::ui::draw`] sets it from
+    /// `Settings.corners` every frame. Bubbles stay square: a cell can
+    /// only cut a corner in steps, which looks worse.
+    pub rounded: bool,
+    /// Pills have round ends, which only Nerd Fonts have glyphs for, so
+    /// it's off unless `Settings.nerd_font` says so; set with `rounded`.
+    pub pills: bool,
+}
+
+/// The shape of corners, set in `settings.toml`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Corners {
+    /// Round, unless the terminal is one whose fonts lack the glyphs.
+    #[default]
+    Auto,
+    Rounded,
+    /// Plain right angles, which every terminal that draws boxes can.
+    Square,
+}
+
+impl Corners {
+    /// Whether corners are drawn round, `Auto` decided from what the
+    /// terminal says about itself in the environment.
+    pub fn rounded(self, env: impl Fn(&str) -> Option<String>) -> bool {
+        match self {
+            Corners::Auto => !lacks_round_glyphs(env, cfg!(windows)),
+            Corners::Rounded => true,
+            Corners::Square => false,
+        }
+    }
+}
+
+/// The terminal's font has no `╭`: the Linux console's
+/// (its fonts hold a few hundred glyphs), hardware terminals and their
+/// emulations, and the old Windows console, whose raster and Lucida
+/// fonts don't either. Windows Terminal, and others that say who they are,
+/// have them.
+fn lacks_round_glyphs(env: impl Fn(&str) -> Option<String>, windows: bool) -> bool {
+    let set = |name: &str| env(name).is_some_and(|v| !v.is_empty());
+    let term = env("TERM").unwrap_or_default();
+    let old_console = windows
+        && !set("WT_SESSION")
+        && !set("TERM_PROGRAM")
+        && !set("WEZTERM_PANE")
+        && !set("ALACRITTY_WINDOW_ID");
+    old_console || term == "linux" || term.starts_with("vt") || term.starts_with("cons")
 }
 
 impl Default for Colors {
@@ -436,6 +486,29 @@ fn mix(a: Color, b: Color, amount: f32) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corners_are_square_only_where_the_font_lacks_round_ones() {
+        let env = |vars: &'static [(&str, &str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let round = |vars, windows| !lacks_round_glyphs(env(vars), windows);
+        assert!(round(&[("TERM", "xterm-256color")], false));
+        assert!(round(&[], false), "nothing said, nothing against");
+        assert!(!round(&[("TERM", "linux")], false), "the Linux console");
+        assert!(!round(&[("TERM", "vt220")], false));
+        assert!(!round(&[], true), "the old Windows console");
+        assert!(round(&[("WT_SESSION", "1")], true), "Windows Terminal");
+        assert!(round(&[("TERM_PROGRAM", "vscode")], true));
+
+        // Picked by hand, whatever the terminal.
+        assert!(Corners::Rounded.rounded(env(&[("TERM", "linux")])));
+        assert!(!Corners::Square.rounded(env(&[])));
+    }
 
     /// The built-in themes and these files, as if in the themes folder.
     fn with_files(files: &[(&str, &str)]) -> Themes {

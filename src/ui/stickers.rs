@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui_image::FontSize;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
@@ -48,7 +48,7 @@ pub fn draw(
     images: &mut Images,
     colors: &Colors,
 ) {
-    let mut block = Block::bordered()
+    let mut block = super::bordered(colors)
         .title(" Stickers ")
         .border_style(border(true, colors));
     if let Some(shown) = panel.shown().filter(|s| !s.is_empty())
@@ -119,11 +119,12 @@ fn top_line(panel: &StickerPanel, width: usize, colors: &Colors) -> Line<'static
         .into_iter()
         .enumerate()
         .skip(first)
-        .map(|(i, title)| {
+        .flat_map(|(i, title)| {
             if i == panel.tab {
-                Span::from(title).fg(colors.bg).bg(colors.accent).bold()
+                let tab = Span::from(title).fg(colors.bg).bg(colors.accent).bold();
+                super::pill(tab, Style::new(), colors)
             } else {
-                Span::from(title).fg(colors.muted)
+                vec![Span::from(title).fg(colors.muted)]
             }
         })
         .collect::<Vec<_>>();

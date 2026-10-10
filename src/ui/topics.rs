@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Colors;
@@ -61,7 +61,7 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &TopicList, colors: &Colors) {
         title.push(super::badge_span(badge, colors));
     }
     title.push(Span::from(after));
-    let block = Block::bordered()
+    let block = super::bordered(colors)
         .title(Line::from(title))
         .border_style(border(list.focused, colors));
     let inner = block.inner(area);
@@ -117,14 +117,16 @@ fn rows(
     };
     let mut badges = Vec::new();
     if topic.mentions > 0 {
-        badges.push(Span::from(" @ ").fg(colors.bg).bg(colors.primary));
+        let at = Span::from(" @ ").fg(colors.bg).bg(colors.primary);
+        badges.extend(super::pill(at, Style::new(), colors));
     }
     if topic.unread > 0 {
         if !badges.is_empty() {
             badges.push(Span::from(" "));
         }
-        let count = format!(" {} ", topic.unread);
-        badges.push(Span::from(count).fg(colors.bg).bg(colors.primary));
+        let count = Span::from(format!(" {} ", topic.unread));
+        let count = count.fg(colors.bg).bg(colors.primary);
+        badges.extend(super::pill(count, Style::new(), colors));
     } else if topic.pinned {
         badges.push(Span::from(PINNED));
     }

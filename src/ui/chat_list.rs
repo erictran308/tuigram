@@ -67,7 +67,7 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
     if list.loading {
         title.push_str("loading… ");
     }
-    let block = Block::bordered()
+    let block = super::bordered(colors)
         .title(title)
         .border_style(border(list.focused, colors));
     let inner = block.inner(area);
@@ -130,7 +130,8 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
             // a pin for a pinned one.
             let mut badges = Vec::new();
             if chat.mentions > 0 {
-                badges.push(Span::from(" @ ").fg(colors.bg).bg(colors.primary));
+                let at = Span::from(" @ ").fg(colors.bg).bg(colors.primary);
+                badges.extend(super::pill(at, Style::new(), colors));
             }
             if chat.unread > 0 {
                 if !badges.is_empty() {
@@ -138,7 +139,11 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
                 }
                 let bg = if muted { colors.muted } else { colors.primary };
                 let count = Span::from(format!(" {} ", chat.unread));
-                badges.push(count.fg(colors.bg).bg(bg));
+                badges.extend(super::pill(
+                    count.fg(colors.bg).bg(bg),
+                    Style::new(),
+                    colors,
+                ));
             } else if badges.is_empty() && chats.pinned(id) {
                 badges.push(Span::from(PINNED));
             }
@@ -267,7 +272,11 @@ fn tab_line(tabs: &[Tab], shown: chats::List, width: usize, colors: &Colors) -> 
         } else {
             Style::new().fg(colors.subtle)
         };
-        spans.push(Span::styled(label, style));
+        spans.extend(super::pill(
+            Span::styled(label, style),
+            Style::new(),
+            colors,
+        ));
     }
     if last + 1 < tabs.len() {
         spans.push(Span::from("›").fg(colors.muted));

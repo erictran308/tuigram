@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{self, ApiKeys};
 use crate::notify::Notifications;
-use crate::theme;
+use crate::theme::{self, Corners};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -17,6 +17,13 @@ pub struct Settings {
     /// The theme in use, by file name without `.toml`: a built-in one or one
     /// in the themes folder.
     pub theme: String,
+    /// Round corners on panes and popups: "auto" leaves them square on
+    /// terminals whose fonts can't draw them; also "rounded" or "square".
+    pub corners: Corners,
+    /// The terminal's font is a Nerd Font, whose half circles give pills
+    /// (unread counts, reactions, the mode) round ends. Other fonts show
+    /// a box for them, so it's off unless asked for.
+    pub nerd_font: bool,
     /// Chats highlighted with `H`, by id.
     pub highlighted_chats: Vec<i64>,
     /// How new messages are announced: "auto" picks what the terminal
@@ -51,6 +58,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: theme::DEFAULT.into(),
+            corners: Corners::default(),
+            nerd_font: false,
             highlighted_chats: Vec::new(),
             notifications: Notifications::default(),
             normal_after_send: false,
@@ -171,6 +180,8 @@ mod tests {
         assert_eq!(Settings::load(&file).unwrap().theme, "mocha");
         let mut settings = Settings {
             theme: "latte".into(),
+            corners: Corners::Square,
+            nerd_font: true,
             highlighted_chats: vec![-1001234567890, 42],
             notifications: Notifications::Off,
             normal_after_send: true,
@@ -185,7 +196,7 @@ mod tests {
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40\ntopics_width = 26\naccept_secret_chats = true"
+            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40\ntopics_width = 26\naccept_secret_chats = true"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
 
@@ -213,6 +224,8 @@ mod tests {
         assert_eq!(old.chat_list_width, DEFAULT_LIST_WIDTH);
         assert_eq!(old.topics_width, DEFAULT_TOPICS_WIDTH);
         assert_eq!(old.chat_list_side, Side::Left);
+        assert_eq!(old.corners, Corners::Auto);
+        assert!(!old.nerd_font);
 
         // A theme that's gone is the app's to deal with, not a broken file.
         std::fs::write(&file, r#"theme = "deleted""#).unwrap();

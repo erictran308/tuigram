@@ -5,7 +5,6 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Block;
 use ratatui_image::FontSize;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 
@@ -22,7 +21,7 @@ pub(super) fn draw(
     images: &mut Images,
     colors: &Colors,
 ) {
-    let inner = Block::bordered().inner(area);
+    let inner = super::bordered(colors).inner(area);
     frame.render_widget(Cover, area);
     let shot = shot(
         &view.photo,

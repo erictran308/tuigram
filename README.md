@@ -288,6 +288,10 @@ Sixteen `[palette]` colors make a whole theme: `bg`, `bg_alt`, `surface`, `overl
 
 If a theme can't be used, tuigram says why in the status bar and uses Catppuccin Mocha until the file is fixed.
 
+Panes and popups have round corners. In terminals whose font can't draw them (the Linux console, the old Windows console), they're square instead. If they look broken in yours, press `?`, go to **Settings**, and turn off **Round corners**, or set `corners` in `settings.toml` to `"square"` (or `"rounded"`; the default `"auto"` picks for your terminal).
+
+If your terminal uses a [Nerd Font](https://www.nerdfonts.com), turn on **Round pills** there too (`nerd_font = true`): unread counts, reactions, the tab you're on and the mode in the status bar get round ends. Other fonts show a box for them, so it's off at first.
+
 ## Your data
 
 Everything lives in one folder on your machine (`tuigram --help` prints its path):
