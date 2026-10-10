@@ -84,17 +84,25 @@ pub fn is_link(url: &str) -> bool {
 /// The proxy in words, without its password or secret, e.g.
 /// "SOCKS5 proxy 10.0.0.1:1080".
 pub fn describe(proxy: &Proxy) -> String {
-    let kind = match proxy.r#type {
+    format!("{} proxy {}", kind(proxy), address(proxy))
+}
+
+/// What kind of proxy it is: "SOCKS5", "HTTP" or "MTProto".
+pub fn kind(proxy: &Proxy) -> &'static str {
+    match proxy.r#type {
         ProxyType::Socks5(_) => "SOCKS5",
         ProxyType::Http(_) => "HTTP",
         ProxyType::Mtproto(_) => "MTProto",
-    };
-    let server = if proxy.server.contains(':') {
-        format!("[{}]", proxy.server)
+    }
+}
+
+/// Its server and port, `host:port`, or `[address]:port` for IPv6.
+pub fn address(proxy: &Proxy) -> String {
+    if proxy.server.contains(':') {
+        format!("[{}]:{}", proxy.server, proxy.port)
     } else {
-        proxy.server.clone()
-    };
-    format!("{kind} proxy {server}:{}", proxy.port)
+        format!("{}:{}", proxy.server, proxy.port)
+    }
 }
 
 const NOT_A_PROXY: &str =

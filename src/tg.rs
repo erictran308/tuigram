@@ -1760,6 +1760,15 @@ impl Tg {
         let client_id = self.client_id;
         self.task(async move {
             let ended = async {
+                // Deleting the history leaves the draft in TDLib's database,
+                // and a closed chat may take none, so it goes first. It's
+                // no reason not to end the chat.
+                let none = draft::Keep {
+                    chat_id,
+                    topic: None,
+                    draft: None,
+                };
+                let _ = set_draft(none, client_id).await;
                 if open {
                     functions::close_secret_chat(secret_id, client_id).await?;
                 }
@@ -2050,17 +2059,18 @@ impl Tg {
     }
 
     /// Flushes TDLib's database and ends with `authorizationStateClosed`,
-    /// keeping the open chat's draft first.
+    /// going offline first, then keeping the open chat's draft.
     pub fn close(&self, draft: Option<draft::Keep>) {
         let client_id = self.client_id;
         self.spawn(async move {
-            if let Some(keep) = draft {
-                let _ = set_draft(keep, client_id).await;
-            }
-            // Others see you go offline now, not minutes later. Before login
+            // Others see you go offline now, not minutes later, and before
+            // anything else that could keep the close waiting. Before login
             // this fails, which is fine.
             let offline = enums::OptionValue::Boolean(types::OptionValueBoolean { value: false });
             let _ = functions::set_option("online".into(), Some(offline), client_id).await;
+            if let Some(keep) = draft {
+                let _ = set_draft(keep, client_id).await;
+            }
             functions::close(client_id).await
         });
     }

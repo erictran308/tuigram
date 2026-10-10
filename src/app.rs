@@ -186,9 +186,8 @@ pub struct Confirm {
     pub title: String,
     /// Why it asks, and what exactly would open.
     pub lines: Vec<String>,
-    /// For a link: the site it goes to, on a line of its own. A site's name
-    /// is at the end of its host, so a long one is cut from the left.
-    pub site: Option<String>,
+    /// For a link, the site it goes to; for a proxy, its server.
+    pub site: Option<Site>,
     /// For a chat to join: what Telegram says about it, on a line of its
     /// own at the top.
     pub badge: Option<Badge>,
@@ -207,6 +206,33 @@ impl Confirm {
             badge: None,
             action,
             shown: Instant::now(),
+        }
+    }
+}
+
+/// Where a [`Confirm`] would connect, on a line of its own after its first.
+/// A site's name is at the end of its host, so a long one is cut from the
+/// left: a long host can only hide the part a sender made up.
+pub struct Site {
+    /// What it is, in front: "It goes to:".
+    pub label: &'static str,
+    pub host: String,
+}
+
+impl Site {
+    /// The site a link goes to.
+    pub fn link(host: String) -> Self {
+        Self {
+            label: "It goes to:",
+            host,
+        }
+    }
+
+    /// A proxy's server, `host:port`.
+    pub fn server(address: String) -> Self {
+        Self {
+            label: "Server:",
+            host: address,
         }
     }
 }
@@ -244,6 +270,8 @@ pub enum Confirmed {
     },
     /// Connect through the proxy this link gives, from now on.
     UseProxy(String),
+    /// Stop using the saved proxy, and connect directly from now on.
+    NoProxy,
 }
 
 impl Confirmed {
@@ -258,6 +286,7 @@ impl Confirmed {
             Confirmed::StartSecret { .. } => "start it",
             Confirmed::EndSecret { .. } => "end it",
             Confirmed::UseProxy(_) => "use it",
+            Confirmed::NoProxy => "connect directly",
         }
     }
 }
@@ -2143,7 +2172,7 @@ impl App {
             (Focus::Chats, KeyCode::Esc) => self.chats.set_filter(""),
             (Focus::Chats, KeyCode::Char('p')) if !ctrl => self.toggle_pin(),
             (Focus::Chats, KeyCode::Char('m')) if !ctrl => self.toggle_mute(),
-            (Focus::Chats, KeyCode::Char('a')) => self.toggle_archive(),
+            (Focus::Chats, KeyCode::Char('a')) if !ctrl => self.toggle_archive(),
             (Focus::Messages, KeyCode::Esc)
                 if self.open.as_ref().is_some_and(|o| o.search.is_some()) =>
             {
@@ -2173,6 +2202,7 @@ impl App {
             {
                 if let Some(open) = self.open.as_mut() {
                     open.reply = None;
+                    open.draft_reply = None;
                 }
             }
             (Focus::Messages, KeyCode::Char('r')) => self.reply_to_selected(),
@@ -2603,6 +2633,19 @@ impl App {
         })
     }
 
+    /// A secret chat that's ending keeps no draft: not in the list, and not
+    /// in the composer, which leaving would keep again.
+    fn forget_draft(&mut self, chat_id: i64) {
+        self.chats.keep_draft(chat_id, None);
+        if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == chat_id) {
+            open.editing = None;
+            open.reply = None;
+            open.draft_reply = None;
+            open.draft = Default::default();
+            self.composer = new_composer();
+        }
+    }
+
     /// Keeps what's written in the open chat as its draft on Telegram.
     fn keep_draft(&mut self) {
         if let Some(keep) = self.draft_to_keep() {
@@ -2691,7 +2734,7 @@ impl App {
             ));
             return;
         }
-        let reply_to = open.reply.take().map(|r| r.id).or(open.draft_reply.take());
+        let reply_to = open.take_reply();
         if open.attachments.is_empty() {
             self.tg
                 .send_text(open.chat_id, open.topic, text, reply_to, secret);
@@ -2838,7 +2881,7 @@ impl App {
                 self.attach(paths, None);
             }
             PromptKind::Proxy if !submit => {}
-            PromptKind::Proxy => self.set_proxy(&query),
+            PromptKind::Proxy => self.ask_to_change_proxy(&query),
             PromptKind::Command if !submit || query.is_empty() => {}
             PromptKind::Command => match Command::parse(&query) {
                 Some(Command::Info) => self.open_chat_info(),
@@ -4153,6 +4196,8 @@ impl App {
             return;
         }
         open.reply = Some(Replied::new(id, msg));
+        // The draft's reply, still being fetched, can't come back over it.
+        open.draft_reply = None;
         self.focus = Focus::Input;
     }
 
@@ -5393,7 +5438,7 @@ impl App {
                     ],
                     Confirmed::OpenLink(url),
                 );
-                confirm.site = site;
+                confirm.site = site.map(Site::link);
                 self.confirm = Some(confirm);
             }
             link => self.open_externally(&link.url),
@@ -5491,6 +5536,7 @@ impl App {
                                 .chats
                                 .secret(chat_id)
                                 .is_some_and(|s| s.state != SecretState::Closed);
+                            self.forget_draft(chat_id);
                             self.tg.end_secret_chat(chat_id, secret_id, open)
                         }
                         Confirmed::JoinLink { link, request } => {
@@ -5498,6 +5544,7 @@ impl App {
                             self.tg.join_by_link(link, request);
                         }
                         Confirmed::UseProxy(link) => self.set_proxy(&link),
+                        Confirmed::NoProxy => self.set_proxy(""),
                     }
                 }
             }
@@ -6108,7 +6155,35 @@ impl App {
         }
     }
 
-    /// A proxy link in a message: asks before connecting through it.
+    /// Enter in `:proxy`: asks before changing the proxy, as for a link in a
+    /// message, since a paste can arrive as keys (always on Windows, which
+    /// has no bracketed paste) and type `:proxy`, a link and Enter.
+    fn ask_to_change_proxy(&mut self, link: &str) {
+        let link = link.trim();
+        if !link.is_empty() {
+            self.ask_to_use_proxy(link);
+            return;
+        }
+        let Some(saved) = self.settings.proxy.as_deref() else {
+            self.status = Some("No proxy: tuigram connects to Telegram directly".into());
+            return;
+        };
+        let what = proxy::parse(saved)
+            .map(|proxy| proxy::describe(&proxy))
+            .unwrap_or_else(|_| "the proxy".into());
+        self.confirm = Some(Confirm::new(
+            "Connect directly?",
+            vec![
+                format!("tuigram would stop using {what}."),
+                "Telegram would see your IP address, and your network that you use Telegram."
+                    .into(),
+            ],
+            Confirmed::NoProxy,
+        ));
+    }
+
+    /// A proxy link in a message, or typed in `:proxy`: asks before
+    /// connecting through it.
     fn ask_to_use_proxy(&mut self, link: &str) {
         if self.tg.env_proxy().is_some() {
             self.status = Some("TG_PROXY sets the proxy: change it there".into());
@@ -6116,17 +6191,19 @@ impl App {
         }
         match proxy::parse(link) {
             Ok(proxy) => {
-                self.confirm = Some(Confirm::new(
+                let mut confirm = Confirm::new(
                     "Use this proxy?",
                     vec![
-                        proxy::describe(&proxy),
+                        format!("Proxy:         {}", proxy::kind(&proxy)),
                         "tuigram would connect to Telegram through it. It sees your IP \
                          address and when you use Telegram, not your messages."
                             .into(),
                         "`:proxy` changes it, or goes back to connecting directly.".into(),
                     ],
                     Confirmed::UseProxy(link.to_string()),
-                ));
+                );
+                confirm.site = Some(Site::server(proxy::address(&proxy)));
+                self.confirm = Some(confirm);
             }
             Err(why) => self.status = Some(why),
         }
@@ -6294,7 +6371,6 @@ fn mark_downloaded(path: &str) {
     let _ = path;
 }
 
-/// A one-line prompt input holding `text`, with the cursor at its end.
 /// Trying to reach Telegram, directly: where it's blocked, that's all
 /// that ever happens.
 pub const CONNECTING: &str = "Connecting…";
@@ -6311,6 +6387,7 @@ fn connection_words(state: &ConnectionState) -> Option<&'static str> {
     }
 }
 
+/// A one-line prompt input holding `text`, with the cursor at its end.
 fn prompt_input(text: &str) -> TextArea<'static> {
     let mut input = TextArea::new(vec![text.to_string()]);
     input.set_cursor_line_style(Style::default());
@@ -6752,6 +6829,50 @@ mod tests {
     }
 
     #[test]
+    fn a_drafts_reply_that_is_not_shown_is_not_sent() {
+        crate::tg::quiet();
+        let mut app = test_app("drafts-hidden-reply");
+        let none = KeyModifiers::NONE;
+        let (here, other) = two_chats(&app);
+        app.chats
+            .keep_draft(here, Draft::new("from my phone", Some(7)));
+        app.open_chat(other);
+        app.open_chat(here);
+        app.focus = Focus::Messages;
+        // `r` on another message while message 7 is still being fetched,
+        // then that reply cancelled: nothing shows over the composer.
+        let open = app.open.as_mut().unwrap();
+        assert_eq!(open.draft_reply, Some(7));
+        open.add_page(Page::Latest, crate::messages::tests::page([1, 2, 3]));
+        let another = 2;
+        open.selected = Some(another);
+        press(&mut app, KeyCode::Char('r'), none);
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.reply.as_ref().map(|r| r.id), Some(another));
+        assert_eq!(open.draft_reply, None, "message 7 can't come back over it");
+        press(&mut app, KeyCode::Esc, none);
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.open.as_ref().unwrap().reply.is_none());
+        assert_eq!(app.written().unwrap().1, None, "the draft answers nothing");
+
+        // Sent before message 7 comes, the text doesn't answer it, and the
+        // next message won't once it comes.
+        app.open_chat(other);
+        app.chats
+            .keep_draft(here, Draft::new("from my phone", Some(7)));
+        app.open_chat(here);
+        let open = app.open.as_mut().unwrap();
+        assert_eq!(open.draft_reply, Some(7));
+        assert_eq!(open.take_reply(), None);
+        assert_eq!(open.draft_reply, None);
+        // A reply that's shown is sent.
+        open.add_page(Page::Latest, crate::messages::tests::page([1, 2, 3]));
+        open.selected = Some(2);
+        press(&mut app, KeyCode::Char('r'), none);
+        assert_eq!(app.open.as_mut().unwrap().take_reply(), Some(2));
+    }
+
+    #[test]
     fn the_status_bar_says_while_telegram_cant_be_reached() {
         let mut app = test_app("connection");
         let state =
@@ -7095,6 +7216,9 @@ mod tests {
         app.chats.refresh();
         let ids = app.chats.ids().to_vec();
         app.selected = Some(ids[1]);
+        // Ctrl-a isn't `a`.
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(app.toast.is_none() && app.selected == Some(ids[1]));
         press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
         assert_eq!(app.selected, Some(ids[2]));
         assert_eq!(
@@ -7667,7 +7791,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_sets_the_proxy_now_and_for_next_time_and_says_what_is_wrong() {
+    fn proxy_asks_then_sets_the_proxy_now_and_for_next_time_and_says_what_is_wrong() {
         let dir = std::env::temp_dir().join(format!("tuigram-proxy-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
@@ -7682,6 +7806,14 @@ mod tests {
             }
             press(app, KeyCode::Enter, none);
         };
+        // `y` right away does nothing; `y` once it has been up a moment says yes.
+        let answer = |app: &mut App| {
+            press(app, KeyCode::Char('y'), none);
+            let confirm = app.confirm.as_mut().expect("still asking");
+            confirm.shown = Instant::now().checked_sub(CONFIRM_GRACE).unwrap();
+            press(app, KeyCode::Char('y'), none);
+            assert!(app.confirm.is_none());
+        };
 
         command(&mut app, "proxy");
         assert!(
@@ -7690,6 +7822,11 @@ mod tests {
                 .is_some_and(|p| p.kind == PromptKind::Proxy)
         );
         type_in(&mut app, "socks5://10.0.0.1:1080");
+        let confirm = app.confirm.as_ref().expect("asks first");
+        assert_eq!(confirm.lines[0], "Proxy:         SOCKS5");
+        assert_eq!(confirm.site.as_ref().unwrap().host, "10.0.0.1:1080");
+        assert_eq!(saved(), None, "not before `y`");
+        answer(&mut app);
         assert_eq!(saved().as_deref(), Some("socks5://10.0.0.1:1080"));
         let toast = app.toast.as_ref().unwrap();
         assert_eq!(
@@ -7702,14 +7839,95 @@ mod tests {
         let prompt = app.prompt.as_ref().unwrap();
         assert_eq!(prompt.query(), "socks5://10.0.0.1:1080");
         type_in(&mut app, "socks5://10.0.0.1");
+        assert!(app.confirm.is_none());
         assert!(app.status.as_deref().unwrap().contains("no port"));
         assert_eq!(saved().as_deref(), Some("socks5://10.0.0.1:1080"));
 
-        // Empty: directly.
+        // Empty: asks, naming the proxy it stops using, then directly.
         command(&mut app, "proxy");
         type_in(&mut app, "");
+        let confirm = app.confirm.as_ref().expect("asks first");
+        assert_eq!(confirm.title, "Connect directly?");
+        assert!(confirm.lines[0].contains("SOCKS5 proxy 10.0.0.1:1080"));
+        assert_eq!(saved().as_deref(), Some("socks5://10.0.0.1:1080"));
+        answer(&mut app);
         assert_eq!(saved(), None);
         assert_eq!(app.toast.as_ref().unwrap().title, "No proxy");
+
+        // Empty again: there's nothing to stop using.
+        command(&mut app, "proxy");
+        type_in(&mut app, "");
+        assert!(app.confirm.is_none());
+        assert!(app.status.as_deref().unwrap().contains("directly"));
+    }
+
+    #[test]
+    fn a_paste_arriving_as_keys_cannot_set_a_proxy_without_a_y() {
+        let mut app = test_app("paste-proxy");
+        app.focus = Focus::Messages;
+        assert!(app.settings.proxy.is_none());
+        let key = |app: &mut App, code: KeyCode| {
+            let modifiers = match code {
+                KeyCode::Char(c) if !c.is_alphanumeric() => KeyModifiers::SHIFT,
+                _ => KeyModifiers::NONE,
+            };
+            app.on_terminal_event(Event::Key(KeyEvent::new(code, modifiers)));
+        };
+        // What Windows hands over for a paste of ":proxy⏎socks5://…⏎y".
+        let pasted = ":proxy\nsocks5://192.0.2.1:1080\ny";
+        for c in pasted.chars() {
+            key(
+                &mut app,
+                if c == '\n' {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Char(c)
+                },
+            );
+        }
+        let confirm = app.confirm.as_ref().expect("asks first");
+        assert_eq!(confirm.site.as_ref().unwrap().host, "192.0.2.1:1080");
+        assert!(app.settings.proxy.is_none(), "the pasted `y` came too soon");
+        assert!(app.toast.is_none());
+
+        // A real paste never gets that far.
+        let mut app = test_app("paste-proxy-bracketed");
+        app.focus = Focus::Messages;
+        app.on_terminal_event(Event::Paste(":proxy\r\nsocks5://192.0.2.1:1080\r\n".into()));
+        assert!(app.settings.proxy.is_none());
+        assert!(app.prompt.is_none() && app.confirm.is_none());
+    }
+
+    #[test]
+    fn a_proxy_link_names_the_end_of_a_long_server_and_says_what_it_sees() {
+        let mut app = test_app("proxy-long-host");
+        let server = "proxy.my-vpn-provider.com.cdn-relay-node-77.attacker.example";
+        let url = format!("https://t.me/proxy?server={server}&port=443&secret=ee0123abcd");
+        app.open_target(Target::Link(Link {
+            url,
+            disguise: Some("MyVPN proxy".into()),
+        }));
+        assert!(app.confirm.is_some(), "asks first");
+        let rows = screen_of(&mut app, 80);
+        let server = rows.iter().find(|r| r.contains("Server:")).unwrap();
+        assert!(server.contains("attacker.example:443"), "{rows:#?}");
+        // The warning wraps rather than being cut.
+        let top = rows
+            .iter()
+            .position(|r| r.contains("Use this proxy?"))
+            .unwrap();
+        let bottom = rows.iter().position(|r| r.contains("y use it ·")).unwrap();
+        let said = rows[top + 1..bottom]
+            .iter()
+            .filter_map(|r| r.split_once("││"))
+            .flat_map(|(_, inside)| inside.trim_end_matches('│').split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            said.contains("It sees your IP address and when you use Telegram, not your messages."),
+            "{rows:#?}"
+        );
+        assert!(said.contains("MTProto"), "{rows:#?}");
     }
 
     #[test]
@@ -7722,7 +7940,8 @@ mod tests {
         }));
         assert!(app.finding.is_none(), "not looked up as a chat");
         let confirm = app.confirm.as_ref().expect("asks first");
-        assert_eq!(confirm.lines[0], "MTProto proxy 1.2.3.4:443");
+        assert_eq!(confirm.lines[0], "Proxy:         MTProto");
+        assert_eq!(confirm.site.as_ref().unwrap().host, "1.2.3.4:443");
         assert!(matches!(&confirm.action, Confirmed::UseProxy(u) if u == url));
         let rows = screen(&mut app);
         assert!(rows[19].contains("y use it"), "{:?}", rows[19]);
@@ -7989,6 +8208,26 @@ mod tests {
             confirm.action,
             Confirmed::EndSecret { chat_id: id, secret_id: 9 } if id == chat_id
         ));
+    }
+
+    #[test]
+    fn ending_a_secret_chat_forgets_its_draft() {
+        crate::tg::quiet();
+        let mut app = test_app("secret-end-draft");
+        let chat_id = open_chardy(&mut app, Some(crate::secret::SecretState::Ready));
+        app.chats
+            .keep_draft(chat_id, Draft::new("meet at noon", None));
+        app.composer.insert_str("meet at noon");
+        app.open.as_mut().unwrap().draft = ("meet at noon".into(), None);
+        app.focus = Focus::Messages;
+        command(&mut app, "leave");
+        let confirm = app.confirm.as_mut().expect("asks");
+        confirm.shown = Instant::now().checked_sub(CONFIRM_GRACE).unwrap();
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.confirm.is_none());
+        assert!(app.chats.draft(chat_id).is_none());
+        assert_eq!(app.composer.lines(), [""]);
+        assert!(app.draft_to_keep().is_none(), "leaving keeps nothing");
     }
 
     #[test]

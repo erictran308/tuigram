@@ -1266,6 +1266,14 @@ impl OpenChat {
         (self.chat_id, self.topic)
     }
 
+    /// What the message being sent answers: only the reply shown over the
+    /// composer. One the draft had, whose message is still being fetched,
+    /// isn't shown, and won't come over the next message either.
+    pub fn take_reply(&mut self) -> Option<i64> {
+        self.draft_reply = None;
+        self.reply.take().map(|r| r.id)
+    }
+
     /// Ctrl-z after a paste of file paths: takes back the files it
     /// attached, and gives the text that was pasted.
     pub fn undo_drop(&mut self) -> Option<String> {

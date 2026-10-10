@@ -1446,12 +1446,17 @@ fn short_path(path: &std::path::Path) -> String {
     text::clean(&path.display().to_string())
 }
 
-/// A popup's frame: accent border and its own background, so it stands out
-/// from what's underneath. Callers draw `Clear` first.
+/// Rows one line of a [`Confirm`] may wrap onto: enough for tuigram's own
+/// sentences, while a sender's long name or link text can't push what
+/// follows out of the popup.
+const CONFIRM_LINE_ROWS: usize = 3;
+
 /// The "are you sure" popup over the message pane, for a file that could
-/// run code or a link that hides where it goes.
+/// run code, a link that hides where it goes, a chat to join or a proxy.
+/// Long lines wrap, so a warning is read in full.
 fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Colors) {
-    const SITE: &str = "It goes to:    ";
+    // Wide enough for "The text says: ", so what follows lines up.
+    const LABEL: usize = 15;
     let title = format!(" {} ", confirm.title);
     let verdict = confirm.badge.map(|badge| match badge {
         Badge::Scam => "Telegram marks it as a SCAM",
@@ -1461,7 +1466,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
     let site_width = confirm
         .site
         .as_ref()
-        .map_or(0, |s| SITE.width() + s.width());
+        .map_or(0, |site| LABEL + site.host.width());
     let longest = confirm
         .lines
         .iter()
@@ -1472,27 +1477,14 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
     let width = (longest.max(title.width()).max(site_width) as u16 + 4)
         .min(area.width)
         .max(40.min(area.width));
-    let height =
-        confirm.lines.len() + usize::from(confirm.site.is_some()) + usize::from(verdict.is_some());
-    let popup = center(area, width, height as u16 + 2);
     let keys = format!(" `y` {} · `Esc` cancel ", confirm.action.verb());
     let border = match confirm.badge {
         Some(Badge::Scam | Badge::Fake) => colors.error,
         _ => colors.warning,
     };
     let block = popup_block(title, &keys, colors).border_style(Style::new().fg(border));
-    let room = (block.inner(popup).width as usize).saturating_sub(2);
-    let mut lines: Vec<Line> = confirm
-        .lines
-        .iter()
-        .map(|line| Line::from(format!(" {}", truncate(line, room))))
-        .collect();
-    // The site goes right after what the text says, and keeps its end: a
-    // long host can only hide the part a sender made up.
-    if let Some(site) = &confirm.site {
-        let host = truncate_start(site, room.saturating_sub(SITE.width()));
-        lines.insert(lines.len().min(1), Line::from(format!(" {SITE}{host}")));
-    }
+    let room = (block.inner(Rect::new(0, 0, width, 2)).width as usize).saturating_sub(2);
+    let mut lines: Vec<Line> = Vec::new();
     // What Telegram says about the chat goes first, on a line of its own,
     // so a long name can't push it out of sight or pose as it.
     if let (Some(verdict), Some(badge)) = (verdict, confirm.badge) {
@@ -1500,13 +1492,45 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
             Badge::Scam | Badge::Fake => Style::new().fg(colors.error).bold(),
             Badge::Official => Style::new().fg(colors.accent),
         };
-        lines.insert(
-            0,
-            Line::styled(format!(" {}", truncate(verdict, room)), style),
-        );
+        lines.push(Line::styled(format!(" {}", truncate(verdict, room)), style));
     }
+    // The site goes right after what the text says, on one row, and keeps
+    // its end: a long host can only hide the part a sender made up.
+    let site = confirm.site.as_ref().map(|site| {
+        let host = truncate_start(&site.host, room.saturating_sub(LABEL));
+        Line::from(format!(" {:<LABEL$}{host}", site.label))
+    });
+    let mut site = site.into_iter();
+    for (i, line) in confirm.lines.iter().enumerate() {
+        for row in confirm_rows(line, room) {
+            lines.push(Line::from(format!(" {row}")));
+        }
+        if i == 0 {
+            lines.extend(site.by_ref());
+        }
+    }
+    lines.extend(site);
+    let popup = center(area, width, lines.len() as u16 + 2);
     frame.render_widget(Cover, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// `line` wrapped to `room` columns, on at most [`CONFIRM_LINE_ROWS`] rows,
+/// the last ending in `…` if that cut it.
+fn confirm_rows(line: &str, room: usize) -> Vec<String> {
+    let room = room.max(1);
+    let mut rows: Vec<String> = messages::wrap(line, room)
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect();
+    if rows.len() > CONFIRM_LINE_ROWS {
+        rows.truncate(CONFIRM_LINE_ROWS);
+        if let Some(last) = rows.last_mut() {
+            while last.width() + 1 > room && last.pop().is_some() {}
+            last.push('…');
+        }
+    }
+    rows
 }
 
 /// The popup Enter opens on a bot's message: the message on a line, then
@@ -1858,6 +1882,8 @@ fn draw_notice(frame: &mut Frame, area: Rect, notice: &Notice, colors: &Colors) 
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+/// A popup's frame: accent border and its own background, so it stands out
+/// from what's underneath. Callers draw `Cover` first.
 fn popup_block<'a>(title: impl Into<Line<'a>>, keys: &'a str, colors: &Colors) -> Block<'a> {
     bordered(colors)
         .title(title)
@@ -3719,7 +3745,7 @@ mod tests {
             ],
             crate::app::Confirmed::OpenLink(url),
         );
-        confirm.site = Some(host.into());
+        confirm.site = Some(crate::app::Site::link(host.into()));
         for width in [60, 78, 80] {
             let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
             terminal
@@ -3744,7 +3770,7 @@ mod tests {
             ],
             crate::app::Confirmed::OpenLink("https://evil.example/login".into()),
         );
-        confirm.site = Some("evil.example".into());
+        confirm.site = Some(crate::app::Site::link("evil.example".into()));
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|f| draw_confirm(f, f.area(), &confirm, &colors))
@@ -3788,11 +3814,14 @@ mod tests {
             .iter()
             .position(|r| r.contains("Telegram marks it as a SCAM"))
             .expect("its own line");
-        let name = rows
-            .iter()
-            .position(|r| r.contains("Official Support"))
-            .unwrap();
+        let name = rows.iter().position(|r| r.contains("Official")).unwrap();
         assert!(verdict < name, "before the name: {rows:#?}");
+        // The name wraps, but only so far: what follows it stays in sight.
+        let about = rows
+            .iter()
+            .position(|r| r.contains("A group with 5000 members."))
+            .expect("not pushed out");
+        assert_eq!(about, name + CONFIRM_LINE_ROWS, "{rows:#?}");
         let x = column(&rows[verdict], "SCAM");
         assert_eq!(buf[(x, verdict as u16)].fg, colors.error);
         let keys = rows.iter().position(|r| r.contains("y join")).unwrap();
