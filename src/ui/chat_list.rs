@@ -31,6 +31,11 @@ const MIN_WIDTH_FOR_PHOTOS: u16 = 24;
 const MUTED: &str = " 🔕";
 /// On the right of a pinned chat with nothing unread.
 const PINNED: &str = "📌";
+/// In place of the count of a chat marked as unread, with nothing in it
+/// unread.
+const MARKED_UNREAD: &str = "●";
+/// Before what was left written in a chat.
+const DRAFT: &str = "Draft: ";
 /// A folder's tab shows at most this many columns of its name.
 const TAB_NAME_COLS: usize = 16;
 
@@ -40,6 +45,8 @@ pub struct ChatList<'a> {
     /// Display names by user id, for who's typing in groups.
     pub users: &'a HashMap<i64, String>,
     pub selected: Option<i64>,
+    /// The chat open, whose draft is in the composer rather than here.
+    pub open: Option<i64>,
     pub loading: bool,
     pub focused: bool,
     /// A popup that may be drawn over the list is open.
@@ -144,6 +151,14 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
                     Style::new(),
                     colors,
                 ));
+            } else if chat.marked_unread {
+                // Marked as unread on another device: a dot, in the count's
+                // color, where the count would be.
+                if !badges.is_empty() {
+                    badges.push(Span::from(" "));
+                }
+                let color = if muted { colors.muted } else { colors.primary };
+                badges.push(Span::from(MARKED_UNREAD).fg(color));
             } else if badges.is_empty() && chats.pinned(id) {
                 badges.push(Span::from(PINNED));
             }
@@ -179,13 +194,24 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
             } else {
                 Style::new()
             };
-            let second = match activity(chat, &names, None) {
-                Some(doing) => Span::from(truncate(&doing, width)).fg(colors.activity),
-                None => Span::from(truncate(&chat.preview, width)).fg(colors.subtle),
-            };
+            let mut second = vec![bar, gap];
+            match (activity(chat, &names, None), &chat.draft) {
+                (Some(doing), _) => {
+                    second.push(Span::from(truncate(&doing, width)).fg(colors.activity));
+                }
+                // As in Telegram, in place of the last message.
+                (None, Some(draft)) if list.open != Some(id) => {
+                    second.push(Span::from(DRAFT).fg(colors.error));
+                    let room = width.saturating_sub(DRAFT.width());
+                    second.push(Span::from(truncate(&draft.snippet(), room)).fg(colors.subtle));
+                }
+                (None, _) => {
+                    second.push(Span::from(truncate(&chat.preview, width)).fg(colors.subtle));
+                }
+            }
             let mut lines = vec![
                 Line::from(first).style(row_style),
-                Line::from(vec![bar, gap, second]).style(row_style),
+                Line::from(second).style(row_style),
             ];
             if list.gaps {
                 lines.push(Line::default());
@@ -375,6 +401,7 @@ mod tests {
             users: &NO_USERS,
             gaps: true,
             selected,
+            open: None,
             loading: false,
             focused: true,
             covered: false,
@@ -474,6 +501,54 @@ mod tests {
         assert!(rows[quiet].contains("Quiet 🔕"), "{rows:#?}");
         let x = rows[quiet].chars().position(|c| c == '4').unwrap() as u16;
         assert_eq!(buf[(x, quiet as u16)].bg, colors.muted, "a grey count");
+    }
+
+    #[test]
+    fn a_draft_shows_in_place_of_the_last_message_except_in_the_chat_open() {
+        crate::tg::quiet();
+        let mut chats = Chats::default();
+        chats.add_local(1, "Maya", None).preview = "see you at 5".into();
+        chats.keep_draft(1, crate::draft::Draft::new("on my **way**", None));
+        chats.refresh();
+        let colors = Colors::default();
+        let rows = |open| {
+            let list = ChatList {
+                open,
+                ..list(&chats, None)
+            };
+            render(&list, &mut images(ProtocolType::Halfblocks), 40, 10)
+        };
+        let buf = rows(None);
+        assert_eq!(cells(&buf, 7, 2, 20), "Draft: on my **way**");
+        assert_eq!(buf[(7, 2)].fg, colors.error);
+        assert_eq!(buf[(14, 2)].fg, colors.subtle);
+        // Open, it's in the composer.
+        let buf = rows(Some(1));
+        assert_eq!(cells(&buf, 7, 2, 12), "see you at 5");
+    }
+
+    #[test]
+    fn a_chat_marked_unread_has_a_dot_for_its_count_and_goes_with_the_unread() {
+        let mut chats = Chats::default();
+        chats.add_local(1, "First", None);
+        chats.add_local(2, "Marked", None);
+        chats.set_marked_unread(2, true);
+        chats.refresh();
+        assert_eq!(chats.ids(), [2, 1], "with the unread chats, on top");
+        let colors = Colors::default();
+        let buf = render(
+            &list(&chats, None),
+            &mut images(ProtocolType::Halfblocks),
+            40,
+            10,
+        );
+        // The count's place, right of the title.
+        assert_eq!(cells(&buf, 7, 1, 6), "Marked");
+        assert_eq!(cells(&buf, 37, 1, 3), " ●│");
+        assert_eq!(buf[(38, 1)].fg, colors.primary);
+        chats.set_marked_unread(2, false);
+        chats.refresh();
+        assert_eq!(chats.ids(), [1, 2]);
     }
 
     #[test]

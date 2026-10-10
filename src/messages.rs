@@ -51,7 +51,10 @@ pub enum SendState {
     Sent,
     /// Still on its way to the server, under a temporary id.
     Pending,
-    Failed,
+    /// Telegram didn't take it; Enter sends it again if it can.
+    Failed {
+        can_retry: bool,
+    },
 }
 
 /// An image shown inline: a photo, or a video's thumbnail.
@@ -1078,7 +1081,9 @@ impl From<Message> for Msg {
         let state = match message.sending_state {
             None => SendState::Sent,
             Some(MessageSendingState::Pending(_)) => SendState::Pending,
-            Some(MessageSendingState::Failed(_)) => SendState::Failed,
+            Some(MessageSendingState::Failed(f)) => SendState::Failed {
+                can_retry: f.can_retry,
+            },
         };
         // Replies to stories aren't shown.
         let reply_to = match message.reply_to {
@@ -1213,6 +1218,14 @@ pub struct OpenChat {
     pub unread_line: Option<i64>,
     /// What `gm` or `gM` asked TDLib for, while the answer is on its way.
     pub mentions_asked: Option<Mentions>,
+    /// What the composer started with, the chat's draft, and the message it
+    /// answers, or what was last kept as the draft since. Leaving keeps
+    /// what's written only if it's something else, so a draft written on
+    /// another device meanwhile isn't replaced by one nobody touched here.
+    pub draft: (String, Option<i64>),
+    /// The message the draft answers, while it's fetched to show over the
+    /// composer.
+    pub draft_reply: Option<i64>,
 }
 
 impl OpenChat {
@@ -1243,6 +1256,8 @@ impl OpenChat {
             unread_after: None,
             unread_line: None,
             mentions_asked: None,
+            draft: (String::new(), None),
+            draft_reply: None,
         }
     }
 
@@ -1314,7 +1329,7 @@ impl OpenChat {
         let msg = self.messages.get(&id)?;
         match msg.state {
             SendState::Pending => Some("Wait until it's sent"),
-            SendState::Failed => Some("This message wasn't sent"),
+            SendState::Failed { .. } => Some("This message wasn't sent"),
             SendState::Sent if msg.editable == Editable::No => {
                 Some("This message has no text to edit")
             }
@@ -1352,6 +1367,16 @@ impl OpenChat {
         self.bubble(id)
             .into_iter()
             .filter(|(_, m)| m.state == SendState::Sent)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// What Enter sends again in the bubble with message `id`: those of its
+    /// messages that weren't sent and Telegram can take again.
+    pub fn retry_ids(&self, id: i64) -> Vec<i64> {
+        self.bubble(id)
+            .into_iter()
+            .filter(|(_, m)| m.state == SendState::Failed { can_retry: true })
             .map(|(id, _)| id)
             .collect()
     }
@@ -2275,7 +2300,7 @@ pub(crate) mod tests {
         let mut open = OpenChat::new(1);
         let mut msgs = page([1, 2, 3, 4]);
         msgs[1].1.state = SendState::Pending;
-        msgs[2].1.state = SendState::Failed;
+        msgs[2].1.state = SendState::Failed { can_retry: true };
         msgs[3].1.editable = Editable::No;
         open.messages.extend(msgs);
         assert_eq!(open.cant_edit(1), None, "TDLib decides the rest");

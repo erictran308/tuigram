@@ -16,6 +16,7 @@ use tdlib_rs::enums::MessageTopic;
 use tdlib_rs::types::{self, Message};
 
 use crate::chats;
+use crate::draft::Draft;
 use crate::messages::{Sender, one_line};
 
 /// TDLib's id for the General topic, which every forum has. Messages sent
@@ -51,6 +52,8 @@ pub struct Topic {
     /// You sent the newest message.
     pub yours: bool,
     pub preview: String,
+    /// What was left written in it.
+    pub draft: Option<Draft>,
     /// The newest message that was sent (not one still on its way), to
     /// tell when reading reached it.
     newest: i64,
@@ -72,6 +75,7 @@ impl Topic {
             from: None,
             yours: false,
             preview: String::new(),
+            draft: Draft::of(topic.draft_message.as_ref(), None),
             newest: 0,
             read_inbox: topic.last_read_inbox_message_id,
         };
@@ -107,6 +111,7 @@ impl Topic {
             from: None,
             yours: false,
             preview: preview.into(),
+            draft: None,
             newest: 0,
             read_inbox: 0,
         }
@@ -215,6 +220,14 @@ impl Forum {
         self.topics.iter().find(|t| t.id == id)
     }
 
+    /// Keeps what's left written in a topic as its draft at once, rather
+    /// than when TDLib says it's saved.
+    pub fn keep_draft(&mut self, id: i32, draft: Option<Draft>) {
+        if let Some(topic) = self.topics.iter_mut().find(|t| t.id == id) {
+            topic.draft = draft;
+        }
+    }
+
     /// The topic under the cursor: the one selected, else the first. One
     /// selected that isn't loaded yet (opened from a link) is none, not
     /// another topic.
@@ -299,9 +312,13 @@ impl Forum {
     /// Puts in a topic as TDLib has it now, new or not.
     pub fn upsert(&mut self, topic: &types::ForumTopic) {
         self.asking.remove(&topic.info.forum_topic_id);
-        let new = Topic::of(topic);
+        let mut new = Topic::of(topic);
         match self.topics.iter_mut().find(|t| t.id == new.id) {
-            Some(old) => *old = new,
+            Some(old) => {
+                // A draft saved from here keeps its text as typed.
+                new.draft = Draft::of(topic.draft_message.as_ref(), old.draft.as_ref());
+                *old = new;
+            }
             None => self.topics.push(new),
         }
         self.sort();
@@ -339,6 +356,7 @@ impl Forum {
             .iter_mut()
             .find(|t| t.id == update.forum_topic_id)?;
         topic.mentions = update.unread_mention_count;
+        topic.draft = Draft::of(update.draft_message.as_ref(), topic.draft.as_ref());
         let read_before = topic.read_inbox;
         topic.read_inbox = update.last_read_inbox_message_id;
         let pinned = topic.pinned != update.is_pinned;

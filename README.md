@@ -33,7 +33,10 @@ With Rust: `cargo binstall tuigram-cli` gets the same ready-made app.
 - **Forward.** `f` sends the selected message, or a whole album, to another chat, with "Forwarded from" as in Telegram.
 - **Polls and link previews.** Polls show their answers, and how people voted once you have; `Enter` votes. Links show the page's title and a few lines of it, under the site they really go to, beside a small picture where the terminal shows images.
 - **Write faster.** `@` and a few letters suggests people in the group, `:` and a few letters suggests emoji (`:tada` 🎉), and `/` starting a message lists the bots' commands; `Tab` puts one in.
-- **Pin and mute.** `p` pins a chat to the top and `m` mutes it, on Telegram, so your other devices follow.
+- **Pin, mute, archive.** `p` pins a chat to the top, `m` mutes it and `a` archives it, on Telegram, so your other devices follow.
+- **Drafts.** What you leave written in a chat stays there as its draft, on your phone too, and the chat list shows it in place of the last message. Come back and it's in the composer, reply and all.
+- **Works where Telegram is blocked.** `:proxy` takes a SOCKS5, HTTP or MTProto proxy (a `t.me/proxy` link in a message asks to use it), and the status bar says while tuigram is offline or connecting. [More below](#proxy).
+- **Not sent? Send again.** A message that didn't go out says "not sent", and `Enter` sends it again.
 - **Folders.** Your Telegram folders, and the archive, are tabs over the chat list, each with its unread chats; `Tab` and `Shift-Tab` go round them.
 - **Forum topics.** A group split into topics shows them in a pane of their own beside the chat list, with their unread counts and newest message; `Enter` opens one, and what you write goes there.
 - **Bot buttons.** A bot's buttons show under its message. `Enter` lists them to press: the bot answers, a link opens (asking first), and a reply button sends its words.
@@ -169,10 +172,10 @@ The status bar always shows the keys for where you are. The essentials:
 | `j` / `k` | Move down / up |
 | `gg` / `G` | Jump to top / bottom |
 | `Ctrl-d` / `Ctrl-u` | Half a page down / up |
-| `Enter` / `l` | Open a chat, at its first unread message if it has some (a forum shows its topics: `Enter` opens one); show a photo as big as the window allows (`h` / `l` the one before / after it, `j` / `k` zoom in / out, up to filling the window, `o` opens it in your default app and `y` copies it, unless the chat doesn't allow saving, `Esc` closes it); or open the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens). On a message with spoilers, `Enter` shows them first; on a voice message, it plays it in tuigram, and pauses it; on a poll, it votes; on a bot's message, it lists its buttons, then the message's file and links (`h/j/k/l` choose, `Enter` presses); a `t.me` link opens in tuigram |
+| `Enter` / `l` | Open a chat, at its first unread message if it has some, with what you left written there in the composer (a forum shows its topics: `Enter` opens one); show a photo as big as the window allows (`h` / `l` the one before / after it, `j` / `k` zoom in / out, up to filling the window, `o` opens it in your default app and `y` copies it, unless the chat doesn't allow saving, `Esc` closes it); or open the file or link in a message (files that could run code, and links that hide their address, ask first: `y` opens). On a message that wasn't sent, `Enter` sends it again; on one with spoilers, it shows them first; on a voice message, it plays it in tuigram, and pauses it; on a poll, it votes; on a bot's message, it lists its buttons, then the message's file and links (`h/j/k/l` choose, `Enter` presses); a `t.me` link opens in tuigram |
 | `Tab` / `Shift-Tab` | In the chat list: your next / previous folder, in Telegram's order, then the archive. With folders, they're tabs over the list, each with its count of unread chats |
 | `h` / `Esc` | Back to the chat list, or from a topic to its forum's topics. To have the list on the right, tick **On the right side of the window** in `?` > **Settings**; `h` and `l` then swap, to follow the screen |
-| `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line. `@name` or `:emoji` shows suggestions, and so does `/` starting a message (the bots' commands); `Tab` puts one in. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
+| `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line, `Esc` stops, leaving what you wrote as the chat's draft, on your other devices too. `@name` or `:emoji` shows suggestions, and so does `/` starting a message (the bots' commands); `Tab` puts one in. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings** |
 | `Tab` | While writing: stickers. `h/j/k/l` pick one, `H` / `L` switch between Recent, Favorites and your sets, `/` finds stickers by emoji or word, `Enter` sends |
 | `y` | Copy the selected message: its text, a link, or the photo or file |
 | `r` | Reply to the selected message (`Esc` twice cancels the reply) |
@@ -192,9 +195,10 @@ The status bar always shows the keys for where you are. The essentials:
 | `n` / `N` | Next older / newer match |
 | `H` | Highlight a chat |
 | `p` / `m` | Pin the selected chat to the top, or mute it, on Telegram, so your phone shows the same; again to undo. Pinned chats show 📌, muted ones 🔕 and a grey unread count |
+| `a` | Archive the selected chat, or in the archive, move it back to the main list |
 | `s` | Find a chat or person: type a name, an `@username` or a `t.me` link, then `Enter` opens it. In a public group or channel you're not in, `i` asks to join |
 | `Ctrl-r` | Resize the panes: `h` / `l` move the line between them left / right, `=` puts it back as at first, `Enter` keeps it (also next time), `Esc` cancels. In a forum's topics, it resizes their pane |
-| `:` | Run a command, typed in full (`Tab` completes the name, and goes on to the next one that fits): `:leave` leaves the group or channel, or ends a secret chat (asks first), `:logout` logs out of Telegram on this computer (asks first), `:info` shows what the chat is and who's in it, and `:secret`, `:key` and `:timer` for [secret chats](#secret-chats) |
+| `:` | Run a command, typed in full (`Tab` completes the name, and goes on to the next one that fits): `:leave` leaves the group or channel, or ends a secret chat (asks first), `:logout` logs out of Telegram on this computer (asks first), `:info` shows what the chat is and who's in it, `:proxy` sets a [proxy](#proxy), and `:secret`, `:key` and `:timer` for [secret chats](#secret-chats) |
 | `?` | Every shortcut, plus settings and themes |
 | `q` | Quit |
 
@@ -292,6 +296,18 @@ Panes and popups have round corners. In terminals whose font can't draw them (th
 
 If your terminal uses a [Nerd Font](https://www.nerdfonts.com), turn on **Round pills** there too (`nerd_font = true`): unread counts, reactions, the tab you're on and the mode in the status bar get round ends. Other fonts show a box for them, so it's off at first.
 
+## Proxy
+
+Where Telegram is blocked, tuigram can connect through a proxy. Type `:proxy` and give its link, `Enter` to use it from then on; empty connects directly again:
+
+- `socks5://host:1080`, with `socks5://user:password@host:1080` if it needs a login
+- `http://host:3128`
+- a Telegram proxy link: `https://t.me/proxy?server=…&port=…&secret=…`, or `t.me/socks?…`
+
+`Enter` on a proxy link in a message asks to use it, naming the server. A proxy sees your IP address and when you use Telegram, but not your messages, which are encrypted to Telegram's servers.
+
+To log in through one, set it before starting tuigram: `TG_PROXY=socks5://host:1080 tuigram`, or `proxy = "socks5://host:1080"` in `settings.toml` (in [your data folder](#your-data)). `TG_PROXY` wins over the saved one. The status bar says "Connecting…" or "Waiting for network…" while Telegram can't be reached.
+
 ## Your data
 
 Everything lives in one folder on your machine (`tuigram --help` prints its path):
@@ -310,6 +326,7 @@ Environment variables:
 | --- | --- |
 | `TG_DATA_DIR` | Keep the data folder somewhere else |
 | `TG_API_ID`, `TG_API_HASH` | Use your own API key instead of the saved or built-in one |
+| `TG_PROXY` | Connect through this [proxy](#proxy) instead of the saved one |
 
 ## Development
 

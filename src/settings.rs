@@ -49,6 +49,11 @@ pub struct Settings {
     /// lives on whichever of your devices accepts it first, so it's off
     /// unless asked for, and they go to your phone.
     pub accept_secret_chats: bool,
+    /// Connect to Telegram through this proxy, a link: `socks5://host:port`
+    /// (with `user:password@` if it needs one), `http://host:port`, or a
+    /// t.me/proxy link. Set with `:proxy`; `TG_PROXY` wins over it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
     /// Telegram API credentials entered on the login screen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<ApiKeys>,
@@ -69,6 +74,7 @@ impl Default for Settings {
             chat_list_width: DEFAULT_LIST_WIDTH,
             topics_width: DEFAULT_TOPICS_WIDTH,
             accept_secret_chats: false,
+            proxy: None,
             api_keys: None,
         }
     }
@@ -191,6 +197,7 @@ mod tests {
             chat_list_width: 40,
             topics_width: 26,
             accept_secret_chats: true,
+            proxy: None,
             api_keys: None,
         };
         settings.save(&file).unwrap();
@@ -204,6 +211,7 @@ mod tests {
             id: 1234567,
             hash: "0123456789abcdef0123456789abcdef".into(),
         });
+        settings.proxy = Some("socks5://me:secret@10.0.0.1:1080".into());
         settings.save(&file).unwrap();
         assert_eq!(Settings::load(&file).unwrap(), settings);
         assert!(

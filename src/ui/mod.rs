@@ -21,7 +21,7 @@ use crate::chats::{Badge, Chat};
 use crate::complete::Completion;
 use crate::config;
 use crate::images::Images;
-use crate::messages::{Editing, OpenChat, Replied, Sender};
+use crate::messages::{Editing, OpenChat, Replied, SendState, Sender};
 use crate::notify::Notifications;
 use crate::picker::{ChatPicker, Choice, Purpose};
 use crate::pins::{PinMenu, PinnedMenu};
@@ -79,7 +79,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.area(),
     );
     match &app.screen {
-        Screen::Login(login) => draw_login(frame, login, &colors),
+        Screen::Login(login) => draw_login(frame, login, app.connection, &colors),
         Screen::Main => draw_main(frame, app, &colors),
     }
 }
@@ -238,7 +238,7 @@ fn border(focused: bool, colors: &Colors) -> Style {
     })
 }
 
-fn draw_login(frame: &mut Frame, login: &Login, colors: &Colors) {
+fn draw_login(frame: &mut Frame, login: &Login, connection: Option<&str>, colors: &Colors) {
     if let LoginStep::OtherDevice { link } = &login.step
         && let Some(code) = qr::lines(link, colors)
     {
@@ -341,6 +341,15 @@ fn draw_login(frame: &mut Frame, login: &Login, colors: &Colors) {
     }
     if let Some(message) = &login.error {
         frame.render_widget(Line::from(message.as_str()).fg(colors.error), error);
+    } else if let Some(connection) = connection {
+        // Before logging in, there's no `:proxy` yet.
+        let line = match connection {
+            crate::app::CONNECTING => {
+                format!("{connection} Blocked here? See TG_PROXY in tuigram --help")
+            }
+            _ => connection.to_string(),
+        };
+        frame.render_widget(Line::from(line).fg(colors.warning), error);
     }
     let hint = match login.step {
         _ if login.busy => "Sending…",
@@ -446,6 +455,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         chats: &app.chats,
         users: &app.users,
         selected: app.selected,
+        open: app.open.as_ref().map(|o| o.chat_id),
         loading: app.chats_loading(),
         focused: app.focus == Focus::Chats,
         // The settings popup, the command list and toasts can reach over it;
@@ -468,6 +478,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         let pane = topics::TopicList {
             forum,
             names: &names,
+            open: app.open.as_ref().and_then(|o| o.topic),
             focused: app.focus == Focus::Topics,
             gaps: app.settings.chat_gaps,
         };
@@ -2215,6 +2226,12 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             " ",
             "  `Tab` complete · `Enter` attach · `Esc` cancel ",
         ),
+        PromptKind::Proxy => (
+            " PROXY ",
+            colors.command,
+            " ",
+            "  socks5://, http:// or t.me/proxy link · `Enter` use it, empty for none · `Esc` cancel ",
+        ),
     };
     let hints = Line::from(hint_spans(hints, Style::new().fg(colors.muted), colors));
     let [mode, slash, input, keys] = Layout::horizontal([
@@ -2421,6 +2438,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
                 Some(Confirmed::Logout) => "  `y` log out · `n` or `Esc` cancel",
                 Some(Confirmed::StartSecret { .. }) => "  `y` start it · `n` or `Esc` cancel",
                 Some(Confirmed::EndSecret { .. }) => "  `y` end it · `n` or `Esc` cancel",
+                Some(Confirmed::UseProxy(_)) => "  `y` use it · `n` or `Esc` cancel",
                 _ => "  `y` open · `n` or `Esc` cancel",
             },
         ),
@@ -2494,11 +2512,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Chats if !app.chats.tabs().is_empty() => (
             normal,
-            "  `j/k` move · `Enter` open · `i` write · `Tab/Shift-Tab` folders · `/` search · `s` find anyone · `p` pin · `m` mute · `I` info · `Ctrl-o/i` back/forward · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            "  `j/k` move · `Enter` open · `i` write · `Tab/Shift-Tab` folders · `/` search · `s` find anyone · `p` pin · `m` mute · `a` archive · `I` info · `Ctrl-o/i` back/forward · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         Focus::Chats => (
             normal,
-            "  `j/k` move · `Enter` open · `i` write · `/` search · `s` find anyone · `p` pin · `m` mute · `I` info · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            "  `j/k` move · `Enter` open · `i` write · `/` search · `s` find anyone · `p` pin · `m` mute · `a` archive · `I` info · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
         ),
         Focus::Topics => (
             normal,
@@ -2584,6 +2602,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     if app.focus == Focus::Messages && !popup && app.unread_mentions() > 0 {
         context.insert(0, "`gm` mention");
     }
+    let retry = app.open.as_ref().is_some_and(|o| {
+        o.cursor_id()
+            .and_then(|id| o.messages.get(&id))
+            .is_some_and(|m| m.state == SendState::Failed { can_retry: true })
+    });
+    if app.focus == Focus::Messages && !popup && retry {
+        context.insert(0, "`Enter` send again");
+    }
     if let Some(open) = &app.open
         && matches!(app.focus, Focus::Messages | Focus::Input)
         && !popup
@@ -2592,6 +2618,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         context.insert(0, hint);
     }
     let mut spans = pill(mode.bold(), Style::new(), colors);
+    // First, where it can't be cut off: nothing goes out or comes in
+    // meanwhile.
+    if let Some(connection) = app.connection {
+        spans.push(Span::from(format!("  {connection}")).fg(colors.warning));
+    }
     let muted = Style::new().fg(colors.muted);
     if context.is_empty() {
         spans.extend(hint_spans(&hints, muted, colors));
@@ -3440,7 +3471,7 @@ mod tests {
         let colors = Colors::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
-            .draw(|f| draw_login(f, &Login::new(LoginStep::ApiId), &colors))
+            .draw(|f| draw_login(f, &Login::new(LoginStep::ApiId), None, &colors))
             .unwrap();
         let buf = terminal.backend().buffer();
         let text: String = (0..buf.area.height)
@@ -3462,7 +3493,7 @@ mod tests {
         let colors = Colors::default();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|f| draw_login(f, &Login::new(step), &colors))
+            .draw(|f| draw_login(f, &Login::new(step), None, &colors))
             .unwrap();
         buffer_rows(terminal.backend().buffer())
     }
@@ -3485,7 +3516,10 @@ mod tests {
         let link = LOGIN_LINK.to_string();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| draw_login(f, &Login::new(LoginStep::OtherDevice { link }), &colors))
+            .draw(|f| {
+                let login = Login::new(LoginStep::OtherDevice { link });
+                draw_login(f, &login, None, &colors)
+            })
             .unwrap();
         let buf = terminal.backend().buffer();
         let rows = buffer_rows(buf);

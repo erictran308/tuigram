@@ -14,9 +14,10 @@ use tdlib_rs::enums::{
 };
 use tdlib_rs::types::{
     self, AccentColor, ChatFolderInfo, ChatNotificationSettings, ChatPhotoInfo, ChatPosition,
-    FormattedText, Message,
+    DraftMessage, FormattedText, Message,
 };
 
+use crate::draft::Draft;
 use crate::images::Thumbnail;
 use crate::messages::{Sender, decode_minithumbnail, without_spoilers};
 use crate::search;
@@ -41,6 +42,10 @@ pub struct Chat {
     read_inbox: i64,
     /// One-line summary of the last message, e.g. "You: see you at 5".
     pub preview: String,
+    /// What was left written in it, which the list shows instead.
+    pub draft: Option<Draft>,
+    /// Marked as unread on another device, though nothing in it may be.
+    pub marked_unread: bool,
     /// The id of the chat's newest message; 0 if it has none, or it isn't
     /// known.
     last_message: i64,
@@ -319,6 +324,8 @@ impl Chats {
             read_outbox: chat.last_read_outbox_message_id,
             read_inbox: chat.last_read_inbox_message_id,
             preview: chat.last_message.as_ref().map(preview).unwrap_or_default(),
+            draft: Draft::of(chat.draft_message.as_ref(), None),
+            marked_unread: chat.is_marked_as_unread,
             last_message: chat.last_message.as_ref().map_or(0, |m| m.id),
             positions: HashMap::new(),
             photo: chat.photo.as_ref().map(ChatPhoto::new),
@@ -356,6 +363,44 @@ impl Chats {
                 chat.set_position(position);
                 self.dirty = true;
             }
+        }
+    }
+
+    /// Telegram's draft of a chat, from `updateChatDraftMessage`, which
+    /// may move the chat. One saved from here keeps its text as typed.
+    pub fn set_draft(
+        &mut self,
+        chat_id: i64,
+        draft: Option<&DraftMessage>,
+        positions: &[ChatPosition],
+    ) {
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            chat.draft = Draft::of(draft, chat.draft.as_ref());
+            for position in positions {
+                chat.set_position(position);
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Keeps what's left written in a chat as its draft at once, rather
+    /// than when TDLib says it's saved.
+    pub fn keep_draft(&mut self, chat_id: i64, draft: Option<Draft>) {
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            chat.draft = draft;
+        }
+    }
+
+    pub fn draft(&self, chat_id: i64) -> Option<&Draft> {
+        self.by_id.get(&chat_id)?.draft.as_ref()
+    }
+
+    /// Marked as unread (`updateChatIsMarkedAsUnread`), which lists it with
+    /// the unread chats.
+    pub fn set_marked_unread(&mut self, chat_id: i64, marked: bool) {
+        if let Some(chat) = self.by_id.get_mut(&chat_id) {
+            chat.marked_unread = marked;
+            self.dirty = true;
         }
     }
 
@@ -464,7 +509,11 @@ impl Chats {
 
     /// Call when a chat is opened, before it's marked as read.
     pub fn opened(&mut self, chat_id: i64) {
-        self.held = Some(chat_id).filter(|id| self.by_id.get(id).is_some_and(|c| c.unread > 0));
+        self.held = Some(chat_id).filter(|id| {
+            self.by_id
+                .get(id)
+                .is_some_and(|c| c.unread > 0 || c.marked_unread)
+        });
         self.dirty = true;
     }
 
@@ -493,7 +542,7 @@ impl Chats {
         let (by_id, held) = (&self.by_id, self.held);
         self.sorted.sort_unstable_by_key(|&id| {
             let chat = &by_id[&id];
-            let unread = chat.unread > 0 || held == Some(id);
+            let unread = chat.unread > 0 || chat.marked_unread || held == Some(id);
             std::cmp::Reverse((chat.pinned(list), unread, chat.order(list), id))
         });
         self.dirty = false;
@@ -945,6 +994,8 @@ impl Chat {
             read_outbox: 0,
             read_inbox: 0,
             preview: String::new(),
+            draft: None,
+            marked_unread: false,
             last_message: 0,
             positions,
             photo: None,

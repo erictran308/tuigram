@@ -22,6 +22,8 @@ const GENERAL_ICON: &str = "#";
 const ICON: &str = "●";
 /// On the right of a pinned topic with nothing unread.
 const PINNED: &str = "📌";
+/// Before what was left written in a topic.
+const DRAFT: &str = "Draft: ";
 /// After a closed topic's name.
 const CLOSED: &str = " closed";
 /// Columns a topic's name keeps at least, before "closed" makes way.
@@ -31,6 +33,8 @@ const MIN_NAME: usize = 6;
 pub struct TopicList<'a> {
     pub forum: &'a Forum,
     pub names: &'a Names<'a>,
+    /// The topic open, whose draft is in the composer rather than here.
+    pub open: Option<i32>,
     pub focused: bool,
     /// A blank row between topics.
     pub gaps: bool,
@@ -152,6 +156,22 @@ fn rows(
     // for you), then what it says.
     let room = width.saturating_sub(icon_w);
     let mut second = vec![bar, Span::from(" ".repeat(icon_w))];
+    // Highlighted by hand too, so the blank row below stays blank.
+    let row_style = if is_selected {
+        Style::new().bg(colors.selection)
+    } else {
+        Style::new()
+    };
+    // As in the chat list, in place of the newest message.
+    if let Some(draft) = topic.draft.as_ref().filter(|_| list.open != Some(topic.id)) {
+        second.push(Span::from(DRAFT).fg(colors.error));
+        let text = truncate(&draft.snippet(), room.saturating_sub(DRAFT.width()));
+        second.push(Span::from(text).fg(colors.subtle));
+        return vec![
+            Line::from(first).style(row_style),
+            Line::from(second).style(row_style),
+        ];
+    }
     let who = match topic.from {
         _ if topic.preview.is_empty() => None,
         Some(sender) => Some(Span::from(list.names.get(sender)).fg(colors.fg)),
@@ -167,12 +187,6 @@ fn rows(
     }
     let text = truncate(&topic.preview, room.saturating_sub(used));
     second.push(Span::from(text).fg(colors.subtle));
-    // Highlighted by hand too, so the blank row below stays blank.
-    let row_style = if is_selected {
-        Style::new().bg(colors.selection)
-    } else {
-        Style::new()
-    };
     vec![
         Line::from(first).style(row_style),
         Line::from(second).style(row_style),
@@ -208,6 +222,7 @@ mod tests {
         let list = TopicList {
             forum,
             names: &names,
+            open: None,
             focused: true,
             gaps: true,
         };
@@ -280,6 +295,7 @@ mod tests {
         let list = TopicList {
             forum: &forum,
             names: &names,
+            open: None,
             focused: true,
             gaps: false,
         };

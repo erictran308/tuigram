@@ -24,6 +24,8 @@ pub struct Config {
     /// Where TDLib keeps its database (your login session), downloaded files and
     /// log, next to the app's own `settings.toml`.
     pub data_dir: PathBuf,
+    /// From `TG_PROXY`: a proxy link, which wins over the saved one.
+    pub proxy: Option<String>,
 }
 
 impl Config {
@@ -58,7 +60,11 @@ impl Config {
             data_dir
         };
 
-        Ok(Self { api_keys, data_dir })
+        Ok(Self {
+            api_keys,
+            data_dir,
+            proxy: var("TG_PROXY"),
+        })
     }
 }
 

@@ -644,7 +644,7 @@ fn measure<'a>(
                 Some(done) => format!("sending {done}%"),
                 None => "sending…".into(),
             }),
-            SendState::Failed => Some("not sent".into()),
+            SendState::Failed { .. } => Some("not sent".into()),
         };
         let photo = msg.preview.as_ref().map(|p| photo_cells(p, max_text, font));
         let matches = caption.map_or(Vec::new(), |c| search::find(&c.text, query));
@@ -1478,7 +1478,7 @@ impl<'a> Bubble<'a> {
         // Secondary text that still reads on the bubble.
         let faded = if sticker { colors.muted } else { meta_fg };
         let meta_color = match msg.state {
-            SendState::Failed => colors.error,
+            SendState::Failed { .. } => colors.error,
             _ => faded,
         };
         let meta_style = style.fg(meta_color);

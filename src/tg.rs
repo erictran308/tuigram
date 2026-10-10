@@ -19,6 +19,7 @@ use tokio::sync::mpsc::error::SendError;
 
 use crate::chats::{Badge, List, Peer};
 use crate::config::{ApiKeys, Config};
+use crate::draft;
 use crate::info::{self, About, Member};
 use crate::messages::Sender;
 use crate::reactions::{self, Available, ReactionKind};
@@ -57,6 +58,13 @@ pub enum TgEvent {
         chat_id: i64,
         message_id: i64,
         replied: Option<Box<types::Message>>,
+    },
+    /// The message a draft answers; `None` if it's gone.
+    DraftReply {
+        chat_id: i64,
+        topic: Option<i32>,
+        message_id: i64,
+        message: Option<Box<types::Message>>,
     },
     /// A chat's pinned messages, newest first, for request number
     /// `request`; `None` if TDLib couldn't send them.
@@ -610,9 +618,15 @@ impl Tg {
             config: Arc::new(Config {
                 api_keys: None,
                 data_dir: std::env::temp_dir(),
+                proxy: None,
             }),
             accept: Arc::default(),
         }
+    }
+
+    /// The proxy link `TG_PROXY` gives, which wins over the saved one.
+    pub fn env_proxy(&self) -> Option<&str> {
+        self.config.proxy.as_deref()
     }
 
     /// The client events must come from to count; see [`Tagged`].
@@ -620,7 +634,11 @@ impl Tg {
         self.client_id
     }
 
-    pub fn set_tdlib_parameters(&self, keys: ApiKeys) {
+    /// Starts TDLib with its parameters, then sets its proxy: `proxy` is
+    /// the one to use, or none (`Some(None)`); `None` leaves TDLib's as
+    /// they were. In that order, since TDLib keeps its proxies in the
+    /// database the parameters open.
+    pub fn set_tdlib_parameters(&self, keys: ApiKeys, proxy: Option<Option<types::Proxy>>) {
         let config = Arc::clone(&self.config);
         let client_id = self.client_id;
         self.spawn(async move {
@@ -642,8 +660,17 @@ impl Tg {
                 env!("CARGO_PKG_VERSION").into(),
                 client_id,
             )
-            .await
+            .await?;
+            match proxy {
+                Some(proxy) => use_proxy(proxy, client_id).await,
+                None => Ok(()),
+            }
         });
+    }
+
+    /// Connects to Telegram through this proxy from now on, or directly.
+    pub fn use_proxy(&self, proxy: Option<types::Proxy>) {
+        self.spawn(use_proxy(proxy, self.client_id));
     }
 
     pub fn send_phone_number(&self, phone: String) {
@@ -694,7 +721,7 @@ impl Tg {
     pub fn load_chats(&self, list: List, limit: i32) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let (all, failed) =
                 match functions::load_chats(Some(list.tdlib()), limit, client_id).await {
                     Ok(()) => (false, false),
@@ -730,7 +757,7 @@ impl Tg {
         };
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result = match topic {
                 Some(topic) => {
                     functions::get_forum_topic_history(
@@ -782,7 +809,7 @@ impl Tg {
     ) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let found = match secret && !ask.words.is_empty() {
                 true => secret_search_page(chat_id, &ask, offset, limit, client_id).await,
                 false => search_page(chat_id, topic, &ask, from, limit, client_id).await,
@@ -808,7 +835,7 @@ impl Tg {
     pub fn pinned_messages(&self, chat_id: i64, topic: Option<i32>, request: u32) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let mut messages = Vec::new();
             let mut from = 0;
             for _ in 0..PINNED_PAGES {
@@ -868,7 +895,7 @@ impl Tg {
             Mentions::Before(id) => (enums::SearchMessagesFilter::Mention, id, 0),
             Mentions::After(id) => (enums::SearchMessagesFilter::Mention, id, 1 - MENTIONS_PAGE),
         };
-        tokio::spawn(async move {
+        self.task(async move {
             let search = |topic| {
                 functions::search_chat_messages(
                     chat_id,
@@ -916,7 +943,7 @@ impl Tg {
     pub fn chat_info(&self, chat_id: i64, peer: Peer) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let about = match peer {
                 Peer::User(id) => match functions::get_user(id, client_id).await {
                     Ok(enums::User::User(user)) => {
@@ -964,7 +991,7 @@ impl Tg {
     pub fn chat_members(&self, chat_id: i64, supergroup_id: i64, offset: i32) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result = functions::get_supergroup_members(
                 supergroup_id,
                 None,
@@ -995,7 +1022,7 @@ impl Tg {
     pub fn check_pinnable(&self, chat_id: i64, message_id: i64) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result = functions::get_message_properties(chat_id, message_id, client_id).await;
             let pinnable = match result {
                 Ok(enums::MessageProperties::MessageProperties(p)) => Some(p.can_be_pinned),
@@ -1039,7 +1066,7 @@ impl Tg {
     pub fn get_replied_message(&self, chat_id: i64, message_id: i64) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let replied = functions::get_replied_message(chat_id, message_id, client_id)
                 .await
                 .ok()
@@ -1056,7 +1083,7 @@ impl Tg {
     pub fn check_deletable(&self, chat_id: i64, message_id: i64) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result = functions::get_message_properties(chat_id, message_id, client_id).await;
             let deletable = match result {
                 Ok(enums::MessageProperties::MessageProperties(p)) => Some(Deletable {
@@ -1081,7 +1108,7 @@ impl Tg {
     pub fn available_reactions(&self, chat_id: i64, message_id: i64) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let row = reactions::COLUMNS as i32;
             let result =
                 functions::get_message_available_reactions(chat_id, message_id, row, client_id)
@@ -1131,7 +1158,7 @@ impl Tg {
     pub fn check_editable(&self, chat_id: i64, message_id: i64) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result = functions::get_message_properties(chat_id, message_id, client_id).await;
             let editable = match result {
                 Ok(enums::MessageProperties::MessageProperties(p)) => Some(p.can_be_edited),
@@ -1283,7 +1310,7 @@ impl Tg {
     pub fn stickers(&self, source: Source) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result = match source {
                 Source::Recent => functions::get_recent_stickers(false, client_id)
                     .await
@@ -1310,7 +1337,7 @@ impl Tg {
     pub fn sticker_sets(&self) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result =
                 functions::get_installed_sticker_sets(enums::StickerType::Regular, client_id).await;
             let sets = match result {
@@ -1331,7 +1358,7 @@ impl Tg {
     pub fn find_stickers(&self, chat_id: i64, query: String) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result = functions::get_stickers(
                 enums::StickerType::Regular,
                 query.clone(),
@@ -1367,7 +1394,7 @@ impl Tg {
         let tx = self.tx.clone();
         let client_id = self.client_id;
         let mut caption = (!caption.is_empty()).then(|| markdown(caption));
-        tokio::spawn(async move {
+        self.task(async move {
             let mut reply_to = reply_to.map(reply_to_message);
             for group in groups {
                 let mut contents: Vec<_> = group
@@ -1407,7 +1434,7 @@ impl Tg {
     pub fn forward(&self, chat_id: i64, from_chat_id: i64, message_ids: Vec<i64>) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result = functions::forward_messages(
                 chat_id,
                 None,
@@ -1431,7 +1458,7 @@ impl Tg {
     pub fn find_chats(&self, query: String) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let user_ids =
                 match functions::search_contacts(query.clone(), CONTACT_SEARCH_LIMIT, client_id)
                     .await
@@ -1550,7 +1577,7 @@ impl Tg {
     pub fn join_chat(&self, chat_id: i64) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let _ = match functions::join_chat(chat_id, client_id).await {
                 Ok(()) => tx.send(TgEvent::Joined { chat_id }),
                 Err(e) => tx.send(TgEvent::Error(e.message)),
@@ -1563,7 +1590,7 @@ impl Tg {
     pub fn find_members(&self, chat_id: i64, query: String) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result = functions::search_chat_members(
                 chat_id,
                 query.clone(),
@@ -1596,7 +1623,7 @@ impl Tg {
     pub fn bot_commands(&self, chat_id: i64, peer: Peer) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let by_bot: Vec<(i64, Vec<types::BotCommand>)> = match peer {
                 Peer::User(id) => match functions::get_user_full_info(id, client_id).await {
                     Ok(enums::UserFullInfo::UserFullInfo(info)) => info
@@ -1692,7 +1719,7 @@ impl Tg {
     ) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let payload =
                 enums::CallbackQueryPayload::Data(types::CallbackQueryPayloadData { data });
             let answer =
@@ -1731,7 +1758,7 @@ impl Tg {
     pub fn end_secret_chat(&self, chat_id: i64, secret_id: i32, open: bool) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let ended = async {
                 if open {
                     functions::close_secret_chat(secret_id, client_id).await?;
@@ -1774,7 +1801,7 @@ impl Tg {
         let state = Arc::clone(&self.accept);
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             // One at a time, each applying the latest wish, so a quick tick
             // and untick can't end with an older one applied last.
             let _applying = state.applying.lock().await;
@@ -1811,7 +1838,7 @@ impl Tg {
     pub fn leave_chat(&self, chat_id: i64) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let _ = match functions::leave_chat(chat_id, client_id).await {
                 Ok(()) => tx.send(TgEvent::Left { chat_id }),
                 Err(e) => tx.send(TgEvent::Error(e.message)),
@@ -1827,7 +1854,7 @@ impl Tg {
         lookup: impl Future<Output = Result<Spot, Missed>> + Send + 'static,
     ) {
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.task(async move {
             let found = lookup.await;
             let _ = tx.send(TgEvent::ChatFound { request, found });
         });
@@ -1839,7 +1866,7 @@ impl Tg {
     pub fn send_typing(&self, chat_id: i64, topic: Option<i32>, typing: bool) {
         let action = typing.then_some(enums::ChatAction::Typing);
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let topic = forum_topic(topic);
             let _ = functions::send_chat_action(chat_id, topic, action, client_id).await;
         });
@@ -1860,7 +1887,7 @@ impl Tg {
     fn fetch_file(&self, file_id: i32, priority: i32, report_errors: bool) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             // synchronous = true: answer only once the whole file is on disk.
             let result = functions::download_file(file_id, priority, 0, 0, true, client_id).await;
             let path = match result {
@@ -1915,12 +1942,34 @@ impl Tg {
         ));
     }
 
+    /// Marks a chat as unread, or not, though nothing in it may be: a
+    /// reminder only you see, which Telegram's apps set. TDLib then sends
+    /// `updateChatIsMarkedAsUnread`.
+    pub fn mark_unread(&self, chat_id: i64, marked: bool) {
+        self.spawn(functions::toggle_chat_is_marked_as_unread(
+            chat_id,
+            marked,
+            self.client_id,
+        ));
+    }
+
+    /// Moves a chat to the archive, or out of it to the main list. TDLib
+    /// then sends `updateChatPosition` for both.
+    pub fn archive(&self, chat_id: i64, archive: bool) {
+        let list = if archive { List::Archive } else { List::Main };
+        self.spawn(functions::add_chat_to_list(
+            chat_id,
+            list.tdlib(),
+            self.client_id,
+        ));
+    }
+
     /// Fetches a page of a forum's topics, from where the last one ended,
     /// as [`TgEvent::Topics`] numbered `request`.
     pub fn forum_topics(&self, chat_id: i64, request: u32, from: Offset) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result = functions::get_forum_topics(
                 chat_id,
                 String::new(),
@@ -1951,7 +2000,7 @@ impl Tg {
     pub fn forum_topic(&self, chat_id: i64, topic_id: i32) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
-        tokio::spawn(async move {
+        self.task(async move {
             let result = functions::get_forum_topic(chat_id, topic_id, client_id).await;
             let topic = result
                 .ok()
@@ -1964,10 +2013,50 @@ impl Tg {
         });
     }
 
-    /// Flushes TDLib's database and ends with `authorizationStateClosed`.
-    pub fn close(&self) {
+    /// Sends messages Telegram didn't take again. TDLib deletes the ones
+    /// that failed and sends new ones (`updateNewMessage`).
+    pub fn resend(&self, chat_id: i64, message_ids: Vec<i64>) {
+        self.spawn(functions::resend_messages(
+            chat_id,
+            message_ids,
+            None,
+            0,
+            self.client_id,
+        ));
+    }
+
+    /// Keeps what's left written in a chat as its draft, or clears it.
+    /// TDLib then sends `updateChatDraftMessage`, or `updateForumTopic`.
+    pub fn set_draft(&self, keep: draft::Keep) {
+        self.spawn(set_draft(keep, self.client_id));
+    }
+
+    /// The message a chat's draft answers, to show over the composer.
+    pub fn draft_reply(&self, chat_id: i64, topic: Option<i32>, message_id: i64) {
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        self.task(async move {
+            let message = match functions::get_message(chat_id, message_id, client_id).await {
+                Ok(enums::Message::Message(m)) => Some(Box::new(m)),
+                Err(_) => None,
+            };
+            let _ = tx.send(TgEvent::DraftReply {
+                chat_id,
+                topic,
+                message_id,
+                message,
+            });
+        });
+    }
+
+    /// Flushes TDLib's database and ends with `authorizationStateClosed`,
+    /// keeping the open chat's draft first.
+    pub fn close(&self, draft: Option<draft::Keep>) {
         let client_id = self.client_id;
         self.spawn(async move {
+            if let Some(keep) = draft {
+                let _ = set_draft(keep, client_id).await;
+            }
             // Others see you go offline now, not minutes later. Before login
             // this fails, which is fine.
             let offline = enums::OptionValue::Boolean(types::OptionValueBoolean { value: false });
@@ -1999,11 +2088,19 @@ impl Tg {
         request: impl Future<Output = Result<T, types::Error>> + Send + 'static,
     ) {
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.task(async move {
             if let Err(e) = request.await {
                 let _ = tx.send(TgEvent::Error(e.message));
             }
         });
+    }
+
+    /// Runs a request on its own task. A client that was never started
+    /// (`detached`, for the demo and tests) takes none.
+    fn task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        if self.client_id != 0 {
+            tokio::spawn(task);
+        }
     }
 }
 
@@ -2201,7 +2298,33 @@ async fn public_chat(username: &str, client_id: i32) -> Result<i64, String> {
     }
 }
 
-fn reply_to_message(message_id: i64) -> enums::InputMessageReplyTo {
+/// Enables the proxy among TDLib's, adding it if it's new, or disables
+/// the one enabled.
+async fn use_proxy(proxy: Option<types::Proxy>, client_id: i32) -> Result<(), types::Error> {
+    let enums::AddedProxies::AddedProxies(added) = functions::get_proxies(client_id).await?;
+    match proxy {
+        Some(proxy) => match added.proxies.iter().find(|a| a.proxy == proxy) {
+            Some(added) if added.is_enabled => Ok(()),
+            Some(added) => functions::enable_proxy(added.id, client_id).await,
+            None => functions::add_proxy(proxy, true, client_id).await.map(drop),
+        },
+        None if added.proxies.iter().any(|a| a.is_enabled) => {
+            functions::disable_proxy(client_id).await
+        }
+        None => Ok(()),
+    }
+}
+
+fn set_draft(keep: draft::Keep, client_id: i32) -> impl Future<Output = Result<(), types::Error>> {
+    functions::set_chat_draft_message(
+        keep.chat_id,
+        forum_topic(keep.topic),
+        keep.draft.map(|d| d.message()),
+        client_id,
+    )
+}
+
+pub fn reply_to_message(message_id: i64) -> enums::InputMessageReplyTo {
     enums::InputMessageReplyTo::Message(types::InputMessageReplyToMessage {
         message_id,
         quote: None,
@@ -2218,15 +2341,17 @@ pub fn plain(text: String) -> types::FormattedText {
     }
 }
 
+/// Without `log_to_file`, TDLib prints every request it runs (`markdown`
+/// and the like) in a test's output.
+#[cfg(test)]
+pub fn quiet() {
+    let request = json!({ "@type": "setLogVerbosityLevel", "new_verbosity_level": 1 });
+    execute(&request).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Without `log_to_file`, TDLib prints every request it runs here.
-    fn quiet() {
-        let request = json!({ "@type": "setLogVerbosityLevel", "new_verbosity_level": 1 });
-        execute(&request).unwrap();
-    }
 
     fn entities(text: &types::FormattedText) -> Vec<(i32, i32, String)> {
         text.entities

@@ -10,10 +10,10 @@ use ratatui::DefaultTerminal;
 use ratatui::style::Style;
 use ratatui_textarea::{DataCursor, TextArea};
 use tdlib_rs::enums::{
-    AuthenticationCodeType, AuthorizationState, ChatMemberStatus, MessageSender, MessageTopic,
-    NotificationType, OptionValue, Update, UserType,
+    AuthenticationCodeType, AuthorizationState, ChatMemberStatus, ConnectionState, MessageSender,
+    MessageTopic, NotificationType, OptionValue, Update, UserType,
 };
-use tdlib_rs::types::{Message, UpdateNotificationGroup};
+use tdlib_rs::types::{Message, Proxy, UpdateNotificationGroup};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Instant, sleep_until};
 
@@ -23,6 +23,7 @@ use crate::chats::{Badge, Chats, List, Peer, Presence};
 use crate::clipboard::{Clipboard, ClipboardEvent, Copied, Decoded, Paste, Pasted};
 use crate::complete::{self, Commands, Completion, Kind, Suggestion};
 use crate::config::{self, ApiKeys};
+use crate::draft::{self, Draft};
 use crate::images::{ImageEvent, Images};
 use crate::info::ChatInfo;
 use crate::messages::{
@@ -33,6 +34,7 @@ use crate::notify::{self, Note, Notifications, Notifier};
 use crate::picker::{self, ChatPicker, Choice, Purpose};
 use crate::pins::{PinMenu, Pinned, PinnedMenu, Place};
 use crate::poll::{Vote, VoteMenu};
+use crate::proxy;
 use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search::{self, MessageSearch, Who};
 use crate::secret::{KeyView, Secret, SecretState, TimerMenu};
@@ -240,6 +242,8 @@ pub enum Confirmed {
         chat_id: i64,
         secret_id: i32,
     },
+    /// Connect through the proxy this link gives, from now on.
+    UseProxy(String),
 }
 
 impl Confirmed {
@@ -253,6 +257,7 @@ impl Confirmed {
             Confirmed::Logout => "log out",
             Confirmed::StartSecret { .. } => "start it",
             Confirmed::EndSecret { .. } => "end it",
+            Confirmed::UseProxy(_) => "use it",
         }
     }
 }
@@ -510,6 +515,8 @@ pub enum PromptKind {
     Messages,
     Command,
     Attach,
+    /// `:proxy`: the link of the proxy to connect through.
+    Proxy,
 }
 
 /// The prompt in the status bar. Searching chats filters the list as you
@@ -600,16 +607,18 @@ pub enum Command {
     Key,
     Leave,
     Logout,
+    Proxy,
     Secret,
     Timer,
 }
 
 impl Command {
-    pub const ALL: [Command; 6] = [
+    pub const ALL: [Command; 7] = [
         Command::Info,
         Command::Key,
         Command::Leave,
         Command::Logout,
+        Command::Proxy,
         Command::Secret,
         Command::Timer,
     ];
@@ -620,6 +629,7 @@ impl Command {
             Command::Key => "key",
             Command::Leave => "leave",
             Command::Logout => "logout",
+            Command::Proxy => "proxy",
             Command::Secret => "secret",
             Command::Timer => "timer",
         }
@@ -631,6 +641,7 @@ impl Command {
             Command::Key => "Show a secret chat's key, to compare with the other person's",
             Command::Leave => "Leave this group or channel, or end a secret chat (asks first)",
             Command::Logout => "Log out of Telegram on this computer (asks first)",
+            Command::Proxy => "Connect through a proxy where Telegram is blocked, or directly",
             Command::Secret => "Start a secret chat with this person (asks first)",
             Command::Timer => "Set how long messages in a secret chat last once seen",
         }
@@ -757,6 +768,9 @@ pub struct App {
     pub jumps: Jumps,
     /// Last error, shown in the status bar until the next key press.
     pub status: Option<String>,
+    /// What TDLib's connection to Telegram is doing, while it isn't
+    /// working, e.g. "Connecting…"; shown in the status bar.
+    pub connection: Option<&'static str>,
     /// First `g` of `gg` was pressed.
     pending_g: bool,
     /// Set once quitting started; we exit at this time even if TDLib never answers.
@@ -873,6 +887,7 @@ impl App {
             // pick a separate session should know this one didn't.
             status: config::dotenv_ignored()
                 .then(|| "./.env is ignored: only development builds read it".into()),
+            connection: None,
             pending_g: false,
             quit_deadline: None,
             terminal_focused: true,
@@ -1192,6 +1207,12 @@ impl App {
                     open.set_replied(message_id, replied.map(|m| *m));
                 }
             }
+            TgEvent::DraftReply {
+                chat_id,
+                topic,
+                message_id,
+                message,
+            } => self.on_draft_reply((chat_id, topic), message_id, message.map(|m| *m)),
             TgEvent::Deletable {
                 chat_id,
                 message_id,
@@ -1519,6 +1540,14 @@ impl App {
                     .set_last_message(u.chat_id, u.last_message.as_ref(), &u.positions)
             }
             Update::ChatTitle(u) => self.chats.set_title(u.chat_id, u.title),
+            Update::ConnectionState(u) => self.connection = connection_words(&u.state),
+            Update::ChatDraftMessage(u) => {
+                self.chats
+                    .set_draft(u.chat_id, u.draft_message.as_ref(), &u.positions)
+            }
+            Update::ChatIsMarkedAsUnread(u) => self
+                .chats
+                .set_marked_unread(u.chat_id, u.is_marked_as_unread),
             Update::ChatNotificationSettings(u) => self
                 .chats
                 .set_notifications(u.chat_id, u.notification_settings),
@@ -1780,7 +1809,8 @@ impl App {
             AuthorizationState::WaitTdlibParameters => match self.api_keys() {
                 Some((source, keys)) => {
                     self.keys_source = Some(source);
-                    self.tg.set_tdlib_parameters(keys);
+                    let proxy = self.proxy_setting();
+                    self.tg.set_tdlib_parameters(keys, proxy);
                     return;
                 }
                 None => LoginStep::ApiId,
@@ -1960,10 +1990,11 @@ impl App {
                     // TDLib only takes a key at startup, so a new client
                     // starts with the saved one.
                     self.relogin = true;
-                    self.tg.close();
+                    self.tg.close(None);
                 } else {
                     self.keys_source = Some(KeySource::Saved);
-                    self.tg.set_tdlib_parameters(keys);
+                    let proxy = self.proxy_setting();
+                    self.tg.set_tdlib_parameters(keys, proxy);
                 }
                 self.screen = login_screen(LoginStep::Connecting);
                 return;
@@ -2112,6 +2143,7 @@ impl App {
             (Focus::Chats, KeyCode::Esc) => self.chats.set_filter(""),
             (Focus::Chats, KeyCode::Char('p')) if !ctrl => self.toggle_pin(),
             (Focus::Chats, KeyCode::Char('m')) if !ctrl => self.toggle_mute(),
+            (Focus::Chats, KeyCode::Char('a')) => self.toggle_archive(),
             (Focus::Messages, KeyCode::Esc)
                 if self.open.as_ref().is_some_and(|o| o.search.is_some()) =>
             {
@@ -2515,6 +2547,94 @@ impl App {
     fn leave_insert(&mut self) {
         self.focus = Focus::Messages;
         self.set_typing(false);
+        // Your other devices have it too, should you go on there.
+        self.keep_draft();
+    }
+
+    /// What's written in the open chat: the composer's text, or during an
+    /// edit what it held before, and the message it answers. Only spaces
+    /// is nothing.
+    fn written(&self) -> Option<(String, Option<i64>)> {
+        let open = self.open.as_ref()?;
+        let (text, reply) = match &open.editing {
+            Some(editing) => (editing.draft.clone(), editing.reply.as_ref().map(|r| r.id)),
+            None => (
+                self.composer.lines().join("\n"),
+                open.reply.as_ref().map(|r| r.id).or(open.draft_reply),
+            ),
+        };
+        let text = if text.trim().is_empty() {
+            String::new()
+        } else {
+            text
+        };
+        Some((text, reply))
+    }
+
+    /// Keeps what's written in the open chat as its draft, here at once,
+    /// if it changed since the composer was filled or last kept. Returns
+    /// what to tell Telegram.
+    fn draft_to_keep(&mut self) -> Option<draft::Keep> {
+        let written = self.written()?;
+        let open = self.open.as_mut()?;
+        if open.draft == written {
+            return None;
+        }
+        let draft = Draft::new(&written.0, written.1);
+        // A reply with nothing written yet isn't a draft, and there was none.
+        let had_none = open.draft.0.is_empty();
+        open.draft = written;
+        if draft.is_none() && had_none {
+            return None;
+        }
+        let (chat_id, topic) = open.place();
+        match topic {
+            Some(topic) => {
+                if let Some(forum) = self.forum.as_mut().filter(|f| f.chat_id == chat_id) {
+                    forum.keep_draft(topic, draft.clone());
+                }
+            }
+            None => self.chats.keep_draft(chat_id, draft.clone()),
+        }
+        Some(draft::Keep {
+            chat_id,
+            topic,
+            draft,
+        })
+    }
+
+    /// Keeps what's written in the open chat as its draft on Telegram.
+    fn keep_draft(&mut self) {
+        if let Some(keep) = self.draft_to_keep() {
+            self.tg.set_draft(keep);
+        }
+    }
+
+    /// The message the draft answers, fetched to show over the composer;
+    /// `None` if it's gone, and the draft then answers nothing.
+    fn on_draft_reply(
+        &mut self,
+        place: (i64, Option<i32>),
+        message_id: i64,
+        message: Option<Message>,
+    ) {
+        let Some(open) = self
+            .open
+            .as_mut()
+            .filter(|o| o.place() == place && o.draft_reply == Some(message_id))
+        else {
+            return;
+        };
+        open.draft_reply = None;
+        if let Some(message) = message
+            && open.reply.is_none()
+            && open.editing.is_none()
+        {
+            open.reply = Some(Replied::new(
+                message_id,
+                &crate::messages::Msg::from(message),
+            ));
+        }
     }
 
     /// You're typing while the composer has text, and stopped once it's empty.
@@ -2571,10 +2691,12 @@ impl App {
             ));
             return;
         }
-        let reply_to = open.reply.take().map(|r| r.id);
+        let reply_to = open.reply.take().map(|r| r.id).or(open.draft_reply.take());
         if open.attachments.is_empty() {
             self.tg
                 .send_text(open.chat_id, open.topic, text, reply_to, secret);
+            // Sending a text clears the draft.
+            open.draft = (String::new(), None);
         } else {
             let as_files = open.as_files;
             let groups = attach::albums(&open.attachments, as_files)
@@ -2715,12 +2837,15 @@ impl App {
                 };
                 self.attach(paths, None);
             }
+            PromptKind::Proxy if !submit => {}
+            PromptKind::Proxy => self.set_proxy(&query),
             PromptKind::Command if !submit || query.is_empty() => {}
             PromptKind::Command => match Command::parse(&query) {
                 Some(Command::Info) => self.open_chat_info(),
                 Some(Command::Key) => self.show_key(),
                 Some(Command::Leave) => self.ask_to_leave(),
                 Some(Command::Logout) => self.ask_to_log_out(),
+                Some(Command::Proxy) => self.open_proxy_prompt(),
                 Some(Command::Secret) => self.ask_secret_chat(),
                 Some(Command::Timer) => self.open_timer_menu(),
                 None => self.status = Some(format!("Not a command: {query}")),
@@ -3438,13 +3563,23 @@ impl App {
             return;
         }
         self.focus = Focus::Messages;
+        // Even the chat open, marked meanwhile, is unmarked entering it
+        // again. It's opened first, so it stays put among the unread.
+        let marked = self.chats.get(chat_id).is_some_and(|c| c.marked_unread);
         if self.open.as_ref().is_some_and(|o| o.chat_id == chat_id) {
+            if marked {
+                self.chats.opened(chat_id);
+                self.unmark_unread(chat_id);
+            }
             return;
         }
         self.leave_chat();
         // TDLib only sends some updates (e.g. for channels) while a chat is open.
         self.tg.open_chat(chat_id);
         self.chats.opened(chat_id);
+        if marked {
+            self.unmark_unread(chat_id);
+        }
         let mut open = OpenChat::new(chat_id);
         // With unread messages, it opens at the first of them, as in
         // Telegram, and nothing is read until you get to the newest. (In a
@@ -3460,13 +3595,21 @@ impl App {
     /// pick one to read.
     fn enter_forum(&mut self, chat_id: i64) {
         self.focus = Focus::Topics;
+        let marked = self.chats.get(chat_id).is_some_and(|c| c.marked_unread);
         if self.forum.as_ref().is_some_and(|f| f.chat_id == chat_id) {
+            if marked {
+                self.chats.opened(chat_id);
+                self.unmark_unread(chat_id);
+            }
             return;
         }
         self.leave_chat();
         // Topics are only kept up to date while the forum is open.
         self.tg.open_chat(chat_id);
         self.chats.opened(chat_id);
+        if marked {
+            self.unmark_unread(chat_id);
+        }
         self.composer = new_composer();
         self.forum = Some(Forum::new(chat_id));
         self.ask_topics();
@@ -3634,6 +3777,7 @@ impl App {
     /// Before the messages shown give way to others: you stop typing in
     /// them, and a voice message in them stops playing.
     fn leave_messages(&mut self) {
+        self.keep_draft();
         self.set_typing(false);
         // A paste on its way was for these messages.
         self.pasting = false;
@@ -3644,10 +3788,26 @@ impl App {
         }
     }
 
-    fn show_messages(&mut self, open: OpenChat) {
+    fn show_messages(&mut self, mut open: OpenChat) {
         let page = open.first_page();
-        self.open = Some(open);
         self.composer = new_composer();
+        let draft = match open.topic {
+            Some(topic) => self
+                .forum
+                .as_ref()
+                .and_then(|f| f.get(topic))
+                .and_then(|t| t.draft.as_ref()),
+            None => self.chats.draft(open.chat_id),
+        };
+        if let Some(draft) = draft.cloned() {
+            self.composer.insert_str(&draft.text);
+            if let Some(id) = draft.reply_to {
+                open.draft_reply = Some(id);
+                self.tg.draft_reply(open.chat_id, open.topic, id);
+            }
+            open.draft = (draft.text, draft.reply_to);
+        }
+        self.open = Some(open);
         match page {
             Page::Latest => self.load_older_messages(),
             page => self.load_page(page),
@@ -3726,7 +3886,7 @@ impl App {
         };
         match msg.state {
             SendState::Pending => self.status = Some("Wait until it's sent".into()),
-            SendState::Failed => self.status = Some("This message wasn't sent".into()),
+            SendState::Failed { .. } => self.status = Some("This message wasn't sent".into()),
             SendState::Sent if msg.pinned => self.tg.unpin_message(open.chat_id, id),
             SendState::Sent => {
                 let chat = self.chats.get(open.chat_id);
@@ -3854,6 +4014,9 @@ impl App {
     /// poll; lists a bot's buttons; else opens its file or link (playing a
     /// voice message) right away, or shows a menu when there's more than one.
     fn open_selected_message(&mut self) {
+        if self.resend_selected() {
+            return;
+        }
         let Some(open) = self.open.as_mut() else {
             return;
         };
@@ -3945,6 +4108,32 @@ impl App {
         }
     }
 
+    /// Enter on a message Telegram didn't take sends it again, with the
+    /// rest of its album. Returns whether the cursor was on one.
+    fn resend_selected(&mut self) -> bool {
+        let Some(open) = self.open.as_ref() else {
+            return false;
+        };
+        let Some((id, msg)) = open
+            .cursor_id()
+            .and_then(|id| open.messages.get_key_value(&id))
+        else {
+            return false;
+        };
+        let SendState::Failed { can_retry } = msg.state else {
+            return false;
+        };
+        let (chat_id, ids) = (open.chat_id, open.retry_ids(*id));
+        if !can_retry {
+            self.status = Some("Telegram won't take this message again: `d` deletes it".into());
+        } else if let Some(why) = self.cant_send(chat_id) {
+            self.status = Some(why);
+        } else {
+            self.tg.resend(chat_id, ids);
+        }
+        true
+    }
+
     /// `r`: answer the message under the cursor. Goes straight to Insert mode,
     /// keeping whatever was already typed.
     fn reply_to_selected(&mut self) {
@@ -3959,7 +4148,7 @@ impl App {
         else {
             return;
         };
-        if msg.state == SendState::Failed {
+        if matches!(msg.state, SendState::Failed { .. }) {
             self.status = Some("Can't reply to a message that wasn't sent".into());
             return;
         }
@@ -4198,7 +4387,7 @@ impl App {
         };
         match msg.state {
             SendState::Pending => self.status = Some("Wait until it's sent".into()),
-            SendState::Failed => self.status = Some("This message wasn't sent".into()),
+            SendState::Failed { .. } => self.status = Some("This message wasn't sent".into()),
             SendState::Sent => {
                 self.react_menu = Some(ReactMenu::new(message_id, msg.snippet()));
                 self.tg.available_reactions(open.chat_id, message_id);
@@ -4494,7 +4683,7 @@ impl App {
         };
         match msg.state {
             SendState::Pending => self.status = Some("Wait until it's sent".into()),
-            SendState::Failed => self.status = Some("This message wasn't sent".into()),
+            SendState::Failed { .. } => self.status = Some("This message wasn't sent".into()),
             SendState::Sent => {
                 self.picker = Some(ChatPicker::new(Purpose::Forward {
                     from: open.chat_id,
@@ -5037,6 +5226,9 @@ impl App {
             // A chat, a message or an invite on Telegram opens here. Where
             // the link really goes decides, not its words, so it can't be
             // disguised; anything tuigram can't open goes to the browser.
+            // A proxy, which all of tuigram's connection to Telegram would
+            // go through: only once you say so, naming it.
+            Target::Link(link) if proxy::is_link(&link.url) => self.ask_to_use_proxy(&link.url),
             Target::Link(link) if picker::telegram_link(&link.url) => {
                 self.finding = Some(Finding {
                     request: link.url.clone(),
@@ -5305,6 +5497,7 @@ impl App {
                             self.finding = Some(Finding::new(&request));
                             self.tg.join_by_link(link, request);
                         }
+                        Confirmed::UseProxy(link) => self.set_proxy(&link),
                     }
                 }
             }
@@ -5878,6 +6071,128 @@ impl App {
         }
     }
 
+    /// The proxy to connect through, from `TG_PROXY` or the settings, or
+    /// none (`Some(None)`). One that can't be used is said, and `None`
+    /// leaves TDLib's proxies as they were rather than connect directly,
+    /// which may be what the proxy was there to avoid.
+    fn proxy_setting(&mut self) -> Option<Option<Proxy>> {
+        let (link, from) = match (self.tg.env_proxy(), &self.settings.proxy) {
+            (Some(link), _) => (link.to_string(), "TG_PROXY"),
+            (None, Some(link)) => (link.clone(), "The proxy in settings.toml"),
+            (None, None) => return Some(None),
+        };
+        match proxy::parse(&link) {
+            Ok(proxy) => Some(Some(proxy)),
+            Err(why) => {
+                let said = format!("{from} isn't used: {why}");
+                if let Screen::Login(login) = &mut self.screen {
+                    login.error = Some(said.clone());
+                }
+                self.status = Some(said);
+                None
+            }
+        }
+    }
+
+    /// `:proxy`: the proxy's link in the prompt, to change, or empty for
+    /// none.
+    fn open_proxy_prompt(&mut self) {
+        if self.tg.env_proxy().is_some() {
+            self.status = Some("TG_PROXY sets the proxy: change it there".into());
+            return;
+        }
+        self.open_prompt(PromptKind::Proxy);
+        let link = self.settings.proxy.clone().unwrap_or_default();
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.input = prompt_input(&link);
+        }
+    }
+
+    /// A proxy link in a message: asks before connecting through it.
+    fn ask_to_use_proxy(&mut self, link: &str) {
+        if self.tg.env_proxy().is_some() {
+            self.status = Some("TG_PROXY sets the proxy: change it there".into());
+            return;
+        }
+        match proxy::parse(link) {
+            Ok(proxy) => {
+                self.confirm = Some(Confirm::new(
+                    "Use this proxy?",
+                    vec![
+                        proxy::describe(&proxy),
+                        "tuigram would connect to Telegram through it. It sees your IP \
+                         address and when you use Telegram, not your messages."
+                            .into(),
+                        "`:proxy` changes it, or goes back to connecting directly.".into(),
+                    ],
+                    Confirmed::UseProxy(link.to_string()),
+                ));
+            }
+            Err(why) => self.status = Some(why),
+        }
+    }
+
+    /// Connects through the proxy this link gives from now on, and next
+    /// time; an empty one connects directly.
+    fn set_proxy(&mut self, link: &str) {
+        let link = link.trim();
+        let proxy = if link.is_empty() {
+            None
+        } else {
+            match proxy::parse(link) {
+                Ok(proxy) => Some(proxy),
+                Err(why) => {
+                    self.status = Some(why);
+                    return;
+                }
+            }
+        };
+        self.settings.proxy = proxy.is_some().then(|| link.to_string());
+        if let Err(e) = self.settings.save(&self.settings_path) {
+            self.status = Some(format!("Proxy not saved for next time: {e:#}"));
+        }
+        match &proxy {
+            Some(proxy) => self.show_toast("Connecting through", &proxy::describe(proxy)),
+            None => self.show_toast("No proxy", "Connecting to Telegram directly"),
+        }
+        self.tg.use_proxy(proxy);
+    }
+
+    /// A chat marked as unread (on another device) isn't once it's opened,
+    /// as in Telegram.
+    fn unmark_unread(&mut self, chat_id: i64) {
+        self.chats.set_marked_unread(chat_id, false);
+        self.tg.mark_unread(chat_id, false);
+    }
+
+    /// `a` in the list: moves the chat under the cursor to the archive, or
+    /// out of it to the main list, on Telegram. As it leaves the list
+    /// shown, the cursor goes on to the next chat.
+    fn toggle_archive(&mut self) {
+        let Some(chat_id) = self.selected else {
+            return;
+        };
+        let archived = self.chats.in_list(chat_id, List::Archive);
+        // Folders keep archived chats.
+        if matches!(self.chats.shown(), List::Main | List::Archive) {
+            let ids = self.chats.ids();
+            if let Some(i) = ids.iter().position(|&id| id == chat_id) {
+                let next = ids
+                    .get(i + 1)
+                    .or_else(|| i.checked_sub(1).and_then(|i| ids.get(i)));
+                self.selected = next.copied();
+            }
+        }
+        self.tg.archive(chat_id, !archived);
+        let title = self.chats.title(chat_id).unwrap_or_default().to_string();
+        let done = if archived {
+            "Moved out of the archive"
+        } else {
+            "Archived"
+        };
+        self.show_toast(done, &title);
+    }
+
     /// `H`: marks the selected chat so it's easy to find, or unmarks it.
     fn toggle_highlight(&mut self) {
         let Some(chat_id) = self.selected else {
@@ -5896,7 +6211,8 @@ impl App {
             self.exit = true;
             return;
         }
-        self.tg.close();
+        let draft = self.draft_to_keep();
+        self.tg.close(draft);
         self.quit_deadline = Some(Instant::now() + CLOSE_TIMEOUT);
     }
 }
@@ -5979,6 +6295,22 @@ fn mark_downloaded(path: &str) {
 }
 
 /// A one-line prompt input holding `text`, with the cursor at its end.
+/// Trying to reach Telegram, directly: where it's blocked, that's all
+/// that ever happens.
+pub const CONNECTING: &str = "Connecting…";
+
+/// What the connection to Telegram is doing, in words, while it isn't
+/// working.
+fn connection_words(state: &ConnectionState) -> Option<&'static str> {
+    match state {
+        ConnectionState::WaitingForNetwork => Some("Waiting for network…"),
+        ConnectionState::ConnectingToProxy => Some("Connecting to the proxy…"),
+        ConnectionState::Connecting => Some(CONNECTING),
+        ConnectionState::Updating => Some("Updating…"),
+        ConnectionState::Ready => None,
+    }
+}
+
 fn prompt_input(text: &str) -> TextArea<'static> {
     let mut input = TextArea::new(vec![text.to_string()]);
     input.set_cursor_line_style(Style::default());
@@ -6353,6 +6685,90 @@ mod tests {
         crate::demo::demo_app(Tg::detached(unbounded_channel().0), images, &dir)
     }
 
+    /// The chat open in the demo, and another plain chat.
+    fn two_chats(app: &App) -> (i64, i64) {
+        let here = app.open.as_ref().unwrap().chat_id;
+        let other = app
+            .chats
+            .ids()
+            .iter()
+            .copied()
+            .find(|&id| id != here && !app.chats.is_forum(id) && !app.chats.is_secret(id))
+            .unwrap();
+        (here, other)
+    }
+
+    fn draft_text(app: &App, chat_id: i64) -> Option<&str> {
+        app.chats.draft(chat_id).map(|d| d.text.as_str())
+    }
+
+    #[test]
+    fn what_is_left_written_in_a_chat_is_its_draft_and_comes_back_when_it_opens() {
+        crate::tg::quiet();
+        let mut app = test_app("drafts");
+        let none = KeyModifiers::NONE;
+        let (here, other) = two_chats(&app);
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('i'), none);
+        for c in "on my **way**".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        // Esc keeps it, for your other devices.
+        press(&mut app, KeyCode::Esc, none);
+        assert_eq!(draft_text(&app, here), Some("on my **way**"));
+
+        app.open_chat(other);
+        assert_eq!(app.composer.lines().join("\n"), "");
+
+        // Back, it's in the composer again, as it was typed.
+        app.open_chat(here);
+        assert_eq!(app.composer.lines().join("\n"), "on my **way**");
+
+        // Emptied, the draft goes once you leave.
+        app.composer = new_composer();
+        app.open_chat(other);
+        assert_eq!(draft_text(&app, here), None);
+    }
+
+    #[test]
+    fn a_draft_written_elsewhere_is_not_replaced_by_a_composer_nobody_touched() {
+        crate::tg::quiet();
+        let mut app = test_app("drafts-elsewhere");
+        let (here, other) = two_chats(&app);
+        // Written on the phone while the chat is open here.
+        app.chats
+            .keep_draft(here, Draft::new("from my phone", Some(7)));
+        app.open_chat(other);
+        assert_eq!(draft_text(&app, here), Some("from my phone"));
+        // Opened again, it's in the composer, answering its message once
+        // that's fetched.
+        app.open_chat(here);
+        assert_eq!(app.composer.lines().join("\n"), "from my phone");
+        let open = app.open.as_ref().unwrap();
+        assert_eq!((open.draft_reply, open.reply.is_none()), (Some(7), true));
+        // Left before the answer came, it still answers it.
+        app.open_chat(other);
+        assert_eq!(app.chats.draft(here).and_then(|d| d.reply_to), Some(7));
+    }
+
+    #[test]
+    fn the_status_bar_says_while_telegram_cant_be_reached() {
+        let mut app = test_app("connection");
+        let state =
+            |state| Update::ConnectionState(tdlib_rs::types::UpdateConnectionState { state });
+        app.on_update(state(ConnectionState::WaitingForNetwork));
+        let rows = screen(&mut app);
+        assert!(
+            rows[19].starts_with(" NORMAL   Waiting for network…"),
+            "{:?}",
+            rows[19]
+        );
+        app.on_update(state(ConnectionState::ConnectingToProxy));
+        assert!(screen(&mut app)[19].contains("Connecting to the proxy…"));
+        app.on_update(state(ConnectionState::Ready));
+        assert!(!screen(&mut app)[19].contains('…'));
+    }
+
     #[test]
     fn ctrl_o_and_ctrl_i_go_back_and_forward_like_vims_jump_list() {
         let at = |chat_id, message_id| Jump {
@@ -6629,6 +7045,67 @@ mod tests {
             .unwrap();
         open.selected = Some(id);
         id
+    }
+
+    #[test]
+    fn enter_on_a_message_that_was_not_sent_sends_it_again_if_telegram_can_take_it() {
+        let mut app = test_app("resend");
+        app.focus = Focus::Messages;
+        let id = plain_message(&mut app);
+        let set = |app: &mut App, can_retry| {
+            let open = app.open.as_mut().unwrap();
+            open.messages.get_mut(&id).unwrap().state = SendState::Failed { can_retry };
+        };
+        set(&mut app, true);
+        let rows = screen(&mut app);
+        assert!(rows[19].contains("Enter send again"), "{:?}", rows[19]);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.status, None);
+        assert!(app.menu.is_none(), "nothing opens instead");
+
+        set(&mut app, false);
+        assert!(!screen(&mut app)[19].contains("Enter send again"));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Telegram won't take this message again: `d` deletes it")
+        );
+    }
+
+    #[test]
+    fn a_chat_marked_unread_elsewhere_is_unmarked_once_opened_even_the_one_open() {
+        let mut app = test_app("marked-unread");
+        let (here, other) = two_chats(&app);
+        app.chats.set_marked_unread(other, true);
+        app.open_chat(other);
+        assert!(!app.chats.get(other).unwrap().marked_unread);
+        // Marked on the phone while it's open here: Enter on it again.
+        app.chats.set_marked_unread(other, true);
+        app.focus = Focus::Chats;
+        app.selected = Some(other);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.chats.get(other).unwrap().marked_unread);
+        assert!(!app.chats.get(here).unwrap().marked_unread);
+    }
+
+    #[test]
+    fn a_archives_the_chat_and_the_cursor_goes_on_to_the_next() {
+        let mut app = test_app("archive");
+        app.focus = Focus::Chats;
+        app.chats.refresh();
+        let ids = app.chats.ids().to_vec();
+        app.selected = Some(ids[1]);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(ids[2]));
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.title.as_str()),
+            Some("Archived")
+        );
+        // The last one: the cursor goes up instead.
+        let last = *ids.last().unwrap();
+        app.selected = Some(last);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(ids[ids.len() - 2]));
     }
 
     #[test]
@@ -7187,6 +7664,77 @@ mod tests {
         app.composer.insert_str("see /st");
         app.update_completion();
         assert!(app.completion.is_none(), "only at the start of a message");
+    }
+
+    #[test]
+    fn proxy_sets_the_proxy_now_and_for_next_time_and_says_what_is_wrong() {
+        let dir = std::env::temp_dir().join(format!("tuigram-proxy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        let none = KeyModifiers::NONE;
+        let saved = || Settings::load(&settings::path(&dir)).unwrap().proxy;
+        let type_in = |app: &mut App, text: &str| {
+            app.prompt.as_mut().unwrap().input = prompt_input("");
+            for c in text.chars() {
+                press(app, KeyCode::Char(c), none);
+            }
+            press(app, KeyCode::Enter, none);
+        };
+
+        command(&mut app, "proxy");
+        assert!(
+            app.prompt
+                .as_ref()
+                .is_some_and(|p| p.kind == PromptKind::Proxy)
+        );
+        type_in(&mut app, "socks5://10.0.0.1:1080");
+        assert_eq!(saved().as_deref(), Some("socks5://10.0.0.1:1080"));
+        let toast = app.toast.as_ref().unwrap();
+        assert_eq!(
+            (toast.title.as_str(), toast.detail.as_str()),
+            ("Connecting through", "SOCKS5 proxy 10.0.0.1:1080")
+        );
+
+        // It's there to change, and a link that can't be used changes nothing.
+        command(&mut app, "proxy");
+        let prompt = app.prompt.as_ref().unwrap();
+        assert_eq!(prompt.query(), "socks5://10.0.0.1:1080");
+        type_in(&mut app, "socks5://10.0.0.1");
+        assert!(app.status.as_deref().unwrap().contains("no port"));
+        assert_eq!(saved().as_deref(), Some("socks5://10.0.0.1:1080"));
+
+        // Empty: directly.
+        command(&mut app, "proxy");
+        type_in(&mut app, "");
+        assert_eq!(saved(), None);
+        assert_eq!(app.toast.as_ref().unwrap().title, "No proxy");
+    }
+
+    #[test]
+    fn a_proxy_link_in_a_message_asks_first_naming_the_proxy() {
+        let mut app = test_app("proxy-link");
+        let url = "https://t.me/proxy?server=1.2.3.4&port=443&secret=ee0123abcd";
+        app.open_target(Target::Link(Link {
+            url: url.into(),
+            disguise: Some("free fast proxy".into()),
+        }));
+        assert!(app.finding.is_none(), "not looked up as a chat");
+        let confirm = app.confirm.as_ref().expect("asks first");
+        assert_eq!(confirm.lines[0], "MTProto proxy 1.2.3.4:443");
+        assert!(matches!(&confirm.action, Confirmed::UseProxy(u) if u == url));
+        let rows = screen(&mut app);
+        assert!(rows[19].contains("y use it"), "{:?}", rows[19]);
+
+        // One that can't be used says why.
+        app.confirm = None;
+        app.open_target(Target::Link(Link {
+            url: "https://t.me/proxy?server=1.2.3.4&port=443".into(),
+            disguise: None,
+        }));
+        assert!(app.confirm.is_none());
+        assert_eq!(app.status.as_deref(), Some("The link has no secret"));
     }
 
     #[test]

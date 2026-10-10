@@ -18,7 +18,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("?", "This help, and settings"),
             (
                 ":",
-                "Type a command: info, secret, key, timer, leave or logout",
+                "Type a command: info, secret, key, timer, leave, proxy or logout",
             ),
             ("s", "Find a chat or person: a name, @username or t.me link"),
             (
@@ -57,6 +57,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("/", "Filter chats by name"),
             ("p", "Pin or unpin the chat (on all your devices)"),
             ("m", "Mute or unmute the chat"),
+            ("a", "Archive the chat, or move it out of the archive"),
             ("Esc", "Clear the filter"),
         ],
     ),
@@ -85,7 +86,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-d / Ctrl-u", "Half a page newer / older"),
             (
                 "Enter",
-                "Show spoilers, view a photo shown only while open, play or pause a voice message, vote in a poll, list a bot's buttons, show the photo, or open the file or link",
+                "Send a message that wasn't sent again, show spoilers, view a photo shown only while open, play or pause a voice message, vote in a poll, list a bot's buttons, show the photo, or open the file or link",
             ),
             ("y", "Copy the text, a link, or the photo or file"),
             ("r", "Reply"),
@@ -164,7 +165,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Send attached photos as files, uncompressed, or back",
             ),
             ("Tab", "Stickers"),
-            ("Esc / Ctrl-c", "Back to Normal mode"),
+            (
+                "Esc / Ctrl-c",
+                "Back to Normal mode; what's written stays as the chat's draft, on your other devices too",
+            ),
         ],
     ),
     (

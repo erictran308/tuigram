@@ -6,6 +6,7 @@ mod clipboard;
 mod complete;
 mod config;
 mod demo;
+mod draft;
 mod images;
 mod info;
 mod messages;
@@ -14,6 +15,7 @@ mod opus;
 mod picker;
 mod pins;
 mod poll;
+mod proxy;
 mod reactions;
 mod search;
 mod secret;
@@ -182,6 +184,9 @@ Environment:
   TG_DATA_DIR    keep them somewhere else
   TG_API_ID      your own API key, used before saved or built-in ones
   TG_API_HASH
+  TG_PROXY       connect through a proxy where Telegram is blocked:
+                 socks5://[user:password@]host:port, http://host:port
+                 or a t.me/proxy link (inside the app: :proxy)
 ",
         version = env!("CARGO_PKG_VERSION"),
         data = config::shown(&config::data_dir()?),
