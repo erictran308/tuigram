@@ -1,4 +1,4 @@
-//! The terminal tuimeta draws on: ratatui's crossterm backend, with the blank
+//! The terminal tuigram draws on: ratatui's crossterm backend, with the blank
 //! behind an emoji like ❤️ sent before the emoji instead of after it.
 
 use std::io::{self, Stdout, Write, stdout};
