@@ -21,6 +21,10 @@ const MAX_SECRET_DOMAIN: usize = 182;
 pub fn parse(link: &str) -> Result<Proxy, String> {
     let link = link.trim();
     let lower = link.to_ascii_lowercase();
+    // Before `http://`, which Telegram's own links can start with too.
+    if let Some((kind, query)) = telegram_link(link, &lower) {
+        return telegram_proxy(kind, query);
+    }
     if let Some(rest) = strip(link, &lower, "socks5://") {
         let (user, pass, server, port) = authority(rest)?;
         return Ok(Proxy {
@@ -44,13 +48,17 @@ pub fn parse(link: &str) -> Result<Proxy, String> {
             }),
         });
     }
-    let (kind, query) = telegram_link(link, &lower).ok_or(NOT_A_PROXY)?;
+    Err(NOT_A_PROXY.into())
+}
+
+/// The proxy a Telegram proxy link's query (after the `?`) gives.
+fn telegram_proxy(kind: Kind, query: &str) -> Result<Proxy, String> {
     let get = |key: &str| {
         query
             .split('&')
             .filter_map(|pair| pair.split_once('='))
             .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, v)| decode(v))
+            .map(|(_, v)| decode(v, true))
             .transpose()
             .map(Option::unwrap_or_default)
     };
@@ -106,6 +114,50 @@ pub fn address(proxy: &Proxy) -> String {
     } else {
         format!("{}:{}", proxy.server, proxy.port)
     }
+}
+
+/// What stands for a link's password or secret where it's shown.
+pub const MASK: &str = "•••";
+
+/// `link` with its password or secret written [`MASK`], to show it
+/// without them; anything else in it is left as it was.
+pub fn masked(link: &str) -> String {
+    let link = link.trim();
+    let lower = link.to_ascii_lowercase();
+    if telegram_link(link, &lower).is_some()
+        && let Some((path, rest)) = link.split_once('?')
+    {
+        let (query, fragment) = match rest.split_once('#') {
+            Some((query, fragment)) => (query, Some(fragment)),
+            None => (rest, None),
+        };
+        let query: Vec<String> = query
+            .split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((key, value))
+                    if !value.is_empty()
+                        && (key.eq_ignore_ascii_case("secret")
+                            || key.eq_ignore_ascii_case("pass")) =>
+                {
+                    format!("{key}={MASK}")
+                }
+                _ => pair.to_string(),
+            })
+            .collect();
+        let fragment = fragment.map(|f| format!("#{f}")).unwrap_or_default();
+        return format!("{path}?{}{fragment}", query.join("&"));
+    }
+    for scheme in ["socks5://", "http://"] {
+        if let Some(rest) = strip(link, &lower, scheme)
+            && let Some((login, place)) = rest.rsplit_once('@')
+            && let Some((user, pass)) = login.split_once(':')
+            && !pass.is_empty()
+        {
+            let scheme = &link[..scheme.len()];
+            return format!("{scheme}{user}:{MASK}@{place}");
+        }
+    }
+    link.to_string()
 }
 
 const NOT_A_PROXY: &str =
@@ -165,7 +217,10 @@ fn authority(rest: &str) -> Result<(String, String, String, i32), String> {
     let (user, pass) = match login {
         Some(login) => {
             let (user, pass) = login.split_once(':').unwrap_or((login, ""));
-            (secret_text(decode(user)?)?, secret_text(decode(pass)?)?)
+            (
+                secret_text(decode(user, false)?)?,
+                secret_text(decode(pass, false)?)?,
+            )
         }
         None => (String::new(), String::new()),
     };
@@ -249,22 +304,24 @@ fn hex(text: &str) -> Option<Vec<u8>> {
         .then(|| digits.chunks(2).map(|p| p[0] << 4 | p[1]).collect())
 }
 
-/// Undoes `%XX` escapes, and `+` for a space as forms write it.
-fn decode(text: &str) -> Result<String, String> {
+/// Undoes `%XX` escapes, and in a query, `+` for a space as forms write
+/// it. Elsewhere a `+` is itself: in a password, say.
+fn decode(text: &str, query: bool) -> Result<String, String> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'%' => {
-                let hex = text
+                let byte = text
                     .get(i + 1..i + 3)
-                    .and_then(|h| u8::from_str_radix(h, 16).ok())
+                    .and_then(hex)
+                    .and_then(|byte| byte.first().copied())
                     .ok_or("A % in the link isn't followed by two hex digits")?;
-                out.push(hex);
+                out.push(byte);
                 i += 3;
             }
-            b'+' => {
+            b'+' if query => {
                 out.push(b' ');
                 i += 1;
             }
@@ -347,6 +404,63 @@ mod tests {
         assert!(why("tg://proxy?port=443&secret=ee").contains("no server"));
         assert!(why("socks5://a%0Ab@host:1080").contains("can't be used"));
         assert!(why("socks5://a%zzb@host:1080").contains("two hex digits"));
+    }
+
+    #[test]
+    fn a_plus_is_a_space_only_in_a_links_query() {
+        let proxy = parse("socks5://a+b:p+q@host:1080").unwrap();
+        assert_eq!(proxy.r#type, socks("a+b", "p+q"));
+        let proxy = parse("http://me:p%2Bq+@host:3128").unwrap();
+        let ProxyType::Http(http) = &proxy.r#type else {
+            panic!()
+        };
+        assert_eq!(http.password, "p+q+");
+        let proxy =
+            parse("https://t.me/socks?server=h.example&port=1080&user=a+b&pass=c%2Bd").unwrap();
+        assert_eq!(proxy.r#type, socks("a b", "c+d"));
+        assert!(
+            parse("socks5://a%+fb@host:1080").is_err(),
+            "a sign isn't a hex digit"
+        );
+    }
+
+    #[test]
+    fn a_links_password_or_secret_is_masked_and_nothing_else() {
+        assert_eq!(
+            masked("SOCKS5://me:p@ss@10.0.0.1:1080"),
+            "SOCKS5://me:•••@10.0.0.1:1080"
+        );
+        assert_eq!(
+            masked("http://me@h.example:3128"),
+            "http://me@h.example:3128"
+        );
+        assert_eq!(
+            masked(" socks5://h.example:1080 "),
+            "socks5://h.example:1080"
+        );
+        assert_eq!(
+            masked(&format!(
+                "https://t.me/proxy?server=1.2.3.4&port=443&secret={SECRET}#x"
+            )),
+            "https://t.me/proxy?server=1.2.3.4&port=443&secret=•••#x"
+        );
+        assert_eq!(
+            masked("tg://socks?server=h&port=1&user=me&Pass=pw"),
+            "tg://socks?server=h&port=1&user=me&Pass=•••"
+        );
+        assert_eq!(masked("not a link"), "not a link");
+    }
+
+    #[test]
+    fn telegrams_links_over_plain_http_are_read_as_theirs() {
+        let link = format!("http://t.me/proxy?server=1.2.3.4&port=443&secret={SECRET}");
+        let proxy = parse(&link).unwrap();
+        assert!(matches!(proxy.r#type, ProxyType::Mtproto(_)));
+        let proxy = parse("HTTP://telegram.me/socks?server=h.example&port=1080").unwrap();
+        assert_eq!(proxy.r#type, socks("", ""));
+        // An HTTP proxy is still one.
+        let proxy = parse("http://t.me.proxy.example:3128").unwrap();
+        assert!(matches!(proxy.r#type, ProxyType::Http(_)));
     }
 
     #[test]

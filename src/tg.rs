@@ -7,8 +7,8 @@
 use std::ffi::{CStr, CString, c_char};
 use std::future::Future;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -31,6 +31,13 @@ pub enum TgEvent {
     Update(Box<enums::Update>),
     /// A request failed. The text is TDLib's, e.g. `PHONE_CODE_INVALID`.
     Error(String),
+    /// TDLib took the proxy change numbered `number` (from
+    /// [`Tg::use_proxy`]), or refused it with this reason, keeping the
+    /// proxies it had. A change asked for later may have taken its place.
+    ProxyApplied {
+        number: u64,
+        result: Result<(), String>,
+    },
     /// A `loadChats` call for a list finished; `all` is true once every
     /// chat in it is loaded. `failed` if TDLib answered with an error (sent
     /// before as `Error`).
@@ -562,12 +569,41 @@ pub struct Tg {
     /// Whether this session should take the secret chats others start, the
     /// last thing asked, applied one request at a time.
     accept: Arc<AcceptSecretChats>,
+    /// The proxy to connect through, the last one asked, applied one
+    /// request at a time.
+    proxy: Arc<ProxyWishes>,
 }
 
 #[derive(Default)]
 struct AcceptSecretChats {
     wanted: AtomicBool,
     applying: tokio::sync::Mutex<()>,
+}
+
+#[derive(Default)]
+struct ProxyWishes {
+    /// How many changes were asked for, and the last one: a proxy, or
+    /// none to connect directly.
+    wanted: Mutex<(u64, Option<types::Proxy>)>,
+    /// The number of the last change applied, held while one is.
+    applying: tokio::sync::Mutex<u64>,
+}
+
+impl ProxyWishes {
+    /// Asks for `proxy`, or none; the change's number.
+    fn ask(&self, proxy: Option<types::Proxy>) -> u64 {
+        let mut wanted = self.wanted.lock().unwrap_or_else(PoisonError::into_inner);
+        wanted.0 += 1;
+        wanted.1 = proxy;
+        wanted.0
+    }
+
+    /// The change to apply after the one numbered `applied`: the latest,
+    /// unless that's it. Changes asked for meanwhile are skipped.
+    fn next(&self, applied: u64) -> Option<(u64, Option<types::Proxy>)> {
+        let wanted = self.wanted.lock().unwrap_or_else(PoisonError::into_inner);
+        (wanted.0 != applied).then(|| wanted.clone())
+    }
 }
 
 impl Tg {
@@ -604,6 +640,7 @@ impl Tg {
             tx: Events { client_id, tx },
             config: Arc::new(config),
             accept: Arc::default(),
+            proxy: Arc::default(),
         })
     }
 
@@ -621,6 +658,7 @@ impl Tg {
                 proxy: None,
             }),
             accept: Arc::default(),
+            proxy: Arc::default(),
         }
     }
 
@@ -636,13 +674,17 @@ impl Tg {
 
     /// Starts TDLib with its parameters, then sets its proxy: `proxy` is
     /// the one to use, or `None` to connect directly. In that order, since
-    /// TDLib keeps its proxies in the database the parameters open.
-    pub fn set_tdlib_parameters(&self, keys: ApiKeys, proxy: Option<types::Proxy>) {
+    /// TDLib keeps its proxies in the database the parameters open. The
+    /// proxy's change is numbered as by [`Tg::use_proxy`].
+    pub fn set_tdlib_parameters(&self, keys: ApiKeys, proxy: Option<types::Proxy>) -> u64 {
+        let number = self.proxy.ask(proxy);
+        let wishes = Arc::clone(&self.proxy);
         let config = Arc::clone(&self.config);
+        let tx = self.tx.clone();
         let client_id = self.client_id;
-        self.spawn(async move {
+        self.task(async move {
             let dir = |name: &str| config.data_dir.join(name).to_string_lossy().into_owned();
-            functions::set_tdlib_parameters(
+            let started = functions::set_tdlib_parameters(
                 false,
                 dir("db"),
                 dir("files"),
@@ -659,14 +701,25 @@ impl Tg {
                 env!("CARGO_PKG_VERSION").into(),
                 client_id,
             )
-            .await?;
-            use_proxy(proxy, client_id).await
+            .await;
+            match started {
+                Ok(()) => apply_proxy(&wishes, &tx, client_id).await,
+                Err(e) => drop(tx.send(TgEvent::Error(e.message))),
+            }
         });
+        number
     }
 
     /// Connects to Telegram through this proxy from now on, or directly.
-    pub fn use_proxy(&self, proxy: Option<types::Proxy>) {
-        self.spawn(use_proxy(proxy, self.client_id));
+    /// Returns the change's number, which [`TgEvent::ProxyApplied`] brings
+    /// back once TDLib answers.
+    pub fn use_proxy(&self, proxy: Option<types::Proxy>) -> u64 {
+        let number = self.proxy.ask(proxy);
+        let wishes = Arc::clone(&self.proxy);
+        let tx = self.tx.clone();
+        let client_id = self.client_id;
+        self.task(async move { apply_proxy(&wishes, &tx, client_id).await });
+        number
     }
 
     pub fn send_phone_number(&self, phone: String) {
@@ -2058,12 +2111,16 @@ impl Tg {
     /// going offline first, then keeping the open chat's draft.
     pub fn close(&self, draft: Option<draft::Keep>) {
         let client_id = self.client_id;
+        let wishes = Arc::clone(&self.proxy);
         self.spawn(async move {
             // Others see you go offline now, not minutes later, and before
             // anything else that could keep the close waiting. Before login
             // this fails, which is fine.
             let offline = enums::OptionValue::Boolean(types::OptionValueBoolean { value: false });
             let _ = functions::set_option("online".into(), Some(offline), client_id).await;
+            // A proxy change on its way is finished first, so the proxy
+            // TDLib keeps for next time is the one it said it took.
+            let _applying = wishes.applying.lock().await;
             if let Some(keep) = draft {
                 let _ = set_draft(keep, client_id).await;
             }
@@ -2306,19 +2363,67 @@ async fn public_chat(username: &str, client_id: i32) -> Result<i64, String> {
 
 /// Enables the proxy among TDLib's, adding it if it's new, or disables
 /// the one enabled.
+/// Applies the latest proxy change, if it isn't yet, and says how it went.
+/// One at a time, so two quick changes can't end with the older applied
+/// last.
+async fn apply_proxy(wishes: &ProxyWishes, tx: &Events, client_id: i32) {
+    let mut applied = wishes.applying.lock().await;
+    let Some((number, proxy)) = wishes.next(*applied) else {
+        return;
+    };
+    let result = use_proxy(proxy, client_id).await.map_err(|e| e.message);
+    *applied = number;
+    let _ = tx.send(TgEvent::ProxyApplied { number, result });
+}
+
+/// What [`use_proxy`] does first.
+#[derive(Debug, PartialEq)]
+enum ProxyStep {
+    /// The proxy is in use already, or there's none to stop using.
+    Nothing,
+    Enable(i32),
+    Add(types::Proxy),
+    Disable,
+}
+
+/// The step to connect through `wanted`, or directly, given TDLib's
+/// proxies, and the proxies to remove after it. The database is tuigram's
+/// own, so tuigram added them all, and one that isn't used only keeps an
+/// old password there. They go after the step, never before: removing the
+/// one in use would connect directly until the new one is on.
+fn proxy_steps(
+    added: &[types::AddedProxy],
+    wanted: Option<&types::Proxy>,
+) -> (ProxyStep, Vec<i32>) {
+    let current = wanted.and_then(|w| added.iter().find(|a| &a.proxy == w));
+    let step = match (wanted, current) {
+        (Some(_), Some(a)) if a.is_enabled => ProxyStep::Nothing,
+        (Some(_), Some(a)) => ProxyStep::Enable(a.id),
+        (Some(w), None) => ProxyStep::Add(w.clone()),
+        (None, _) if added.iter().any(|a| a.is_enabled) => ProxyStep::Disable,
+        (None, _) => ProxyStep::Nothing,
+    };
+    let unused = added
+        .iter()
+        .filter(|a| current.is_none_or(|c| c.id != a.id))
+        .map(|a| a.id)
+        .collect();
+    (step, unused)
+}
+
 async fn use_proxy(proxy: Option<types::Proxy>, client_id: i32) -> Result<(), types::Error> {
     let enums::AddedProxies::AddedProxies(added) = functions::get_proxies(client_id).await?;
-    match proxy {
-        Some(proxy) => match added.proxies.iter().find(|a| a.proxy == proxy) {
-            Some(added) if added.is_enabled => Ok(()),
-            Some(added) => functions::enable_proxy(added.id, client_id).await,
-            None => functions::add_proxy(proxy, true, client_id).await.map(drop),
-        },
-        None if added.proxies.iter().any(|a| a.is_enabled) => {
-            functions::disable_proxy(client_id).await
-        }
-        None => Ok(()),
+    let (step, unused) = proxy_steps(&added.proxies, proxy.as_ref());
+    match step {
+        ProxyStep::Nothing => {}
+        ProxyStep::Enable(id) => functions::enable_proxy(id, client_id).await?,
+        ProxyStep::Add(proxy) => drop(functions::add_proxy(proxy, true, client_id).await?),
+        ProxyStep::Disable => functions::disable_proxy(client_id).await?,
     }
+    for id in unused {
+        let _ = functions::remove_proxy(id, client_id).await;
+    }
+    Ok(())
 }
 
 fn set_draft(keep: draft::Keep, client_id: i32) -> impl Future<Output = Result<(), types::Error>> {
@@ -2358,6 +2463,60 @@ pub fn quiet() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn socks(port: i32) -> types::Proxy {
+        types::Proxy {
+            server: "10.0.0.1".into(),
+            port,
+            r#type: enums::ProxyType::Socks5(types::ProxyTypeSocks5 {
+                username: "me".into(),
+                password: "old password".into(),
+            }),
+        }
+    }
+
+    fn added(id: i32, port: i32, is_enabled: bool) -> types::AddedProxy {
+        types::AddedProxy {
+            id,
+            last_used_date: 0,
+            is_enabled,
+            proxy: socks(port),
+        }
+    }
+
+    #[test]
+    fn a_new_proxy_goes_on_before_the_old_ones_are_removed() {
+        let tdlib = [added(1, 1080, true), added(2, 1081, false)];
+        let (step, unused) = proxy_steps(&tdlib, Some(&socks(1082)));
+        assert_eq!(step, ProxyStep::Add(socks(1082)));
+        assert_eq!(unused, [1, 2]);
+
+        let (step, unused) = proxy_steps(&tdlib, Some(&socks(1081)));
+        assert_eq!(step, ProxyStep::Enable(2));
+        assert_eq!(unused, [1]);
+
+        let (step, unused) = proxy_steps(&tdlib, Some(&socks(1080)));
+        assert_eq!(step, ProxyStep::Nothing);
+        assert_eq!(unused, [2]);
+
+        let (step, unused) = proxy_steps(&tdlib, None);
+        assert_eq!(step, ProxyStep::Disable);
+        assert_eq!(unused, [1, 2]);
+        assert_eq!(proxy_steps(&[], None), (ProxyStep::Nothing, vec![]));
+    }
+
+    #[test]
+    fn quick_proxy_changes_apply_only_the_last() {
+        let wishes = ProxyWishes::default();
+        let first = wishes.ask(Some(socks(1080)));
+        let second = wishes.ask(None);
+        assert!(second > first);
+        // The first task to run applies the latest; the next has nothing to do.
+        assert_eq!(wishes.next(0), Some((second, None)));
+        assert_eq!(wishes.next(second), None);
+        let third = wishes.ask(Some(socks(1081)));
+        assert_eq!(wishes.next(second), Some((third, Some(socks(1081)))));
+    }
 
     fn entities(text: &types::FormattedText) -> Vec<(i32, i32, String)> {
         text.entities

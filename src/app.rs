@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 use std::time::{Duration, SystemTime};
@@ -84,6 +84,15 @@ enum KeySource {
     Env,
     Saved,
     BuiltIn,
+}
+
+/// A proxy change asked of TDLib.
+enum ProxyChange {
+    /// Starting with the proxy set in `TG_PROXY` or settings.toml.
+    Start,
+    /// From `:proxy` or a link: the link to save once TDLib takes it, or
+    /// none for connecting directly.
+    Set(Option<String>),
 }
 
 pub enum Screen {
@@ -808,6 +817,8 @@ pub struct App {
     /// What TDLib's connection to Telegram is doing, while it isn't
     /// working, e.g. "Connecting…"; shown in the status bar.
     pub connection: Option<&'static str>,
+    /// Proxy changes TDLib hasn't answered yet, by their number.
+    proxy_changes: BTreeMap<u64, ProxyChange>,
     /// First `g` of `gg` was pressed.
     pending_g: bool,
     /// Set once quitting started; we exit at this time even if TDLib never answers.
@@ -942,6 +953,7 @@ impl App {
             shown_viewing: None,
             shown_in_viewer: None,
             relogin: false,
+            proxy_changes: BTreeMap::new(),
             exit: false,
         };
         app.use_saved_theme();
@@ -1172,6 +1184,7 @@ impl App {
     fn on_tg(&mut self, event: TgEvent) {
         match event {
             TgEvent::Update(update) => self.on_update(*update),
+            TgEvent::ProxyApplied { number, result } => self.on_proxy_applied(number, result),
             TgEvent::Error(message) if message.contains("API_ID") => self.reject_api_keys(),
             TgEvent::Error(message) => match &mut self.screen {
                 Screen::Login(login) => {
@@ -6145,8 +6158,20 @@ impl App {
     /// avoid.
     fn start_tdlib(&mut self, keys: ApiKeys) {
         match self.proxy_setting() {
-            Ok(proxy) => self.tg.set_tdlib_parameters(keys, proxy),
+            Ok(proxy) => {
+                let number = self.tg.set_tdlib_parameters(keys, proxy);
+                self.proxy_changes.insert(number, ProxyChange::Start);
+            }
             Err((from, why)) => self.screen = login_screen(LoginStep::BadProxy { from, why }),
+        }
+    }
+
+    /// Where the proxy tuigram starts with is set.
+    fn proxy_source(&self) -> &'static str {
+        if self.tg.env_proxy().is_some() {
+            "TG_PROXY"
+        } else {
+            "the proxy in settings.toml"
         }
     }
 
@@ -6162,14 +6187,20 @@ impl App {
     }
 
     /// `:proxy`: the proxy's link in the prompt, to change, or empty for
-    /// none.
+    /// none. Its password or secret shows as `•••`, so the screen doesn't
+    /// show it to whoever is looking.
     fn open_proxy_prompt(&mut self) {
         if self.tg.env_proxy().is_some() {
             self.status = Some("TG_PROXY sets the proxy: change it there".into());
             return;
         }
         self.open_prompt(PromptKind::Proxy);
-        let link = self.settings.proxy.clone().unwrap_or_default();
+        let link = self
+            .settings
+            .proxy
+            .as_deref()
+            .map(proxy::masked)
+            .unwrap_or_default();
         if let Some(prompt) = self.prompt.as_mut() {
             prompt.input = prompt_input(&link);
         }
@@ -6180,6 +6211,20 @@ impl App {
     /// has no bracketed paste) and type `:proxy`, a link and Enter.
     fn ask_to_change_proxy(&mut self, link: &str) {
         let link = link.trim();
+        let saved = self.settings.proxy.clone();
+        // Left as it was shown, it's the saved one, password and all.
+        if let Some(saved) = saved.filter(|saved| link == proxy::masked(saved)) {
+            self.ask_to_use_proxy(&saved);
+            return;
+        }
+        // Changed, it doesn't take the old password along, to another server.
+        if link.contains(proxy::MASK) {
+            self.status = Some(format!(
+                "The link still has {} for the hidden password or secret: write it out",
+                proxy::MASK
+            ));
+            return;
+        }
         if !link.is_empty() {
             self.ask_to_use_proxy(link);
             return;
@@ -6238,7 +6283,8 @@ impl App {
     }
 
     /// Connects through the proxy this link gives from now on, and next
-    /// time; an empty one connects directly.
+    /// time; an empty one connects directly. It's saved, and said, once
+    /// TDLib takes it ([`App::on_proxy_applied`]).
     fn set_proxy(&mut self, link: &str) {
         let link = link.trim();
         let proxy = if link.is_empty() {
@@ -6252,15 +6298,54 @@ impl App {
                 }
             }
         };
-        self.settings.proxy = proxy.is_some().then(|| link.to_string());
-        if let Err(e) = self.settings.save(&self.settings_path) {
-            self.status = Some(format!("Proxy not saved for next time: {e:#}"));
+        self.status = Some(match &proxy {
+            Some(proxy) => format!("Switching to {}…", proxy::describe(proxy)),
+            None => "Switching to connecting directly…".into(),
+        });
+        let number = self.tg.use_proxy(proxy);
+        let link = (!link.is_empty()).then(|| link.to_string());
+        self.proxy_changes.insert(number, ProxyChange::Set(link));
+    }
+
+    /// TDLib took a proxy change, or refused it and kept the proxy it had.
+    /// What it took is saved, even if a later change is still on its way,
+    /// so the settings always say what TDLib does.
+    fn on_proxy_applied(&mut self, number: u64, result: Result<(), String>) {
+        let Some(change) = self.proxy_changes.remove(&number) else {
+            return;
+        };
+        // Ones asked before it were skipped for it, and won't be answered.
+        self.proxy_changes.retain(|&n, _| n > number);
+        match (change, result) {
+            (ProxyChange::Start, Ok(())) => {}
+            // TDLib is started, connecting with what it had: on the login
+            // screen, nobody logs in through that.
+            (ProxyChange::Start, Err(why)) => match &self.screen {
+                Screen::Login(_) => {
+                    let from = self.proxy_source();
+                    self.screen = login_screen(LoginStep::BadProxy { from, why });
+                }
+                Screen::Main => {
+                    let from = self.proxy_source();
+                    self.status = Some(format!("Telegram's library refused {from}: {why}"));
+                }
+            },
+            (ProxyChange::Set(link), Ok(())) => {
+                let proxy = link.as_deref().and_then(|l| proxy::parse(l).ok());
+                self.settings.proxy = link;
+                self.status = None;
+                if let Err(e) = self.settings.save(&self.settings_path) {
+                    self.status = Some(format!("Proxy not saved for next time: {e:#}"));
+                }
+                match &proxy {
+                    Some(proxy) => self.show_toast("Connecting through", &proxy::describe(proxy)),
+                    None => self.show_toast("No proxy", "Connecting to Telegram directly"),
+                }
+            }
+            (ProxyChange::Set(_), Err(why)) => {
+                self.status = Some(format!("The proxy wasn't changed: {why}"));
+            }
         }
-        match &proxy {
-            Some(proxy) => self.show_toast("Connecting through", &proxy::describe(proxy)),
-            None => self.show_toast("No proxy", "Connecting to Telegram directly"),
-        }
-        self.tg.use_proxy(proxy);
     }
 
     /// A chat marked as unread (on another device) isn't once it's opened,
@@ -7842,6 +7927,11 @@ mod tests {
             press(app, KeyCode::Char('y'), none);
             assert!(app.confirm.is_none());
         };
+        // TDLib answers the last change asked.
+        let answers = |app: &mut App, result: Result<(), String>| {
+            let number = *app.proxy_changes.keys().next_back().expect("one asked");
+            app.on_tg(TgEvent::ProxyApplied { number, result });
+        };
 
         command(&mut app, "proxy");
         assert!(
@@ -7856,7 +7946,13 @@ mod tests {
         assert!(!confirm.lines.iter().any(|l| l.contains("proxy sponsor")));
         assert_eq!(saved(), None, "not before `y`");
         answer(&mut app);
+        assert_eq!(saved(), None, "not before TDLib takes it");
+        assert!(app.toast.is_none());
+        let status = app.status.as_deref().unwrap();
+        assert_eq!(status, "Switching to SOCKS5 proxy 10.0.0.1:1080…");
+        answers(&mut app, Ok(()));
         assert_eq!(saved().as_deref(), Some("socks5://10.0.0.1:1080"));
+        assert!(app.status.is_none());
         let toast = app.toast.as_ref().unwrap();
         assert_eq!(
             (toast.title.as_str(), toast.detail.as_str()),
@@ -7880,6 +7976,7 @@ mod tests {
         assert!(confirm.lines[0].contains("SOCKS5 proxy 10.0.0.1:1080"));
         assert_eq!(saved().as_deref(), Some("socks5://10.0.0.1:1080"));
         answer(&mut app);
+        answers(&mut app, Ok(()));
         assert_eq!(saved(), None);
         assert_eq!(app.toast.as_ref().unwrap().title, "No proxy");
 
@@ -7888,6 +7985,93 @@ mod tests {
         type_in(&mut app, "");
         assert!(app.confirm.is_none());
         assert!(app.status.as_deref().unwrap().contains("directly"));
+    }
+
+    #[test]
+    fn a_proxy_is_saved_only_once_tdlib_takes_it_and_one_it_refuses_changes_nothing() {
+        let mut app = test_app("proxy-answers");
+        app.settings.proxy = None;
+        let link = |port| format!("socks5://10.0.0.1:{port}");
+        let answer = |app: &mut App, number, result| {
+            app.on_tg(TgEvent::ProxyApplied { number, result });
+        };
+
+        // Refused: nothing is saved, and it says why.
+        app.set_proxy(&link(1080));
+        let refused = *app.proxy_changes.keys().next_back().unwrap();
+        answer(&mut app, refused, Err("Wrong port".into()));
+        assert_eq!(app.settings.proxy, None);
+        assert!(app.toast.is_none());
+        let status = app.status.clone().unwrap();
+        assert_eq!(status, "The proxy wasn't changed: Wrong port");
+
+        // Two quick changes: TDLib may take the first before the second, and
+        // what it took is saved meanwhile.
+        app.set_proxy(&link(1081));
+        let first = *app.proxy_changes.keys().next_back().unwrap();
+        app.set_proxy(&link(1082));
+        let second = *app.proxy_changes.keys().next_back().unwrap();
+        answer(&mut app, first, Ok(()));
+        assert_eq!(app.settings.proxy, Some(link(1081)));
+        answer(&mut app, second, Err("refused".into()));
+        assert_eq!(app.settings.proxy, Some(link(1081)), "what TDLib uses");
+        // Or skip the first for the second, which then answers alone.
+        app.set_proxy(&link(1083));
+        app.set_proxy(&link(1084));
+        let last = *app.proxy_changes.keys().next_back().unwrap();
+        answer(&mut app, last, Ok(()));
+        assert_eq!(app.settings.proxy, Some(link(1084)));
+        assert!(
+            app.proxy_changes.is_empty(),
+            "the skipped one isn't waited for"
+        );
+
+        // Refused at startup, on the login screen: nobody logs in without it.
+        let keys = ApiKeys {
+            id: 1,
+            hash: "0123456789abcdef0123456789abcdef".into(),
+        };
+        app.screen = login_screen(LoginStep::Connecting);
+        app.start_tdlib(keys);
+        let start = *app.proxy_changes.keys().next_back().unwrap();
+        answer(&mut app, start, Err("Unsupported proxy secret".into()));
+        let Screen::Login(login) = &app.screen else {
+            panic!("still logging in");
+        };
+        assert!(
+            matches!(&login.step, LoginStep::BadProxy { why, .. } if why == "Unsupported proxy secret")
+        );
+        assert_eq!(
+            app.settings.proxy,
+            Some(link(1084)),
+            "startup saves nothing"
+        );
+    }
+
+    #[test]
+    fn proxy_hides_the_saved_password_and_keeps_it_only_for_the_same_server() {
+        let mut app = test_app("proxy-masked");
+        let saved = "socks5://me:hunter2@10.0.0.1:1080";
+        app.settings.proxy = Some(saved.into());
+        let type_in = |app: &mut App, text: &str| {
+            app.prompt.as_mut().unwrap().input = prompt_input(text);
+            press(app, KeyCode::Enter, KeyModifiers::NONE);
+        };
+
+        command(&mut app, "proxy");
+        let shown = app.prompt.as_ref().unwrap().query();
+        assert_eq!(shown, "socks5://me:•••@10.0.0.1:1080");
+        assert!(!screen(&mut app).concat().contains("hunter2"));
+        // Unchanged, it's the saved one.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let confirm = app.confirm.take().expect("asks first");
+        assert!(matches!(&confirm.action, Confirmed::UseProxy(link) if link == saved));
+
+        // Another server with the hidden password: refused.
+        command(&mut app, "proxy");
+        type_in(&mut app, "socks5://me:•••@203.0.113.9:1080");
+        assert!(app.confirm.is_none());
+        assert!(app.status.as_deref().unwrap().contains("write it out"));
     }
 
     #[test]

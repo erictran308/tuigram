@@ -298,7 +298,7 @@ If your terminal uses a [Nerd Font](https://www.nerdfonts.com), turn on **Round 
 
 ## Proxy
 
-Where Telegram is blocked, tuigram can connect through a proxy. Type `:proxy` and give its link, then `Enter` and `y` to use it from then on; empty connects directly again:
+Where Telegram is blocked, tuigram can connect through a proxy. Type `:proxy` and give its link, then `Enter` and `y` to use it from then on; empty connects directly again. It's saved once tuigram has switched to it, and the saved one's password shows as `•••`:
 
 - `socks5://host:1080`, with `socks5://user:password@host:1080` if it needs a login
 - `http://host:3128`
