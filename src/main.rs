@@ -115,7 +115,9 @@ async fn main() -> Result<()> {
     }
 
     let (image_tx, image_rx) = tokio::sync::mpsc::unbounded_channel();
-    let images = images::Images::new(picker, image_tx);
+    let mut images = images::Images::new(picker, image_tx);
+    // Measured against the answer, to tell later when cells change size.
+    images.measured(images::measure_cells());
     let (clipboard_tx, clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
     let clipboard = clipboard::Clipboard::new(clipboard_tx, outbox);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::app::{
     App, Command, Confirm, Confirmed, DeleteMenu, Focus, HelpTab, Jumps, Login, LoginStep,
@@ -524,7 +524,16 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 users: &app.users,
                 chats: &app.chats,
             };
-            let mut rows = app.composer.lines().len().clamp(1, MAX_COMPOSER_ROWS) as u16;
+            let wrap = match app.settings.wrap_composer {
+                true => WrapMode::WordOrGlyph,
+                false => WrapMode::None,
+            };
+            if app.composer.wrap_mode() != wrap {
+                app.composer.set_wrap_mode(wrap);
+            }
+            // Inside the border and the column of padding on each side.
+            let width = chat_area.width.saturating_sub(4);
+            let mut rows = composer_rows(&app.composer, width).clamp(1, MAX_COMPOSER_ROWS) as u16;
             if ComposerBar::of(open).is_some() {
                 rows += BAR_ROWS;
             }
@@ -1376,6 +1385,12 @@ fn draw_settings(
         check(settings.normal_after_send),
         "Back to Normal mode after sending a message",
     );
+    add(
+        &mut lines,
+        SettingsMenu::WRAP_COMPOSER,
+        check(settings.wrap_composer),
+        "Wrap long lines onto the next row",
+    );
     lines.push(Line::default());
     lines.push(heading(" Secret chats"));
     add(
@@ -2051,6 +2066,25 @@ fn draw_composer(
     // which can't make the keys stand out. The cursor's look stays.
     let muted = Style::new().fg(colors.muted);
     frame.render_widget(Line::from(hint_spans(placeholder, muted, colors)), text);
+}
+
+/// Rows the composer's text takes `width` columns wide: one a line, or as
+/// many as its lines wrap onto.
+fn composer_rows(composer: &TextArea, width: u16) -> usize {
+    if composer.wrap_mode() == WrapMode::None || width == 0 {
+        return composer.lines().len();
+    }
+    // The text area says which row its cursor is on, not how many rows it
+    // takes, so a copy of the text is laid out as wide with the cursor at
+    // its end: the same wrapping, so the composer is never a row short.
+    let mut copy = TextArea::new(composer.lines().to_vec());
+    copy.set_wrap_mode(composer.wrap_mode());
+    copy.set_tab_length(composer.tab_length());
+    let area = Rect::new(0, 0, width, 1);
+    (&copy).render(area, &mut Buffer::empty(area));
+    copy.move_cursor(CursorMove::Bottom);
+    copy.move_cursor(CursorMove::End);
+    copy.screen_cursor().row + 1
 }
 
 fn attachment_rows(attachments: &[Attachment]) -> u16 {

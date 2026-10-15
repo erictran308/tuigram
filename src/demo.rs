@@ -24,7 +24,7 @@ use crate::app::{self, App, Focus, HelpTab, Screen, SettingsMenu};
 use crate::buttons::{Button, ButtonMenu, Keyboard, Press};
 use crate::chats::{Chat, ChatPhoto, Chats, List, Peer, Presence};
 use crate::clipboard::Clipboard;
-use crate::images::Images;
+use crate::images::{self, Images};
 use crate::messages::{
     Card, Editable, Format, Link, Msg, OpenChat, Origin, Preview, Replied, ReplyTo, SendState,
     Sender, Styled,
@@ -188,6 +188,7 @@ async fn show(dir: &Path) -> Result<()> {
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     let (image_tx, mut image_rx) = unbounded_channel();
     let mut images = Images::new(picker, image_tx);
+    images.measured(images::measure_cells());
     // Every photo is on disk already, so nothing asks TDLib for a download.
     for (file_id, path) in photos {
         images.on_downloaded(file_id, Some(path));
@@ -210,6 +211,12 @@ async fn show(dir: &Path) -> Result<()> {
                     if !on_key(&mut app, &mut scene, key) {
                         break Ok(());
                     }
+                }
+                // As in the app: cells may change size on another screen.
+                Ok(Event::Resize(..) | Event::FocusGained)
+                    if app.images.measured(images::measure_cells()) =>
+                {
+                    let _ = terminal.clear();
                 }
                 Ok(_) => {}
                 Err(e) => break Err(e.into()),

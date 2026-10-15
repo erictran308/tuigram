@@ -183,8 +183,54 @@ struct Avatar {
     shown: bool,
 }
 
+/// How much a cell's measured width or height must change, as a share of
+/// what it was, to count as a new cell size rather than rounding: a window
+/// whose pixels include its padding measures a little more per cell the
+/// fewer rows it has. A screen of another density changes it by a quarter
+/// or more, a step of the font's size by about a fourteenth.
+const CELL_CHANGE: u32 = 16;
+
+/// The pixel size of a cell as the terminal's window size says: its size
+/// in pixels over its columns and rows. None where it doesn't say, as on
+/// Windows, so cells keep the size the terminal answered at startup.
+pub fn measure_cells() -> Option<FontSize> {
+    let size = crossterm::terminal::window_size().ok()?;
+    if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
+        return None;
+    }
+    Some(FontSize::new(
+        size.width / size.columns,
+        size.height / size.rows,
+    ))
+}
+
+/// The cells' size in pixels, for a terminal that answered `queried` at
+/// startup, when its window measured `then`, and measures `now` (see
+/// [`measure_cells`]): as answered, unless they measure noticeably bigger
+/// or smaller, then grown or shrunk as much. The answer is kept as the
+/// truth, since a window's measure may count its padding.
+fn cells_now(queried: FontSize, then: FontSize, now: FontSize) -> FontSize {
+    let changed =
+        |then: u16, now: u16| u32::from(then.abs_diff(now)) * CELL_CHANGE > u32::from(then);
+    if !changed(then.width, now.width) && !changed(then.height, now.height) {
+        return queried;
+    }
+    let scale = |queried: u16, then: u16, now: u16| {
+        let (queried, then, now) = (u32::from(queried), u32::from(then.max(1)), u32::from(now));
+        ((queried * now + then / 2) / then).clamp(1, u32::from(u16::MAX)) as u16
+    };
+    FontSize::new(
+        scale(queried.width, then.width, now.width),
+        scale(queried.height, then.height, now.height),
+    )
+}
+
 pub struct Images {
     picker: Picker,
+    /// The cell size the terminal answered at startup.
+    queried: FontSize,
+    /// What its window measured its cells as then: see [`Images::measured`].
+    measured: Option<FontSize>,
     tx: UnboundedSender<ImageEvent>,
     /// Encoded photos, with the frame each was last drawn in.
     ready: HashMap<Key, (SlicedProtocol, u64)>,
@@ -192,7 +238,8 @@ pub struct Images {
     frame: u64,
     /// Goes up when the files are forgotten, for a new TDLib client: an
     /// image still being built for the old one numbers its file the old way,
-    /// and is dropped when it's done.
+    /// and is dropped when it's done. Also when cells change size, which
+    /// leaves one being built the wrong size.
     generation: u64,
     /// Kept apart from `ready`: they stay when another chat is opened.
     avatars: HashMap<Key, Avatar>,
@@ -212,6 +259,8 @@ pub struct Images {
 impl Images {
     pub fn new(picker: Picker, tx: UnboundedSender<ImageEvent>) -> Self {
         Self {
+            queried: picker.font_size(),
+            measured: None,
             picker,
             tx,
             ready: HashMap::new(),
@@ -246,6 +295,44 @@ impl Images {
     /// Pixel size of one terminal cell, for sizing photos by aspect ratio.
     pub fn font_size(&self) -> FontSize {
         self.picker.font_size()
+    }
+
+    /// The terminal's window measures its cells `now` (see
+    /// [`measure_cells`]): first right after the terminal answered at
+    /// startup, then whenever its size may have changed. Cells change size
+    /// in pixels when the window moves to a screen of another density, or
+    /// the font is made bigger or smaller. True if they did: photos and
+    /// chat photos are then encoded again at the new size, since sixel and
+    /// iTerm2's protocol draw them as many pixels as they were made, too
+    /// big or too small for the cells, and kitty's would be blurred or
+    /// wasted. The screen must then be drawn afresh.
+    pub fn measured(&mut self, now: Option<FontSize>) -> bool {
+        let Some(now) = now else {
+            return false;
+        };
+        let Some(then) = self.measured else {
+            self.measured = Some(now);
+            return false;
+        };
+        let font = cells_now(self.queried, then, now);
+        let old = self.picker.font_size();
+        if (font.width, font.height) == (old.width, old.height) {
+            return false;
+        }
+        // A picker takes its cell size only when it's made, from the
+        // terminal's answer, which can't be asked for again while keys are
+        // read. This one keeps the protocol found then, but not kitty's
+        // compression, so kitty is sent its images uncompressed.
+        let protocol = self.picker.protocol_type();
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(font);
+        picker.set_protocol_type(protocol);
+        self.picker = picker;
+        self.generation += 1;
+        self.ready.clear();
+        self.avatars.clear();
+        self.building.clear();
+        true
     }
 
     /// The best image ready to draw: the photo, else its blurry thumbnail.
@@ -670,6 +757,65 @@ mod tests {
             "not the new session's"
         );
         assert!(!images.is_broken(&preview(7)));
+    }
+
+    fn cells_after(queried: (u16, u16), then: (u16, u16), now: (u16, u16)) -> (u16, u16) {
+        let font = |(w, h)| FontSize::new(w, h);
+        let size = cells_now(font(queried), font(then), font(now));
+        (size.width, size.height)
+    }
+
+    #[test]
+    fn cells_keep_the_size_the_terminal_answered_unless_they_measure_another() {
+        assert_eq!(cells_after((20, 40), (20, 40), (20, 40)), (20, 40));
+        // A window that counts its padding measures a pixel more per cell
+        // with few rows: not a new size.
+        assert_eq!(cells_after((20, 40), (20, 40), (20, 41)), (20, 40));
+        // Moved from a Retina screen to one of half its density.
+        assert_eq!(cells_after((20, 40), (20, 40), (10, 20)), (10, 20));
+        assert_eq!(cells_after((10, 20), (10, 20), (20, 40)), (20, 40));
+        // Measured with its padding, the answer is scaled, not replaced.
+        assert_eq!(cells_after((20, 40), (21, 42), (10, 21)), (10, 20));
+        // A step of the font's size.
+        assert_eq!(cells_after((14, 28), (14, 28), (15, 30)), (15, 30));
+    }
+
+    #[tokio::test]
+    async fn photos_are_made_again_once_cells_change_size() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        let start = images.font_size();
+        let measure = |w, h| Some(FontSize::new(w, h));
+        assert!(
+            !images.measured(measure(10, 20)),
+            "the first is the startup's"
+        );
+        assert!(!images.measured(None), "a terminal that doesn't say");
+        assert!(!images.measured(measure(10, 20)));
+        images.insert_ready(key(1), DynamicImage::new_rgba8(8, 8));
+
+        // One on its way is the old size.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        images.build(key(7), move || {
+            wait.recv().ok();
+            Ok(DynamicImage::new_rgba8(8, 8))
+        });
+        assert!(images.measured(measure(20, 40)));
+        let font = images.font_size();
+        assert_eq!(
+            (font.width, font.height),
+            (start.width * 2, start.height * 2)
+        );
+        assert!(!images.draws_photos(), "the protocol stays");
+        assert!(images.get(&preview(1), 4, 2).is_none(), "made again");
+        go.send(()).unwrap();
+        images.on_built(rx.recv().await.unwrap());
+        assert!(images.get(&preview(7), 4, 2).is_none(), "dropped");
+        assert!(!images.is_broken(&preview(7)));
+        assert!(!images.measured(measure(20, 40)), "only once");
+        images.build(key(7), || Ok(DynamicImage::new_rgba8(8, 8)));
+        images.on_built(rx.recv().await.unwrap());
+        assert!(images.get(&preview(7), 4, 2).is_some(), "the new size");
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ use crate::clipboard::{Clipboard, ClipboardEvent, Copied, Decoded, Paste, Pasted
 use crate::complete::{self, Commands, Completion, Kind, Suggestion};
 use crate::config::{self, ApiKeys};
 use crate::draft::{self, Draft};
-use crate::images::{ImageEvent, Images};
+use crate::images::{self, ImageEvent, Images};
 use crate::info::ChatInfo;
 use crate::messages::{
     Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState, Sender, link_host, one_line,
@@ -478,8 +478,10 @@ impl SettingsMenu {
     pub const PILLS: usize = Self::CORNERS + 1;
     /// The "Normal mode after sending" row.
     pub const AFTER_SEND: usize = Self::PILLS + 1;
+    /// The "wrap long lines in the composer" row.
+    pub const WRAP_COMPOSER: usize = Self::AFTER_SEND + 1;
     /// The "take secret chats others start" row.
-    pub const SECRET_CHATS: usize = Self::AFTER_SEND + 1;
+    pub const SECRET_CHATS: usize = Self::WRAP_COMPOSER + 1;
     /// The first theme's row. The themes come last, since the user's own
     /// can make a long list.
     pub const THEMES: usize = Self::SECRET_CHATS + 1;
@@ -858,6 +860,10 @@ pub struct App {
     /// The photo the last frame showed in the viewer, by file id, and the
     /// size it was zoomed to.
     shown_in_viewer: Option<(i32, Option<usize>)>,
+    /// The terminal's cells changed size in pixels, so the next frame is
+    /// drawn on a cleared screen: sixel and iTerm2 pictures drawn the old
+    /// size would stay on it.
+    cells_resized: bool,
     /// TDLib is logging out (`:logout`, the session ended elsewhere, or
     /// leaving a QR login), and a new client takes over once it has closed.
     relogin: bool,
@@ -952,6 +958,7 @@ impl App {
             unread_chats: 0,
             shown_viewing: None,
             shown_in_viewer: None,
+            cells_resized: false,
             relogin: false,
             proxy_changes: BTreeMap::new(),
             exit: false,
@@ -1016,6 +1023,9 @@ impl App {
             }
             self.shown_viewing = viewing;
             self.shown_in_viewer = in_viewer;
+            if std::mem::take(&mut self.cells_resized) {
+                let _ = terminal.clear();
+            }
             self.mark_seen();
             self.update_online();
             self.send_notification();
@@ -1123,6 +1133,15 @@ impl App {
         if matches!(event, Event::Key(_) | Event::Paste(_) | Event::FocusGained) {
             self.last_input = Instant::now();
             self.last_input_wall = SystemTime::now();
+        }
+        // A window moved to another screen may have cells of another size
+        // in pixels without changing its rows and columns. The terminal
+        // then says it was resized, or at least, once it's clicked on,
+        // that it has focus.
+        if matches!(event, Event::Resize(..) | Event::FocusGained)
+            && self.images.measured(images::measure_cells())
+        {
+            self.cells_resized = true;
         }
         match event {
             Event::Key(key) => self.on_key(key),
@@ -6006,6 +6025,7 @@ impl App {
             }
             SettingsMenu::PILLS => settings.nerd_font = !settings.nerd_font,
             SettingsMenu::AFTER_SEND => settings.normal_after_send = !settings.normal_after_send,
+            SettingsMenu::WRAP_COMPOSER => settings.wrap_composer = !settings.wrap_composer,
             SettingsMenu::SECRET_CHATS => {
                 settings.accept_secret_chats = !settings.accept_secret_chats;
                 self.tg.accept_secret_chats(settings.accept_secret_chats);
@@ -7752,6 +7772,45 @@ mod tests {
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         assert_eq!(app.composer.lines(), ["first lineline"]);
         assert!(app.focus == Focus::Input);
+    }
+
+    #[test]
+    fn long_lines_in_the_composer_wrap_and_it_grows_with_them_unless_turned_off() {
+        let mut app = test_app("wrap");
+        app.focus = Focus::Input;
+        app.composer
+            .insert_str("zebra crossing ".repeat(12).trim_end());
+        let count = |screen: &[String]| -> usize {
+            screen.iter().map(|r| r.matches("zebra").count()).sum()
+        };
+        let rows = |screen: &[String]| screen.iter().filter(|r| r.contains("zebra")).count();
+
+        assert!(app.settings.wrap_composer, "on unless turned off");
+        let wrapped = screen(&mut app);
+        assert_eq!(count(&wrapped), 12, "all of it shows: {wrapped:#?}");
+        assert!(rows(&wrapped) >= 3, "{wrapped:#?}");
+        let last = wrapped.iter().rposition(|r| r.contains("zebra")).unwrap();
+        assert!(
+            wrapped[last + 1].contains(['╰', '└']),
+            "no blank row under the text: {wrapped:#?}"
+        );
+
+        // Turned off, the line keeps to one row, scrolled to the cursor.
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        app.settings_menu.as_mut().unwrap().selected = SettingsMenu::WRAP_COMPOSER;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.settings.wrap_composer);
+        assert!(
+            !Settings::load(&app.settings_path).unwrap().wrap_composer,
+            "saved"
+        );
+        app.settings_menu = None;
+        app.focus = Focus::Input;
+        let one_row = screen(&mut app);
+        assert_eq!(rows(&one_row), 1, "{one_row:#?}");
+        assert!(count(&one_row) < 12, "{one_row:#?}");
     }
 
     #[test]
