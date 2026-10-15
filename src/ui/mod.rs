@@ -18,6 +18,7 @@ use crate::app::{
 use crate::attach::{self, Attachment, Kind};
 use crate::buttons::ButtonMenu;
 use crate::chats::{Badge, Chat};
+use crate::chime::Sounds;
 use crate::complete::Completion;
 use crate::config;
 use crate::images::Images;
@@ -685,7 +686,15 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         draw_confirm(frame, chat_area, confirm, colors);
     }
     if let Some(menu) = &mut app.settings_menu {
-        draw_settings(frame, menu, &app.settings, &app.themes, colors);
+        draw_settings(
+            frame,
+            menu,
+            &app.settings,
+            &app.themes,
+            &app.sounds,
+            app.over_ssh,
+            colors,
+        );
     }
     if let Some(toast) = &app.toast {
         draw_toast(frame, toast, colors);
@@ -1267,6 +1276,8 @@ fn draw_settings(
     menu: &mut SettingsMenu,
     settings: &Settings,
     themes: &Themes,
+    sounds: &Sounds,
+    over_ssh: bool,
     colors: &Colors,
 ) {
     let area = frame.area();
@@ -1293,7 +1304,7 @@ fn draw_settings(
     let tabs = Line::from(tabs);
     let keys = match menu.tab {
         HelpTab::Shortcuts => " `j/k` scroll · `Tab` settings · `Esc` close ",
-        HelpTab::Settings if menu.selected >= SettingsMenu::THEMES => {
+        HelpTab::Settings if menu.selected >= SettingsMenu::SOUNDS => {
             " `Enter` or `Space` use · `Tab` shortcuts · `Esc` close "
         }
         HelpTab::Settings => " `Enter` or `Space` on/off · `Tab` shortcuts · `Esc` close ",
@@ -1323,7 +1334,8 @@ fn draw_settings(
     };
     let heading = |text: &'static str| Line::from(text).fg(colors.muted).bold();
     let check = |on: bool| if on { " [✓] " } else { " [ ] " };
-    let last_row = SettingsMenu::THEMES + themes.list.len() - 1;
+    let first_theme = SettingsMenu::themes(sounds);
+    let last_row = first_theme + themes.list.len() - 1;
     // The line the cursor is on, and the last one to show with it.
     let mut lines = Vec::new();
     let (mut cursor, mut cursor_end) = (0, 0);
@@ -1400,6 +1412,37 @@ fn draw_settings(
         "Take the ones others start here, not on your phone",
     );
     lines.push(Line::default());
+    lines.push(heading(" Sound for new messages"));
+    if over_ssh {
+        let why = " Not played over SSH: it would play on the other computer";
+        lines.push(Line::from(why).fg(colors.muted));
+    }
+    add(
+        &mut lines,
+        SettingsMenu::SOUND_FOCUSED,
+        check(settings.sound_when_focused),
+        "Also while tuigram's window is focused",
+    );
+    // The dot marks the sound in use.
+    let picked = settings.notification_sound.as_deref();
+    let dot = |on: bool| if on { " ● " } else { " ○ " };
+    add(
+        &mut lines,
+        SettingsMenu::SOUNDS,
+        dot(picked.is_none()),
+        "None",
+    );
+    for (i, sound) in sounds.list.iter().enumerate() {
+        let mark = dot(picked == Some(sound.id.as_str()));
+        add(&mut lines, SettingsMenu::SOUNDS + 1 + i, mark, &sound.label);
+    }
+    if let Some(dir) = &sounds.dir {
+        lines.push(Line::default());
+        lines.push(Line::from(" Your own sounds, WAV or Ogg Opus, go in").fg(colors.muted));
+        lines.push(Line::from(format!(" {}", short_path(dir))).fg(colors.muted));
+    }
+    let sounds_end = lines.len() - 1;
+    lines.push(Line::default());
     lines.push(heading(" Theme"));
     for (i, theme) in themes.list.iter().enumerate() {
         // The dot marks the theme in use.
@@ -1408,7 +1451,7 @@ fn draw_settings(
         } else {
             " ○ "
         };
-        add(&mut lines, SettingsMenu::THEMES + i, mark, &theme.label);
+        add(&mut lines, first_theme + i, mark, &theme.label);
         // One that can't be used is dimmed; picking it says why.
         if theme.colors.is_err()
             && let Some(line) = lines.last_mut()
@@ -1422,7 +1465,10 @@ fn draw_settings(
         lines.push(Line::from(" Your own themes go in").fg(colors.muted));
         lines.push(Line::from(format!(" {}", short_path(dir))).fg(colors.muted));
     }
-    // On the last theme, the lines after it show too.
+    // On the last sound or theme, the lines after it show too.
+    if menu.selected == first_theme - 1 {
+        cursor_end = sounds_end;
+    }
     if menu.selected == last_row {
         cursor_end = lines.len() - 1;
     }
@@ -2915,7 +2961,15 @@ mod tests {
         let mut draw = |menu: &mut SettingsMenu| {
             terminal
                 .draw(|f| {
-                    draw_settings(f, menu, &Settings::default(), &Themes::built_in(), &colors)
+                    draw_settings(
+                        f,
+                        menu,
+                        &Settings::default(),
+                        &Themes::built_in(),
+                        &Sounds::built_in(),
+                        false,
+                        &colors,
+                    )
                 })
                 .unwrap();
             buffer_rows(terminal.backend().buffer())
@@ -3709,7 +3763,17 @@ mod tests {
             };
             let mut terminal = Terminal::new(TestBackend::new(70, 30)).unwrap();
             terminal
-                .draw(|f| draw_settings(f, &mut menu, &settings, &Themes::built_in(), &colors))
+                .draw(|f| {
+                    draw_settings(
+                        f,
+                        &mut menu,
+                        &settings,
+                        &Themes::built_in(),
+                        &Sounds::built_in(),
+                        false,
+                        &colors,
+                    )
+                })
                 .unwrap();
             let buf = terminal.backend().buffer();
             let rows = buffer_rows(buf);
@@ -3902,17 +3966,71 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_list_the_sounds_after_the_checkboxes_and_mark_the_one_in_use() {
+        let settings = Settings {
+            notification_sound: Some("pop".into()),
+            ..Settings::default()
+        };
+        let mut menu = SettingsMenu {
+            selected: SettingsMenu::SOUNDS,
+            ..SettingsMenu::new(HelpTab::Settings, &settings)
+        };
+        let (themes, sounds) = (Themes::built_in(), Sounds::built_in());
+        let colors = Colors::default();
+        let mut terminal = Terminal::new(TestBackend::new(70, 60)).unwrap();
+        let mut draw = |menu: &mut SettingsMenu, over_ssh| {
+            terminal
+                .draw(|f| draw_settings(f, menu, &settings, &themes, &sounds, over_ssh, &colors))
+                .unwrap();
+            buffer_rows(terminal.backend().buffer())
+        };
+        let rows = draw(&mut menu, false);
+        let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+        assert!(at("Sound for new messages") > at("Take the ones others start"));
+        let focused = at("Also while tuigram's window is focused");
+        assert_eq!(focused, at("Sound for new messages") + 1);
+        assert!(rows[focused].contains("[ ]"), "off unless asked for");
+        assert_eq!(at("None"), focused + 1);
+        assert!(rows[at("None")].contains("▌ ○"), "cursor on None");
+        assert!(rows[at("Pop")].contains("●"), "Pop is in use");
+        for sound in ["Ding", "Chime", "Trill", "Knock"] {
+            assert!(rows[at(sound)].contains("○"), "{sound}");
+        }
+        assert!(rows.iter().any(|r| r.contains("Enter or Space use")));
+        assert!(!rows.iter().any(|r| r.contains("SSH")));
+
+        let rows = draw(&mut menu, true);
+        let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+        assert_eq!(
+            at("Not played over SSH"),
+            at("Sound for new messages") + 1,
+            "said under the heading"
+        );
+    }
+
+    #[test]
     fn settings_list_every_theme_last_and_mark_the_saved_one() {
         // On Latte while Mocha is saved.
         let mut menu = SettingsMenu {
-            selected: SettingsMenu::THEMES,
+            selected: SettingsMenu::themes(&Sounds::built_in()),
             ..SettingsMenu::new(HelpTab::Settings, &Settings::default())
         };
         let themes = Themes::built_in();
         let colors = themes.colors("latte").unwrap();
-        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+        // Tall enough for the checkboxes and the sounds above the themes.
+        let mut terminal = Terminal::new(TestBackend::new(60, 60)).unwrap();
         terminal
-            .draw(|f| draw_settings(f, &mut menu, &Settings::default(), &themes, &colors))
+            .draw(|f| {
+                draw_settings(
+                    f,
+                    &mut menu,
+                    &Settings::default(),
+                    &themes,
+                    &Sounds::built_in(),
+                    false,
+                    &colors,
+                )
+            })
             .unwrap();
         let buf = terminal.backend().buffer();
         let rows = buffer_rows(buf);
@@ -3959,7 +4077,17 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
         let mut draw = |menu: &mut SettingsMenu| {
             terminal
-                .draw(|f| draw_settings(f, menu, &Settings::default(), &themes, &colors))
+                .draw(|f| {
+                    draw_settings(
+                        f,
+                        menu,
+                        &Settings::default(),
+                        &themes,
+                        &Sounds::built_in(),
+                        false,
+                        &colors,
+                    )
+                })
                 .unwrap();
             terminal.backend().buffer().clone()
         };
@@ -3969,7 +4097,7 @@ mod tests {
         assert!(has(&rows, "Notifications") && !has(&rows, "Rosé Pine"));
 
         // On the last theme, the lines after it show too.
-        menu.selected = SettingsMenu::THEMES + themes.list.len() - 1;
+        menu.selected = SettingsMenu::themes(&Sounds::built_in()) + themes.list.len() - 1;
         let buf = draw(&mut menu);
         let rows = buffer_rows(&buf);
         assert!(
@@ -3983,7 +4111,7 @@ mod tests {
         assert_eq!(buf[(x, y as u16)].fg, colors.muted, "dimmed");
 
         // Back up on the first theme, its heading shows above it.
-        menu.selected = SettingsMenu::THEMES;
+        menu.selected = SettingsMenu::themes(&Sounds::built_in());
         let rows = buffer_rows(&draw(&mut menu));
         let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
         assert_eq!(at("Catppuccin Latte"), at("Theme") + 1);
@@ -4004,7 +4132,17 @@ mod tests {
                 ..Settings::default()
             };
             terminal
-                .draw(|f| draw_settings(f, &mut menu, &settings, &Themes::built_in(), &colors))
+                .draw(|f| {
+                    draw_settings(
+                        f,
+                        &mut menu,
+                        &settings,
+                        &Themes::built_in(),
+                        &Sounds::built_in(),
+                        false,
+                        &colors,
+                    )
+                })
                 .unwrap();
             buffer_rows(terminal.backend().buffer())
         };
@@ -4040,7 +4178,17 @@ mod tests {
                 ..Settings::default()
             };
             terminal
-                .draw(|f| draw_settings(f, &mut menu, &settings, &Themes::built_in(), &colors))
+                .draw(|f| {
+                    draw_settings(
+                        f,
+                        &mut menu,
+                        &settings,
+                        &Themes::built_in(),
+                        &Sounds::built_in(),
+                        false,
+                        &colors,
+                    )
+                })
                 .unwrap();
             buffer_rows(terminal.backend().buffer())
         };

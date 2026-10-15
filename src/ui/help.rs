@@ -256,7 +256,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("1-9", "Choose by number"),
             (
                 "Space",
-                "Turn a setting on or off, or use a theme (Enter too); saved at once",
+                "Tick a setting, or use a sound or a theme (Enter too); saved at once",
             ),
             ("Esc / q", "Close"),
             ("Tab / h / l", "Switch tabs in this popup"),

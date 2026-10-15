@@ -396,7 +396,7 @@ fn help(app: &App, tab: HelpTab) -> SettingsMenu {
         .position(|t| t.id == app.settings.theme)
         .unwrap_or(0);
     SettingsMenu {
-        selected: SettingsMenu::THEMES + theme,
+        selected: SettingsMenu::themes(&app.sounds) + theme,
         ..SettingsMenu::new(tab, &app.settings)
     }
 }

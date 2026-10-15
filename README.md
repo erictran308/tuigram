@@ -226,6 +226,16 @@ They work in Ghostty, kitty, WezTerm, iTerm2, foot and Konsole, also over SSH. I
 
 To turn them off or on, press `?`, go to **Settings**, and press `Space` or `Enter` on **Notifications**; it's saved at once. To pick how they're sent, set `notifications` in `settings.toml` (in [your data folder](#your-data)) to `"bell"`, `"osc9"`, `"osc777"` or `"osc99"`; the default `"auto"` picks for your terminal.
 
+### Notification sound
+
+tuigram can also play a sound of its own for new messages. Press `?`, go to **Settings**, and pick one under **Sound for new messages**: Ding, Chime, Trill, Pop or Knock. It plays once so you can hear it, and it's saved at once; **None** turns it off again.
+
+To use your own, put a WAV or Ogg Opus file in the `sounds` folder inside [your data folder](#your-data), press `?` and pick it in the same list. A file named like a built-in sound, such as `ding.wav`, replaces it. Only the first ten seconds play. On macOS, this turns one of the system's sounds into a file tuigram plays: `afconvert -f WAVE -d LEI16 /System/Library/Sounds/Glass.aiff Glass.wav`.
+
+It plays as each new message comes, at most once a second, even in a chat that just had a notification and gets no other for half a minute. While tuigram's window is focused it's quiet, unless you tick **Also while tuigram's window is focused** above the sounds: then every message you'd be notified of rings, whether you're looking or not. Chats you muted in Telegram stay silent, as do chats whose sound you turned off and messages sent without sound; as in Telegram's apps, a mention of you or a reply to you in a muted group still rings. It doesn't play over a voice message that's playing.
+
+The sound plays on the computer tuigram runs on, so over SSH there's none, and the terminal's own sound stays. While tuigram plays one, the terminal's notification makes no sound of its own, and with `notifications = "bell"` the bell isn't rung.
+
 Like Telegram Desktop, tuigram shows you as online while its window is focused and you've pressed a key in the last minute, so notifications arrive right away instead of waiting to see if you read them on your phone.
 
 ## Secret chats
@@ -318,7 +328,7 @@ Everything lives in one folder on your machine (`tuigram --help` prints its path
 | Linux | `~/.local/share/tuigram` |
 | Windows | `%LOCALAPPDATA%\tuigram` |
 
-It holds your login session, [secret chats](#secret-chats), API keys, downloaded files, settings and [your own themes](#themes). Deleting it removes your session from this computer, and your secret chats for good. To end the session completely, go to **Settings → Devices** in another Telegram app.
+It holds your login session, [secret chats](#secret-chats), API keys, downloaded files, settings, and [your own themes](#themes) and [sounds](#notification-sound). Deleting it removes your session from this computer, and your secret chats for good. To end the session completely, go to **Settings → Devices** in another Telegram app.
 
 Environment variables:
 

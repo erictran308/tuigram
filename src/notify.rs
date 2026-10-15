@@ -78,7 +78,8 @@ pub fn detect(env: impl Fn(&str) -> Option<String>) -> Notifications {
 pub struct Alert {
     pub title: String,
     pub body: String,
-    /// Telegram says to make no sound: the chat's sound is off.
+    /// Telegram says to make no sound: the chat's sound is off, or the
+    /// messages were sent without one.
     pub silent: bool,
 }
 

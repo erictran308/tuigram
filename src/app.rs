@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
@@ -19,6 +20,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::attach::{self, Attachment, Dropped};
 use crate::buttons::{ButtonMenu, Press};
 use crate::chats::{Badge, Chats, List, Peer, Presence};
+use crate::chime::{self, Sounds};
 use crate::clipboard::{Clipboard, ClipboardEvent, Copied, Decoded, Paste, Pasted};
 use crate::complete::{self, Commands, Completion, Kind, Suggestion};
 use crate::config::{self, ApiKeys};
@@ -77,6 +79,9 @@ const AWAY_AFTER: Duration = Duration::from_secs(5 * 60);
 /// While typing, the chat is told again this often: others' apps stop
 /// showing it after 5.5 s without a repeat.
 const TYPING_EVERY: Duration = Duration::from_secs(5);
+/// The sound for new messages plays at most this often, so a burst of them
+/// rings once.
+const RING_GAP: Duration = Duration::from_secs(1);
 
 /// Where the API key TDLib was given came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -446,14 +451,17 @@ pub enum HelpTab {
 
 /// The `?` popup: every keyboard shortcut, and the settings. On the settings
 /// tab, Enter or Space ticks a checkbox (notifications, gaps in the chat list
-/// and in message blocks, Normal mode after sending, taking secret chats) or
-/// picks a theme, and saves it at once.
+/// and in message blocks, Normal mode after sending, taking secret chats, the
+/// sound while focused too),
+/// picks the sound for new messages, which plays it, or picks a theme, and
+/// saves it at once.
 pub struct SettingsMenu {
     pub tab: HelpTab,
     /// First row shown on the shortcuts tab. Drawing keeps it in range.
     pub scroll: usize,
-    /// Row on the settings tab: one of the checkboxes, then the themes from
-    /// [`SettingsMenu::THEMES`] on.
+    /// Row on the settings tab: one of the checkboxes, then the sounds from
+    /// [`SettingsMenu::SOUNDS`] on and the themes from
+    /// [`SettingsMenu::themes`] on.
     pub selected: usize,
     /// First line shown on the settings tab. Drawing moves it to show the
     /// selected row.
@@ -482,9 +490,17 @@ impl SettingsMenu {
     pub const WRAP_COMPOSER: usize = Self::AFTER_SEND + 1;
     /// The "take secret chats others start" row.
     pub const SECRET_CHATS: usize = Self::WRAP_COMPOSER + 1;
-    /// The first theme's row. The themes come last, since the user's own
-    /// can make a long list.
-    pub const THEMES: usize = Self::SECRET_CHATS + 1;
+    /// The "sound while focused too" row, first under the sound's heading.
+    pub const SOUND_FOCUSED: usize = Self::SECRET_CHATS + 1;
+    /// The "no sound" row, the first of the sounds: the built-in ones and
+    /// the user's follow it.
+    pub const SOUNDS: usize = Self::SOUND_FOCUSED + 1;
+
+    /// The first theme's row, after the sounds. The themes come last, since
+    /// the user's own can make a long list.
+    pub fn themes(sounds: &Sounds) -> usize {
+        Self::SOUNDS + 1 + sounds.list.len()
+    }
 
     /// Opens on `tab` with the cursor on the first setting.
     pub fn new(tab: HelpTab, settings: &Settings) -> Self {
@@ -786,6 +802,14 @@ pub struct App {
     settings_path: PathBuf,
     /// Every theme, read again whenever `?` opens, so changes to a file show.
     pub themes: Themes,
+    /// Every sound for new messages, read again whenever `?` opens.
+    pub sounds: Sounds,
+    /// The sound for new messages, ready to play; `None` for none.
+    sound: Option<Arc<[i16]>>,
+    /// When the sound for new messages last played, for [`RING_GAP`].
+    rang_at: Option<Instant>,
+    /// tuigram runs over SSH, so its sound would play on the other computer.
+    pub over_ssh: bool,
     /// The colors of the theme in use.
     pub colors: Colors,
     /// Corners are drawn round (`Settings.corners`, `Auto` decided).
@@ -923,6 +947,10 @@ impl App {
             confirm: None,
             settings,
             themes: Themes::load(&settings_path.with_file_name("themes")),
+            sounds: Sounds::load(&settings_path.with_file_name("sounds")),
+            sound: None,
+            rang_at: None,
+            over_ssh: chime::over_ssh(|name| std::env::var(name).ok()),
             settings_path,
             colors: Colors::default(),
             rounded,
@@ -964,6 +992,7 @@ impl App {
             exit: false,
         };
         app.use_saved_theme();
+        app.use_saved_sound();
         app
     }
 
@@ -977,6 +1006,20 @@ impl App {
                 self.colors = Colors::default();
                 self.status = Some(format!("Theme not used: {e}"));
             }
+        }
+    }
+
+    /// Gets the sound for new messages the settings name ready to play, or
+    /// says why it can't be, leaving none. The setting stays, so fixing the
+    /// file is enough.
+    fn use_saved_sound(&mut self) {
+        self.sound = None;
+        let Some(id) = &self.settings.notification_sound else {
+            return;
+        };
+        match self.sounds.samples(id) {
+            Ok(samples) => self.sound = Some(samples),
+            Err(e) => self.status = Some(format!("Sound not used: {e}")),
         }
     }
 
@@ -2202,6 +2245,10 @@ impl App {
                     self.themes = Themes::load(&dir);
                 }
                 self.use_saved_theme();
+                if let Some(dir) = self.sounds.dir.clone() {
+                    self.sounds = Sounds::load(&dir);
+                }
+                self.use_saved_sound();
                 self.settings_menu = Some(SettingsMenu::new(HelpTab::Shortcuts, &self.settings));
             }
             (_, KeyCode::Char(':')) => self.open_prompt(PromptKind::Command),
@@ -3129,6 +3176,9 @@ impl App {
             return;
         }
         let chat_id = update.chat_id;
+        // No sound for these: the chat's is off, they were sent without one,
+        // or they were shown before and come again.
+        let no_sound = update.notification_sound_id == 0;
         for notification in update.added_notifications {
             let topic = match &notification.r#type {
                 NotificationType::NewMessage(new) => self
@@ -3138,7 +3188,17 @@ impl App {
                     .map(|f| f.topic_of(&new.message)),
                 _ => None,
             };
-            if notification.date < self.notify_since || self.sees(chat_id, topic) {
+            if notification.date < self.notify_since {
+                continue;
+            }
+            let seen = self.sees(chat_id, topic);
+            if matches!(
+                notification.r#type,
+                NotificationType::NewMessage(_) | NotificationType::NewSecretChat
+            ) {
+                self.ring_for(notification.is_silent || no_sound, seen);
+            }
+            if seen {
                 continue;
             }
             let new = match notification.r#type {
@@ -3150,7 +3210,7 @@ impl App {
                         chat_id,
                         chat: "Secret chat".into(),
                         text: "Someone started a secret chat with you".into(),
-                        silent: notification.is_silent,
+                        silent: notification.is_silent || no_sound,
                     };
                     self.notifier.add(note, Instant::now());
                     continue;
@@ -3165,7 +3225,7 @@ impl App {
                     chat_id,
                     chat: "Secret chat".into(),
                     text: "New message".into(),
-                    silent: notification.is_silent,
+                    silent: notification.is_silent || no_sound,
                 };
                 self.notifier.add(note, Instant::now());
                 continue;
@@ -3184,7 +3244,7 @@ impl App {
                     self.chats.badge(chat_id).map_or("", Badge::mark)
                 ),
                 text,
-                silent: notification.is_silent,
+                silent: notification.is_silent || no_sound,
             };
             self.notifier.add(note, Instant::now());
         }
@@ -3221,10 +3281,36 @@ impl App {
         }
     }
 
-    fn send_notification(&mut self) {
-        let Some(alert) = self.notifier.due(Instant::now()) else {
+    /// Plays the sound for a new message Telegram tells of, as it comes,
+    /// whatever its notification does: unless its chat makes no sound, or
+    /// the user sees it come and didn't ask for one then. A burst rings
+    /// once, at most once per [`RING_GAP`]. Over SSH it would play on the
+    /// other computer, so it doesn't.
+    fn ring_for(&mut self, silent: bool, seen: bool) {
+        let now = Instant::now();
+        if silent
+            || (seen && !self.settings.sound_when_focused)
+            || self.over_ssh
+            || self.rang_at.is_some_and(|at| now < at + RING_GAP)
+        {
+            return;
+        }
+        let Some(sound) = &self.sound else {
             return;
         };
+        self.rang_at = Some(now);
+        self.player.ring(Arc::clone(sound));
+    }
+
+    fn send_notification(&mut self) {
+        let Some(mut alert) = self.notifier.due(Instant::now()) else {
+            return;
+        };
+        // tuigram's own sound went as the messages came (`App::ring_for`),
+        // so the terminal makes none of its own.
+        if self.sound.is_some() && !self.over_ssh {
+            alert.silent = true;
+        }
         self.notifications_sent += 1;
         let id = self.notifications_sent;
         if let Some(code) = notify::escape(self.notify_with, &alert, id, self.in_tmux) {
@@ -5680,6 +5766,10 @@ impl App {
 
     /// Word from the voice message playing.
     fn on_voice(&mut self, event: VoiceEvent) {
+        if let Some(why) = event.ring_failed() {
+            self.status = Some(format!("Can't play the sound for new messages: {why}"));
+            return;
+        }
         let Some(news) = self.player.on_event(event) else {
             return;
         };
@@ -5965,7 +6055,7 @@ impl App {
             // Drawing stops it at the end of the list.
             HelpTab::Shortcuts => menu.scroll = menu.scroll.saturating_add_signed(delta),
             HelpTab::Settings => {
-                let last = SettingsMenu::THEMES + self.themes.list.len() - 1;
+                let last = SettingsMenu::themes(&self.sounds) + self.themes.list.len() - 1;
                 menu.selected = menu.selected.saturating_add_signed(delta).min(last);
             }
         }
@@ -5978,9 +6068,10 @@ impl App {
             return;
         };
         let settings = &mut self.settings;
+        let themes = SettingsMenu::themes(&self.sounds);
         match menu.selected {
-            i if i >= SettingsMenu::THEMES => {
-                let Some(theme) = self.themes.list.get(i - SettingsMenu::THEMES) else {
+            i if i >= themes => {
+                let Some(theme) = self.themes.list.get(i - themes) else {
                     return;
                 };
                 match &theme.colors {
@@ -5994,6 +6085,35 @@ impl App {
                     }
                 }
             }
+            i if i >= SettingsMenu::SOUNDS => match i
+                .checked_sub(SettingsMenu::SOUNDS + 1)
+                .and_then(|n| self.sounds.list.get(n))
+            {
+                // The first row: no sound.
+                None => {
+                    self.sound = None;
+                    settings.notification_sound = None;
+                }
+                Some(sound) => match self.sounds.samples(&sound.id) {
+                    Ok(samples) => {
+                        // Played, to hear what it's like.
+                        if self.over_ssh {
+                            self.status = Some(
+                                "Over SSH, tuigram plays no sound: it would play on the other computer"
+                                    .into(),
+                            );
+                        } else {
+                            self.player.ring(Arc::clone(&samples));
+                        }
+                        self.sound = Some(samples);
+                        settings.notification_sound = Some(sound.id.clone());
+                    }
+                    Err(e) => {
+                        self.status = Some(format!("Sound not used: {e}"));
+                        return;
+                    }
+                },
+            },
             SettingsMenu::NOTIFICATIONS => {
                 // Back on, they go out the way they did before, e.g. "bell".
                 let on = match menu.saved_notifications {
@@ -6026,6 +6146,9 @@ impl App {
             SettingsMenu::PILLS => settings.nerd_font = !settings.nerd_font,
             SettingsMenu::AFTER_SEND => settings.normal_after_send = !settings.normal_after_send,
             SettingsMenu::WRAP_COMPOSER => settings.wrap_composer = !settings.wrap_composer,
+            SettingsMenu::SOUND_FOCUSED => {
+                settings.sound_when_focused = !settings.sound_when_focused;
+            }
             SettingsMenu::SECRET_CHATS => {
                 settings.accept_secret_chats = !settings.accept_secret_chats;
                 self.tg.accept_secret_chats(settings.accept_secret_chats);
@@ -6778,6 +6901,115 @@ mod tests {
         press(&mut app, KeyCode::Char('q'), none);
         assert_eq!(app.settings.theme, "rose-pine", "closing keeps it");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sound_picked_in_the_settings_plays_and_is_saved() {
+        let dir = std::env::temp_dir().join(format!("tuigram-sound-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sounds")).unwrap();
+        std::fs::write(dir.join("sounds/broken.wav"), b"RIFF, and no more").unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        app.over_ssh = false;
+        let pick = |app: &mut App, row| {
+            if app.settings_menu.is_none() {
+                press(app, KeyCode::Char('?'), KeyModifiers::NONE);
+                press(app, KeyCode::Tab, KeyModifiers::NONE);
+            }
+            app.settings_menu.as_mut().unwrap().selected = row;
+            press(app, KeyCode::Enter, KeyModifiers::NONE);
+        };
+        app.player = Player::new(unbounded_channel().0, crate::voice::Output::Nowhere);
+        // No sound, Ding, then Chime.
+        pick(&mut app, SettingsMenu::SOUNDS + 2);
+        assert_eq!(app.settings.notification_sound.as_deref(), Some("chime"));
+        assert!(app.player.rang(), "played, to hear it");
+        let saved = Settings::load(&settings::path(&dir)).unwrap();
+        assert_eq!(saved.notification_sound.as_deref(), Some("chime"));
+
+        // One that can't be used says why, and the last one stays.
+        let broken = app.sounds.list.iter().position(|s| s.id == "broken");
+        pick(&mut app, SettingsMenu::SOUNDS + 1 + broken.unwrap());
+        let status = app.status.take().unwrap_or_default();
+        assert!(
+            status.starts_with("Sound not used: broken.wav: "),
+            "{status}"
+        );
+        assert_eq!(app.settings.notification_sound.as_deref(), Some("chime"));
+        assert!(app.sound.is_some());
+
+        pick(&mut app, SettingsMenu::SOUNDS);
+        assert_eq!(app.settings.notification_sound, None);
+        assert!(app.sound.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_sound_rings_for_each_new_message_at_most_once_a_second() {
+        let mut app = test_app("ring");
+        app.over_ssh = false;
+        app.sound = Some(vec![100; 480].into());
+        let quiet = || Player::new(unbounded_channel().0, crate::voice::Output::Nowhere);
+        let ring = |app: &mut App, silent, seen| {
+            app.player = quiet();
+            app.rang_at = None;
+            app.ring_for(silent, seen);
+            app.player.rang()
+        };
+        assert!(ring(&mut app, false, false));
+        assert!(!ring(&mut app, true, false), "a chat whose sound is off");
+        assert!(!ring(&mut app, false, true), "seen while focused");
+        app.settings.sound_when_focused = true;
+        assert!(ring(&mut app, false, true), "asked for while focused too");
+        app.over_ssh = true;
+        assert!(
+            !ring(&mut app, false, false),
+            "it'd play on the other computer"
+        );
+        app.over_ssh = false;
+
+        // A burst rings once.
+        assert!(ring(&mut app, false, false));
+        app.player = quiet();
+        app.ring_for(false, false);
+        assert!(!app.player.rang(), "within a second of the last");
+        app.rang_at = app.rang_at.map(|at| at - RING_GAP);
+        app.ring_for(false, false);
+        assert!(app.player.rang());
+
+        // Each of Telegram's notifications rings, though once a chat had
+        // one, its next ones are held back for a while.
+        use tdlib_rs::enums::NotificationGroupType;
+        use tdlib_rs::types::Notification;
+        app.notify_with = Notifications::Bell;
+        app.notify_since = 0;
+        (app.focus_reported, app.terminal_focused) = (true, false);
+        // Telegram's id for the default sound is -1; 0 is none.
+        let update = |id, sound| UpdateNotificationGroup {
+            notification_group_id: 1,
+            r#type: NotificationGroupType::SecretChat,
+            chat_id: 1,
+            notification_settings_chat_id: 1,
+            notification_sound_id: sound,
+            total_count: 1,
+            added_notifications: vec![Notification {
+                id,
+                date: unix_now(),
+                is_silent: false,
+                r#type: NotificationType::NewSecretChat,
+            }],
+            removed_notification_ids: Vec::new(),
+        };
+        for id in [1, 2] {
+            (app.player, app.rang_at) = (quiet(), None);
+            app.on_notifications(update(id, -1));
+            assert!(app.player.rang(), "notification {id}");
+            assert!(app.notifier.due(Instant::now()).is_some() == (id == 1));
+        }
+        (app.player, app.rang_at) = (quiet(), None);
+        app.on_notifications(update(3, 0));
+        assert!(!app.player.rang(), "the chat's sound is off in Telegram");
     }
 
     #[test]

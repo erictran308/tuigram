@@ -2,6 +2,7 @@ mod app;
 mod attach;
 mod buttons;
 mod chats;
+mod chime;
 mod clipboard;
 mod complete;
 mod config;

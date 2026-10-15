@@ -133,16 +133,35 @@ pub enum Output {
     Speakers,
     /// Nowhere, at once: tests and the demo must make no sound.
     Nowhere,
+    /// A device that hangs in its first write, until `tests::UNSTICK`.
+    #[cfg(test)]
+    Stuck,
 }
 
-/// Plays one voice message at a time.
+/// Plays one voice message at a time, and the sound for new messages.
 pub struct Player {
     tx: UnboundedSender<VoiceEvent>,
     output: Output,
     now: Option<Playing>,
     /// Numbers each playback, so word from one that was stopped is dropped.
     tickets: u64,
+    /// The sound for new messages played last, maybe still playing.
+    ringing: Option<Ringing>,
 }
+
+/// The sound for new messages, playing on a thread of its own.
+struct Ringing {
+    shared: Arc<Shared>,
+    /// Waited for before the next one opens the device.
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// The ticket of the sound for new messages: voice messages' start at 1.
+const RING: u64 = 0;
+
+/// Samples written to the device at a time for the sound for new messages:
+/// 20 ms, an Opus frame.
+const RING_CHUNK: usize = 960;
 
 struct Playing {
     chat_id: i64,
@@ -163,13 +182,27 @@ struct Shared {
     paused: AtomicBool,
     /// Samples heard so far.
     played: AtomicU64,
+    /// The sound for new messages is past waiting for the last one to let
+    /// go of the device: it plays, or is about to.
+    began: AtomicBool,
 }
 
-/// Word from the thread playing a voice message.
+/// Word from the thread playing a voice message, or the sound for new
+/// messages, which says only if it failed.
 #[derive(Debug)]
 pub struct VoiceEvent {
     ticket: u64,
     happened: Happened,
+}
+
+impl VoiceEvent {
+    /// Why the sound for new messages couldn't play, if this says that.
+    pub fn ring_failed(&self) -> Option<&str> {
+        match &self.happened {
+            Happened::Failed(why) if self.ticket == RING => Some(why),
+            _ => None,
+        }
+    }
 }
 
 /// A [`VoiceEvent`] about what's playing, and which message that is.
@@ -199,7 +232,82 @@ impl Player {
             output,
             now: None,
             tickets: 0,
+            ringing: None,
         }
+    }
+
+    /// Plays `samples`, the sound for new messages, cutting off the last
+    /// one if it's still playing. A voice message playing isn't talked
+    /// over, and while one waits for the last to let go of the device, no
+    /// more do: then nothing plays.
+    pub fn ring(&mut self, samples: Arc<[i16]>) {
+        if self
+            .now
+            .as_ref()
+            .is_some_and(|n| n.shared.is_some() && !n.paused)
+        {
+            return;
+        }
+        // The one waiting may wait for good, behind a device that hangs:
+        // no more threads pile up behind it.
+        if let Some(last) = &self.ringing
+            && !last.shared.began.load(Relaxed)
+            && !last.thread.is_finished()
+        {
+            return;
+        }
+        let last = self.ringing.take();
+        if let Some(last) = &last {
+            last.shared.stop.store(true, Relaxed);
+        }
+        let shared = Arc::new(Shared::default());
+        let (tx, output, ours) = (self.tx.clone(), self.output, Arc::clone(&shared));
+        let spawned = std::thread::Builder::new()
+            .name("ring".into())
+            .spawn(move || {
+                // One sound at a time on the device: the last one lets go
+                // of it first.
+                if let Some(last) = last {
+                    let _ = last.thread.join();
+                }
+                ours.began.store(true, Relaxed);
+                // Cut off while waiting: nothing to open the device for.
+                if ours.stop.load(Relaxed) {
+                    return;
+                }
+                let mut chunks = samples.chunks(RING_CHUNK);
+                let mut next = |out: &mut Vec<i16>| {
+                    out.clear();
+                    let chunk = chunks.next();
+                    out.extend_from_slice(chunk.unwrap_or_default());
+                    Ok(chunk.is_some())
+                };
+                let played = sink_for(output)
+                    .and_then(|mut sink| play_out(sink.as_mut(), &ours, &mut || {}, &mut next));
+                if let Err(e) = played {
+                    let happened = Happened::Failed(format!("{e:#}"));
+                    let _ = tx.send(VoiceEvent {
+                        ticket: RING,
+                        happened,
+                    });
+                }
+            });
+        match spawned {
+            Ok(thread) => self.ringing = Some(Ringing { shared, thread }),
+            Err(_) => {
+                let happened = Happened::Failed("there's no thread to play it on".into());
+                let _ = self.tx.send(VoiceEvent {
+                    ticket: RING,
+                    happened,
+                });
+            }
+        }
+    }
+
+    /// The sound for new messages was played, maybe still is.
+    #[cfg(test)]
+    pub fn rang(&self) -> bool {
+        self.ringing.is_some()
     }
 
     /// Plays message `message_id`'s voice once its file, `file_id`, is
@@ -333,6 +441,9 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         self.stop();
+        if let Some(ringing) = &self.ringing {
+            ringing.shared.stop.store(true, Relaxed);
+        }
     }
 }
 
@@ -344,15 +455,35 @@ fn play(path: &Path, shared: &Shared, output: Output, started: &mut dyn FnMut())
         bail!("it's too long");
     }
     let mut sound = OggOpus::new(BufReader::new(file))?;
-    let mut sink: Box<dyn Sink> = match output {
+    let mut sink = sink_for(output)?;
+    play_out(sink.as_mut(), shared, started, &mut |samples| {
+        sound.next(samples)
+    })
+}
+
+fn sink_for(output: Output) -> Result<Box<dyn Sink>> {
+    Ok(match output {
         Output::Speakers => sound::open()?,
         Output::Nowhere => Box::new(sound::Silent::default()),
-    };
+        #[cfg(test)]
+        Output::Stuck => Box::new(tests::StuckSink),
+    })
+}
+
+/// Plays what `next` puts in its `Vec` a stretch at a time (false once
+/// there's no more), until it runs out or `shared` says stop. `started` is
+/// called once sound is on its way.
+fn play_out(
+    sink: &mut dyn Sink,
+    shared: &Shared,
+    started: &mut dyn FnMut(),
+    next: &mut dyn FnMut(&mut Vec<i16>) -> Result<bool>,
+) -> Result<()> {
     let mut samples = Vec::new();
-    let mut heard = Heard::new(sink.as_mut());
-    // Decoded a little ahead of what's heard, until the file runs out.
+    let mut heard = Heard::new(sink);
+    // Decoded a little ahead of what's heard, until the sound runs out.
     loop {
-        if !heard.go_on(sink.as_mut(), shared, started)? {
+        if !heard.go_on(sink, shared, started)? {
             return Ok(());
         }
         if !sink.wants_more() {
@@ -360,7 +491,7 @@ fn play(path: &Path, shared: &Shared, output: Output, started: &mut dyn FnMut())
             std::thread::sleep(POLL);
             continue;
         }
-        if !sound.next(&mut samples)? {
+        if !next(&mut samples)? {
             break;
         }
         sink.write(&samples)?;
@@ -368,7 +499,7 @@ fn play(path: &Path, shared: &Shared, output: Output, started: &mut dyn FnMut())
     sink.finish();
     // Then what's queued plays out.
     loop {
-        if !heard.go_on(sink.as_mut(), shared, started)? || sink.done()? {
+        if !heard.go_on(sink, shared, started)? || sink.done()? {
             return Ok(());
         }
         heard.check()?;
@@ -591,7 +722,7 @@ fn read_up_to(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> 
 
 /// The sound of an Ogg Opus file (RFC 7845), packet by packet, mixed down
 /// to one channel.
-struct OggOpus<R: Read> {
+pub struct OggOpus<R: Read> {
     packets: OggPackets<R>,
     decoder: OpusDecoder,
     /// Samples at the start that are the encoder's warm-up, not sound.
@@ -604,7 +735,7 @@ struct OggOpus<R: Read> {
 }
 
 impl<R: Read> OggOpus<R> {
-    fn new(reader: R) -> Result<Self> {
+    pub fn new(reader: R) -> Result<Self> {
         let mut packets = OggPackets::new(reader);
         let head = packets.next(true)?.context("it's empty")?;
         let h = &head.data;
@@ -635,7 +766,7 @@ impl<R: Read> OggOpus<R> {
 
     /// The next stretch of sound, into `out` (maybe none); false once
     /// there's no more.
-    fn next(&mut self, out: &mut Vec<i16>) -> Result<bool> {
+    pub fn next(&mut self, out: &mut Vec<i16>) -> Result<bool> {
         out.clear();
         let Some(packet) = self.packets.next(true)? else {
             return Ok(false);
@@ -671,6 +802,47 @@ mod tests {
 
     /// A second of a 440 Hz tone, as ffmpeg's libopus writes it.
     const TONE: &[u8] = include_bytes!("../testdata/voice.ogg");
+
+    /// Lets [`StuckSink`]'s writes go on.
+    static UNSTICK: AtomicBool = AtomicBool::new(false);
+    /// Writes [`StuckSink`] was given, stuck or not.
+    static STUCK_WRITES: AtomicU64 = AtomicU64::new(0);
+
+    /// A device whose writes hang until [`UNSTICK`], as ALSA's blocking
+    /// write can.
+    pub struct StuckSink;
+
+    impl Sink for StuckSink {
+        fn wants_more(&self) -> bool {
+            true
+        }
+
+        fn write(&mut self, _: &[i16]) -> Result<()> {
+            STUCK_WRITES.fetch_add(1, Relaxed);
+            while !UNSTICK.load(Relaxed) {
+                std::thread::sleep(POLL);
+            }
+            Ok(())
+        }
+
+        fn finish(&mut self) {}
+
+        fn pause(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn played(&mut self) -> u64 {
+            0
+        }
+
+        fn done(&mut self) -> Result<bool> {
+            Ok(true)
+        }
+    }
 
     fn decode_all(bytes: &[u8]) -> Result<Vec<i16>> {
         decode(OggOpus::new(Cursor::new(bytes))?)
@@ -909,5 +1081,62 @@ mod tests {
         assert_eq!(player.next_tick(), None, "nothing moves while paused");
         assert!(!player.toggle(), "plays on");
         assert!(player.next_tick().is_some());
+    }
+
+    #[test]
+    fn the_sound_for_new_messages_plays_unless_a_voice_message_is_playing() {
+        let (mut free, mut rx) = player();
+        free.ring(vec![100; 4800].into());
+        assert!(free.rang());
+        free.ringing.take().unwrap().thread.join().unwrap();
+        assert!(rx.try_recv().is_err(), "only a failure is told");
+
+        let (mut busy, _rx) = player();
+        busy.play(1, 10, 99, true);
+        busy.start(fixture("rung-over"));
+        busy.ring(vec![100; 4800].into());
+        assert!(!busy.rang(), "a voice message isn't talked over");
+        busy.toggle();
+        busy.ring(vec![100; 4800].into());
+        assert!(busy.rang(), "a paused one is");
+    }
+
+    #[test]
+    fn a_device_that_hangs_holds_back_at_most_two_rings() {
+        let tx = tokio::sync::mpsc::unbounded_channel().0;
+        let mut player = Player::new(tx, Output::Stuck);
+        let sound: Arc<[i16]> = vec![100; 4800].into();
+        player.ring(Arc::clone(&sound));
+        let start = Instant::now();
+        while STUCK_WRITES.load(Relaxed) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(5), "it never wrote");
+            std::thread::sleep(POLL);
+        }
+
+        // The next one waits for the stuck one, and the rest are dropped
+        // rather than each getting a thread that waits behind them.
+        player.ring(Arc::clone(&sound));
+        let waiting = Arc::clone(&player.ringing.as_ref().unwrap().shared);
+        for _ in 0..5 {
+            player.ring(Arc::clone(&sound));
+        }
+        let last = &player.ringing.as_ref().unwrap().shared;
+        assert!(Arc::ptr_eq(last, &waiting), "no new thread");
+        assert!(!waiting.began.load(Relaxed));
+
+        // Once the device lets go, the one waiting plays.
+        UNSTICK.store(true, Relaxed);
+        player.ringing.take().unwrap().thread.join().unwrap();
+        assert!(waiting.began.load(Relaxed));
+        assert!(STUCK_WRITES.load(Relaxed) > 1, "it played");
+    }
+
+    #[test]
+    fn only_the_sound_for_new_messages_failing_is_told_as_that() {
+        let event = |ticket, happened| VoiceEvent { ticket, happened };
+        let failed = || Happened::Failed("no device".into());
+        assert_eq!(event(RING, failed()).ring_failed(), Some("no device"));
+        assert_eq!(event(3, failed()).ring_failed(), None, "a voice message");
+        assert_eq!(event(RING, Happened::Ended).ring_failed(), None);
     }
 }
