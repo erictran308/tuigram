@@ -178,6 +178,7 @@ The status bar always shows the keys for where you are. The essentials:
 | `i` | Write a message: `Enter` sends, `Alt-Enter` or `Ctrl-j` starts a new line, `Esc` stops, leaving what you wrote as the chat's draft, on your other devices too. `@name` or `:emoji` shows suggestions, and so does `/` starting a message (the bots' commands); `Tab` puts one in. You stay in Insert mode to write the next one, unless you tick **Back to Normal mode after sending** in `?` > **Settings**. Long lines wrap onto the next row; untick **Wrap long lines onto the next row** there to keep each on one row, scrolled sideways |
 | `Tab` | While writing: stickers. `h/j/k/l` pick one, `H` / `L` switch between Recent, Favorites and your sets, `/` finds stickers by emoji or word, `Enter` sends |
 | `y` | Copy the selected message: its text, a link, or the photo or file |
+| `v` | Copy part of the selected message's text: it shows in a popup, where `h/j/k/l`, `w/b/e`, `0/$` and `g/G` move as in vim, `v` starts selecting and `y` copies what's selected. `Esc` stops selecting, then closes |
 | `r` | Reply to the selected message (`Esc` twice cancels the reply) |
 | `f` | Forward the selected message, or its whole album: type part of a chat's name, `Enter` sends it there |
 | `e` | Edit your message, its formatting written as Markdown: `Enter` saves, `Esc` twice cancels |

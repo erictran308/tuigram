@@ -89,6 +89,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Send a message that wasn't sent again, show spoilers, view a photo shown only while open, play or pause a voice message, vote in a poll, list a bot's buttons, show the photo, or open the file or link",
             ),
             ("y", "Copy the text, a link, or the photo or file"),
+            ("v", "Show the text to select part of it and copy that"),
             ("r", "Reply"),
             ("f", "Forward to another chat (an album goes whole)"),
             ("e", "Edit your message"),
@@ -169,6 +170,22 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Esc / Ctrl-c",
                 "Back to Normal mode; what's written stays as the chat's draft, on your other devices too",
             ),
+        ],
+    ),
+    (
+        "Selecting text (v)",
+        &[
+            ("h / j / k / l", "Move a character, or a row on screen"),
+            ("w / b / e", "Next word / word before / end of the word"),
+            ("0 / $", "Start / end of the line"),
+            ("g / G", "Start / end of the text"),
+            ("Ctrl-d / Ctrl-u", "Half a page down / up"),
+            (
+                "v",
+                "Start selecting where the cursor is, or stop; it takes in both ends, as in vim",
+            ),
+            ("y", "Copy what's selected and close"),
+            ("Esc", "Stop selecting, then close"),
         ],
     ),
     (

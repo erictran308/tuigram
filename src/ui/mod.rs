@@ -30,6 +30,7 @@ use crate::poll::VoteMenu;
 use crate::reactions::{self, ReactMenu};
 use crate::search;
 use crate::secret::{self, KeyView, TimerMenu};
+use crate::select::TextSelect;
 use crate::settings::{Settings, Side};
 use crate::text;
 use crate::theme::{Colors, Themes};
@@ -63,6 +64,7 @@ mod help;
 mod info;
 mod messages;
 mod qr;
+mod select;
 mod stickers;
 mod topics;
 mod viewer;
@@ -510,6 +512,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         || app.key_view.is_some()
         || app.photo_view.is_some()
         || app.chat_info.is_some()
+        || app.text_select.is_some()
         || app.picker.is_some()
         || app.confirm.is_some()
         || app.settings_menu.is_some()
@@ -534,7 +537,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             }
             // Inside the border and the column of padding on each side.
             let width = chat_area.width.saturating_sub(4);
-            let mut rows = composer_rows(&app.composer, width).clamp(1, MAX_COMPOSER_ROWS) as u16;
+            let mut rows = text_rows(&app.composer, width).clamp(1, MAX_COMPOSER_ROWS) as u16;
             if ComposerBar::of(open).is_some() {
                 rows += BAR_ROWS;
             }
@@ -654,6 +657,9 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             chats: &app.chats,
         };
         info::draw(frame, chat_area, chat_info, &names, colors);
+    }
+    if let Some(text_select) = &mut app.text_select {
+        select::draw(frame, chat_area, text_select, colors);
     }
     if let (Some(menu), Some(open)) = (&app.pinned_menu, &app.open) {
         let names = messages::Names {
@@ -2114,18 +2120,18 @@ fn draw_composer(
     frame.render_widget(Line::from(hint_spans(placeholder, muted, colors)), text);
 }
 
-/// Rows the composer's text takes `width` columns wide: one a line, or as
+/// Rows a text area's text takes `width` columns wide: one a line, or as
 /// many as its lines wrap onto.
-fn composer_rows(composer: &TextArea, width: u16) -> usize {
-    if composer.wrap_mode() == WrapMode::None || width == 0 {
-        return composer.lines().len();
+fn text_rows(text: &TextArea, width: u16) -> usize {
+    if text.wrap_mode() == WrapMode::None || width == 0 {
+        return text.lines().len();
     }
     // The text area says which row its cursor is on, not how many rows it
     // takes, so a copy of the text is laid out as wide with the cursor at
-    // its end: the same wrapping, so the composer is never a row short.
-    let mut copy = TextArea::new(composer.lines().to_vec());
-    copy.set_wrap_mode(composer.wrap_mode());
-    copy.set_tab_length(composer.tab_length());
+    // its end: the same wrapping, so the box is never a row short.
+    let mut copy = TextArea::new(text.lines().to_vec());
+    copy.set_wrap_mode(text.wrap_mode());
+    copy.set_tab_length(text.tab_length());
     let area = Rect::new(0, 0, width, 1);
     (&copy).render(area, &mut Buffer::empty(area));
     copy.move_cursor(CursorMove::Bottom);
@@ -2596,6 +2602,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             )
         }
         _ if app.chat_info.is_some() => (normal, "  `Esc` close"),
+        _ if app.text_select.as_ref().is_some_and(TextSelect::selecting) => (
+            Span::from(" VISUAL ").fg(colors.bg).bg(colors.accent),
+            "  `y` copy · `h/j/k/l` `w/b/e` `0/$` `g/G` move the end · `v` or `Esc` stop selecting",
+        ),
+        _ if app.text_select.is_some() => (
+            normal,
+            "  `v` start selecting · `h/j/k/l` move · `w/b/e` by word · `0/$` line start/end · `g/G` start/end · `Ctrl-d/u` half page · `Esc` close",
+        ),
         _ if app.photo_view.is_some() => (
             normal,
             "  `h/l` older/newer photo · `j/k` zoom in/out · `o` open in its app · `y` copy · `Enter` or `Esc` close",
@@ -2706,6 +2720,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         || app.key_view.is_some()
         || app.photo_view.is_some()
         || app.chat_info.is_some()
+        || app.text_select.is_some()
         || app.picker.is_some()
         || app.confirm.is_some();
     let mut context = match &app.open {

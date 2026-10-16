@@ -20,6 +20,7 @@ mod proxy;
 mod reactions;
 mod search;
 mod secret;
+mod select;
 mod service;
 mod settings;
 mod sound;

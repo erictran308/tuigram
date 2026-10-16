@@ -39,6 +39,7 @@ use crate::proxy;
 use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search::{self, MessageSearch, Who};
 use crate::secret::{KeyView, Secret, SecretState, TimerMenu};
+use crate::select::{self, TextSelect};
 use crate::settings::{self, Settings, Side};
 use crate::stickers::{self, Source, StickerPanel};
 use crate::term::Terminal;
@@ -784,6 +785,8 @@ pub struct App {
     pub photo_view: Option<PhotoView>,
     /// `I`: what a chat is, and who's in it.
     pub chat_info: Option<ChatInfo>,
+    /// `v`: a message's text, to select part of it and copy that.
+    pub text_select: Option<TextSelect>,
     /// `f` to forward a message, or `s` to find a chat to open.
     pub picker: Option<ChatPicker>,
     /// A chat being looked up to open. Opening another chat meanwhile
@@ -939,6 +942,7 @@ impl App {
             key_view: None,
             photo_view: None,
             chat_info: None,
+            text_select: None,
             picker: None,
             finding: None,
             completion: None,
@@ -1227,6 +1231,9 @@ impl App {
             // to send them.
             Event::Paste(_) if self.chat_info.is_some() => {
                 self.status = Some("Close the info to paste".into());
+            }
+            Event::Paste(_) if self.text_select.is_some() => {
+                self.status = Some("Close the text to paste".into());
             }
             Event::Paste(text) if matches!(self.focus, Focus::Input | Focus::Messages) => {
                 self.on_paste(text)
@@ -1850,6 +1857,15 @@ impl App {
                     {
                         self.photo_view = None;
                     }
+                    // Edited: what's selected may not be in it any more.
+                    if self.text_select.as_ref().is_some_and(|s| {
+                        s.chat_id == u.chat_id
+                            && s.message_id == u.message_id
+                            && msg.is_none_or(|m| m.source_text != s.source)
+                    }) {
+                        self.text_select = None;
+                        self.status = Some("The message was edited: v selects again".into());
+                    }
                 }
             }
             Update::MessageEdited(u) => {
@@ -1900,6 +1916,11 @@ impl App {
                     .is_some_and(|v| u.message_ids.iter().any(|&id| v.lost(u.chat_id, id, None)))
                 {
                     self.photo_view = None;
+                }
+                if self.text_select.as_ref().is_some_and(|s| {
+                    s.chat_id == u.chat_id && u.message_ids.contains(&s.message_id)
+                }) {
+                    self.text_select = None;
                 }
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
                     open.remove(&u.message_ids);
@@ -2036,6 +2057,7 @@ impl App {
             Screen::Main if self.pinned_menu.is_some() => self.on_pinned_key(key),
             Screen::Main if self.timer_menu.is_some() => self.on_timer_key(key),
             Screen::Main if self.chat_info.is_some() => self.on_info_key(key, ctrl),
+            Screen::Main if self.text_select.is_some() => self.on_select_key(key, ctrl),
             Screen::Main if self.menu.is_some() => self.on_menu_key(key),
             Screen::Main if self.picker.is_some() => self.on_picker_key(key, ctrl),
             Screen::Main if self.resizing.is_some() => self.on_resize_key(key, ctrl),
@@ -2307,6 +2329,7 @@ impl App {
             (Focus::Messages, KeyCode::Char('r')) => self.reply_to_selected(),
             (Focus::Messages, KeyCode::Char('e')) => self.edit_selected(),
             (Focus::Messages, KeyCode::Char('y')) => self.copy_selected(),
+            (Focus::Messages, KeyCode::Char('v')) if !ctrl => self.open_text_select(),
             (Focus::Messages, KeyCode::Char('a')) => self.open_prompt(PromptKind::Attach),
             (Focus::Messages, KeyCode::Char('p')) if pending_g => self.open_pinned_menu(),
             (Focus::Messages, KeyCode::Char('u')) if pending_g => self.go_to_unread(),
@@ -3082,6 +3105,8 @@ impl App {
             && self.photo_view.is_none()
             // As tall as the pane, over the newest messages.
             && self.chat_info.is_none()
+            // Over them too, maybe as tall.
+            && self.text_select.is_none()
             && self.open.as_ref().is_some_and(|o| {
                 o.chat_id == chat_id
                     // Going to an older message: what arrives meanwhile
@@ -3098,7 +3123,10 @@ impl App {
     /// What's shown only while open is covered once you look away, or go
     /// away.
     fn cover_unseen(&mut self) {
-        let looking = self.focus == Focus::Messages && self.present() && self.chat_info.is_none();
+        let looking = self.focus == Focus::Messages
+            && self.present()
+            && self.chat_info.is_none()
+            && self.text_select.is_none();
         if let Some(open) = self.open.as_mut() {
             open.cover_unless_viewed(looking);
         }
@@ -3548,6 +3576,7 @@ impl App {
         self.key_view = None;
         self.photo_view = None;
         self.chat_info = None;
+        self.text_select = None;
         self.picker = None;
         self.finding = None;
         self.completion = None;
@@ -3943,6 +3972,7 @@ impl App {
         self.key_view = None;
         self.photo_view = None;
         self.chat_info = None;
+        self.text_select = None;
     }
 
     /// Leaves the chat open, or the forum shown, telling TDLib.
@@ -4380,6 +4410,10 @@ impl App {
         }
         if self.chat_info.is_some() {
             self.status = Some("The edit came while the info was open: e edits again".into());
+            return;
+        }
+        if self.text_select.is_some() {
+            self.status = Some("The edit came while a text was open: e edits again".into());
             return;
         }
         // Without it as Markdown, it's edited as plain text, which loses
@@ -5631,6 +5665,7 @@ impl App {
             || self.key_view.is_some()
             || self.photo_view.is_some()
             || self.chat_info.is_some()
+            || self.text_select.is_some()
             || self.menu.is_some()
             || self.picker.is_some()
             || self.resizing.is_some()
@@ -5725,6 +5760,59 @@ impl App {
                     selected: 0,
                 })
             }
+        }
+    }
+
+    /// `v`: the text of the message under the cursor in a popup, to select
+    /// part of it with vim's motions and copy that. In an album, the photo
+    /// sent with the caption, as for `e`.
+    fn open_text_select(&mut self) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let Some(id) = open.edit_target() else {
+            return;
+        };
+        let Some(msg) = open.messages.get(&id) else {
+            return;
+        };
+        if let Some(why) = viewer::cant_copy(msg) {
+            self.status = Some(why.into());
+            return;
+        }
+        if msg.source_text.is_empty() {
+            self.status = Some("No text to select in this message".into());
+            return;
+        }
+        let select = TextSelect::new(open.chat_id, id, msg.source_text.clone());
+        // It's all there to read in the popup, spoilers too.
+        open.reveal_spoilers(id);
+        self.text_select = Some(select);
+    }
+
+    /// The `v` popup: vim's motions move the cursor, `v` starts or drops a
+    /// selection, and `y` copies it and closes the popup.
+    fn on_select_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let Some(select) = self.text_select.as_mut() else {
+            return;
+        };
+        if let Some(motion) = select::motion(key.code, ctrl) {
+            select.go(motion);
+            return;
+        }
+        match key.code {
+            _ if ctrl => {}
+            KeyCode::Char('v') => select.toggle(),
+            KeyCode::Esc if select.selecting() => select.cancel(),
+            KeyCode::Esc | KeyCode::Char('q') => self.text_select = None,
+            KeyCode::Char('y') => match select.selected() {
+                Some(text) => {
+                    self.text_select = None;
+                    self.copy_target(Target::Text(text));
+                }
+                None => self.status = Some("Nothing selected: v starts a selection".into()),
+            },
+            _ => {}
         }
     }
 
@@ -5910,6 +5998,10 @@ impl App {
         }
         if self.chat_info.is_some() {
             self.status = Some("The paste came while the info was open: p pastes again".into());
+            return;
+        }
+        if self.text_select.is_some() {
+            self.status = Some("The paste came while a text was open: p pastes again".into());
             return;
         }
         match pasted.content {
@@ -8975,6 +9067,118 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v_shows_the_text_to_pick_out_part_of_it_with_vim_motions() {
+        let mut app = test_app("select");
+        app.focus = Focus::Messages;
+        let id = plain_message(&mut app);
+        let open = app.open.as_mut().unwrap();
+        open.messages.get_mut(&id).unwrap().source_text = "meet at the old station".into();
+        let none = KeyModifiers::NONE;
+        press(&mut app, KeyCode::Char('v'), none);
+        let rows = screen(&mut app);
+        assert!(rows.iter().any(|r| r.contains("Select text")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("meet at the old station")));
+        assert!(rows[19].contains("v start selecting"), "{:?}", rows[19]);
+
+        for c in "wwwve".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        let selected = |app: &App| app.text_select.as_ref().unwrap().selected();
+        assert_eq!(selected(&app).as_deref(), Some("old"));
+        press(&mut app, KeyCode::Char('w'), none);
+        press(&mut app, KeyCode::Char('e'), none);
+        assert_eq!(selected(&app).as_deref(), Some("old station"));
+        let rows = screen(&mut app);
+        assert!(rows[19].contains("VISUAL"), "{:?}", rows[19]);
+
+        // Esc drops the selection first, then closes.
+        press(&mut app, KeyCode::Esc, none);
+        assert_eq!(selected(&app), None);
+        press(&mut app, KeyCode::Char('y'), none);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Nothing selected: v starts a selection")
+        );
+        assert!(app.toast.is_none(), "nothing copied");
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.text_select.is_none());
+        assert!(app.focus == Focus::Messages, "back where it was");
+    }
+
+    #[test]
+    fn v_takes_nothing_telegram_says_cant_be_saved_nor_a_message_without_text() {
+        let mut app = test_app("select-none");
+        app.focus = Focus::Messages;
+        let id = plain_message(&mut app);
+        let msg = app.open.as_mut().unwrap().messages.get_mut(&id).unwrap();
+        msg.saveable = false;
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert!(app.text_select.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("This chat doesn't allow copying its messages")
+        );
+        let msg = app.open.as_mut().unwrap().messages.get_mut(&id).unwrap();
+        msg.saveable = true;
+        msg.source_text.clear();
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert!(app.text_select.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("No text to select in this message")
+        );
+    }
+
+    #[test]
+    fn nothing_is_read_under_the_text_popup_and_it_closes_once_the_text_changes_or_goes() {
+        let mut app = test_app("select-gone");
+        app.focus = Focus::Messages;
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        let id = plain_message(&mut app);
+        let open = app.open.as_mut().unwrap();
+        open.messages.get_mut(&id).unwrap().source_text = "hello".into();
+        assert!(app.looking_at(chat_id));
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert!(app.text_select.is_some());
+        assert!(!app.looking_at(chat_id), "it's over the messages");
+
+        let edited = |text: &str| {
+            Update::MessageContent(tdlib_rs::types::UpdateMessageContent {
+                chat_id,
+                message_id: id,
+                new_content: tdlib_rs::enums::MessageContent::MessageText(
+                    tdlib_rs::types::MessageText {
+                        text: tdlib_rs::types::FormattedText {
+                            text: text.into(),
+                            ..Default::default()
+                        },
+                        link_preview: None,
+                        link_preview_options: None,
+                    },
+                ),
+            })
+        };
+        app.on_tg(TgEvent::Update(Box::new(edited("hello"))));
+        assert!(app.text_select.is_some(), "the text didn't change");
+        app.on_tg(TgEvent::Update(Box::new(edited("goodbye"))));
+        assert!(app.text_select.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("The message was edited: v selects again")
+        );
+
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert!(app.text_select.is_some());
+        let deleted = Update::DeleteMessages(tdlib_rs::types::UpdateDeleteMessages {
+            chat_id,
+            message_ids: vec![id],
+            is_permanent: true,
+            from_cache: false,
+        });
+        app.on_tg(TgEvent::Update(Box::new(deleted)));
+        assert!(app.text_select.is_none());
+    }
     /// Adds a photo shown only while open, lasting 10 seconds once opened,
     /// as the newest message of the open chat, under the cursor.
     fn secret_photo(app: &mut App) -> i64 {
