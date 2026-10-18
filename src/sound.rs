@@ -425,10 +425,16 @@ mod device {
         quietly(|| open_with(alsa))
     }
 
+    /// One redirect at a time: the new-message sound and a voice message can
+    /// open the device together, and the one that saved the other's
+    /// /dev/null as stderr would put it back last, for good.
+    static QUIET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Runs `f` with stderr going nowhere. ALSA's own errors go to `quiet`,
     /// but the libraries it loads for the device (PulseAudio's, JACK's)
     /// print theirs, mostly while connecting, over the screen.
     fn quietly<T>(f: impl FnOnce() -> T) -> T {
+        let _one = QUIET.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: plain descriptor calls; the saved stderr is put back and
         // both descriptors closed whatever `f` returns.
         unsafe {

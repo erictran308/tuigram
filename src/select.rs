@@ -32,7 +32,8 @@ pub enum Motion {
     WordEnd,
     LineStart,
     LineEnd,
-    /// The text's first character, or past its last.
+    /// The text's first character, or its last: past it while selecting,
+    /// so the selection takes in the last one too.
     Start,
     End,
     HalfPageDown,
@@ -87,11 +88,13 @@ impl TextSelect {
             Some(_) => None,
             None => Some(self.text.cursor()),
         };
+        self.settle();
         self.mark();
     }
 
     pub fn cancel(&mut self) {
         self.anchor = None;
+        self.settle();
         self.mark();
     }
 
@@ -122,7 +125,23 @@ impl TextSelect {
         for &m in moves {
             self.text.move_cursor(m);
         }
+        self.settle();
         self.mark();
+    }
+
+    /// Out of a selection the cursor is on a character, as in vim's Normal
+    /// mode, not past the end of a line where `$` and `G` leave it: `v`
+    /// there then takes in that last character, not nothing. While
+    /// selecting, past the end takes in the line's break, as `v$` does.
+    fn settle(&mut self) {
+        if self.anchor.is_some() {
+            return;
+        }
+        let DataCursor(row, col) = self.text.cursor();
+        let len = self.text.lines()[row].chars().count();
+        if len > 0 && col >= len {
+            self.jump(DataCursor(row, len - 1));
+        }
     }
 
     /// What's selected, both ends included, as `y` copies it.
@@ -153,7 +172,8 @@ impl TextSelect {
                 &line[from..to]
             })
             .collect();
-        Some(pieces.join("\n"))
+        let text = pieces.join("\n");
+        (!text.is_empty()).then_some(text)
     }
 
     /// Has the text area highlight the selection from where `v` was pressed
@@ -277,6 +297,33 @@ mod tests {
         s.toggle();
         s.go(Motion::End);
         assert_eq!(s.selected().as_deref(), Some("ab\ncd"), "g to G: all of it");
+    }
+
+    #[test]
+    fn dollar_or_g_then_v_y_copies_the_last_character_as_in_vim() {
+        let mut s = select("ab\ncd");
+        s.go(Motion::LineEnd);
+        s.toggle();
+        assert_eq!(s.selected().as_deref(), Some("b"));
+        s.cancel();
+        s.go(Motion::End);
+        s.toggle();
+        assert_eq!(s.selected().as_deref(), Some("d"));
+        // Esc out of `v$` puts the cursor back on the last character.
+        s.cancel();
+        s.go(Motion::Start);
+        s.toggle();
+        s.go(Motion::LineEnd);
+        s.cancel();
+        assert_eq!(s.text.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn an_empty_last_line_selects_nothing_rather_than_an_empty_text() {
+        let mut s = select("ab\n");
+        s.go(Motion::End);
+        s.toggle();
+        assert_eq!(s.selected(), None, "y copies nothing");
     }
 
     #[test]

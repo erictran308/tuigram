@@ -60,6 +60,9 @@ pub struct Clipboard {
     /// Kept for the whole run: on Linux, what was copied stays on the
     /// clipboard only while the program that copied it holds on to it.
     system: Option<arboard::Clipboard>,
+    /// tuigram runs on another computer, reached over SSH: the system
+    /// clipboard there isn't the user's.
+    pub remote: bool,
     tx: UnboundedSender<ClipboardEvent>,
     /// Where pasted images are saved for TDLib to upload.
     outbox: PathBuf,
@@ -69,6 +72,7 @@ impl Clipboard {
     pub fn new(tx: UnboundedSender<ClipboardEvent>, outbox: PathBuf) -> Self {
         Self {
             system: None,
+            remote: crate::chime::over_ssh(|name| std::env::var(name).ok()),
             tx,
             outbox,
         }
@@ -81,10 +85,13 @@ impl Clipboard {
         Ok(self.system.as_mut().expect("just set"))
     }
 
-    /// Copies `text`. Where there's no system clipboard to reach (over SSH,
-    /// or a Linux box without a display), asks the terminal instead.
+    /// Copies `text`. Where there's no system clipboard to reach (a Linux
+    /// box without a display), or the one there is another computer's
+    /// (over SSH), asks the terminal instead, which puts it in the clipboard
+    /// of the computer the user is at.
     pub fn copy_text(&mut self, text: &str) -> std::io::Result<Copied> {
-        if let Ok(system) = self.system()
+        if !self.remote
+            && let Ok(system) = self.system()
             && system.set_text(text).is_ok()
         {
             return Ok(Copied::System);

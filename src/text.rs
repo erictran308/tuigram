@@ -54,6 +54,12 @@ pub fn first_chars(text: &str, n: usize) -> &str {
     text.char_indices().nth(n).map_or(text, |(i, _)| &text[..i])
 }
 
+/// `text` [`clean`]ed and on one line: runs of spaces, tabs and line
+/// breaks become single spaces.
+pub fn flat(text: &str) -> String {
+    clean(text).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -89,8 +89,8 @@ pub struct Alert {
 /// (which needs `set -g allow-passthrough on`).
 pub fn escape(method: Notifications, alert: &Alert, id: u64, tmux: bool) -> Option<String> {
     // The codes end at a control character, and a `;` separates fields.
-    let title = plain(&alert.title).replace(';', ",");
-    let body = plain(&alert.body).replace(';', ",");
+    let title = text::flat(&alert.title).replace(';', ",");
+    let body = text::flat(&alert.body).replace(';', ",");
     let code = match method {
         Notifications::Auto | Notifications::Off => return None,
         Notifications::Bell if alert.silent => return None,
@@ -137,14 +137,6 @@ pub const SAVE_TITLE: &str = "\x1b[22;0t";
 /// Puts back the title [`SAVE_TITLE`] saved. Terminals that can't clear it
 /// instead, so it doesn't stay "tuigram".
 pub const RESTORE_TITLE: &str = "\x1b]2;\x07\x1b[23;0t";
-
-/// `text` on one line, without control characters.
-fn plain(text: &str) -> String {
-    text::clean(text)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
 /// At most `max` characters of `text`, ending with `…` if cut.
 fn cut(text: &str, max: usize) -> String {
@@ -242,8 +234,8 @@ fn alert(notes: &[Note]) -> Alert {
         _ => (format!("{} new messages", notes.len()), chats.join(", ")),
     };
     Alert {
-        title: cut(&plain(&title), MAX_TITLE),
-        body: cut(&plain(&body), MAX_BODY),
+        title: cut(&text::flat(&title), MAX_TITLE),
+        body: cut(&text::flat(&body), MAX_BODY),
         silent: notes.iter().all(|n| n.silent),
     }
 }

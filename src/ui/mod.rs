@@ -500,22 +500,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     let suggesting =
         app.focus == Focus::Input && app.completion.as_ref().is_some_and(|c| !c.items.is_empty());
     let popup_over_chat = suggesting
-        || app.menu.is_some()
-        || app.delete_menu.is_some()
-        || app.react_menu.is_some()
-        || app.vote_menu.is_some()
-        || app.button_menu.is_some()
-        || app.notice.is_some()
-        || app.pin_menu.is_some()
-        || app.pinned_menu.is_some()
-        || app.timer_menu.is_some()
-        || app.key_view.is_some()
-        || app.photo_view.is_some()
-        || app.chat_info.is_some()
-        || app.text_select.is_some()
-        || app.picker.is_some()
-        || app.confirm.is_some()
-        || app.settings_menu.is_some()
+        || app.popup_open()
         || app
             .prompt
             .as_ref()
@@ -1975,7 +1960,7 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
         .iter()
         .map(|t| match t {
             // The label, then how the message starts.
-            Target::Text(text) => t.label().width() + 2 + one_line(text).width(),
+            Target::Text(text) => t.label().width() + 2 + crate::messages::one_line(text).width(),
             _ => t.label().width(),
         })
         .max()
@@ -2024,7 +2009,11 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
             if let Target::Text(text) = target {
                 let room = text_width.saturating_sub(label.width() + 2);
                 line.push(
-                    Span::from(format!("  {}", truncate(&one_line(text), room))).fg(colors.subtle),
+                    Span::from(format!(
+                        "  {}",
+                        truncate(&crate::messages::one_line(text), room)
+                    ))
+                    .fg(colors.subtle),
                 );
             }
             ListItem::new(Line::from(line))
@@ -2707,22 +2696,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         Side::Left => hints.to_string(),
         Side::Right => hints.replace("`h` back", "`l` back"),
     };
-    let popup = app.settings_menu.is_some()
-        || app.resizing.is_some()
-        || app.delete_menu.is_some()
-        || app.react_menu.is_some()
-        || app.vote_menu.is_some()
-        || app.button_menu.is_some()
-        || app.notice.is_some()
-        || app.pin_menu.is_some()
-        || app.pinned_menu.is_some()
-        || app.timer_menu.is_some()
-        || app.key_view.is_some()
-        || app.photo_view.is_some()
-        || app.chat_info.is_some()
-        || app.text_select.is_some()
-        || app.picker.is_some()
-        || app.confirm.is_some();
+    let popup = app.popup_open() || app.resizing.is_some();
     let mut context = match &app.open {
         Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open, &app.jumps),
         _ => Vec::new(),
@@ -2797,10 +2771,6 @@ fn center(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(area);
     area
-}
-
-fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Telegram's mark after a name: SCAM and FAKE as warnings, ✓ for verified

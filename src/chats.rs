@@ -599,10 +599,7 @@ impl Chats {
     pub fn set_folders(&mut self, folders: &[ChatFolderInfo], main_at: i32) {
         self.folders = folders
             .iter()
-            .map(|f| {
-                let name = text::clean(&f.name.text.text);
-                (f.id, name.split_whitespace().collect::<Vec<_>>().join(" "))
-            })
+            .map(|f| (f.id, text::flat(&f.name.text.text)))
             .collect();
         self.main_at = usize::try_from(main_at).unwrap_or(0);
         if !self.tabs().iter().any(|t| t.list == self.shown) {

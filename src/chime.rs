@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::f32::consts::TAU;
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -60,6 +60,14 @@ pub struct Sounds {
     pub list: Vec<Sound>,
     /// Where the user's sounds were read from.
     pub dir: Option<PathBuf>,
+}
+
+/// What a sound was made from, to tell whether it has to be made again:
+/// its name, and for a file, when it last changed and its size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    id: String,
+    file: Option<(PathBuf, Option<std::time::SystemTime>, u64)>,
 }
 
 impl Sounds {
@@ -132,6 +140,23 @@ impl Sounds {
         };
         Ok(samples.into())
     }
+
+    /// What the sound called `id` is made from now, if there's one by that
+    /// name and its file can be looked at.
+    pub fn stamp(&self, id: &str) -> Option<Stamp> {
+        let sound = self.list.iter().find(|sound| sound.id == id)?;
+        let file = match &sound.source {
+            Source::BuiltIn(_) => None,
+            Source::File(path) => {
+                let meta = std::fs::metadata(path).ok()?;
+                Some((path.clone(), meta.modified().ok(), meta.len()))
+            }
+        };
+        Some(Stamp {
+            id: id.to_string(),
+            file,
+        })
+    }
 }
 
 /// tuigram runs on another computer, reached over SSH: a sound would play
@@ -142,21 +167,9 @@ pub fn over_ssh(env: impl Fn(&str) -> Option<String>) -> bool {
         .any(|name| env(name).is_some_and(|v| !v.is_empty()))
 }
 
-/// A sound file's sound. Links are followed, but only to a plain file of a
-/// sound's size: a link to `/dev/zero` or a pipe would otherwise hang
-/// tuigram, or fill its memory.
+/// A sound file's sound, read as [`crate::config::read_small`] reads.
 fn read(path: &Path) -> Result<Vec<i16>, String> {
-    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err("not a file".into());
-    }
-    if meta.len() > MAX_FILE_BYTES {
-        return Err(format!("bigger than {} MB", MAX_FILE_BYTES >> 20));
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|file| file.take(MAX_FILE_BYTES).read_to_end(&mut bytes))
-        .map_err(|e| e.to_string())?;
+    let bytes = crate::config::read_small(path, MAX_FILE_BYTES)?;
     let samples = if bytes.starts_with(b"RIFF") {
         wav(&bytes)?
     } else if bytes.starts_with(b"OggS") {
@@ -552,6 +565,30 @@ mod tests {
         assert_eq!(why("folder"), "folder.wav: not a file");
         assert_eq!(why("big"), "big.opus: bigger than 16 MB");
         assert_eq!(why("notes"), "there is no sound called \"notes\"");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sounds_stamp_changes_only_with_its_file() {
+        let dir = std::env::temp_dir().join(format!("tuigram-stamps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = |n| wav_file(1, 1, RATE, 16, &pcm16(&vec![8000; n]));
+        std::fs::write(dir.join("zap.wav"), tone(4800)).unwrap();
+        let sounds = Sounds::load(&dir);
+        let stamp = sounds.stamp("zap");
+        assert!(stamp.is_some());
+        assert_eq!(
+            Sounds::load(&dir).stamp("zap"),
+            stamp,
+            "read again, unchanged"
+        );
+        std::fs::write(dir.join("zap.wav"), tone(2400)).unwrap();
+        assert_ne!(sounds.stamp("zap"), stamp, "rewritten");
+        assert_ne!(sounds.stamp("chime"), stamp);
+        assert_eq!(sounds.stamp("chime"), sounds.stamp("chime"));
+        std::fs::remove_file(dir.join("zap.wav")).unwrap();
+        assert_eq!(sounds.stamp("zap"), None, "gone");
+        assert_eq!(sounds.stamp("nothing"), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

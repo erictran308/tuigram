@@ -177,7 +177,8 @@ Inside the app, the status bar lists the keys for wherever you are;
 press ? for settings and q to quit.
 
 --demo shows made-up chats without logging in or touching your session:
-1-5 or Tab switch scenes, t changes the theme, q quits.
+1-9 and 0 switch scenes, Tab or h/l go through them all (the forum too),
+t changes the theme, q quits.
 
 {keys}
 

@@ -203,23 +203,11 @@ impl Files {
     }
 }
 
-/// A theme file's text. Links are followed, but only to a plain file of a
-/// theme's size: a link to `/dev/zero` or a pipe would otherwise hang
-/// tuigram, or fill its memory, on every start.
+/// A theme file's text, read as [`crate::config::read_small`] reads: a
+/// theme is read on every start.
 fn read(path: &Path) -> Result<String, String> {
-    use std::io::Read;
-    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err("not a file".into());
-    }
-    if meta.len() > MAX_FILE_BYTES {
-        return Err(format!("bigger than {} KB", MAX_FILE_BYTES / 1024));
-    }
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .and_then(|file| file.take(MAX_FILE_BYTES).read_to_string(&mut text))
-        .map_err(|e| e.to_string())?;
-    Ok(text)
+    let bytes = crate::config::read_small(path, MAX_FILE_BYTES)?;
+    String::from_utf8(bytes).map_err(|_| "it isn't UTF-8 text".into())
 }
 
 /// Reads a theme file, or says what's wrong with it and on which line.

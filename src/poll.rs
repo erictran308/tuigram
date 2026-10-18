@@ -38,12 +38,7 @@ pub struct Answer {
 
 impl Poll {
     pub fn new(poll: &types::Poll) -> Self {
-        let line = |text: &types::FormattedText| {
-            text::clean(&without_spoilers(text))
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
+        let line = |text: &types::FormattedText| text::flat(&without_spoilers(text));
         let (several, quiz, correct) = match &poll.r#type {
             PollType::Regular(r) => (r.allow_multiple_answers, false, None),
             PollType::Quiz(q) => (false, true, usize::try_from(q.correct_option_id).ok()),

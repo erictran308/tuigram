@@ -593,11 +593,7 @@ impl From<&MessageOrigin> for Origin {
 /// shows only its start, and a sender's 4096 characters would be measured
 /// again on every frame.
 pub fn one_line(text: &str) -> String {
-    let line = text::clean(text)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    text::first_chars(&line, SNIPPET_CHARS).to_string()
+    text::first_chars(&text::flat(text), SNIPPET_CHARS).to_string()
 }
 
 /// How much of a message a one-line snippet keeps.

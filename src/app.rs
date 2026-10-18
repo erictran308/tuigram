@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{self, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -20,7 +19,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::attach::{self, Attachment, Dropped};
 use crate::buttons::{ButtonMenu, Press};
 use crate::chats::{Badge, Chats, List, Peer, Presence};
-use crate::chime::{self, Sounds};
+use crate::chime::{self, Sounds, Stamp};
 use crate::clipboard::{Clipboard, ClipboardEvent, Copied, Decoded, Paste, Pasted};
 use crate::complete::{self, Commands, Completion, Kind, Suggestion};
 use crate::config::{self, ApiKeys};
@@ -809,6 +808,9 @@ pub struct App {
     pub sounds: Sounds,
     /// The sound for new messages, ready to play; `None` for none.
     sound: Option<Arc<[i16]>>,
+    /// What `sound` was made from, so opening `?` decodes it again only if
+    /// its file changed.
+    sound_stamp: Option<Stamp>,
     /// When the sound for new messages last played, for [`RING_GAP`].
     rang_at: Option<Instant>,
     /// tuigram runs over SSH, so its sound would play on the other computer.
@@ -953,6 +955,7 @@ impl App {
             themes: Themes::load(&settings_path.with_file_name("themes")),
             sounds: Sounds::load(&settings_path.with_file_name("sounds")),
             sound: None,
+            sound_stamp: None,
             rang_at: None,
             over_ssh: chime::over_ssh(|name| std::env::var(name).ok()),
             settings_path,
@@ -1015,14 +1018,20 @@ impl App {
 
     /// Gets the sound for new messages the settings name ready to play, or
     /// says why it can't be, leaving none. The setting stays, so fixing the
-    /// file is enough.
+    /// file is enough. One already decoded is kept unless its file changed:
+    /// a long one takes a moment, on the thread that draws.
     fn use_saved_sound(&mut self) {
-        self.sound = None;
         let Some(id) = &self.settings.notification_sound else {
+            (self.sound, self.sound_stamp) = (None, None);
             return;
         };
+        let stamp = self.sounds.stamp(id);
+        if self.sound.is_some() && stamp.is_some() && stamp == self.sound_stamp {
+            return;
+        }
+        (self.sound, self.sound_stamp) = (None, None);
         match self.sounds.samples(id) {
-            Ok(samples) => self.sound = Some(samples),
+            Ok(samples) => (self.sound, self.sound_stamp) = (Some(samples), stamp),
             Err(e) => self.status = Some(format!("Sound not used: {e}")),
         }
     }
@@ -1222,18 +1231,10 @@ impl App {
                 }
                 self.on_prompt_edit();
             }
-            // Files attached and Insert mode under the photo, out of sight,
-            // would go out with the next Enter or two.
-            Event::Paste(_) if self.photo_view.is_some() => {
-                self.status = Some("Close the photo to paste".into());
-            }
-            // And under the info, where Esc would leave Insert mode, ready
-            // to send them.
-            Event::Paste(_) if self.chat_info.is_some() => {
-                self.status = Some("Close the info to paste".into());
-            }
-            Event::Paste(_) if self.text_select.is_some() => {
-                self.status = Some("Close the text to paste".into());
+            // Files attached and Insert mode under a popup would go out with
+            // the next Enter or two, meant for the popup.
+            Event::Paste(_) if self.over_panes() => {
+                self.status = Some("Close what's open to paste".into());
             }
             Event::Paste(text) if matches!(self.focus, Focus::Input | Focus::Messages) => {
                 self.on_paste(text)
@@ -1254,7 +1255,16 @@ impl App {
         match event {
             TgEvent::Update(update) => self.on_update(*update),
             TgEvent::ProxyApplied { number, result } => self.on_proxy_applied(number, result),
-            TgEvent::Error(message) if message.contains("API_ID") => self.reject_api_keys(),
+            // Telegram's own names for refusing the key, whole: tuigram's
+            // sentences can quote what was typed, like `@API_ID_bot`.
+            TgEvent::Error(message)
+                if matches!(
+                    message.as_str(),
+                    "API_ID_INVALID" | "API_ID_PUBLISHED_FLOOD"
+                ) =>
+            {
+                self.reject_api_keys()
+            }
             TgEvent::Error(message) => match &mut self.screen {
                 Screen::Login(login) => {
                     login.busy = false;
@@ -1924,12 +1934,31 @@ impl App {
                 }
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == u.chat_id) {
                     open.remove(&u.message_ids);
+                    // A popup about one of them would act on a message
+                    // that's gone.
+                    let gone = |id: i64| u.message_ids.contains(&id);
                     if self
                         .button_menu
                         .as_ref()
-                        .is_some_and(|m| u.message_ids.contains(&m.message_id))
+                        .is_some_and(|m| gone(m.message_id))
                     {
                         self.button_menu = None;
+                    }
+                    if self
+                        .delete_menu
+                        .as_ref()
+                        .is_some_and(|m| gone(m.message_id))
+                    {
+                        self.delete_menu = None;
+                    }
+                    if self.react_menu.as_ref().is_some_and(|m| gone(m.message_id)) {
+                        self.react_menu = None;
+                    }
+                    if self.vote_menu.as_ref().is_some_and(|m| gone(m.message_id)) {
+                        self.vote_menu = None;
+                    }
+                    if self.pin_menu.as_ref().is_some_and(|m| gone(m.message_id)) {
+                        self.pin_menu = None;
                     }
                 }
             }
@@ -3101,12 +3130,9 @@ impl App {
         matches!(self.screen, Screen::Main)
             && self.present()
             && matches!(self.focus, Focus::Messages | Focus::Input)
-            && self.settings_menu.is_none()
-            && self.photo_view.is_none()
-            // As tall as the pane, over the newest messages.
-            && self.chat_info.is_none()
-            // Over them too, maybe as tall.
-            && self.text_select.is_none()
+            // Any popup may be over the newest messages: the pinned list and
+            // a bot's buttons can be as tall as the pane.
+            && !self.popup_open()
             && self.open.as_ref().is_some_and(|o| {
                 o.chat_id == chat_id
                     // Going to an older message: what arrives meanwhile
@@ -3123,10 +3149,7 @@ impl App {
     /// What's shown only while open is covered once you look away, or go
     /// away.
     fn cover_unseen(&mut self) {
-        let looking = self.focus == Focus::Messages
-            && self.present()
-            && self.chat_info.is_none()
-            && self.text_select.is_none();
+        let looking = self.focus == Focus::Messages && self.present() && !self.popup_open();
         if let Some(open) = self.open.as_mut() {
             open.cover_unless_viewed(looking);
         }
@@ -3200,9 +3223,6 @@ impl App {
                 "{who} started a secret chat, which this computer took anyway: :leave ends it"
             ));
         }
-        if self.notify_with == Notifications::Off {
-            return;
-        }
         let chat_id = update.chat_id;
         // No sound for these: the chat's is off, they were sent without one,
         // or they were shown before and come again.
@@ -3226,7 +3246,9 @@ impl App {
             ) {
                 self.ring_for(notification.is_silent || no_sound, seen);
             }
-            if seen {
+            // The sound is a setting of its own, so it rang above even with
+            // notifications off.
+            if seen || self.notify_with == Notifications::Off {
                 continue;
             }
             let new = match notification.r#type {
@@ -3564,28 +3586,14 @@ impl App {
         self.player.stop();
         self.opening.clear();
         self.copying.clear();
-        self.menu = None;
-        self.delete_menu = None;
-        self.react_menu = None;
-        self.vote_menu = None;
-        self.button_menu = None;
-        self.notice = None;
-        self.pin_menu = None;
-        self.pinned_menu = None;
-        self.timer_menu = None;
-        self.key_view = None;
-        self.photo_view = None;
-        self.chat_info = None;
-        self.text_select = None;
-        self.picker = None;
+        self.close_popups();
         self.finding = None;
         self.completion = None;
         self.stickers = None;
         // The next account says if it has Premium; one without may not.
         self.premium = false;
-        self.confirm = None;
-        self.settings_menu = None;
         self.prompt = None;
+        self.resizing = None;
         self.loading_lists.clear();
         self.loaded_lists.clear();
         self.wanted_lists.clear();
@@ -3961,6 +3969,20 @@ impl App {
     fn close_chat_popups(&mut self) {
         // A lookup still on its way would open another chat over this one.
         self.finding = None;
+        self.close_message_popups();
+    }
+
+    /// Closes every popup: those of [`App::popup_open`].
+    fn close_popups(&mut self) {
+        self.close_message_popups();
+        self.confirm = None;
+        self.notice = None;
+        self.settings_menu = None;
+        self.picker = None;
+    }
+
+    /// Closes the popups about the open chat and its messages.
+    fn close_message_popups(&mut self) {
         self.menu = None;
         self.delete_menu = None;
         self.react_menu = None;
@@ -4403,17 +4425,10 @@ impl App {
         let Some(msg) = open.messages.get(&message_id) else {
             return;
         };
-        // Nor under the photo viewer, where the composer is out of sight.
-        if self.photo_view.is_some() {
-            self.status = Some("The edit came while a photo was open: e edits again".into());
-            return;
-        }
-        if self.chat_info.is_some() {
-            self.status = Some("The edit came while the info was open: e edits again".into());
-            return;
-        }
-        if self.text_select.is_some() {
-            self.status = Some("The edit came while a text was open: e edits again".into());
+        // Nor under a popup or a prompt, which would keep the keys while the
+        // composer took the edit, or lose a `Confirm` already up.
+        if self.over_panes() {
+            self.status = Some("The edit came while something else was open: e edits again".into());
             return;
         }
         // Without it as Markdown, it's edited as plain text, which loses
@@ -5652,13 +5667,27 @@ impl App {
 
     /// A popup, a prompt or the composer is taking keys.
     fn busy(&self) -> bool {
+        self.over_panes() || self.focus == Focus::Input
+    }
+
+    /// A popup, a prompt or resize mode takes keys before the panes.
+    fn over_panes(&self) -> bool {
+        self.popup_open() || self.prompt.is_some() || self.resizing.is_some()
+    }
+
+    /// A popup is up over the panes, taking keys first. Every popup is in
+    /// this list and closes in [`App::close_popups`], so nothing that asks
+    /// whether one is up can miss one.
+    pub fn popup_open(&self) -> bool {
         self.confirm.is_some()
+            || self.notice.is_some()
             || self.settings_menu.is_some()
+            || self.picker.is_some()
+            || self.menu.is_some()
             || self.delete_menu.is_some()
             || self.react_menu.is_some()
             || self.vote_menu.is_some()
             || self.button_menu.is_some()
-            || self.notice.is_some()
             || self.pin_menu.is_some()
             || self.pinned_menu.is_some()
             || self.timer_menu.is_some()
@@ -5666,11 +5695,6 @@ impl App {
             || self.photo_view.is_some()
             || self.chat_info.is_some()
             || self.text_select.is_some()
-            || self.menu.is_some()
-            || self.picker.is_some()
-            || self.resizing.is_some()
-            || self.prompt.is_some()
-            || self.focus == Focus::Input
     }
 
     fn open_externally(&mut self, target: &str) {
@@ -5823,6 +5847,13 @@ impl App {
             Target::Text(text) => text,
             Target::Link(link) => link.url,
             Target::File(file) | Target::Photo { file, .. } => {
+                // Only text gets through the terminal to the user's own
+                // computer.
+                if self.clipboard.remote {
+                    self.status =
+                        Some("Over SSH, only text reaches your computer's clipboard".into());
+                    return;
+                }
                 let id = file.id;
                 if self.copying.insert(id, file).is_none() {
                     self.tg.download(id);
@@ -5955,10 +5986,7 @@ impl App {
             // Into the sticker search: pasting an emoji is a quick way to
             // find stickers for it.
             let before = panel.search_query();
-            let line = text::clean(&text)
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
+            let line = text::flat(&text);
             panel.edit_query(|q| q.push_str(&line));
             self.find_stickers(before);
             return;
@@ -5975,6 +6003,15 @@ impl App {
         let Some(open) = &self.open else {
             return;
         };
+        // Over SSH the system clipboard is the other computer's. The
+        // terminal's own paste brings the user's, as a bracketed paste.
+        if self.clipboard.remote {
+            self.status = Some(
+                "Over SSH, paste with your terminal's own paste key: the clipboard here is the other computer's"
+                    .into(),
+            );
+            return;
+        }
         self.clipboard.paste(open.place());
         self.pasting = true;
     }
@@ -5991,17 +6028,10 @@ impl App {
             self.status = Some("The paste came after you left the messages: p pastes again".into());
             return;
         }
-        // Nor under the photo viewer, out of sight.
-        if self.photo_view.is_some() {
-            self.status = Some("The paste came while a photo was open: p pastes again".into());
-            return;
-        }
-        if self.chat_info.is_some() {
-            self.status = Some("The paste came while the info was open: p pastes again".into());
-            return;
-        }
-        if self.text_select.is_some() {
-            self.status = Some("The paste came while a text was open: p pastes again".into());
+        // Nor under a popup or a prompt, out of sight or taking the Enter.
+        if self.over_panes() {
+            self.status =
+                Some("The paste came while something else was open: p pastes again".into());
             return;
         }
         match pasted.content {
@@ -6067,7 +6097,7 @@ impl App {
     fn show_toast(&mut self, title: &str, detail: &str) {
         self.toast = Some(Toast {
             title: title.into(),
-            detail: detail.split_whitespace().collect::<Vec<_>>().join(" "),
+            detail: crate::messages::one_line(detail),
             until: Instant::now() + TOAST_TIME,
         });
     }
@@ -6183,7 +6213,7 @@ impl App {
             {
                 // The first row: no sound.
                 None => {
-                    self.sound = None;
+                    (self.sound, self.sound_stamp) = (None, None);
                     settings.notification_sound = None;
                 }
                 Some(sound) => match self.sounds.samples(&sound.id) {
@@ -6197,6 +6227,7 @@ impl App {
                         } else {
                             self.player.ring(Arc::clone(&samples));
                         }
+                        self.sound_stamp = self.sounds.stamp(&sound.id);
                         self.sound = Some(samples);
                         settings.notification_sound = Some(sound.id.clone());
                     }
@@ -6689,10 +6720,11 @@ fn open_externally(target: &str) -> std::io::Result<()> {
 fn mark_downloaded(path: &str) {
     #[cfg(target_os = "macos")]
     {
+        use std::process::{Command, Stdio};
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let _ = process::Command::new("/usr/bin/xattr")
+        let _ = Command::new("/usr/bin/xattr")
             .args([
                 "-w",
                 "com.apple.quarantine",
@@ -7038,6 +7070,27 @@ mod tests {
     }
 
     #[test]
+    fn opening_the_settings_keeps_the_sound_decoded_unless_it_changed() {
+        let mut app = test_app("keep-sound");
+        app.settings.notification_sound = Some("chime".into());
+        app.use_saved_sound();
+        let marked: Arc<[i16]> = vec![1].into();
+        app.sound = Some(Arc::clone(&marked));
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        assert!(
+            app.sound.as_ref().is_some_and(|s| Arc::ptr_eq(s, &marked)),
+            "not decoded again"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.settings.notification_sound = Some("ding".into());
+        app.use_saved_sound();
+        assert!(app.sound.as_ref().is_some_and(|s| !Arc::ptr_eq(s, &marked)));
+        app.settings.notification_sound = None;
+        app.use_saved_sound();
+        assert!(app.sound.is_none());
+    }
+
+    #[test]
     fn the_sound_rings_for_each_new_message_at_most_once_a_second() {
         let mut app = test_app("ring");
         app.over_ssh = false;
@@ -7102,6 +7155,17 @@ mod tests {
         (app.player, app.rang_at) = (quiet(), None);
         app.on_notifications(update(3, 0));
         assert!(!app.player.rang(), "the chat's sound is off in Telegram");
+
+        // Notifications off leaves the sound on.
+        app.notify_with = Notifications::Off;
+        (app.player, app.rang_at) = (quiet(), None);
+        app.notifier = crate::notify::Notifier::default();
+        app.on_notifications(update(4, -1));
+        assert!(app.player.rang(), "a setting of its own");
+        assert!(
+            app.notifier.due(Instant::now()).is_none(),
+            "no notification"
+        );
     }
 
     #[test]
@@ -9457,7 +9521,7 @@ mod tests {
         app.on_terminal_event(Event::Paste(file.to_string_lossy().into_owned()));
         assert_eq!(
             app.status.take().as_deref(),
-            Some("Close the photo to paste")
+            Some("Close what's open to paste")
         );
         let place = app.open.as_ref().unwrap().place();
         app.on_pasted(Pasted {
@@ -9471,6 +9535,179 @@ mod tests {
         assert!(app.composer.is_empty());
         assert!(app.open.as_ref().unwrap().attachments.is_empty());
         assert!(app.open.as_ref().unwrap().editing.is_none());
+    }
+
+    #[test]
+    fn pastes_and_late_edits_wait_until_any_popup_is_closed() {
+        let mut app = test_app("popup-paste");
+        app.focus = Focus::Messages;
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        let id = plain_message(&mut app);
+        let file = std::env::temp_dir().join("tuigram-test-popup-paste.txt");
+        std::fs::write(&file, b"notes").unwrap();
+        for popup in 0..3 {
+            match popup {
+                0 => {
+                    app.confirm = Some(Confirm::new(
+                        "Open this link?",
+                        vec!["https://example.com".into()],
+                        Confirmed::OpenLink("https://example.com".into()),
+                    ))
+                }
+                1 => {
+                    app.delete_menu = Some(DeleteMenu {
+                        message_id: id,
+                        snippet: "hi".into(),
+                        choices: Vec::new(),
+                        selected: 0,
+                    })
+                }
+                _ => app.react_menu = Some(ReactMenu::new(id, "hi".into())),
+            }
+            app.on_terminal_event(Event::Paste(file.to_string_lossy().into_owned()));
+            assert_eq!(
+                app.status.take().as_deref(),
+                Some("Close what's open to paste")
+            );
+            let place = app.open.as_ref().unwrap().place();
+            app.on_pasted(Pasted {
+                place,
+                content: Ok(Paste::Text("the screenshot".into())),
+            });
+            let status = app.status.take().unwrap_or_default();
+            assert!(status.starts_with("The paste came while"), "{status}");
+            app.on_editable(chat_id, id, Some(true), None);
+            let status = app.status.take().unwrap_or_default();
+            assert!(status.starts_with("The edit came while"), "{status}");
+            assert!(app.focus == Focus::Messages, "not Insert mode under it");
+            assert!(app.composer.is_empty());
+            let open = app.open.as_ref().unwrap();
+            assert!(open.attachments.is_empty() && open.editing.is_none());
+            if popup == 0 {
+                assert_eq!(app.confirm.as_ref().unwrap().title, "Open this link?");
+            }
+            app.close_popups();
+        }
+    }
+
+    #[test]
+    fn nothing_is_read_while_any_popup_is_over_the_messages() {
+        let mut app = test_app("popup-unseen");
+        app.focus = Focus::Messages;
+        let open = app.open.as_mut().unwrap();
+        open.selected = None;
+        open.at_newest = true;
+        let (chat_id, newest) = (open.chat_id, open.newest_id().unwrap());
+        assert!(app.watching(chat_id));
+        // `gp`'s list can be as tall as the pane, over the newest messages.
+        let pinned = Pinned::new(newest, &app.open.as_ref().unwrap().messages[&newest]);
+        app.pinned_menu = PinnedMenu::new(&[pinned]);
+        assert!(app.pinned_menu.is_some());
+        assert!(!app.watching(chat_id));
+        assert!(!app.sees(chat_id, None), "so it's notified");
+        app.pinned_menu = None;
+        app.picker = Some(ChatPicker::new(Purpose::Open));
+        assert!(!app.watching(chat_id));
+        app.picker = None;
+        assert!(app.watching(chat_id));
+    }
+
+    #[test]
+    fn popups_about_a_message_close_once_it_is_deleted() {
+        let mut app = test_app("popup-deleted");
+        app.focus = Focus::Messages;
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        let deleted = |ids: Vec<i64>| {
+            TgEvent::Update(Box::new(Update::DeleteMessages(
+                tdlib_rs::types::UpdateDeleteMessages {
+                    chat_id,
+                    message_ids: ids,
+                    is_permanent: true,
+                    from_cache: false,
+                },
+            )))
+        };
+        let id = plain_message(&mut app);
+        app.react_menu = Some(ReactMenu::new(id, "hi".into()));
+        app.on_tg(deleted(vec![id + 1000]));
+        assert!(app.react_menu.is_some(), "another message went");
+        app.on_tg(deleted(vec![id]));
+        assert!(app.react_menu.is_none());
+        let id = plain_message(&mut app);
+        app.pin_menu = Some(PinMenu::new(id, "hi".into(), Place::Group, String::new()));
+        app.on_tg(deleted(vec![id]));
+        assert!(app.pin_menu.is_none());
+        let id = plain_message(&mut app);
+        app.delete_menu = Some(DeleteMenu {
+            message_id: id,
+            snippet: "hi".into(),
+            choices: Vec::new(),
+            selected: 0,
+        });
+        app.on_tg(deleted(vec![id]));
+        assert!(app.delete_menu.is_none());
+    }
+
+    #[test]
+    fn logging_out_leaves_no_popup_or_resize_mode_behind() {
+        let mut app = test_app("forget-popups");
+        app.resizing = Some(Resizing::List(30));
+        app.confirm = Some(Confirm::new("Log out?", Vec::new(), Confirmed::Logout));
+        app.react_menu = Some(ReactMenu::new(1, "hi".into()));
+        app.forget_session();
+        assert!(app.resizing.is_none());
+        assert!(!app.popup_open());
+    }
+
+    #[test]
+    fn only_telegram_refusing_the_key_forgets_it() {
+        let mut app = test_app("api-id-error");
+        app.settings.api_keys = Some(ApiKeys {
+            id: 1234567,
+            hash: "0123456789abcdef0123456789abcdef".into(),
+        });
+        app.keys_source = Some(KeySource::Saved);
+        // tuigram's own words, quoting a name that was typed.
+        app.on_tg(TgEvent::Error(
+            "Nobody on Telegram is called @API_ID_bot".into(),
+        ));
+        assert!(app.settings.api_keys.is_some());
+        app.on_tg(TgEvent::Error("API_ID_INVALID".into()));
+        assert!(app.settings.api_keys.is_none());
+    }
+
+    #[test]
+    fn over_ssh_files_and_photos_arent_copied_to_the_other_computer() {
+        let mut app = test_app("ssh-copy");
+        app.clipboard.remote = true;
+        app.copy_target(Target::File(MediaFile {
+            id: 7,
+            label: "notes.pdf".into(),
+            photo: false,
+        }));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Over SSH, only text reaches your computer's clipboard")
+        );
+        assert!(app.copying.is_empty(), "nothing downloaded for it");
+    }
+
+    #[test]
+    fn over_ssh_p_doesnt_paste_the_other_computers_clipboard() {
+        let mut app = test_app("ssh-paste");
+        app.clipboard.remote = true;
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(!app.pasting, "nothing read");
+        let status = app.status.take().unwrap_or_default();
+        assert!(
+            status.starts_with("Over SSH, paste with your terminal's"),
+            "{status}"
+        );
+        // The terminal's own paste still comes in, in Insert mode.
+        app.focus = Focus::Input;
+        app.on_terminal_event(Event::Paste("see you at 5".into()));
+        assert_eq!(app.composer.lines().join("\n"), "see you at 5");
     }
 
     #[test]

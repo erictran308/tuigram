@@ -1729,19 +1729,13 @@ impl Tg {
                 }
             };
             // A bot writes these, so they're cleaned like any message.
-            let line = |text: &str| {
-                crate::text::clean(text)
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
             let commands = by_bot
                 .into_iter()
                 .flat_map(|(bot, commands)| {
                     commands.into_iter().map(move |c| crate::complete::Command {
                         bot,
-                        name: line(&c.command),
-                        description: line(&c.description),
+                        name: crate::text::flat(&c.command),
+                        description: crate::text::flat(&c.description),
                     })
                 })
                 .collect();

@@ -245,8 +245,10 @@ pub struct Images {
     avatars: HashMap<Key, Avatar>,
     /// Counts calls to [`Images::avatar`], to find the least recently drawn.
     avatar_clock: u64,
-    /// Images being built, and when each started.
-    building: HashMap<Key, std::time::Instant>,
+    /// Images being built, by the [`Images::generation`] each was started
+    /// in, and when. One of an older generation keeps its place until it's
+    /// done: its thread still decodes, taking as much memory.
+    building: HashMap<(u64, Key), std::time::Instant>,
     /// Keys that failed to decode; never retried.
     failed: HashSet<Key>,
     files: HashMap<i32, FileState>,
@@ -331,7 +333,6 @@ impl Images {
         self.generation += 1;
         self.ready.clear();
         self.avatars.clear();
-        self.building.clear();
         true
     }
 
@@ -522,10 +523,10 @@ impl Images {
     }
 
     pub fn on_built(&mut self, event: ImageEvent) {
+        self.building.remove(&(event.generation, event.key));
         if event.generation != self.generation {
             return;
         }
-        self.building.remove(&event.key);
         match event.result {
             Ok(image) if event.key.avatar => self.add_avatar(event.key, image),
             Ok(image) => self.add_ready(event.key, image),
@@ -591,7 +592,6 @@ impl Images {
         self.generation += 1;
         self.ready.clear();
         self.avatars.clear();
-        self.building.clear();
         self.failed.clear();
         self.files.clear();
         self.wanted.clear();
@@ -611,25 +611,26 @@ impl Images {
         };
         // One that never finishes mustn't hold its place for good: it counts
         // as failed, and the others get their turn.
-        let failed = &mut self.failed;
-        self.building.retain(|&key, started| {
+        let (failed, generation) = (&mut self.failed, self.generation);
+        self.building.retain(|&(started_in, key), started| {
             let alive = started.elapsed() < BUILD_TIMEOUT;
-            if !alive {
+            if !alive && started_in == generation {
                 failed.insert(key);
             }
             alive
         });
+        // Those still decoding for an older generation count too.
         if built
-            || self.building.contains_key(&key)
+            || self.building.contains_key(&(generation, key))
             || self.failed.contains(&key)
             || self.building.len() >= MAX_BUILDING
         {
             return;
         }
-        self.building.insert(key, std::time::Instant::now());
+        self.building
+            .insert((generation, key), std::time::Instant::now());
         let picker = self.picker.clone();
         let tx = self.tx.clone();
-        let generation = self.generation;
         tokio::task::spawn_blocking(move || {
             let result = contained(|| {
                 decode().and_then(|image| {
@@ -836,15 +837,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decodes_left_over_from_another_cell_size_still_take_their_place() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        images.measured(Some(FontSize::new(10, 20)));
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Arc::new(std::sync::Mutex::new(wait));
+        for id in 0..MAX_BUILDING as i32 {
+            let wait = wait.clone();
+            images.build(key(id), move || {
+                let _ = wait.lock().unwrap().recv();
+                Ok(DynamicImage::new_rgba8(8, 8))
+            });
+        }
+        // Zooming the font a few times shouldn't start four more each time.
+        assert!(images.measured(Some(FontSize::new(20, 40))));
+        images.build(key(99), || Ok(DynamicImage::new_rgba8(8, 8)));
+        assert_eq!(images.building.len(), MAX_BUILDING, "no room yet");
+        drop(go);
+        images.on_built(rx.recv().await.unwrap());
+        images.build(key(99), || Ok(DynamicImage::new_rgba8(8, 8)));
+        assert!(
+            images.building.contains_key(&(images.generation, key(99))),
+            "its turn came once an old one was done"
+        );
+    }
+
+    #[tokio::test]
     async fn a_decode_that_never_finishes_gives_up_its_place() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut images = Images::new(Picker::halfblocks(), tx);
         for id in 0..MAX_BUILDING as i32 {
             let long_ago = std::time::Instant::now() - BUILD_TIMEOUT;
-            images.building.insert(key(id), long_ago);
+            images.building.insert((0, key(id)), long_ago);
         }
         images.build(key(99), || Ok(DynamicImage::new_rgba8(8, 8)));
-        assert!(images.building.contains_key(&key(99)), "its turn came");
+        assert!(images.building.contains_key(&(0, key(99))), "its turn came");
         assert!(
             images.failed.contains(&key(0)),
             "the stuck one counts as failed"
