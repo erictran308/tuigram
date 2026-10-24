@@ -296,6 +296,7 @@ Sixteen `[palette]` colors make a whole theme: `bg`, `bg_alt`, `surface`, `overl
 | `secret` | Secret chats and their 🔒 | `green` |
 | `attach` | Files waiting to be sent | `blue` |
 | `code` | Code in messages | `green` |
+| `mention` | Mentions in messages (`@username`, or a name that leads to the person) | `blue` |
 | `own_bubble`, `other_bubble` | Your messages, and other people's | `bg` tinted `blue`, `surface` |
 | `own_meta`, `other_meta` | The time and ✓ on them | `fg` mixed with `blue`, `subtext` |
 | `own_reaction`, `other_reaction` | Reactions on them | A shade off the bubble |

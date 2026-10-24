@@ -1597,6 +1597,7 @@ impl<'a> Bubble<'a> {
             style,
             found: super::match_style(colors),
             code: colors.code,
+            mention: colors.mention,
             faded,
         };
         let spans = |line: &str, start: usize| line_spans(line, start, &paint);
@@ -1848,6 +1849,8 @@ struct Paint<'a> {
     found: Style,
     /// Code.
     code: Color,
+    /// Mentions of people.
+    mention: Color,
     /// What's quieter than the text on the bubble: quotes, hidden spoilers.
     faded: Color,
 }
@@ -1871,8 +1874,13 @@ impl Paint<'_> {
         if format.code {
             style = style.fg(self.code);
         }
-        if format.quote || (format.spoiler && !self.revealed) {
+        let hidden = format.spoiler && !self.revealed;
+        if format.quote || hidden {
             style = style.fg(self.faded);
+        }
+        // In a quote too, but a hidden spoiler gives nothing away.
+        if format.mention && !hidden {
+            style = style.fg(self.mention);
         }
         style
     }
@@ -2741,8 +2749,39 @@ mod tests {
             style: Style::new(),
             found: Style::new().bg(Color::Yellow),
             code: Color::Green,
+            mention: Color::Blue,
             faded: Color::Gray,
         }
+    }
+
+    #[test]
+    fn mentions_have_a_color_of_their_own_but_not_in_a_hidden_spoiler() {
+        let mention = Format {
+            mention: true,
+            ..Format::default()
+        };
+        let styles = [
+            Styled {
+                range: 3..9,
+                format: mention,
+            },
+            Styled {
+                range: 14..17,
+                format: Format {
+                    spoiler: true,
+                    ..mention
+                },
+            },
+        ];
+        let spans = line_spans("hi @alice and Bob", 0, &paint(&[], &[], &styles));
+        let fg = |part: &str| spans.iter().find(|s| s.content == part).map(|s| s.style.fg);
+        assert_eq!(fg("@alice"), Some(Some(Color::Blue)));
+        assert_eq!(fg("hi "), Some(None));
+        assert_eq!(
+            fg("⠿⠿⠿"),
+            Some(Some(Color::Gray)),
+            "nothing says it hides a name"
+        );
     }
 
     #[test]

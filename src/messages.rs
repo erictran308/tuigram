@@ -428,7 +428,8 @@ impl Msg {
     }
 }
 
-/// How part of a message's text looks, from the formatting its sender picked.
+/// How part of a message's text looks, from the formatting its sender
+/// picked, and the people it mentions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Format {
     pub bold: bool,
@@ -441,6 +442,9 @@ pub struct Format {
     pub spoiler: bool,
     /// A block quote.
     pub quote: bool,
+    /// A mention Telegram made of it: an @username, or a name that leads to
+    /// the person, so it isn't taken for words that only look like one.
+    pub mention: bool,
 }
 
 /// A stretch of text with one [`Format`].
@@ -461,9 +465,10 @@ enum Mark {
     Code,
     Spoiler,
     Quote,
+    Mention,
 }
 
-const MARKS: usize = 7;
+const MARKS: usize = 8;
 
 impl Mark {
     fn of(kind: &TextEntityType) -> Option<Self> {
@@ -476,6 +481,7 @@ impl Mark {
             T::Code | T::Pre | T::PreCode(_) => Mark::Code,
             T::Spoiler => Mark::Spoiler,
             T::BlockQuote | T::ExpandableBlockQuote => Mark::Quote,
+            T::Mention | T::MentionName(_) => Mark::Mention,
             _ => return None,
         })
     }
@@ -493,6 +499,7 @@ impl Format {
             code: on(Mark::Code),
             spoiler: on(Mark::Spoiler),
             quote: on(Mark::Quote),
+            mention: on(Mark::Mention),
         }
     }
 }
@@ -2627,6 +2634,24 @@ pub(crate) mod tests {
         let body = body(&content);
         assert_eq!(body.text, "[File: a.pdf] a    b bold");
         assert_eq!(styled(&body)[0].0, "bold");
+    }
+
+    #[test]
+    fn mentions_telegram_made_are_marked_and_lookalikes_are_not() {
+        use TextEntityType as T;
+        let to_bob = T::MentionName(types::TextEntityTypeMentionName { user_id: 5 });
+        let content = text_message(
+            "hi @alice, Bob and @ nobody",
+            vec![entity(3, 6, T::Mention), entity(11, 3, to_bob)],
+        );
+        let mention = Format {
+            mention: true,
+            ..Format::default()
+        };
+        assert_eq!(
+            styled(&body(&content)),
+            [("@alice", mention), ("Bob", mention)]
+        );
     }
 
     #[test]
