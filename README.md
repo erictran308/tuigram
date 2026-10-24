@@ -285,6 +285,7 @@ Sixteen `[palette]` colors make a whole theme: `bg`, `bg_alt`, `surface`, `overl
 | `selection` | The selected row | `surface` |
 | `popup_bg` | Popups | `bg_alt` |
 | `primary` | Unread counts, the "Unread messages" line, NORMAL, Saved Messages | `blue` |
+| `logo` | The logo in the chat list's border (the Nerd Font's Telegram icon with **Round pills**, else `➤`) | Telegram's blue, `#26a5e4` |
 | `highlighted` | Chats you highlighted with `H` | `orange` |
 | `insert`, `command`, `search` | INSERT, COMMAND and SEARCH; search matches | `green`, `purple`, `yellow` |
 | `error` | Errors, messages that failed to send, deleting | `red` |

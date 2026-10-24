@@ -49,6 +49,9 @@ const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// every scanner reads an inverted code.
 const QR_DARK: Color = rgb(0x181825);
 const QR_LIGHT: Color = rgb(0xeff1f5);
+/// The blue of Telegram's logo, the middle of its gradient, whatever the
+/// theme: the logo is told apart by it.
+const TELEGRAM_BLUE: Color = rgb(0x26a5e4);
 
 /// A theme file as written.
 #[derive(Clone, Deserialize)]
@@ -302,6 +305,7 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
         selection: role("selection", p("surface"))?,
         popup_bg: role("popup_bg", p("bg_alt"))?,
         primary: role("primary", p("blue"))?,
+        logo: role("logo", TELEGRAM_BLUE)?,
         highlighted: role("highlighted", p("orange"))?,
         insert: role("insert", p("green"))?,
         error: role("error", p("red"))?,
@@ -358,6 +362,8 @@ pub struct Colors {
     /// Unread badges and the line over unread messages, the NORMAL label,
     /// the Saved Messages title.
     pub primary: Color,
+    /// tuigram's logo in the chat list's border: Telegram's blue.
+    pub logo: Color,
     /// Titles of chats you highlighted with `H`.
     pub highlighted: Color,
     /// The INSERT label.

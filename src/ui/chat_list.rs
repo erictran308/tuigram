@@ -27,6 +27,35 @@ const PHOTO_ROWS: u16 = 2;
 /// Narrower than this inside its border, the list leaves photos out to keep
 /// room for titles.
 const MIN_WIDTH_FOR_PHOTOS: u16 = 24;
+
+/// tuigram's mark, so it's told from its sister apps at a glance:
+/// Telegram's logo in its blue, then the name. With a Nerd Font
+/// (`Colors.pills`) it's the font's Telegram icon, the paper plane cut out
+/// of a circle; other fonts have none, so an arrowhead.
+const TELEGRAM: &str = "\u{f2c6}";
+const ARROWHEAD: &str = "➤";
+const NAME: &str = " tuigram ";
+
+/// The chat list's title after the logo: the mark and the name where the
+/// border has room for them and the whole title, the mark alone where the
+/// name would cut the title, and no logo on a list too narrow for even
+/// that, since the title says what's listed.
+fn with_logo(title: String, width: u16, colors: &Colors) -> Line<'static> {
+    let room = usize::from(width.saturating_sub(2));
+    let mark = if colors.pills { TELEGRAM } else { ARROWHEAD };
+    let logo = Span::from(mark).fg(colors.logo).bold();
+    let mut spans = vec![Span::from(" ")];
+    if 1 + mark.width() + NAME.width() + 2 + title.width() <= room {
+        spans.push(logo);
+        spans.push(Span::from(NAME).fg(colors.fg).bold());
+        spans.push(Span::from("· "));
+    } else if 1 + mark.width() + 1 + title.width() <= room {
+        spans.push(logo);
+        spans.push(Span::from(" "));
+    }
+    spans.push(Span::from(title));
+    Line::from(spans)
+}
 /// After a muted chat's name.
 const MUTED: &str = " 🔕";
 /// After the name of a chat the MTProto proxy in use put in the list.
@@ -65,10 +94,10 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
         chats,
     };
     let mut title = if filter.is_empty() {
-        format!(" Chats ({}) ", chats.ids().len())
+        format!("Chats ({}) ", chats.ids().len())
     } else {
         format!(
-            " Chats ({} of {}) /{filter} ",
+            "Chats ({} of {}) /{filter} ",
             chats.ids().len(),
             chats.total()
         )
@@ -77,7 +106,7 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
         title.push_str("loading… ");
     }
     let block = super::bordered(colors)
-        .title(title)
+        .title(with_logo(title, area.width, colors))
         .border_style(border(list.focused, colors));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -416,6 +445,51 @@ mod tests {
             focused: true,
             covered: false,
         }
+    }
+
+    #[test]
+    fn the_logo_says_which_app_this_is_and_gives_way_to_the_title() {
+        let mut chats = Chats::default();
+        chats.add_local(1, "Friends", None);
+        chats.refresh();
+        let colors = Colors::default();
+        let top = |width: u16| {
+            let buf = render(
+                &list(&chats, None),
+                &mut images(ProtocolType::Halfblocks),
+                width,
+                10,
+            );
+            let row: String = (0..width).map(|x| buf[(x, 0)].symbol()).collect();
+            let mark = row.find('➤').map(|i| &buf[(row[..i].width() as u16, 0)]);
+            let mark = mark.map(|cell| (cell.fg, cell.bg));
+            (row, mark)
+        };
+        let (row, mark) = top(40);
+        assert!(row.contains("╭ ➤ tuigram · Chats (1)"), "{row}");
+        assert_eq!(
+            mark,
+            Some((colors.logo, ratatui::style::Color::Reset)),
+            "in Telegram's blue, on nothing of its own"
+        );
+        assert_eq!(colors.logo, ratatui::style::Color::Rgb(0x26, 0xa5, 0xe4));
+
+        let (row, _) = top(18);
+        assert!(row.contains("╭ ➤ Chats (1)"), "the mark alone: {row}");
+        let (row, mark) = top(14);
+        assert!(row.contains("Chats (1)"), "the title stays whole: {row}");
+        assert_eq!(mark, None);
+
+        // With a Nerd Font, the font's Telegram icon.
+        let nerd = Colors {
+            pills: true,
+            ..colors
+        };
+        let line = with_logo("Chats (1) ".into(), 40, &nerd);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, " \u{f2c6} tuigram · Chats (1) ");
+        assert_eq!(line.spans[1].style.fg, Some(nerd.logo));
+        assert_eq!(line.spans[1].style.bg, None);
     }
 
     #[test]
