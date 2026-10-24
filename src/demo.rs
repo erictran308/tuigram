@@ -710,6 +710,7 @@ fn msg(sender: i64, date: i32, text: &str) -> Msg {
         service: None,
         mention: false,
         unplayed: false,
+        image_file: None,
     }
 }
 

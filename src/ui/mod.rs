@@ -3648,6 +3648,7 @@ mod tests {
             service: None,
             mention: false,
             unplayed: false,
+            image_file: None,
         };
         let mut open = OpenChat::new(1);
         open.messages.insert(1, msg(None));

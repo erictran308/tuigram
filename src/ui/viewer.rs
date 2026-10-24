@@ -23,14 +23,15 @@ pub(super) fn draw(
 ) {
     let inner = super::bordered(colors).inner(area);
     frame.render_widget(Cover, area);
+    // An image sent as a file is measured only once it's decoded.
+    let photo = images.measured_photo(&view.photo);
     let shot = shot(
-        &view.photo,
+        &photo,
         view.zoom.map(|i| SIZES[i]),
         inner.width,
         inner.height,
         images.font_size(),
     );
-    view.natural = shot.natural;
     let (cols, rows) = (shot.cols, shot.rows);
     // The largest photo, and the bubble's until that's downloaded.
     images.want(&view.photo, cols, rows);
@@ -48,16 +49,21 @@ pub(super) fn draw(
     let ready = sharp
         .as_ref()
         .is_some_and(|p| p.file_id == view.photo.file_id);
-    let broken =
-        images.is_broken(&view.photo) && view.stand_in.as_ref().is_none_or(|s| images.is_broken(s));
+    // Failed: the photo can't be shown. Broken: nor can the bubble's copy.
+    let failed = images.is_broken(&view.photo);
+    let broken = failed && view.stand_in.as_ref().is_none_or(|s| images.is_broken(s));
 
-    let mut title = vec![Span::from(" Photo")];
+    // "Photo", or the name of an image sent as a file.
+    let label = super::truncate(&view.file.label, usize::from(inner.width / 2));
+    let mut title = vec![Span::from(format!(" {label}"))];
     if let Some(i) = view.zoom {
         title.push(Span::from(format!(" · {:.0}%", SIZES[i] * 100.0)));
     }
-    if !ready && !broken {
+    if !ready && !failed {
         title.push(Span::from(" · "));
         title.push(Span::from("loading…").fg(colors.accent).bold());
+    } else if failed && !broken {
+        title.push(Span::from(" · only its thumbnail").fg(colors.subtle));
     }
     title.push(Span::from(" "));
     let block = popup_block(
@@ -104,14 +110,11 @@ struct Shot {
     /// From the window's top left corner.
     x: u16,
     y: u16,
-    /// The share of the size that fills the window it takes unzoomed.
-    natural: f64,
 }
 
 /// The photo in the middle of `cols` × `rows` cells: `share` of the size
 /// that fills them with its shape kept, since cells are taller than wide;
-/// unzoomed (`None`), that size, but no bigger than its own pixels, which
-/// would only blur it.
+/// unzoomed (`None`), all of it, however small the photo is.
 fn shot(photo: &Preview, share: Option<f64>, cols: u16, rows: u16, font: FontSize) -> Shot {
     let (fw, fh) = (f64::from(font.width.max(1)), f64::from(font.height.max(1)));
     let (pw, ph) = (
@@ -120,8 +123,7 @@ fn shot(photo: &Preview, share: Option<f64>, cols: u16, rows: u16, font: FontSiz
     );
     let (cols, rows) = (cols.max(1), rows.max(1));
     let fill = (f64::from(cols) * fw / pw).min(f64::from(rows) * fh / ph);
-    let natural = (1.0 / fill).min(1.0);
-    let scale = fill * share.unwrap_or(natural);
+    let scale = fill * share.unwrap_or(1.0);
     let cells =
         |pixels: f64, cell: f64, room: u16| ((pixels * scale / cell).round() as u16).clamp(1, room);
     let (shown_cols, shown_rows) = (cells(pw, fw, cols), cells(ph, fh, rows));
@@ -130,7 +132,6 @@ fn shot(photo: &Preview, share: Option<f64>, cols: u16, rows: u16, font: FontSiz
         rows: shown_rows,
         x: (cols - shown_cols) / 2,
         y: (rows - shown_rows) / 2,
-        natural,
     }
 }
 
@@ -183,10 +184,8 @@ mod tests {
     }
 
     #[test]
-    fn a_small_photo_opens_no_bigger_than_its_pixels() {
-        assert_eq!(cells(&photo(300, 200), None), (30, 10));
-        let shot = shot(&photo(300, 200), None, 100, 40, FONT);
-        assert_eq!(shot.natural, 0.3, "of filling the width");
+    fn a_small_photo_opens_filling_the_window_too() {
+        assert_eq!(cells(&photo(300, 200), None), (100, 33));
     }
 
     #[test]
@@ -230,7 +229,6 @@ mod tests {
             },
             cant_copy: None,
             zoom: None,
-            natural: 1.0,
         };
         assert!(title(&mut view, &mut images).contains("Photo · loading…"));
 
@@ -256,6 +254,34 @@ mod tests {
             rows[10].contains("Loading…"),
             "in place of the picture before: {rows:#?}"
         );
+    }
+
+    #[test]
+    fn an_image_file_is_named_and_falls_back_to_its_thumbnail() {
+        let mut images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let mut view = PhotoView {
+            chat_id: 1,
+            message_id: 1,
+            photo: photo(4096, 3072),
+            stand_in: Some(Preview {
+                file_id: 2,
+                ..photo(320, 240)
+            }),
+            file: MediaFile {
+                id: 1,
+                label: "File: IMG_2041.PNG".into(),
+                photo: false,
+            },
+            cant_copy: None,
+            zoom: None,
+        };
+        assert!(title(&mut view, &mut images).contains("File: IMG_2041.PNG · loading…"));
+
+        // Too big to decode, or not an image after all.
+        images.on_downloaded(1, None);
+        let title = title(&mut view, &mut images);
+        assert!(title.contains("only its thumbnail"), "{title}");
+        assert!(!title.contains("loading"), "{title}");
     }
 
     #[test]

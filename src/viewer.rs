@@ -25,12 +25,9 @@ pub struct PhotoView {
     pub file: MediaFile,
     /// Why `y` copies nothing, if it doesn't.
     pub cant_copy: Option<&'static str>,
-    /// The size `j` or `k` picked, in [`SIZES`]. `None` until then: as big
-    /// as fills the window, but not past its own pixels.
+    /// The size `j` or `k` picked, in [`SIZES`]. `None` until then: filling
+    /// the window, however small the photo is.
     pub zoom: Option<usize>,
-    /// The share of the size that fills the window it opens at, from the
-    /// last frame: less than all for a photo smaller than the window.
-    pub natural: f64,
 }
 
 impl PhotoView {
@@ -54,13 +51,12 @@ impl PhotoView {
             file,
             cant_copy: cant_copy(msg),
             zoom: None,
-            natural: 1.0,
         })
     }
 
     /// How big it is, as a share of the size that fills the window.
     pub fn share(&self) -> f64 {
-        self.zoom.map_or(self.natural, |i| SIZES[i])
+        self.zoom.map_or(1.0, |i| SIZES[i])
     }
 
     /// The next size up, up to filling the window.
@@ -102,7 +98,7 @@ pub fn cant_copy(msg: &Msg) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    fn view(natural: f64) -> PhotoView {
+    fn view() -> PhotoView {
         let photo = Preview {
             file_id: 1,
             width: 300,
@@ -122,13 +118,12 @@ mod tests {
             },
             cant_copy: None,
             zoom: None,
-            natural,
         }
     }
 
     #[test]
     fn a_photo_filling_the_window_only_zooms_out_and_back() {
-        let mut view = view(1.0);
+        let mut view = view();
         view.zoom_in();
         assert_eq!(view.zoom, None, "it can't get bigger");
         view.zoom_out();
@@ -141,15 +136,5 @@ mod tests {
             view.zoom_in();
         }
         assert_eq!(view.share(), 1.0, "filling the window at most");
-    }
-
-    #[test]
-    fn a_small_photo_zooms_in_from_its_own_size_up_to_filling_the_window() {
-        let mut view = view(0.3);
-        view.zoom_in();
-        assert_eq!(view.share(), 0.5);
-        let mut view = self::view(0.3);
-        view.zoom_out();
-        assert_eq!(view.share(), 0.25);
     }
 }

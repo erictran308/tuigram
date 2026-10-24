@@ -32,6 +32,14 @@ use crate::voice::Voice;
 const PHOTO_MIN_SIDE: i32 = 640;
 /// A link preview's thumbnail is a few cells: TDLib's "m" (320 px) does.
 const THUMBNAIL_MIN_SIDE: i32 = 200;
+/// Images sent as files that show their picture in the bubble: named as an
+/// image, with a thumbnail. Name and type are the sender's to pick, so a
+/// file named otherwise stays a file, whatever its thumbnail shows.
+const PICTURE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "avif", "tif", "tiff",
+];
+/// Of those, the ones the viewer shows; the rest open in their app.
+const VIEWED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp"];
 
 /// Messages kept loaded while following new ones; see [`OpenChat::add_new`].
 const MAX_FOLLOWED: usize = 1000;
@@ -166,6 +174,33 @@ impl Preview {
             sticker: false,
         })
     }
+
+    /// An image sent as a file, small: the thumbnail its sender's app made
+    /// (up to 320 px), not the file, which can be tens of MB.
+    fn from_document(document: &types::Document) -> Option<Self> {
+        let thumbnail = document
+            .thumbnail
+            .as_ref()
+            .filter(|t| decodable(&t.format))?;
+        Some(Self {
+            file_id: thumbnail.file.id,
+            width: thumbnail.width.max(1) as u32,
+            height: thumbnail.height.max(1) as u32,
+            thumbnail: decode_minithumbnail(document.minithumbnail.as_ref()),
+            sticker: false,
+        })
+    }
+
+    /// An image sent as a file, for the viewer: the file itself, in the
+    /// shape of `small`, its thumbnail, until the viewer has decoded it,
+    /// since Telegram doesn't say how big it is.
+    fn of_file(document: &types::Document, small: &Preview) -> Self {
+        Self {
+            file_id: document.document.id,
+            thumbnail: None,
+            ..small.clone()
+        }
+    }
 }
 
 /// Still-image formats the `image` crate decodes (not MPEG-4, TGS or WebM clips).
@@ -174,6 +209,20 @@ fn decodable(format: &ThumbnailFormat) -> bool {
         format,
         ThumbnailFormat::Jpeg | ThumbnailFormat::Png | ThumbnailFormat::Webp | ThumbnailFormat::Gif
     )
+}
+
+/// A file its sender's app says is an image, named as one: its bubble shows
+/// its picture (see [`PICTURE_EXTENSIONS`]).
+fn is_picture(document: &types::Document) -> bool {
+    let mime = document.mime_type.to_ascii_lowercase();
+    mime.starts_with("image/") && has_extension(&document.file_name, PICTURE_EXTENSIONS)
+}
+
+fn has_extension(name: &str, extensions: &[&str]) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| extensions.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 fn largest(photo: &types::Photo) -> Option<&types::PhotoSize> {
@@ -204,6 +253,8 @@ pub struct Msg {
     /// A photo at its largest, the same file as `file`: Enter shows it in
     /// the viewer.
     pub photo: Option<Preview>,
+    /// An image sent as a file: its picture shows like a photo's, named.
+    pub image_file: Option<ImageFile>,
     /// Web links in the text or caption, in order, without duplicates.
     pub links: Vec<Link>,
     /// Byte ranges of `text` that are links, to underline.
@@ -313,6 +364,12 @@ impl Msg {
         }
     }
 
+    /// It's drawn in an album's one bubble: a photo or video. Images sent
+    /// as files are drawn one by one, each named, like other files.
+    pub fn joins_album(&self) -> bool {
+        self.image_file.is_none() && self.preview.as_ref().is_some_and(|p| !p.sticker)
+    }
+
     /// It has spoilers that Enter hasn't shown yet.
     pub fn hides_spoilers(&self) -> bool {
         !self.revealed && self.styles.iter().any(|s| s.format.spoiler)
@@ -359,6 +416,7 @@ impl Msg {
         std::mem::swap(&mut self.preview, &mut body.preview);
         std::mem::swap(&mut self.file, &mut body.file);
         std::mem::swap(&mut self.photo, &mut body.photo);
+        std::mem::swap(&mut self.image_file, &mut body.image_file);
         std::mem::swap(&mut self.links, &mut body.links);
         std::mem::swap(&mut self.link_ranges, &mut body.link_ranges);
         std::mem::swap(&mut self.styles, &mut body.styles);
@@ -659,12 +717,24 @@ pub struct MediaFile {
     pub photo: bool,
 }
 
+/// An image sent as a file, uncompressed. Its bubble shows its picture like
+/// a photo's, with the file's name and size under it, so it isn't taken
+/// for a photo and its name, the sender's to pick, is always in sight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageFile {
+    /// Cleaned.
+    pub name: String,
+    /// In bytes; 0 if Telegram doesn't say.
+    pub size: u64,
+}
+
 struct Body {
     text: String,
     source_text: String,
     preview: Option<Preview>,
     file: Option<MediaFile>,
     photo: Option<Preview>,
+    image_file: Option<ImageFile>,
     links: Vec<Link>,
     link_ranges: Vec<Range<usize>>,
     styles: Vec<Styled>,
@@ -733,6 +803,7 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
         formatted: false,
         hidden: None,
         voice: None,
+        image_file: None,
     };
     let file = |id: i32, label: String| {
         Some(MediaFile {
@@ -815,8 +886,23 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
         }
         C::MessageDocument(m) => {
             body.editable = Editable::Caption { above: false };
-            let label = format!("File: {}", text::clean(&m.document.file_name));
-            body.file = file(m.document.document.id, label);
+            let d = &m.document;
+            let name = text::clean(&d.file_name);
+            body.file = file(d.document.id, format!("File: {name}"));
+            if let Some(preview) = Preview::from_document(d).filter(|_| is_picture(d)) {
+                body.text = m.caption.text.clone();
+                body.photo = has_extension(&d.file_name, VIEWED_EXTENSIONS)
+                    .then(|| Preview::of_file(d, &preview));
+                body.preview = Some(preview);
+                let size = match d.document.size {
+                    0 => d.document.expected_size,
+                    size => size,
+                };
+                body.image_file = Some(ImageFile {
+                    name,
+                    size: size.max(0) as u64,
+                });
+            }
             source = Some(&m.caption);
         }
         C::MessageAudio(m) => {
@@ -1120,6 +1206,7 @@ impl From<Message> for Msg {
             hidden: body.hidden,
             saveable: message.can_be_saved,
             voice: body.voice,
+            image_file: body.image_file,
             service,
             mention: message.contains_unread_mention,
             unplayed: match &message.content {
@@ -1355,10 +1442,7 @@ impl OpenChat {
                 .filter(|(_, m)| m.album == msg.album)
                 .map(|(&id, m)| (id, m))
                 .collect();
-            if photos
-                .iter()
-                .all(|(_, m)| m.preview.as_ref().is_some_and(|p| !p.sticker))
-            {
+            if photos.iter().all(|(_, m)| m.joins_album()) {
                 return photos;
             }
         }
@@ -2051,6 +2135,127 @@ pub(crate) mod tests {
         assert_eq!(body.file.map(|f| f.id), Some(10));
     }
 
+    /// A file named `name` of type `mime`, 3.2 MB, with a 320 × 240
+    /// thumbnail in `format` if any.
+    fn document(name: &str, mime: &str, format: Option<ThumbnailFormat>) -> MessageContent {
+        MessageContent::MessageDocument(types::MessageDocument {
+            document: types::Document {
+                file_name: name.into(),
+                mime_type: mime.into(),
+                minithumbnail: None,
+                thumbnail: format.map(|format| types::Thumbnail {
+                    format,
+                    width: 320,
+                    height: 240,
+                    file: types::File {
+                        id: 5,
+                        ..Default::default()
+                    },
+                }),
+                document: types::File {
+                    id: 9,
+                    size: 3_355_443,
+                    ..Default::default()
+                },
+            },
+            caption: types::FormattedText {
+                text: "the original".into(),
+                ..Default::default()
+            },
+        })
+    }
+
+    #[test]
+    fn an_image_sent_as_a_file_shows_its_thumbnail_named_and_opens_in_the_viewer() {
+        let body = body(&document(
+            "IMG_2041.PNG",
+            "image/png",
+            Some(ThumbnailFormat::Jpeg),
+        ));
+        let preview = body.preview.expect("its picture shows");
+        assert_eq!(
+            (preview.file_id, preview.width, preview.height),
+            (5, 320, 240),
+            "the thumbnail, not the whole file"
+        );
+        assert_eq!(body.text, "the original", "the caption, without [File: …]");
+        assert_eq!(
+            body.image_file,
+            Some(ImageFile {
+                name: "IMG_2041.PNG".into(),
+                size: 3_355_443,
+            })
+        );
+        let photo = body.photo.expect("the viewer shows the file");
+        assert_eq!(
+            (photo.file_id, photo.width, photo.height),
+            (9, 320, 240),
+            "in its thumbnail's shape until decoded"
+        );
+        assert_eq!(
+            body.file.map(|f| (f.id, f.label, f.photo)),
+            Some((9, "File: IMG_2041.PNG".into(), false)),
+            "y copies the file itself, not a recompressed picture"
+        );
+    }
+
+    #[test]
+    fn a_file_only_named_or_only_typed_as_an_image_stays_a_file() {
+        let jpeg = || Some(ThumbnailFormat::Jpeg);
+        for content in [
+            document("cat.png.exe", "image/png", jpeg()),
+            document("cat.png", "application/octet-stream", jpeg()),
+            document("cat.png", "image/png", None),
+            document("cat.png", "image/png", Some(ThumbnailFormat::Mpeg4)),
+        ] {
+            let body = body(&content);
+            assert!(body.preview.is_none() && body.photo.is_none());
+            assert!(body.image_file.is_none());
+            assert!(body.text.starts_with("[File: cat.png"), "{}", body.text);
+        }
+    }
+
+    #[test]
+    fn an_image_file_the_viewer_cant_decode_shows_but_opens_in_its_app() {
+        let body = body(&document(
+            "IMG_1.HEIC",
+            "image/heic",
+            Some(ThumbnailFormat::Jpeg),
+        ));
+        assert!(body.preview.is_some() && body.image_file.is_some());
+        assert!(body.photo.is_none(), "Enter opens it in its app");
+        assert_eq!(body.file.map(|f| f.id), Some(9));
+    }
+
+    #[test]
+    fn images_sent_as_files_are_not_drawn_as_one_album() {
+        let mut open = OpenChat::new(1);
+        let mut msgs = page([1, 2]);
+        for (_, msg) in &mut msgs {
+            msg.album = 7;
+            msg.preview = Some(Preview {
+                file_id: 1,
+                width: 320,
+                height: 240,
+                thumbnail: None,
+                sticker: false,
+            });
+        }
+        open.messages.extend(msgs);
+        assert_eq!(open.forward_ids(1), [1, 2], "photos go together");
+        for msg in open.messages.values_mut() {
+            msg.image_file = Some(ImageFile {
+                name: "a.png".into(),
+                size: 1,
+            });
+        }
+        assert_eq!(
+            open.forward_ids(1),
+            [1],
+            "each file is its own, as other files"
+        );
+    }
+
     fn entity(offset: i32, length: i32, kind: TextEntityType) -> types::TextEntity {
         types::TextEntity {
             offset,
@@ -2566,6 +2771,7 @@ pub(crate) mod tests {
                     service: None,
                     mention: false,
                     unplayed: false,
+                    image_file: None,
                 };
                 (id, msg)
             })

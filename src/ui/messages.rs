@@ -19,8 +19,8 @@ use crate::buttons::Keyboard;
 use crate::chats::{Chats, Presence, Seen};
 use crate::images::Images;
 use crate::messages::{
-    Card, Fetched, Format, Msg, OpenChat, Origin, Preview, Replied, ReplyTo, SPOILER, ScrollAnchor,
-    SendState, Sender, Styled,
+    Card, Fetched, Format, ImageFile, Msg, OpenChat, Origin, Preview, Replied, ReplyTo, SPOILER,
+    ScrollAnchor, SendState, Sender, Styled,
 };
 use crate::reactions::{self, Reaction};
 use crate::search;
@@ -802,12 +802,12 @@ fn measure<'a>(
         }
         // A link preview's picture sits after its bar, under the text.
         if let Some((photo, (cols, rows))) = m.bubble.card_image {
-            let voice_rows = usize::from(m.bubble.voice.is_some());
+            let under_photo = usize::from(m.bubble.voice.is_some() || m.bubble.file_row.is_some());
             laid.photos.push(PhotoSlot {
                 line: bubble_start
                     + m.bubble.header.rows()
                     + photo_rows
-                    + voice_rows
+                    + under_photo
                     + m.bubble.text.len(),
                 x: (bubble_x + 3) as u16,
                 cols,
@@ -934,10 +934,7 @@ struct InAlbum<'a> {
 fn albums<'a>(messages: &[(i64, &'a Msg)]) -> Vec<Option<InAlbum<'a>>> {
     let mut out = Vec::with_capacity(messages.len());
     for run in messages.chunk_by(|(_, a), (_, b)| a.album != 0 && a.album == b.album) {
-        let media = run.len() > 1
-            && run
-                .iter()
-                .all(|(_, m)| m.preview.as_ref().is_some_and(|p| !p.sticker));
+        let media = run.len() > 1 && run.iter().all(|(_, m)| m.joins_album());
         if !media {
             out.extend(run.iter().map(|_| None));
             continue;
@@ -1301,6 +1298,53 @@ impl VoiceRow {
     }
 }
 
+/// Comes before the name of an image sent as a file, as before a file the
+/// composer will send.
+const CLIP: &str = "📎 ";
+
+/// The row under an image sent as a file: 📎, its name and its size, so
+/// it isn't taken for a photo.
+struct FileRow {
+    /// Cut to fit, keeping its extension.
+    name: String,
+    /// " · 3.2 MB", or nothing if Telegram doesn't say.
+    size: String,
+}
+
+impl FileRow {
+    fn new(file: &ImageFile, max: usize) -> Self {
+        let size = match file.size {
+            0 => String::new(),
+            bytes => format!(" · {}", crate::attach::size_label(bytes)),
+        };
+        let room = max.saturating_sub(CLIP.width() + size.width());
+        Self {
+            name: cut_keeping_extension(&file.name, room),
+            size,
+        }
+    }
+
+    fn width(&self) -> usize {
+        CLIP.width() + self.name.width() + self.size.width()
+    }
+}
+
+/// `name` cut to `max` columns, keeping its extension, which says what
+/// the file is.
+fn cut_keeping_extension(name: &str, max: usize) -> String {
+    if name.width() <= max {
+        return name.to_string();
+    }
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && name[dot..].width() < max => {
+            let extension = &name[dot..];
+            let stem = truncate(&name[..dot], max - extension.width());
+            format!("{stem}{extension}")
+        }
+        _ => truncate(name, max),
+    }
+}
+
 /// Where a bubble's time goes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetaAt {
@@ -1308,6 +1352,8 @@ enum MetaAt {
     Text,
     /// After a voice message's waveform, with no text under it.
     Voice,
+    /// After an image file's name, with no text under it.
+    File,
     /// After the last row of reactions.
     Reactions,
     /// On a row of its own.
@@ -1329,6 +1375,8 @@ struct Bubble<'a> {
     photo: Option<(u16, u16)>,
     /// A voice message's waveform, under the photo's place.
     voice: Option<VoiceRow>,
+    /// An image sent as a file's name, under the photo's place.
+    file_row: Option<FileRow>,
     /// The time, or the send status. `None` inside an album, which has one
     /// time at the bottom.
     meta: Option<String>,
@@ -1367,10 +1415,12 @@ impl<'a> Bubble<'a> {
         max_text: usize,
     ) -> Self {
         let source = caption.map_or("", |c| c.text.as_str());
+        let file_row = msg.image_file.as_ref().map(|f| FileRow::new(f, max_text));
         // A photo inside an album has no row under it at all, one with
-        // reactions has its time beside them, and a voice message beside
-        // its waveform.
-        let text = if source.is_empty() && (meta.is_none() || !chips.is_empty() || voice.is_some())
+        // reactions has its time beside them, and a voice message or an
+        // image file beside its row.
+        let text = if source.is_empty()
+            && (meta.is_none() || !chips.is_empty() || voice.is_some() || file_row.is_some())
         {
             Vec::new()
         } else {
@@ -1388,16 +1438,21 @@ impl<'a> Bubble<'a> {
         let meta_w = meta.as_ref().map_or(0, |m| m.width());
         // The time goes beside the last row of reactions, else the last line
         // of text, if it fits. Under a link preview it has a row of its own.
-        let last_w = match (chips.last(), text.last(), &voice) {
+        let under_photo = voice
+            .as_ref()
+            .map(VoiceRow::width)
+            .or(file_row.as_ref().map(FileRow::width));
+        let last_w = match (chips.last(), text.last(), under_photo) {
             (Some(row), _, _) => chips_width(row),
             (None, Some((l, _)), _) => l.width(),
-            (None, None, Some(voice)) => voice.width(),
+            (None, None, Some(w)) => w,
             (None, None, None) => 0,
         };
         let meta_at = match () {
             _ if meta.is_none() || last_w + META_GAP + meta_w > max_text => MetaAt::Own,
             _ if chips.is_empty() && !card.is_empty() => MetaAt::Own,
             _ if chips.is_empty() && text.is_empty() && voice.is_some() => MetaAt::Voice,
+            _ if chips.is_empty() && text.is_empty() && file_row.is_some() => MetaAt::File,
             _ if chips.is_empty() => MetaAt::Text,
             _ => MetaAt::Reactions,
         };
@@ -1405,7 +1460,7 @@ impl<'a> Bubble<'a> {
         let mut width = text
             .iter()
             .map(|(l, _)| l.width())
-            .chain(voice.as_ref().map(VoiceRow::width))
+            .chain(under_photo)
             .chain(chips.iter().map(|row| chips_width(row)))
             .chain(card.iter().map(|(l, _)| card_indent + l.width()))
             .max()
@@ -1452,6 +1507,7 @@ impl<'a> Bubble<'a> {
             },
             photo,
             voice,
+            file_row,
             meta,
             chips,
             matches,
@@ -1468,6 +1524,7 @@ impl<'a> Bubble<'a> {
         self.header.rows()
             + self.photo.map_or(0, |(_, rows)| usize::from(rows))
             + usize::from(self.voice.is_some())
+            + usize::from(self.file_row.is_some())
             + self.text.len()
             + self.card.len()
             + self.chips.len()
@@ -1507,6 +1564,7 @@ impl<'a> Bubble<'a> {
             header,
             photo,
             voice,
+            file_row,
             meta,
             chips,
             matches,
@@ -1588,6 +1646,23 @@ impl<'a> Bubble<'a> {
             let w = voice.width();
             let mut spans = voice.spans(style, faded, colors.accent);
             if meta_at == MetaAt::Voice
+                && let Some(meta) = &meta
+            {
+                spans.push(Span::styled(" ".repeat(inner - w - meta_w), style));
+                spans.push(Span::styled(meta.clone(), meta_style));
+                out.push(row(spans, inner));
+            } else {
+                out.push(row(spans, w));
+            }
+        }
+        if let Some(file) = file_row {
+            let w = file.width();
+            let mut spans = vec![
+                Span::styled(CLIP, style.fg(faded)),
+                Span::styled(file.name, style),
+                Span::styled(file.size, style.fg(faded)),
+            ];
+            if meta_at == MetaAt::File
                 && let Some(meta) = &meta
             {
                 spans.push(Span::styled(" ".repeat(inner - w - meta_w), style));
@@ -1921,6 +1996,7 @@ mod tests {
             service: None,
             mention: false,
             unplayed: false,
+            image_file: None,
         }
     }
 
@@ -2408,6 +2484,77 @@ mod tests {
             2,
             "and once for the text after"
         );
+    }
+
+    #[test]
+    fn an_image_sent_as_a_file_is_named_under_its_picture() {
+        let users = HashMap::new();
+        let chats = Chats::default();
+        let names = Names {
+            users: &users,
+            chats: &chats,
+        };
+        let font = FontSize {
+            width: 10,
+            height: 20,
+        };
+        let colors = Colors::default();
+        let file = |name: &str, caption: &str| Msg {
+            preview: Some(Preview {
+                file_id: 7,
+                width: 320,
+                height: 240,
+                thumbnail: None,
+                sticker: false,
+            }),
+            image_file: Some(ImageFile {
+                name: name.into(),
+                size: 3_355_443,
+            }),
+            ..msg(false, 1_790_000_000, caption)
+        };
+        let mut open = OpenChat::new(42);
+        open.messages.insert(1, file("IMG_2041.PNG", ""));
+        open.messages
+            .insert(2, file("IMG_2042.PNG", "the original"));
+        open.messages
+            .insert(3, file(&format!("{}.png", "a".repeat(80)), ""));
+        let (lines, _, photos) = layout(&open, &names, true, true, 58, font, &colors);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let time = Local
+            .timestamp_opt(1_790_000_000, 0)
+            .unwrap()
+            .format("%H:%M")
+            .to_string();
+        let under = |i: usize| &text[photos[i].line + usize::from(photos[i].rows)];
+
+        assert_eq!(photos.len(), 3, "each its own bubble, with its picture");
+        assert!(
+            under(0).contains("📎 IMG_2041.PNG · 3.2 MB") && under(0).contains(&time),
+            "named, with the time beside: {}",
+            under(0)
+        );
+        assert!(under(1).contains("📎 IMG_2042.PNG · 3.2 MB"));
+        assert!(!under(1).contains(&time), "the time goes after the caption");
+        let caption = &text[photos[1].line + usize::from(photos[1].rows) + 1];
+        assert!(caption.contains("the original") && caption.contains(&time));
+        assert!(
+            under(2).contains("aaa….png · 3.2 MB"),
+            "a long name keeps its extension: {}",
+            under(2)
+        );
+    }
+
+    #[test]
+    fn cut_file_names_keep_their_extension() {
+        assert_eq!(cut_keeping_extension("holiday.png", 20), "holiday.png");
+        assert_eq!(cut_keeping_extension("holiday.png", 8), "hol….png");
+        assert_eq!(cut_keeping_extension("README", 4), "REA…");
+        assert_eq!(cut_keeping_extension(".bashrc", 4), ".ba…");
+        assert_eq!(cut_keeping_extension("a.verylong", 5), "a.ve…");
     }
 
     #[test]

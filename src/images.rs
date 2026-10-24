@@ -64,13 +64,15 @@ fn sized(side: u32) -> image::Limits {
 /// Stickers are 512px a side; this leaves room to spare.
 const STICKER_SIDE: u32 = 1024;
 
-/// Like `image::open` (the format comes from the extension), within [`limits`].
+/// Like `image::open`, within [`limits`]. The format comes from the file's
+/// first bytes, else its extension: a file sent as a file is named by its
+/// sender, so a JPEG can be called `.png`.
 pub fn open_image(path: &str) -> image::ImageResult<image::DynamicImage> {
     open_within(path, limits())
 }
 
 fn open_within(path: &str, limits: image::Limits) -> image::ImageResult<image::DynamicImage> {
-    let mut reader = image::ImageReader::open(path)?;
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
     reader.limits(limits);
     reader.decode()
 }
@@ -163,7 +165,8 @@ pub struct ImageEvent {
     key: Key,
     /// [`Images::generation`] when it was started.
     generation: u64,
-    result: Result<SlicedProtocol>,
+    /// The encoded image, and the size in pixels it was decoded at.
+    result: Result<(SlicedProtocol, (u32, u32))>,
 }
 
 enum FileState {
@@ -252,6 +255,9 @@ pub struct Images {
     /// Keys that failed to decode; never retried.
     failed: HashSet<Key>,
     files: HashMap<i32, FileState>,
+    /// Photos' own size in pixels, learned by decoding them: an image sent
+    /// as a file comes without it.
+    pixels: HashMap<i32, (u32, u32)>,
     /// Photos the last frame showed, with their size.
     wanted: Vec<(Preview, u16, u16)>,
     /// Chat photos the last frame showed, with their size.
@@ -273,6 +279,7 @@ impl Images {
             building: HashMap::new(),
             failed: HashSet::new(),
             files: HashMap::new(),
+            pixels: HashMap::new(),
             wanted: Vec::new(),
             wanted_avatars: Vec::new(),
         }
@@ -528,8 +535,13 @@ impl Images {
             return;
         }
         match event.result {
-            Ok(image) if event.key.avatar => self.add_avatar(event.key, image),
-            Ok(image) => self.add_ready(event.key, image),
+            Ok((image, _)) if event.key.avatar => self.add_avatar(event.key, image),
+            Ok((image, pixels)) => {
+                if !event.key.thumbnail {
+                    self.pixels.insert(event.key.file_id, pixels);
+                }
+                self.add_ready(event.key, image);
+            }
             Err(_) => {
                 self.failed.insert(event.key);
                 if !event.key.thumbnail {
@@ -537,6 +549,16 @@ impl Images {
                 }
             }
         }
+    }
+
+    /// `photo` as many pixels as it was decoded at, once it has been: an
+    /// image sent as a file comes only with its thumbnail's shape.
+    pub fn measured_photo(&self, photo: &Preview) -> Preview {
+        let mut photo = photo.clone();
+        if let Some(&(width, height)) = self.pixels.get(&photo.file_id) {
+            (photo.width, photo.height) = (width.max(1), height.max(1));
+        }
+        photo
     }
 
     fn add_ready(&mut self, key: Key, image: SlicedProtocol) {
@@ -594,6 +616,7 @@ impl Images {
         self.avatars.clear();
         self.failed.clear();
         self.files.clear();
+        self.pixels.clear();
         self.wanted.clear();
         self.wanted_avatars.clear();
     }
@@ -634,10 +657,10 @@ impl Images {
         tokio::task::spawn_blocking(move || {
             let result = contained(|| {
                 decode().and_then(|image| {
+                    let pixels = (image.width(), image.height());
                     let size = Size::new(key.cols, key.rows);
-                    Ok(SlicedProtocol::new_with_resize(
-                        &picker, image, size, RESIZE,
-                    )?)
+                    let image = SlicedProtocol::new_with_resize(&picker, image, size, RESIZE)?;
+                    Ok((image, pixels))
                 })
             });
             let _ = tx.send(ImageEvent {
@@ -909,6 +932,31 @@ mod tests {
         images.fetch(&Tg::detached(tokio::sync::mpsc::unbounded_channel().0));
         images.on_built(rx.recv().await.unwrap());
         assert!(images.get(&photo, 4, 2).is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_file_named_as_another_format_decodes_and_says_how_big_it_is() {
+        let dir = std::env::temp_dir().join(format!("tuigram-misnamed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A PNG its sender named .jpg.
+        let path = dir.join("photo.jpg");
+        std::fs::write(&path, png(80, 60)).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        let photo = preview(3);
+        let size = |p: Preview| (p.width, p.height);
+        assert_eq!(
+            size(images.measured_photo(&photo)),
+            (8, 8),
+            "as said, until decoded"
+        );
+        images.on_downloaded(3, Some(path.to_str().unwrap().into()));
+        images.want(&photo, 4, 2);
+        images.fetch(&Tg::detached(tokio::sync::mpsc::unbounded_channel().0));
+        images.on_built(rx.recv().await.unwrap());
+        assert!(images.get(&photo, 4, 2).is_some(), "read by its contents");
+        assert_eq!(size(images.measured_photo(&photo)), (80, 60));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

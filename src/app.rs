@@ -891,9 +891,10 @@ pub struct App {
     /// The message whose photo, shown only while open, the last frame
     /// showed.
     shown_viewing: Option<i64>,
-    /// The photo the last frame showed in the viewer, by file id, and the
-    /// size it was zoomed to.
-    shown_in_viewer: Option<(i32, Option<usize>)>,
+    /// The photo the last frame showed in the viewer, by file id, the size
+    /// it was zoomed to, and its size in pixels, which an image sent as a
+    /// file has only once it's decoded.
+    shown_in_viewer: Option<(i32, Option<usize>, (u32, u32))>,
     /// The terminal's cells changed size in pixels, so the next frame is
     /// drawn on a cleared screen: sixel and iTerm2 pictures drawn the old
     /// size would stay on it.
@@ -1078,7 +1079,10 @@ impl App {
             // viewer's photo once it closes, changes size or makes way for
             // another, and the bubbles' under its blank edges once it opens.
             let viewing = self.open.as_ref().and_then(|o| o.viewing);
-            let in_viewer = self.photo_view.as_ref().map(|v| (v.photo.file_id, v.zoom));
+            let in_viewer = self.photo_view.as_ref().map(|v| {
+                let photo = self.images.measured_photo(&v.photo);
+                (v.photo.file_id, v.zoom, (photo.width, photo.height))
+            });
             if ((self.shown_viewing.is_some() && viewing != self.shown_viewing)
                 || in_viewer != self.shown_in_viewer)
                 && self.images.paints_over()
