@@ -281,6 +281,7 @@ Sixteen `[palette]` colors make a whole theme: `bg`, `bg_alt`, `surface`, `overl
 | `muted` | Key hints, dates, placeholders | `comment` |
 | `border` | Borders of the pane not in use | `overlay` |
 | `accent` | The pane in use, cursors, popups | `accent` |
+| `light` | The lights round the pane in use when the window gets focus | `accent` mixed with white, or black on a light `bg` (`fg` if `accent` is `reset`) |
 | `selection` | The selected row | `surface` |
 | `popup_bg` | Popups | `bg_alt` |
 | `primary` | Unread counts, the "Unread messages" line, NORMAL, Saved Messages | `blue` |
@@ -306,6 +307,8 @@ If a theme can't be used, tuigram says why in the status bar and uses Catppuccin
 Panes and popups have round corners. In terminals whose font can't draw them (the Linux console, the old Windows console), they're square instead. If they look broken in yours, press `?`, go to **Settings**, and turn off **Round corners**, or set `corners` in `settings.toml` to `"square"` (or `"rounded"`; the default `"auto"` picks for your terminal).
 
 If your terminal uses a [Nerd Font](https://www.nerdfonts.com), turn on **Round pills** there too (`nerd_font = true`): unread counts, reactions, the tab you're on and the mode in the status bar get round ends. Other fonts show a box for them, so it's off at first.
+
+A few short animations catch your eye: when you come back to tuigram's window, four lights draw the border of the pane your keys go to, each a quarter of it, until they meet (this needs a terminal that reports focus; in tmux, `set -g focus-events on`). Popups fade in, the toast slides in and out, and a message from someone else glows for a moment as it comes. Turn them all off with **Animations** there (`animations = false`).
 
 ## Proxy
 

@@ -11,6 +11,7 @@ mod draft;
 mod images;
 mod info;
 mod messages;
+mod motion;
 mod notify;
 mod opus;
 mod picker;

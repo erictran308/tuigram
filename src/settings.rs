@@ -24,6 +24,10 @@ pub struct Settings {
     /// (unread counts, reactions, the mode) round ends. Other fonts show
     /// a box for them, so it's off unless asked for.
     pub nerd_font: bool,
+    /// Short animations: lights drawing the border of the pane with the
+    /// keys when tuigram's window gets focus, popups fading in, new messages
+    /// glowing as they come, and the toast sliding in and out.
+    pub animations: bool,
     /// Chats highlighted with `H`, by id.
     pub highlighted_chats: Vec<i64>,
     /// How new messages are announced: "auto" picks what the terminal
@@ -76,6 +80,7 @@ impl Default for Settings {
             theme: theme::DEFAULT.into(),
             corners: Corners::default(),
             nerd_font: false,
+            animations: true,
             highlighted_chats: Vec::new(),
             notifications: Notifications::default(),
             notification_sound: None,
@@ -202,6 +207,7 @@ mod tests {
             theme: "latte".into(),
             corners: Corners::Square,
             nerd_font: true,
+            animations: false,
             highlighted_chats: vec![-1001234567890, 42],
             notifications: Notifications::Off,
             notification_sound: Some("chime".into()),
@@ -220,7 +226,7 @@ mod tests {
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnotification_sound = \"chime\"\nsound_when_focused = true\nnormal_after_send = true\nwrap_composer = false\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40\ntopics_width = 26\naccept_secret_chats = true"
+            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nanimations = false\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnotification_sound = \"chime\"\nsound_when_focused = true\nnormal_after_send = true\nwrap_composer = false\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40\ntopics_width = 26\naccept_secret_chats = true"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
 
@@ -252,6 +258,7 @@ mod tests {
         assert_eq!(old.chat_list_side, Side::Left);
         assert_eq!(old.corners, Corners::Auto);
         assert!(!old.nerd_font);
+        assert!(old.animations);
 
         // A theme that's gone is the app's to deal with, not a broken file.
         std::fs::write(&file, r#"theme = "deleted""#).unwrap();

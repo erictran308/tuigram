@@ -30,6 +30,7 @@ use crate::messages::{
     Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState, Sender, link_host, one_line,
     web_url,
 };
+use crate::motion::{self, Motion};
 use crate::notify::{self, Note, Notifications, Notifier};
 use crate::picker::{self, ChatPicker, Choice, Purpose};
 use crate::pins::{PinMenu, Pinned, PinnedMenu, Place};
@@ -392,6 +393,8 @@ pub struct Toast {
     pub title: String,
     /// What it was about, e.g. what got copied.
     pub detail: String,
+    /// When it came up, to slide in from the right.
+    pub shown: Instant,
     pub until: Instant,
 }
 
@@ -484,8 +487,10 @@ impl SettingsMenu {
     pub const CORNERS: usize = Self::BLOCK_GAPS + 1;
     /// The "round pills, with a Nerd Font" row.
     pub const PILLS: usize = Self::CORNERS + 1;
+    /// The "animations" row.
+    pub const ANIMATIONS: usize = Self::PILLS + 1;
     /// The "Normal mode after sending" row.
-    pub const AFTER_SEND: usize = Self::PILLS + 1;
+    pub const AFTER_SEND: usize = Self::ANIMATIONS + 1;
     /// The "wrap long lines in the composer" row.
     pub const WRAP_COMPOSER: usize = Self::AFTER_SEND + 1;
     /// The "take secret chats others start" row.
@@ -893,6 +898,8 @@ pub struct App {
     /// drawn on a cleared screen: sixel and iTerm2 pictures drawn the old
     /// size would stay on it.
     cells_resized: bool,
+    /// When what's animated started (`Settings.animations`).
+    pub motion: Motion,
     /// TDLib is logging out (`:logout`, the session ended elsewhere, or
     /// leaving a QR login), and a new client takes over once it has closed.
     relogin: bool,
@@ -994,6 +1001,7 @@ impl App {
             shown_viewing: None,
             shown_in_viewer: None,
             cells_resized: false,
+            motion: Motion::default(),
             relogin: false,
             proxy_changes: BTreeMap::new(),
             exit: false,
@@ -1118,13 +1126,21 @@ impl App {
             // Wakes up to take the toast down, to go offline when idle, to
             // send notifications that had to wait, to search Telegram once
             // typing in the `s` picker pauses, to count down messages that
-            // self-destruct, and to follow a voice message playing.
+            // self-destruct, to follow a voice message playing, and to move
+            // what's animated on.
             let countdown = self
                 .open
                 .as_ref()
                 .and_then(|o| o.next_tick(SystemTime::now()))
                 .map(|left| Instant::now() + left);
             let playing = self.player.next_tick().map(|soon| Instant::now() + soon);
+            let open = self.open.as_ref().map(|o| o.chat_id);
+            let moving = self.motion.next_frame(Instant::now(), open);
+            let sliding = self
+                .toast
+                .as_ref()
+                .filter(|_| self.slides_toast())
+                .and_then(|t| motion::toast_frame(t.shown, t.until, Instant::now()));
             // And to cover what's shown only while open, once you're away.
             let away = self
                 .open
@@ -1134,6 +1150,8 @@ impl App {
             let wake = [
                 countdown,
                 playing,
+                moving,
+                sliding,
                 away,
                 self.toast.as_ref().map(|t| t.until),
                 self.online.then_some(self.last_input + IDLE_AFTER),
@@ -1206,6 +1224,14 @@ impl App {
                 self.focus_reported = true;
                 // Back at tuigram: what was waiting is on screen.
                 self.notifier.clear();
+                // And where the keys are, shown by lights round the pane,
+                // unless a popup has them.
+                if self.settings.animations
+                    && matches!(self.screen, Screen::Main)
+                    && !self.over_panes()
+                {
+                    self.motion.focused = Some(Instant::now());
+                }
             }
             Event::FocusLost => {
                 self.terminal_focused = false;
@@ -1807,13 +1833,27 @@ impl App {
                 if let Some(id) = ask {
                     self.ask_topic(id);
                 }
+                // Nobody sees a message come in while they're away or a
+                // popup is over the chat.
+                let seen = self.present() && !self.popup_open();
                 // While older messages are shown, new ones load with the rest.
                 if let Some(open) = self.open.as_mut().filter(|o| {
                     o.chat_id == u.message.chat_id
                         && o.at_newest
                         && (o.topic.is_none() || o.topic == topic)
                 }) {
+                    let (id, theirs) = (u.message.id, !u.message.is_outgoing);
                     open.insert(u.message);
+                    // Someone else's glows as it comes in, if it's in sight:
+                    // seen, and the view following the newest messages.
+                    let in_sight = seen && open.selected.is_none();
+                    // A theme whose bubbles are the background has none to
+                    // glow, so nothing wakes the run loop for it.
+                    let bubbles = self.colors.other_bubble != self.colors.bg;
+                    let glows = theirs && in_sight && bubbles && self.settings.animations;
+                    if glows && open.messages.contains_key(&id) {
+                        self.motion.arrived(open.chat_id, id, Instant::now());
+                    }
                 }
             }
             Update::ForumTopicInfo(u) => {
@@ -5670,8 +5710,15 @@ impl App {
         self.over_panes() || self.focus == Focus::Input
     }
 
+    /// The toast slides in and out. Not where sixel or iTerm2 pictures may
+    /// be under it: a picture's cells uncovered a frame at a time would
+    /// send it to the terminal again each frame, over the toast.
+    pub fn slides_toast(&self) -> bool {
+        self.settings.animations && !self.images.paints_over()
+    }
+
     /// A popup, a prompt or resize mode takes keys before the panes.
-    fn over_panes(&self) -> bool {
+    pub fn over_panes(&self) -> bool {
         self.popup_open() || self.prompt.is_some() || self.resizing.is_some()
     }
 
@@ -6095,10 +6142,22 @@ impl App {
     }
 
     fn show_toast(&mut self, title: &str, detail: &str) {
+        let now = Instant::now();
+        // One already up stays where it is, rather than slide in again: in
+        // place, or on its way out, from where it got to.
+        let shown = self
+            .toast
+            .as_ref()
+            .filter(|t| t.until > now)
+            .map_or(now, |t| {
+                let going = now.checked_sub(t.until - now).unwrap_or(t.shown);
+                t.shown.max(going)
+            });
         self.toast = Some(Toast {
             title: title.into(),
             detail: crate::messages::one_line(detail),
-            until: Instant::now() + TOAST_TIME,
+            shown,
+            until: now + TOAST_TIME,
         });
     }
 
@@ -6267,6 +6326,13 @@ impl App {
                 };
             }
             SettingsMenu::PILLS => settings.nerd_font = !settings.nerd_font,
+            SettingsMenu::ANIMATIONS => {
+                settings.animations = !settings.animations;
+                // Nothing left moving to wake the run loop for.
+                if !settings.animations {
+                    self.motion.stop();
+                }
+            }
             SettingsMenu::AFTER_SEND => settings.normal_after_send = !settings.normal_after_send,
             SettingsMenu::WRAP_COMPOSER => settings.wrap_composer = !settings.wrap_composer,
             SettingsMenu::SOUND_FOCUSED => {
@@ -6871,6 +6937,67 @@ mod tests {
         assert!(!after.accept_secret_chats, "{after:?}");
         assert!(!after.normal_after_send, "{after:?}");
         assert!(after.block_gaps, "{after:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn getting_focus_back_runs_lights_round_the_pane_with_the_keys() {
+        let dir = std::env::temp_dir().join(format!("tuigram-flash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        app.focus = Focus::Chats;
+        // The chat list's bottom left corner, where no light starts.
+        let corner = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            terminal.draw(|f| ui::draw(f, app)).unwrap();
+            terminal.backend().buffer()[(0, 18)].fg
+        };
+        assert_eq!(corner(&mut app), app.colors.accent);
+
+        app.on_terminal_event(Event::FocusLost);
+        assert_eq!(app.motion.focused, None);
+        app.on_terminal_event(Event::FocusGained);
+        assert!(app.motion.focused.is_some());
+        // Held at its start, however slowly the test runs.
+        app.motion.focused = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(corner(&mut app), app.colors.border, "not come round yet");
+
+        // With a popup up, the keys are in it, and the pane stays as it is.
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(corner(&mut app), app.colors.accent);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        app.motion.focused = None;
+        app.settings.animations = false;
+        app.on_terminal_event(Event::FocusGained);
+        assert_eq!(app.motion.focused, None, "turned off in ?");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_toast_replaced_while_up_stays_in_place() {
+        let dir = std::env::temp_dir().join(format!("tuigram-toast-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        app.show_toast("Copied", "first");
+        let shown = app.toast.as_ref().unwrap().shown;
+        app.show_toast("Copied", "second");
+        let toast = app.toast.as_ref().unwrap();
+        assert_eq!(toast.detail, "second");
+        assert_eq!(toast.shown, shown, "not sliding in again");
+
+        // One on its way out comes back in from where it got to.
+        let now = Instant::now();
+        let until = now + motion::SLIDE / 2;
+        app.toast.as_mut().unwrap().until = until;
+        let out = motion::toast_out(shown, until, now);
+        app.show_toast("Copied", "third");
+        let back = motion::toast_out(app.toast.as_ref().unwrap().shown, until + TOAST_TIME, now);
+        assert!((back - out).abs() < 0.1, "{out} then {back}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

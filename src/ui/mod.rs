@@ -63,6 +63,7 @@ mod chat_list;
 mod help;
 mod info;
 mod messages;
+mod motion;
 mod qr;
 mod select;
 mod stickers;
@@ -428,6 +429,7 @@ fn draw_qr_login(frame: &mut Frame, login: &Login, code: Vec<Line<'static>>, col
 }
 
 fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
+    let now = tokio::time::Instant::now();
     let [body, status] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
     let list_width = Constraint::Percentage(app.settings.list_width());
@@ -480,6 +482,12 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         gaps: app.settings.chat_gaps,
     };
     chat_list::draw(frame, list_area, &list, &mut app.images, colors);
+    // The pane with the keys, for the lights round it.
+    let mut keys_in = match app.focus {
+        Focus::Chats => Some(list_area),
+        Focus::Topics => topics_area,
+        Focus::Messages | Focus::Input => None,
+    };
     if let (Some(area), Some(forum)) = (topics_area, &app.forum) {
         let names = messages::Names {
             users: &app.users,
@@ -540,6 +548,9 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             ])
             .areas(chat_area);
             let playing = app.player.playback(open.chat_id);
+            // Empty with animations off: nothing is added then, and turning
+            // them off clears what was (`Motion::stop`).
+            let glowing = app.motion.glowing(open.chat_id, now);
             // A topic opened from a link may not be loaded yet: its name
             // shows as "…" until it is.
             let loading = open
@@ -564,6 +575,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 colors,
                 app.settings.block_gaps,
                 playing,
+                &glowing,
             );
             if let Some(panel) = panel {
                 stickers::draw(frame, panel_area, panel, &mut app.images, colors);
@@ -584,6 +596,12 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 popup_over_chat,
                 colors,
             );
+            match app.focus {
+                Focus::Messages => keys_in = Some(history),
+                Focus::Input if panel_rows > 0 => keys_in = Some(panel_area),
+                Focus::Input => keys_in = Some(composer),
+                Focus::Chats | Focus::Topics => {}
+            }
         }
         None => frame.render_widget(
             Paragraph::new(match app.forum {
@@ -595,6 +613,17 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             .block(bordered(colors).border_style(border(false, colors))),
             chat_area,
         ),
+    }
+    // Under the popups, drawn next. With one up, the keys are in it, and
+    // where there's no pane to go round either, the lights stop rather
+    // than keep the run loop drawing frames for them.
+    if let Some(elapsed) = app.motion.lights(now) {
+        match keys_in {
+            Some(area) if app.settings.animations && !app.over_panes() => {
+                motion::lights(frame.buffer_mut(), area, elapsed, colors);
+            }
+            _ => app.motion.focused = None,
+        }
     }
     if suggesting && let (Some(composer), Some(completion)) = (suggestions_at, &app.completion) {
         draw_suggestions(frame, composer, completion, colors);
@@ -610,6 +639,15 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     if let Some(prompt) = app.prompt.as_ref().filter(|p| !p.completions.is_empty()) {
         draw_completions(frame, body, &prompt.completions, colors);
     }
+    // Popups fade in over what they come up over. Not the photo viewer: a
+    // changed cell would send its picture to the terminal again.
+    // Told whether one is up even with animations off, so turning them on
+    // in `?` doesn't fade the popup it's in again.
+    let up = app.popup_open();
+    let fading = app
+        .motion
+        .popup(up, app.settings.animations && app.photo_view.is_none(), now);
+    let under = fading.map(|_| frame.buffer_mut().clone());
     if let Some(menu) = &app.menu {
         draw_menu(frame, chat_area, menu, colors);
     }
@@ -687,13 +725,21 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             colors,
         );
     }
+    if let (Some(elapsed), Some(under)) = (fading, under) {
+        motion::fade_in(frame.buffer_mut(), &under, elapsed);
+    }
     if let Some(toast) = &app.toast {
-        draw_toast(frame, toast, colors);
+        let out = match app.slides_toast() {
+            true => crate::motion::toast_out(toast.shown, toast.until, now),
+            false => 0.0,
+        };
+        draw_toast(frame, toast, out, colors);
     }
 }
 
-/// The toast: bottom right, just above the status bar.
-fn draw_toast(frame: &mut Frame, toast: &Toast, colors: &Colors) {
+/// The toast: bottom right, just above the status bar. `out` of the way
+/// (0 to 1) out of sight to the right, as it slides in and out.
+fn draw_toast(frame: &mut Frame, toast: &Toast, out: f32, colors: &Colors) {
     let area = frame.area();
     let rows = if toast.detail.is_empty() { 1 } else { 2 };
     let text = toast.title.width().max(toast.detail.width()) as u16;
@@ -718,8 +764,34 @@ fn draw_toast(frame: &mut Frame, toast: &Toast, colors: &Colors) {
             Line::from(format!("   {}", truncate(&toast.detail, inner_width))).fg(colors.subtle),
         );
     }
-    frame.render_widget(Cover, rect);
-    frame.render_widget(Paragraph::new(lines).block(block), rect);
+    // Drawn aside whole, then as much of it as is still in the window,
+    // moved right by `out` of its width and the gap after it.
+    let mut drawn = Buffer::empty(Rect { x: 0, y: 0, ..rect });
+    Paragraph::new(lines)
+        .block(block)
+        .render(drawn.area, &mut drawn);
+    let x = rect.x + (out * f32::from(width + 1)).round() as u16;
+    let shown = Rect {
+        x,
+        width: area.right().saturating_sub(x).min(width),
+        ..rect
+    };
+    if shown.is_empty() {
+        return;
+    }
+    frame.render_widget(Cover, shown);
+    let buf = frame.buffer_mut();
+    for dy in 0..shown.height {
+        for dx in 0..shown.width {
+            buf[(shown.x + dx, shown.y + dy)] = drawn[(dx, dy)].clone();
+        }
+        // A two-column character cut by the window's edge would wrap onto
+        // the next row in the terminal and stay there, unknown to the diff.
+        let last = &mut buf[(shown.right() - 1, shown.y + dy)];
+        if shown.width < width && last.symbol().width() > 1 {
+            last.set_symbol(" ");
+        }
+    }
 }
 
 /// The `d` popup over the message pane: the message, then how to delete it.
@@ -1379,6 +1451,12 @@ fn draw_settings(
         SettingsMenu::PILLS,
         check(colors.pills),
         "Round pills (needs a Nerd Font)",
+    );
+    add(
+        &mut lines,
+        SettingsMenu::ANIMATIONS,
+        check(settings.animations),
+        "Animations (lights on focus, popups, toasts, new messages)",
     );
     lines.push(Line::default());
     lines.push(heading(" Composer"));
@@ -2987,13 +3065,17 @@ mod tests {
     #[test]
     fn a_toast_says_what_was_copied_in_the_corner() {
         let colors = Colors::default();
+        let now = tokio::time::Instant::now();
         let toast = Toast {
             title: "Copied".into(),
             detail: "https://example.com/a".into(),
-            until: tokio::time::Instant::now(),
+            shown: now,
+            until: now,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
-        terminal.draw(|f| draw_toast(f, &toast, &colors)).unwrap();
+        terminal
+            .draw(|f| draw_toast(f, &toast, 0.0, &colors))
+            .unwrap();
         let buf = terminal.backend().buffer();
         let rows = buffer_rows(buf);
 
@@ -3003,6 +3085,25 @@ mod tests {
         assert!(rows[18].trim_end().ends_with('╯'), "rounded corner");
         assert!(rows[19].trim().is_empty());
         assert_eq!(buf[(78, 18)].fg, colors.success);
+        let left = rows[15].find('╭').unwrap();
+
+        // Sliding in, it's cut at the window's edge, not squeezed.
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|f| draw_toast(f, &toast, 0.5, &colors))
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+        let slid = rows[15].find('╭').unwrap();
+        assert!(slid > left, "moved right");
+        assert!(!rows[18].contains('╯'), "its right end out of sight");
+        assert!(rows[16].contains('✓'), "{}", rows[16]);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|f| draw_toast(f, &toast, 1.0, &colors))
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+        assert!(rows.iter().all(|r| r.trim().is_empty()), "all the way out");
     }
 
     #[test]

@@ -204,7 +204,12 @@ async fn show(dir: &Path) -> Result<()> {
             break Err(e.into());
         }
         app.images.fetch(&tg);
+        // Popups fade in here too.
+        let open = app.open.as_ref().map(|o| o.chat_id);
+        let frame_at = app.motion.next_frame(tokio::time::Instant::now(), open);
         tokio::select! {
+            _ = tokio::time::sleep_until(frame_at.unwrap_or_else(tokio::time::Instant::now)),
+                if frame_at.is_some() => {}
             Some(event) = image_rx.recv() => app.images.on_built(event),
             Some(event) = keys.next() => match event {
                 Ok(Event::Key(key)) => {

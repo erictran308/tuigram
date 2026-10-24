@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use chrono::{Datelike, Local, TimeZone};
 use ratatui::Frame;
@@ -155,6 +155,7 @@ pub fn draw(
     colors: &Colors,
     block_gaps: bool,
     playing: Option<Playback>,
+    glowing: &[(i64, Duration)],
 ) {
     let chat = names.chats.get(open.chat_id);
     let secret = names.chats.secret(open.chat_id);
@@ -328,8 +329,55 @@ pub fn draw(
         height: r.height - pad,
         ..r
     };
+    let shown_rows = visible.len();
     frame.render_widget(Paragraph::new(visible), shift(body));
-    draw_photos(frame, shift(body), &photos, first, images, covered, colors);
+    // New messages glow, but not where pictures go. Only the pictures in
+    // sight are looked at, since every cell of a glowing bubble asks.
+    let pane = shift(body);
+    let in_sight: Vec<&PhotoSlot> = photos
+        .iter()
+        .filter(|p| p.line < first + shown_rows && p.line + usize::from(p.rows) > first)
+        .collect();
+    let picture = |x: u16, y: u16| {
+        let (row, col) = (first + usize::from(y - pane.y), x - pane.x);
+        in_sight.iter().any(|p| {
+            (p.line..p.line + usize::from(p.rows)).contains(&row)
+                && (p.x..p.x + p.cols).contains(&col)
+        })
+    };
+    // Each photo of an album that came in glows the same bubble: the first
+    // to come, furthest into glowing, is the one drawn.
+    let mut glowed = Vec::new();
+    for &(id, elapsed) in glowing {
+        // An album is one bubble, caption and all, so all of it glows.
+        let album = open.messages.get(&id).map_or(0, |m| m.album);
+        let in_bubble = |p: &&Placed| {
+            p.id == id || album != 0 && open.messages.get(&p.id).is_some_and(|m| m.album == album)
+        };
+        let rows = placed
+            .iter()
+            .filter(in_bubble)
+            .map(|p| (p.bubble_start, p.end))
+            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
+        let Some((start, end)) = rows else {
+            continue;
+        };
+        if glowed.contains(&start) {
+            continue;
+        }
+        glowed.push(start);
+        let on_screen = start.max(first)..end.min(first + shown_rows);
+        if on_screen.is_empty() {
+            continue;
+        }
+        let rows = Rect {
+            y: pane.y + (on_screen.start - first) as u16,
+            height: on_screen.len() as u16,
+            ..pane
+        };
+        super::motion::glow(frame.buffer_mut(), rows, picture, elapsed, colors);
+    }
+    draw_photos(frame, pane, &photos, first, images, covered, colors);
 
     let gutters = [shift(left), shift(right)];
     // The message being answered or edited stays marked while writing.
@@ -1943,6 +1991,7 @@ mod tests {
                     colors,
                     Settings::default().block_gaps,
                     playing,
+                    &[],
                 )
             })
             .unwrap();
@@ -2415,6 +2464,7 @@ mod tests {
                         &colors,
                         true,
                         None,
+                        &[],
                     )
                 })
                 .unwrap();
@@ -3484,6 +3534,7 @@ mod tests {
                     &colors,
                     true,
                     None,
+                    &[],
                 )
             })
             .unwrap();
@@ -3499,6 +3550,97 @@ mod tests {
         assert_ne!(buf[(date, y as u16)].fg, colors.muted, "someone's name");
     }
 
+    #[test]
+    fn a_message_that_just_came_glows_and_the_others_dont() {
+        let mut open = OpenChat::new(42);
+        let at = 1_790_086_500;
+        open.messages.insert(1, msg(false, at, "older one"));
+        open.messages.insert(2, msg(false, at + 60, "just came"));
+        let chats = Chats::default();
+        let users = HashMap::new();
+        let names = Names {
+            users: &users,
+            chats: &chats,
+        };
+        let colors = Colors::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(
+                    f,
+                    f.area(),
+                    &mut open,
+                    None,
+                    &names,
+                    &mut images(),
+                    false,
+                    false,
+                    &colors,
+                    true,
+                    None,
+                    &[(2, Duration::ZERO)],
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows = rows_of(buf);
+        let bg_at = |text: &str| {
+            let y = rows.iter().position(|r| r.contains(text)).unwrap();
+            buf[(rows[y].find(text).unwrap() as u16, y as u16)].bg
+        };
+        assert_eq!(bg_at("older one"), colors.other_bubble);
+        assert_ne!(bg_at("just came"), colors.other_bubble, "glowing");
+    }
+
+    #[test]
+    fn a_whole_album_glows_caption_and_all() {
+        let mut open = OpenChat::new(42);
+        for id in [1, 2] {
+            let caption = if id == 2 { "our trip" } else { "" };
+            let mut photo = msg(false, 1_790_000_000, caption);
+            photo.album = 7;
+            photo.preview = Some(Preview {
+                file_id: id as i32,
+                width: 100,
+                height: 100,
+                thumbnail: None,
+                sticker: false,
+            });
+            open.messages.insert(id, photo);
+        }
+        let chats = Chats::default();
+        let users = HashMap::new();
+        let names = Names {
+            users: &users,
+            chats: &chats,
+        };
+        let colors = Colors::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(
+                    f,
+                    f.area(),
+                    &mut open,
+                    None,
+                    &names,
+                    &mut images(),
+                    false,
+                    false,
+                    &colors,
+                    true,
+                    None,
+                    // The first photo came first; the caption is the last's.
+                    &[(1, Duration::ZERO)],
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows = rows_of(buf);
+        let y = rows.iter().position(|r| r.contains("our trip")).unwrap();
+        let x = rows[y].find("our trip").unwrap() as u16;
+        assert_ne!(buf[(x, y as u16)].bg, colors.other_bubble, "{rows:#?}");
+    }
     #[test]
     fn a_long_chat_name_is_cut_so_telegrams_verdict_still_shows() {
         use crate::chats::{Badge, Peer};

@@ -277,13 +277,28 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
     let tint = if is_dark(p("bg")) { 0.3 } else { 0.2 };
     let own_bubble = role("own_bubble", mix(p("bg"), p("blue"), tint))?;
     let other_bubble = role("other_bubble", p("surface"))?;
+    let bg = role("bg", p("bg"))?;
+    let fg = role("fg", p("fg"))?;
+    let accent = role("accent", p("accent"))?;
+    // The lights round the pane in use: the accent, as far from the
+    // background as it goes, white on a dark one and black on a light one.
+    let far = if is_dark(bg) {
+        rgb(0xffffff)
+    } else {
+        rgb(0x000000)
+    };
+    let light = match accent {
+        Color::Rgb(..) => mix(accent, far, 0.8),
+        _ => fg,
+    };
     let colors = Colors {
-        bg: role("bg", p("bg"))?,
-        fg: role("fg", p("fg"))?,
+        bg,
+        fg,
         subtle: role("subtle", p("subtext"))?,
         muted: role("muted", p("comment"))?,
         border: role("border", p("overlay"))?,
-        accent: role("accent", p("accent"))?,
+        accent,
+        light: role("light", light)?,
         selection: role("selection", p("surface"))?,
         popup_bg: role("popup_bg", p("bg_alt"))?,
         primary: role("primary", p("blue"))?,
@@ -334,6 +349,9 @@ pub struct Colors {
     pub border: Color,
     /// Focused borders, cursors, popups.
     pub accent: Color,
+    /// The heads of the lights that run round the pane in use when the
+    /// window gets focus.
+    pub light: Color,
     /// Background of the highlighted row in a list.
     pub selection: Color,
     pub popup_bg: Color,
@@ -462,7 +480,7 @@ const fn rgb(hex: u32) -> Color {
 }
 
 /// `a` moved `amount` (0 to 1) of the way towards `b`.
-fn mix(a: Color, b: Color, amount: f32) -> Color {
+pub(crate) fn mix(a: Color, b: Color, amount: f32) -> Color {
     let (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) = (a, b) else {
         return a;
     };
