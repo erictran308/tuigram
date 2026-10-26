@@ -4345,12 +4345,17 @@ impl App {
         {
             match msg.state {
                 SendState::Sent => {
+                    // In an album, the caption and its links are on the
+                    // photo sent with it, which may not be this one.
+                    let Some((_, captioned)) = open.caption_holder() else {
+                        return;
+                    };
                     self.button_menu = Some(ButtonMenu::new(
                         id,
                         msg.snippet(),
                         keyboard,
                         openable_file(msg),
-                        &msg.links,
+                        &captioned.links,
                     ));
                 }
                 _ => self.status = Some("Wait until it's sent".into()),
@@ -4365,7 +4370,12 @@ impl App {
         };
         let file = openable_file(msg).map(|file| file_target(id, msg, file.clone()));
         let mut targets: Vec<Target> = file.into_iter().collect();
-        targets.extend(msg.links.iter().cloned().map(Target::Link));
+        // In an album, the caption and its links are on the photo sent with
+        // it, which may not be the one under the cursor.
+        let Some((_, captioned)) = open.caption_holder() else {
+            return;
+        };
+        targets.extend(captioned.links.iter().cloned().map(Target::Link));
         match targets.len() {
             0 if opens_once(msg) => {
                 self.status = Some(format!(
@@ -5810,15 +5820,20 @@ impl App {
         let Some(msg) = open.cursor_id().and_then(|id| open.messages.get(&id)) else {
             return;
         };
-        if let Some(why) = viewer::cant_copy(msg) {
+        // In an album, the caption and its links are on the photo sent with
+        // it, which may not be the one under the cursor.
+        let Some((_, captioned)) = open.caption_holder() else {
+            return;
+        };
+        if let Some(why) = viewer::cant_copy(msg).or_else(|| viewer::cant_copy(captioned)) {
             self.status = Some(why.into());
             return;
         }
         let mut targets = Vec::new();
-        if !msg.source_text.is_empty() {
-            targets.push(Target::Text(msg.source_text.clone()));
+        if !captioned.source_text.is_empty() {
+            targets.push(Target::Text(captioned.source_text.clone()));
         }
-        targets.extend(msg.links.iter().cloned().map(Target::Link));
+        targets.extend(captioned.links.iter().cloned().map(Target::Link));
         targets.extend(
             msg.file
                 .clone()
@@ -5845,10 +5860,7 @@ impl App {
         let Some(open) = self.open.as_mut() else {
             return;
         };
-        let Some(id) = open.edit_target() else {
-            return;
-        };
-        let Some(msg) = open.messages.get(&id) else {
+        let Some((id, msg)) = open.caption_holder() else {
             return;
         };
         if let Some(why) = viewer::cant_copy(msg) {
@@ -10073,6 +10085,76 @@ mod tests {
             "names its message"
         );
         assert!(app.opening.is_empty());
+    }
+
+    #[test]
+    fn enter_and_y_on_any_photo_of_an_album_offer_the_links_of_its_caption() {
+        let mut app = test_app("album-links");
+        app.focus = Focus::Messages;
+        let first = plain_message(&mut app);
+        let second = {
+            let open = app.open.as_ref().unwrap();
+            let next = open.messages.range(first + 1..).next();
+            *next.unwrap().0
+        };
+        make_photo(&mut app, first, 50);
+        make_photo(&mut app, second, 60);
+        let open = app.open.as_mut().unwrap();
+        for id in [first, second] {
+            let msg = open.messages.get_mut(&id).unwrap();
+            msg.album = 7;
+            msg.state = SendState::Sent;
+            msg.source_text.clear();
+            msg.poll = None;
+            msg.keyboard = None;
+            msg.styles.clear();
+        }
+        // The caption, and its links, are on the photo sent with it.
+        let captioned = open.messages.get_mut(&first).unwrap();
+        captioned.source_text = "see https://x.dev".into();
+        captioned.links = vec![Link {
+            url: "https://x.dev".into(),
+            disguise: None,
+        }];
+        open.selected = Some(second);
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let menu = app.menu.take().expect("the photo and the caption's link");
+        assert!(
+            matches!(&menu.targets[..], [Target::Photo { message_id, .. }, Target::Link(l)]
+                if *message_id == second && l.url == "https://x.dev"),
+            "the photo under the cursor, and the link"
+        );
+        assert!(app.photo_view.is_none(), "nothing opens instead");
+
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        let menu = app
+            .menu
+            .take()
+            .expect("the caption, its link and the photo");
+        assert!(
+            matches!(&menu.targets[..], [Target::Text(t), Target::Link(_), Target::File(f)]
+                if t == "see https://x.dev" && f.id == 61),
+            "the caption's text and link, then the photo under the cursor (61), not the captioned one (51)"
+        );
+
+        // A bot's buttons on the photo list the caption's link after them.
+        let open = app.open.as_mut().unwrap();
+        open.messages.get_mut(&second).unwrap().keyboard = Some(crate::buttons::Keyboard {
+            rows: vec![vec![crate::buttons::Button {
+                label: "Like".into(),
+                press: crate::buttons::Press::Callback(String::new()),
+            }]],
+            reply: false,
+        });
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let menu = app.button_menu.as_ref().expect("the bot's buttons");
+        assert!(
+            menu.rows.iter().flatten().any(
+                |b| matches!(&b.press, crate::buttons::Press::Open(l) if l.url == "https://x.dev")
+            ),
+            "the caption's link is among them"
+        );
     }
 
     #[test]

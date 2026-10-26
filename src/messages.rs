@@ -1416,6 +1416,13 @@ impl OpenChat {
         }
     }
 
+    /// The message whose caption the bubble under the cursor shows, and so
+    /// whose text and links count for it: [`Self::edit_target`]'s.
+    pub fn caption_holder(&self) -> Option<(i64, &Msg)> {
+        let id = self.edit_target()?;
+        self.messages.get(&id).map(|msg| (id, msg))
+    }
+
     /// The message under the cursor: the selected one, else the newest.
     pub fn cursor_id(&self) -> Option<i64> {
         self.selected.or_else(|| self.newest_id())
