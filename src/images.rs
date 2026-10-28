@@ -9,19 +9,22 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Result;
 use image::imageops::FilterType;
 use image::{DynamicImage, RgbaImage};
 use ratatui::layout::Size;
-use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::picker::cap_parser::Parser;
+use ratatui_image::picker::{Capability, Picker, ProtocolType};
+use ratatui_image::protocol::kitty::Kitty;
 use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FontSize, Resize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chats::ChatPhoto;
 use crate::messages::Preview;
+use crate::term::{self, Terminal};
 use crate::tg::Tg;
 
 /// Scale both ways (`Fit` never enlarges, which would leave the tiny thumbnail
@@ -88,12 +91,101 @@ const MAX_READY: usize = 200;
 /// asks for photos this big.
 const LARGE_CELLS: u32 = 40 * 16;
 
-/// Of those, at most this many are kept. Each can take tens of MB (kitty's
-/// keeps all it sent), and the viewer shows one at a time.
+/// Of those, at most this many are kept. Each can take tens of MB (a kitty
+/// encode keeps the code it sent, the whole image), and the viewer shows one
+/// at a time.
 const MAX_LARGE: usize = 4;
 
 fn large(key: &Key) -> bool {
     u32::from(key.cols) * u32::from(key.rows) > LARGE_CELLS
+}
+
+/// What the photos kept may take in a terminal speaking kitty's protocol, in
+/// bytes of pixels. Such a terminal keeps every image it's sent until told
+/// to delete it, and past its quota (320 MB in kitty and Ghostty) it drops
+/// the ones sent first: the chat photos, sent once at startup and never
+/// again, which then leave blanks in the list. Half the quota leaves room
+/// for those (at most [`MAX_AVATARS`], tens of KB each).
+const KITTY_BUDGET: usize = 160_000_000;
+
+/// Numbers of kitty images dropped since the terminal was last told; see
+/// [`Images::send_deletions`].
+type Dropped = Arc<Mutex<Vec<u32>>>;
+
+/// An image sent with kitty's protocol: the number the terminal knows it by
+/// and the bytes it takes there. Dropping it, wherever that happens, adds
+/// its number to those the terminal is told to delete.
+struct KittyImage {
+    id: u32,
+    bytes: usize,
+    dropped: Dropped,
+}
+
+impl Drop for KittyImage {
+    fn drop(&mut self) {
+        self.dropped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(self.id);
+    }
+}
+
+/// An image encoded for the terminal.
+struct Encoded {
+    image: SlicedProtocol,
+    kitty: Option<KittyImage>,
+}
+
+impl Encoded {
+    fn kitty_bytes(&self) -> usize {
+        self.kitty.as_ref().map_or(0, |k| k.bytes)
+    }
+}
+
+/// `image` encoded to fill `size` cells. With kitty's protocol it's sent as
+/// the image numbered by `kitty`, picked here rather than by the picker, so
+/// it can be deleted from the terminal once it's dropped.
+fn encode(
+    picker: &Picker,
+    image: DynamicImage,
+    size: Size,
+    kitty: Option<(u32, Dropped)>,
+) -> Result<Encoded> {
+    let Some((id, dropped)) = kitty else {
+        let image = SlicedProtocol::new_with_resize(picker, image, size, RESIZE)?;
+        return Ok(Encoded { image, kitty: None });
+    };
+    // As the picker's `new_protocol` does with a `Resize::Scale`, which
+    // always resizes.
+    let font = picker.font_size();
+    let size = RESIZE.size_for(&image, font, size);
+    let image = RESIZE.resize(&image, font, size, None);
+    let bytes = image.width() as usize * image.height() as usize * 4;
+    let compress = picker
+        .capabilities()
+        .contains(&Capability::KittyCompression);
+    let image = Kitty::new(image, size, id, picker.tmux_detected(), compress)?;
+    Ok(Encoded {
+        image: SlicedProtocol::Kitty(image),
+        kitty: Some(KittyImage { id, bytes, dropped }),
+    })
+}
+
+/// Where numbers for kitty's images start: at random, as the picker's own
+/// are, since every program drawing in the terminal's window shares them
+/// (two tuigrams in panes of one tmux), and one's deletions mustn't take
+/// the other's pictures.
+fn kitty_id_base() -> u32 {
+    use std::hash::{BuildHasher, RandomState};
+    RandomState::new().hash_one(std::process::id()) as u32
+}
+
+/// The code that has the terminal delete image number `id` of kitty's
+/// protocol. `I` deletes the image itself, not only where it's placed;
+/// `q=2` asks for no answer, which would come in as keys.
+fn kitty_delete(id: u32, tmux: bool) -> String {
+    let (start, escape, end) = Parser::tmux_start_escape_end(tmux);
+    format!("{start}{escape}_Ga=d,d=I,i={id},q=2{escape}\\{end}")
 }
 
 thread_local! {
@@ -166,7 +258,7 @@ pub struct ImageEvent {
     /// [`Images::generation`] when it was started.
     generation: u64,
     /// The encoded image, and the size in pixels it was decoded at.
-    result: Result<(SlicedProtocol, (u32, u32))>,
+    result: Result<(Encoded, (u32, u32))>,
 }
 
 enum FileState {
@@ -177,7 +269,7 @@ enum FileState {
 
 /// An encoded chat photo.
 struct Avatar {
-    image: SlicedProtocol,
+    image: Encoded,
     /// When it was last drawn, in calls to [`Images::avatar`].
     used: u64,
     /// It has been drawn. Kitty's protocol sends an image to the terminal
@@ -236,7 +328,7 @@ pub struct Images {
     measured: Option<FontSize>,
     tx: UnboundedSender<ImageEvent>,
     /// Encoded photos, with the frame each was last drawn in.
-    ready: HashMap<Key, (SlicedProtocol, u64)>,
+    ready: HashMap<Key, (Encoded, u64)>,
     /// Counts frames, for `ready`.
     frame: u64,
     /// Goes up when the files are forgotten, for a new TDLib client: an
@@ -262,6 +354,12 @@ pub struct Images {
     wanted: Vec<(Preview, u16, u16)>,
     /// Chat photos the last frame showed, with their size.
     wanted_avatars: Vec<(ChatPhoto, u16, u16)>,
+    /// The number the last image built for kitty's protocol was given.
+    kitty_id: u32,
+    /// Images dropped since the terminal was last told.
+    dropped: Dropped,
+    /// See [`KITTY_BUDGET`]; smaller in tests.
+    kitty_budget: usize,
 }
 
 impl Images {
@@ -282,6 +380,9 @@ impl Images {
             pixels: HashMap::new(),
             wanted: Vec::new(),
             wanted_avatars: Vec::new(),
+            kitty_id: kitty_id_base(),
+            dropped: Dropped::default(),
+            kitty_budget: KITTY_BUDGET,
         }
     }
 
@@ -338,8 +439,7 @@ impl Images {
         picker.set_protocol_type(protocol);
         self.picker = picker;
         self.generation += 1;
-        self.ready.clear();
-        self.avatars.clear();
+        self.drop_all();
         true
     }
 
@@ -356,9 +456,9 @@ impl Images {
             .into_iter()
             .find(|k| self.ready.contains_key(k))?;
         let frame = self.frame;
-        let (image, used) = self.ready.get_mut(&key)?;
+        let (encoded, used) = self.ready.get_mut(&key)?;
         *used = frame;
-        Some(image)
+        Some(&encoded.image)
     }
 
     /// Like [`get`](Self::get), but only the photo itself, not its blurry
@@ -372,9 +472,9 @@ impl Images {
             avatar: false,
         };
         let frame = self.frame;
-        let (image, used) = self.ready.get_mut(&key)?;
+        let (encoded, used) = self.ready.get_mut(&key)?;
         *used = frame;
-        Some(image)
+        Some(&encoded.image)
     }
 
     /// The photo's file is downloaded.
@@ -420,7 +520,7 @@ impl Images {
         let avatar = self.avatars.get_mut(&key)?;
         avatar.used = self.avatar_clock;
         avatar.shown = true;
-        Some(&avatar.image)
+        Some(&avatar.image.image)
     }
 
     /// Called while drawing, for each chat photo on screen.
@@ -561,31 +661,51 @@ impl Images {
         photo
     }
 
-    fn add_ready(&mut self, key: Key, image: SlicedProtocol) {
+    fn add_ready(&mut self, key: Key, image: Encoded) {
+        // One it replaces counts no more.
+        self.ready.remove(&key);
         while large(&key)
             && self.ready.keys().filter(|k| large(k)).count() >= MAX_LARGE
-            && let Some(oldest) = self
-                .ready
-                .iter()
-                .filter(|(k, _)| large(k))
-                .min_by_key(|(_, (_, used))| *used)
-                .map(|(&k, _)| k)
+            && let Some(oldest) = self.least_used(|k, _| large(k))
         {
             self.ready.remove(&oldest);
         }
         if self.ready.len() >= MAX_READY
+            && let Some(oldest) = self.least_used(|_, _| true)
+        {
+            self.ready.remove(&oldest);
+        }
+        // Those the last frame drew stay, or the next would build them again
+        // and drop others it shows, frame after frame. Window-sized ones go
+        // first: they free the most, and the viewer shows one at a time, so
+        // zooming in it doesn't take the bubbles' photos behind it.
+        let shown = self.frame.saturating_sub(1);
+        while self.kitty_bytes() + image.kitty_bytes() > self.kitty_budget
             && let Some(oldest) = self
-                .ready
-                .iter()
-                .min_by_key(|(_, (_, used))| *used)
-                .map(|(&k, _)| k)
+                .least_used(|k, used| large(k) && used < shown)
+                .or_else(|| self.least_used(|_, used| used < shown))
         {
             self.ready.remove(&oldest);
         }
         self.ready.insert(key, (image, self.frame));
     }
 
-    fn add_avatar(&mut self, key: Key, image: SlicedProtocol) {
+    /// The photo drawn longest ago of those `which` takes, by its key and
+    /// the frame it was last drawn in.
+    fn least_used(&self, which: impl Fn(&Key, u64) -> bool) -> Option<Key> {
+        self.ready
+            .iter()
+            .filter(|&(key, &(_, used))| which(key, used))
+            .min_by_key(|(_, (_, used))| *used)
+            .map(|(&key, _)| key)
+    }
+
+    /// What the photos kept take in a terminal speaking kitty's protocol.
+    fn kitty_bytes(&self) -> usize {
+        self.ready.values().map(|(e, _)| e.kitty_bytes()).sum()
+    }
+
+    fn add_avatar(&mut self, key: Key, image: Encoded) {
         if self.avatars.len() >= MAX_AVATARS
             && let Some(oldest) = self
                 .avatars
@@ -609,11 +729,37 @@ impl Images {
         self.ready.clear();
     }
 
+    /// Drops every encoded image, chat photos too, as tuigram quits: a
+    /// terminal speaking kitty's protocol would keep them after it's gone.
+    pub fn drop_all(&mut self) {
+        self.ready.clear();
+        self.avatars.clear();
+    }
+
+    /// Has a terminal speaking kitty's protocol delete the images dropped
+    /// since it was last told, freeing what they took there; see
+    /// [`KITTY_BUDGET`]. Called before each frame, ahead of any image it
+    /// sends.
+    pub fn send_deletions(&mut self, terminal: &mut Terminal) {
+        if let Some(code) = self.deletions() {
+            let _ = term::send(terminal, &code);
+        }
+    }
+
+    /// The code [`send_deletions`](Self::send_deletions) sends.
+    fn deletions(&mut self) -> Option<String> {
+        let ids = std::mem::take(&mut *self.dropped.lock().unwrap_or_else(PoisonError::into_inner));
+        if ids.is_empty() {
+            return None;
+        }
+        let tmux = self.picker.tmux_detected();
+        Some(ids.into_iter().map(|id| kitty_delete(id, tmux)).collect())
+    }
+
     /// Forgets every file, for a new TDLib client: it numbers files afresh.
     pub fn forget_files(&mut self) {
         self.generation += 1;
-        self.ready.clear();
-        self.avatars.clear();
+        self.drop_all();
         self.failed.clear();
         self.files.clear();
         self.pixels.clear();
@@ -654,12 +800,13 @@ impl Images {
             .insert((generation, key), std::time::Instant::now());
         let picker = self.picker.clone();
         let tx = self.tx.clone();
+        let kitty = self.next_kitty();
         tokio::task::spawn_blocking(move || {
             let result = contained(|| {
                 decode().and_then(|image| {
                     let pixels = (image.width(), image.height());
                     let size = Size::new(key.cols, key.rows);
-                    let image = SlicedProtocol::new_with_resize(&picker, image, size, RESIZE)?;
+                    let image = encode(&picker, image, size, kitty)?;
                     Ok((image, pixels))
                 })
             });
@@ -671,10 +818,21 @@ impl Images {
         });
     }
 
+    /// A number for the next image built with kitty's protocol, and where
+    /// it goes once that image is dropped.
+    fn next_kitty(&mut self) -> Option<(u32, Dropped)> {
+        (self.picker.protocol_type() == ProtocolType::Kitty).then(|| {
+            // Never 0, which kitty's protocol takes as no number.
+            self.kitty_id = self.kitty_id.wrapping_add(1).max(1);
+            (self.kitty_id, self.dropped.clone())
+        })
+    }
+
     #[cfg(test)]
     pub fn insert_ready(&mut self, key: Key, image: image::DynamicImage) {
         let size = Size::new(key.cols, key.rows);
-        let image = SlicedProtocol::new_with_resize(&self.picker, image, size, RESIZE).unwrap();
+        let kitty = self.next_kitty();
+        let image = encode(&self.picker, image, size, kitty).unwrap();
         if key.avatar {
             self.add_avatar(key, image);
         } else {
@@ -958,6 +1116,132 @@ mod tests {
         assert!(images.get(&photo, 4, 2).is_some(), "read by its contents");
         assert_eq!(size(images.measured_photo(&photo)), (80, 60));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Images for a terminal speaking kitty's protocol, its numbers from 1.
+    fn kitty() -> Images {
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let mut images = Images::new(picker, tokio::sync::mpsc::unbounded_channel().0);
+        images.kitty_id = 0;
+        images
+    }
+
+    /// 4 × 2 cells of 10 × 20 px.
+    fn photo() -> DynamicImage {
+        DynamicImage::new_rgba8(40, 40)
+    }
+
+    fn delete(id: u32) -> String {
+        format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
+    }
+
+    #[test]
+    fn a_kitty_terminal_is_told_to_delete_the_photos_dropped_by_the_number_they_were_sent_as() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+        use ratatui_image::sliced::{SignedPosition, SlicedImage};
+
+        let mut images = kitty();
+        images.insert_ready(key(7), photo());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
+        let image = images.get(&preview(7), 4, 2).unwrap();
+        SlicedImage::new(image, SignedPosition::from((0, 0))).render(buf.area, &mut buf);
+        assert!(buf[(0, 0)].symbol().contains("i=1,a=T"), "sent as 1");
+        assert_eq!(images.deletions(), None, "nothing dropped yet");
+
+        images.clear();
+        assert_eq!(images.deletions(), Some(delete(1)));
+        assert_eq!(images.deletions(), None, "told once");
+    }
+
+    #[test]
+    fn chat_photos_are_deleted_too_once_dropped_and_all_of_them_on_quitting() {
+        let mut images = kitty();
+        let avatar = |file_id| Key {
+            avatar: true,
+            ..key(file_id)
+        };
+        for file_id in 0..=MAX_AVATARS as i32 {
+            images.avatar_clock += 1;
+            images.insert_ready(avatar(file_id), photo());
+        }
+        assert_eq!(images.avatars.len(), MAX_AVATARS);
+        assert_eq!(images.deletions(), Some(delete(1)), "the oldest");
+        images.insert_ready(key(1000), photo());
+        images.drop_all();
+        let code = images.deletions().unwrap();
+        assert_eq!(code.matches("a=d").count(), MAX_AVATARS + 1);
+        assert!(images.avatars.is_empty() && images.ready.is_empty());
+    }
+
+    #[test]
+    fn photos_kept_for_a_kitty_terminal_stay_under_its_quota_but_not_by_dropping_those_on_screen() {
+        let mut images = kitty();
+        images.kitty_budget = 2 * 40 * 40 * 4;
+        images.insert_ready(key(1), photo());
+        images.frame = 1;
+        images.insert_ready(key(2), photo());
+        // A frame draws the second, then a third comes.
+        images.frame = 3;
+        assert!(images.get(&preview(2), 4, 2).is_some());
+        images.frame = 4;
+        images.insert_ready(key(3), photo());
+        assert!(!images.ready.contains_key(&key(1)), "drawn longest ago");
+        assert!(images.ready.contains_key(&key(2)) && images.ready.contains_key(&key(3)));
+        assert_eq!(images.deletions(), Some(delete(1)));
+
+        // Every one kept is on screen: the quota gives way.
+        assert!(images.get(&preview(2), 4, 2).is_some());
+        assert!(images.get(&preview(3), 4, 2).is_some());
+        images.frame = 5;
+        images.insert_ready(key(4), photo());
+        assert_eq!(images.ready.len(), 3);
+        assert_eq!(images.deletions(), None);
+    }
+
+    #[test]
+    fn zooming_in_the_viewer_drops_its_other_sizes_before_the_bubbles_photos() {
+        let mut images = kitty();
+        let window = |file_id| Key {
+            cols: 40,
+            rows: 17,
+            ..key(file_id)
+        };
+        let picture = || DynamicImage::new_rgba8(400, 340);
+        images.kitty_budget = 2 * 400 * 340 * 4;
+        // Drawn before the viewer covered it.
+        images.insert_ready(key(1), photo());
+        images.frame = 2;
+        images.insert_ready(window(2), picture());
+        images.frame = 4;
+        images.insert_ready(window(3), picture());
+        assert!(
+            images.ready.contains_key(&key(1)),
+            "though drawn longest ago"
+        );
+        assert!(!images.ready.contains_key(&window(2)));
+        assert!(images.ready.contains_key(&window(3)));
+    }
+
+    #[test]
+    fn inside_tmux_the_code_that_deletes_images_goes_through_it() {
+        assert_eq!(
+            kitty_delete(1, true),
+            "\x1bPtmux;\x1b\x1b_Ga=d,d=I,i=1,q=2\x1b\x1b\\\x1b\\"
+        );
+    }
+
+    #[test]
+    fn terminals_that_keep_no_images_are_told_nothing() {
+        let mut images = Images::new(
+            Picker::halfblocks(),
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        images.insert_ready(key(1), photo());
+        images.drop_all();
+        assert_eq!(images.deletions(), None);
     }
 
     #[test]
