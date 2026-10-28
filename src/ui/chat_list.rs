@@ -12,7 +12,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use ratatui_image::FontSize;
-use ratatui_image::sliced::{SignedPosition, SlicedImage};
+use ratatui_image::sliced::SignedPosition;
 use unicode_width::UnicodeWidthStr;
 
 use crate::chats::{self, Chats, Tab};
@@ -375,8 +375,11 @@ fn draw_photo(
         && let Some(photo) = chats.get(chat_id).and_then(|c| c.photo.as_ref())
     {
         images.want_avatar(photo, area.width, area.height);
-        if let Some(image) = images.avatar(photo, area.width, area.height, list.covered) {
-            frame.render_widget(SlicedImage::new(image, SignedPosition::from((0, 0))), area);
+        let (cols, rows) = (area.width, area.height);
+        let at = SignedPosition::from((0, 0));
+        if images.draw(frame, area, at, |i| {
+            i.avatar(photo, cols, rows, list.covered)
+        }) {
             return;
         }
     }
@@ -858,25 +861,23 @@ mod tests {
     }
 
     #[test]
-    fn a_new_photo_waits_while_a_popup_could_hide_it() {
-        let colors = Colors::default();
+    fn a_new_photo_is_drawn_under_a_popup_its_image_sent_apart_from_the_frame() {
         let mut chats = Chats::default();
         chats.add_local(1, "Alice", photo(10));
         chats.refresh();
         let mut images = images(ProtocolType::Kitty);
         add_photo(&mut images, 10);
 
-        // Kitty sends the image with its first drawing; under a popup, that
-        // would be lost.
+        // Kitty sends the image with its first drawing, which a popup would
+        // cover: it goes apart from the frame, so the popup can't lose it.
         let mut covered = list(&chats, None);
         covered.covered = true;
         let buf = render(&covered, &mut images, 40, 10);
-        assert!(is_square(&buf, 2, 1, 4, colors.names[0]));
-
-        let buf = render(&list(&chats, None), &mut images, 40, 10);
         assert!(is_kitty_image(&buf, 2, 1));
-        let buf = render(&covered, &mut images, 40, 10);
-        assert!(is_kitty_image(&buf, 2, 1), "already sent");
+        assert!(!buf[(2, 1)].symbol().contains('\x1b'), "not in the frame");
+        assert_eq!(images.sending(), 1);
+        render(&covered, &mut images, 40, 10);
+        assert_eq!(images.sending(), 1, "sent once");
     }
 
     #[test]

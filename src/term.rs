@@ -31,11 +31,17 @@ fn try_init() -> io::Result<Terminal> {
     ratatui::Terminal::new(Crossterm(CrosstermBackend::new(stdout())))
 }
 
-/// Writes `code` to the terminal as it is: one that changes nothing on
-/// screen, such as kitty's for deleting images, ahead of the next frame.
-pub fn send(terminal: &mut Terminal, code: &str) -> io::Result<()> {
+/// Writes `codes` to the terminal as they are, then flushes once: ones that
+/// change nothing on screen, such as kitty's for sending or deleting
+/// images, around a frame.
+pub fn send<S: AsRef<str>>(
+    terminal: &mut Terminal,
+    codes: impl IntoIterator<Item = S>,
+) -> io::Result<()> {
     let out = &mut terminal.backend_mut().0;
-    out.write_all(code.as_bytes())?;
+    for code in codes {
+        out.write_all(code.as_ref().as_bytes())?;
+    }
     Write::flush(out)
 }
 

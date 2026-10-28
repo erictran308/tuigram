@@ -14,11 +14,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use anyhow::Result;
 use image::imageops::FilterType;
 use image::{DynamicImage, RgbaImage};
-use ratatui::layout::Size;
+use ratatui::Frame;
+use ratatui::layout::{Rect, Size};
 use ratatui_image::picker::cap_parser::Parser;
 use ratatui_image::picker::{Capability, Picker, ProtocolType};
 use ratatui_image::protocol::kitty::Kitty;
-use ratatui_image::sliced::SlicedProtocol;
+use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use ratatui_image::{FontSize, Resize};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -180,6 +181,23 @@ fn kitty_id_base() -> u32 {
     RandomState::new().hash_one(std::process::id()) as u32
 }
 
+/// What kitty's protocol draws in every cell of an image, after the code
+/// that sends the image in the first cell of its first drawing.
+const PLACEHOLDER: char = '\u{10EEEE}';
+
+/// The code that sends a kitty image, taken out of `cell`, the first an
+/// image was drawn in, if it holds one: its placeholder stays.
+fn transmit_in(cell: &mut ratatui::buffer::Cell) -> Option<String> {
+    let symbol = cell.symbol();
+    if !symbol.starts_with('\x1b') {
+        return None;
+    }
+    let at = symbol.rfind(PLACEHOLDER)?;
+    let (code, placeholder) = (symbol[..at].to_string(), symbol[at..].to_string());
+    cell.set_symbol(&placeholder);
+    Some(code)
+}
+
 /// The code that has the terminal delete image number `id` of kitty's
 /// protocol. `I` deletes the image itself, not only where it's placed;
 /// `q=2` asks for no answer, which would come in as keys.
@@ -272,10 +290,6 @@ struct Avatar {
     image: Encoded,
     /// When it was last drawn, in calls to [`Images::avatar`].
     used: u64,
-    /// It has been drawn. Kitty's protocol sends an image to the terminal
-    /// the first time it's drawn, and only then, so that time must not be
-    /// under a popup that hides it.
-    shown: bool,
 }
 
 /// How much a cell's measured width or height must change, as a share of
@@ -360,6 +374,9 @@ pub struct Images {
     dropped: Dropped,
     /// See [`KITTY_BUDGET`]; smaller in tests.
     kitty_budget: usize,
+    /// The codes sending the kitty images this frame drew for the first
+    /// time: see [`Images::take_transmit`].
+    transmits: Vec<String>,
 }
 
 impl Images {
@@ -383,6 +400,7 @@ impl Images {
             kitty_id: kitty_id_base(),
             dropped: Dropped::default(),
             kitty_budget: KITTY_BUDGET,
+            transmits: Vec::new(),
         }
     }
 
@@ -492,9 +510,9 @@ impl Images {
         self.wanted.push((photo.clone(), cols, rows));
     }
 
-    /// The best chat photo ready to draw, as for [`get`](Self::get). While
-    /// `covered` (a popup may be over it), only one that has been drawn before
-    /// is returned; see [`Avatar::shown`].
+    /// The best chat photo ready to draw, as for [`get`](Self::get). None
+    /// while `covered` (a popup may be over it) with sixel or iTerm2's
+    /// protocol: see [`paints_over`](Self::paints_over).
     pub fn avatar(
         &mut self,
         photo: &ChatPhoto,
@@ -515,11 +533,10 @@ impl Images {
         }
         let key = [key(false), key(true)]
             .into_iter()
-            .find(|k| self.avatars.get(k).is_some_and(|a| a.shown || !covered))?;
+            .find(|k| self.avatars.contains_key(k))?;
         self.avatar_clock += 1;
         let avatar = self.avatars.get_mut(&key)?;
         avatar.used = self.avatar_clock;
-        avatar.shown = true;
         Some(&avatar.image.image)
     }
 
@@ -718,7 +735,6 @@ impl Images {
         let avatar = Avatar {
             image,
             used: self.avatar_clock,
-            shown: false,
         };
         self.avatars.insert(key, avatar);
     }
@@ -734,6 +750,8 @@ impl Images {
     pub fn drop_all(&mut self) {
         self.ready.clear();
         self.avatars.clear();
+        // Nor are any of them sent.
+        self.transmits.clear();
     }
 
     /// Has a terminal speaking kitty's protocol delete the images dropped
@@ -742,8 +760,71 @@ impl Images {
     /// sends.
     pub fn send_deletions(&mut self, terminal: &mut Terminal) {
         if let Some(code) = self.deletions() {
-            let _ = term::send(terminal, &code);
+            let _ = term::send(terminal, [code]);
         }
+    }
+
+    /// Draws the image `pick` gives (from [`get`](Self::get),
+    /// [`sharp`](Self::sharp) or [`avatar`](Self::avatar)) at `at` in `area`,
+    /// if it's ready; false if not. Every image is drawn through here: with
+    /// kitty's protocol, its first drawing carries the image itself in the
+    /// first cell it covers, where anything drawn over that cell later in
+    /// the frame (a popup, the date at the top, a toast) would lose it for
+    /// good, and with it the image. So it's taken out of the cell, leaving
+    /// the placeholder, and sent after the frame
+    /// ([`send_pictures`](Self::send_pictures)).
+    pub fn draw(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        at: SignedPosition,
+        pick: impl for<'a> FnOnce(&'a mut Images) -> Option<&'a SlicedProtocol>,
+    ) -> bool {
+        let Some(image) = pick(self) else {
+            return false;
+        };
+        frame.render_widget(SlicedImage::new(image, at), area);
+        self.take_transmit(frame, area, at);
+        true
+    }
+
+    /// See [`draw`](Self::draw).
+    fn take_transmit(&mut self, frame: &mut Frame, area: Rect, at: SignedPosition) {
+        if self.picker.protocol_type() != ProtocolType::Kitty {
+            return;
+        }
+        // ratatui-image puts the code in the first cell of the image in the
+        // buffer: from where `SlicedImage` starts drawing it, the first that
+        // holds a placeholder. Images to its left are kept out by starting
+        // at its column, and those drawn before it have given up theirs.
+        let buf = frame.buffer_mut();
+        let shown = area.intersection(buf.area);
+        let left = area.x.saturating_add(at.x.max(0) as u16).max(shown.left());
+        let top = area.y.saturating_add(at.y.max(0) as u16).max(shown.top());
+        for y in top..shown.bottom() {
+            for x in left..shown.right() {
+                let cell = &mut buf[(x, y)];
+                if cell.symbol().rfind(PLACEHOLDER).is_some() {
+                    self.transmits.extend(transmit_in(cell));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Sends the images the frame just drawn drew for the first time (see
+    /// [`draw`](Self::draw)), once it's on the terminal: its placeholders
+    /// show each as soon as it's there.
+    pub fn send_pictures(&mut self, terminal: &mut Terminal) {
+        if !self.transmits.is_empty() {
+            let _ = term::send(terminal, std::mem::take(&mut self.transmits));
+        }
+    }
+
+    /// How many images are waiting to be sent.
+    #[cfg(test)]
+    pub fn sending(&self) -> usize {
+        self.transmits.len()
     }
 
     /// The code [`send_deletions`](Self::send_deletions) sends.
@@ -1223,6 +1304,56 @@ mod tests {
         );
         assert!(!images.ready.contains_key(&window(2)));
         assert!(images.ready.contains_key(&window(3)));
+    }
+
+    #[test]
+    fn a_kitty_images_data_goes_apart_from_the_frame_so_what_covers_it_cant_lose_it() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Paragraph;
+
+        let mut images = kitty();
+        images.insert_ready(key(7), photo());
+        let mut terminal = Terminal::new(TestBackend::new(10, 4)).unwrap();
+        let (area, at) = (Rect::new(1, 1, 4, 2), SignedPosition::from((0, 0)));
+        let mut draw = |images: &mut Images| {
+            terminal
+                .draw(|frame| {
+                    assert!(images.draw(frame, area, at, |i| i.get(&preview(7), 4, 2)));
+                    // A popup over its first cell.
+                    frame.render_widget(Paragraph::new("popup"), Rect::new(0, 1, 6, 1));
+                })
+                .unwrap()
+                .buffer
+                .clone()
+        };
+        let buf = draw(&mut images);
+        assert_eq!(images.sending(), 1);
+        assert!(images.transmits[0].contains("i=1,a=T"), "sent as 1");
+        assert!(
+            buf.content().iter().all(|c| !c.symbol().contains('\x1b')),
+            "nothing of it in the frame"
+        );
+        draw(&mut images);
+        assert_eq!(images.sending(), 1, "sent once");
+    }
+
+    #[test]
+    fn an_images_code_is_found_where_it_starts_drawing_though_its_corner_is_off_the_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut images = kitty();
+        images.insert_ready(key(7), photo());
+        let mut terminal = Terminal::new(TestBackend::new(10, 4)).unwrap();
+        // Partly past the bottom right, a row scrolled away above.
+        let (area, at) = (Rect::new(7, 1, 4, 4), SignedPosition::from((0, -1)));
+        terminal
+            .draw(|frame| {
+                assert!(images.draw(frame, area, at, |i| i.get(&preview(7), 4, 2)));
+            })
+            .unwrap();
+        assert_eq!(images.sending(), 1);
     }
 
     #[test]

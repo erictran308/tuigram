@@ -204,6 +204,7 @@ async fn show(dir: &Path) -> Result<()> {
         if let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
             break Err(e.into());
         }
+        app.images.send_pictures(&mut terminal);
         app.images.fetch(&tg);
         // Popups fade in here too.
         let open = app.open.as_ref().map(|o| o.chat_id);

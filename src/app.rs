@@ -1123,6 +1123,10 @@ impl App {
                 failed = Some(e.into());
                 self.hang_up();
             }
+            // After it: the images it drew for the first time.
+            if failed.is_none() {
+                self.images.send_pictures(terminal);
+            }
             // Start downloads/encodes for photos the frame showed but didn't have.
             self.images.fetch(&self.tg);
             if let Some(open) = self.open.as_mut() {

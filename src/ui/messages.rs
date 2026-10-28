@@ -11,7 +11,7 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_image::FontSize;
-use ratatui_image::sliced::{SignedPosition, SlicedImage};
+use ratatui_image::sliced::SignedPosition;
 use unicode_width::UnicodeWidthStr;
 
 use super::truncate;
@@ -480,9 +480,10 @@ pub(super) fn draw_photos(
         if covered && images.paints_over() {
             continue;
         }
-        if let Some(image) = images.get(&slot.photo, slot.cols, slot.rows) {
-            let position = SignedPosition::from((slot.x as i16, y as i16));
-            frame.render_widget(SlicedImage::new(image, position), area);
+        let position = SignedPosition::from((slot.x as i16, y as i16));
+        if images.draw(frame, area, position, |i| {
+            i.get(&slot.photo, slot.cols, slot.rows)
+        }) {
             continue;
         }
         let label = if images.is_broken(&slot.photo) {

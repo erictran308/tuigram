@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui_image::FontSize;
-use ratatui_image::sliced::{SignedPosition, SlicedImage};
+use ratatui_image::sliced::SignedPosition;
 
 use super::{Cover, popup_block};
 use crate::images::Images;
@@ -77,15 +77,13 @@ pub(super) fn draw(
     }
     let at = SignedPosition::from((shot.x as i16, shot.y as i16));
     if let Some(photo) = &sharp
-        && let Some(image) = images.sharp(photo, cols, rows)
+        && images.draw(frame, inner, at, |i| i.sharp(photo, cols, rows))
     {
-        frame.render_widget(SlicedImage::new(image, at), inner);
         return;
     }
     if let Some(stand_in) = &stand_in
-        && let Some(image) = images.get(stand_in, cols, rows)
+        && images.draw(frame, inner, at, |i| i.get(stand_in, cols, rows))
     {
-        frame.render_widget(SlicedImage::new(image, at), inner);
         return;
     }
     // Nothing of the size before stays while this one gets ready: the

@@ -7,7 +7,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_image::FontSize;
-use ratatui_image::sliced::{SignedPosition, SlicedImage};
+use ratatui_image::sliced::SignedPosition;
 use unicode_width::UnicodeWidthStr;
 
 use super::{border, hint_spans, truncate};
@@ -181,9 +181,8 @@ fn draw_grid(
         };
         if pictures && let Some(preview) = &sticker.preview {
             images.want(preview, cols, IMAGE_ROWS);
-            if let Some(image) = images.get(preview, cols, IMAGE_ROWS) {
-                let at = SignedPosition::from((0, 0));
-                frame.render_widget(SlicedImage::new(image, at), picture);
+            let at = SignedPosition::from((0, 0));
+            if images.draw(frame, picture, at, |i| i.get(preview, cols, IMAGE_ROWS)) {
                 continue;
             }
         }
