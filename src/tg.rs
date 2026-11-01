@@ -348,6 +348,16 @@ const MEMBER_SEARCH_LIMIT: i32 = 20;
 /// Contacts a search in the `s` picker asks for.
 const CONTACT_SEARCH_LIMIT: i32 = 20;
 
+/// Where in the data folder TDLib keeps its database, and the files it
+/// downloads.
+const DATABASE_DIR: &str = "db";
+const FILES_DIR: &str = "files";
+
+/// The folders TDLib keeps its database and downloads in, under `data_dir`.
+pub fn tdlib_dirs(data_dir: &std::path::Path) -> [std::path::PathBuf; 2] {
+    [data_dir.join(DATABASE_DIR), data_dir.join(FILES_DIR)]
+}
+
 /// How long [`offline_now`] gives TDLib to send it before the process ends.
 const OFFLINE_GRACE: Duration = Duration::from_millis(300);
 
@@ -697,11 +707,12 @@ impl Tg {
             // this order, and are answered once TDLib has started.
             let _ = futures::poll!(offline.as_mut());
             let _ = futures::poll!(chosen.as_mut());
-            let dir = |name: &str| config.data_dir.join(name).to_string_lossy().into_owned();
+            let [db, files] =
+                tdlib_dirs(&config.data_dir).map(|dir| dir.to_string_lossy().into_owned());
             let started = functions::set_tdlib_parameters(
                 false,
-                dir("db"),
-                dir("files"),
+                db,
+                files,
                 String::new(), // database_encryption_key
                 true,          // use_file_database
                 true,          // use_chat_info_database

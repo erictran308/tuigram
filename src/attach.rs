@@ -13,7 +13,7 @@ use crate::tg::Upload;
 /// Telegram's limits for photos. Bigger ones go as files, uncompressed.
 const PHOTO_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// Width plus height.
-const PHOTO_MAX_SIDES: u32 = 10_000;
+pub const PHOTO_MAX_SIDES: u32 = 10_000;
 /// Long side over short side.
 const PHOTO_MAX_RATIO: u32 = 20;
 /// Image types that go as photos; anything else (GIFs, HEIC, RAW…) as a file.

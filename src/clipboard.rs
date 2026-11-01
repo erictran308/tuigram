@@ -4,6 +4,7 @@
 use std::borrow::Cow;
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -66,15 +67,23 @@ pub struct Clipboard {
     tx: UnboundedSender<ClipboardEvent>,
     /// Where pasted images are saved for TDLib to upload.
     outbox: PathBuf,
+    /// Where TDLib keeps its database and downloads: a photo from anywhere
+    /// else is from this computer (see `images::open_photo`).
+    tdlib_dirs: Arc<[PathBuf]>,
 }
 
 impl Clipboard {
-    pub fn new(tx: UnboundedSender<ClipboardEvent>, outbox: PathBuf) -> Self {
+    pub fn new(
+        tx: UnboundedSender<ClipboardEvent>,
+        outbox: PathBuf,
+        tdlib_dirs: Arc<[PathBuf]>,
+    ) -> Self {
         Self {
             system: None,
             remote: crate::chime::over_ssh(|name| std::env::var(name).ok()),
             tx,
             outbox,
+            tdlib_dirs,
         }
     }
 
@@ -108,13 +117,17 @@ impl Clipboard {
     }
 
     /// Decodes a downloaded photo on a blocking thread; it comes back as a
-    /// [`Decoded`] for [`Self::copy_image`].
+    /// [`Decoded`] for [`Self::copy_image`]. One from this computer, such as
+    /// a photo you sent, may be as big as Telegram takes a photo (see
+    /// `images::open_photo`).
     pub fn decode_image(&self, path: String, label: String) {
         let tx = self.tx.clone();
+        let tdlib_dirs = Arc::clone(&self.tdlib_dirs);
         tokio::task::spawn_blocking(move || {
-            // The photo is another user's, so a decoder panic is caught here
-            // as it is for the chat's own copy.
-            let image = crate::images::contained(|| Ok(crate::images::open_image(&path)?))
+            // The photo may be another user's, so a decoder panic is caught
+            // here as it is for the chat's own copy.
+            let open = || Ok(crate::images::open_photo(&path, &tdlib_dirs)?);
+            let image = crate::images::contained(open)
                 .map(|i| i.to_rgba8())
                 .map_err(|e| e.to_string());
             let _ = tx.send(ClipboardEvent::Decoded(Decoded { label, image }));

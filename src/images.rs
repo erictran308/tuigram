@@ -9,6 +9,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Result;
@@ -68,6 +69,10 @@ fn sized(side: u32) -> image::Limits {
 /// Stickers are 512px a side; this leaves room to spare.
 const STICKER_SIDE: u32 = 1024;
 
+fn open_sticker(path: &str) -> image::ImageResult<image::DynamicImage> {
+    open_within(path, sized(STICKER_SIDE))
+}
+
 /// Like `image::open`, within [`limits`]. The format comes from the file's
 /// first bytes, else its extension: a file sent as a file is named by its
 /// sender, so a JPEG can be called `.png`.
@@ -79,6 +84,66 @@ fn open_within(path: &str, limits: image::Limits) -> image::ImageResult<image::D
     let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
     reader.limits(limits);
     reader.decode()
+}
+
+/// How big an image from this computer may be (see [`from_this_computer`]):
+/// as big as Telegram takes a photo, width plus height up to this. A photo
+/// you sent is one: TDLib keeps the file you sent as the photo's largest
+/// size, where Telegram's own copies are at most 2560px, and a Retina
+/// screenshot is wider than 4096px.
+const YOUR_SIDES: u32 = crate::attach::PHOTO_MAX_SIDES;
+
+/// A photo, decoded within the caps for where its file is from: one from
+/// this computer, such as a photo you sent, within [`YOUR_SIDES`], anyone
+/// else's, a download, within [`limits`].
+pub fn open_photo(path: &str, tdlib_dirs: &[PathBuf]) -> image::ImageResult<DynamicImage> {
+    match from_this_computer(path, tdlib_dirs) {
+        // The path it was found at, with the links in it resolved.
+        Some(resolved) => open_your_image(&resolved),
+        None => open_image(path),
+    }
+}
+
+/// Like [`open_image`], for an image from this computer: its width plus
+/// height within [`YOUR_SIDES`], read from its header, then decoded from the
+/// same open file, so one put in its place meanwhile isn't.
+fn open_your_image(path: &Path) -> image::ImageResult<DynamicImage> {
+    use image::ImageDecoder;
+    let mut limits = sized(YOUR_SIDES);
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    reader.limits(limits.clone());
+    let decoder = reader.into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    if width.saturating_add(height) > YOUR_SIDES {
+        return Err(image::ImageError::Limits(
+            image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError),
+        ));
+    }
+    // As `ImageReader::decode` does: `into_decoder` checks only the sides.
+    limits.reserve(decoder.total_bytes())?;
+    DynamicImage::from_decoder(decoder)
+}
+
+/// The file at `path`, resolved, if it's one TDLib didn't download, in none
+/// of `tdlib_dirs` (its database and downloads): you gave it from this
+/// computer, as a photo you sent, whose file TDLib keeps as the photo's
+/// largest size, or one about to be. Everything from anyone else is a
+/// download, decoded within [`limits`]. Unsure (no folders known, or a path
+/// that can't be resolved), it isn't. A path on another machine isn't even
+/// resolved: on Windows that would hand its server the user's login hash.
+fn from_this_computer(path: &str, tdlib_dirs: &[PathBuf]) -> Option<PathBuf> {
+    if tdlib_dirs.is_empty() || crate::attach::on_another_machine(Path::new(path)) {
+        return None;
+    }
+    let path = std::fs::canonicalize(path).ok()?;
+    let outside = |dir: &PathBuf| match std::fs::canonicalize(dir) {
+        Ok(dir) => !path.starts_with(dir),
+        // Not made yet, so nothing was downloaded into it: on a new login,
+        // until TDLib first needs it. Still not a path in it as written, in
+        // case it went away just now.
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound && !path.starts_with(dir),
+    };
+    tdlib_dirs.iter().all(outside).then_some(path)
 }
 
 /// At most this many images decode at once; the rest wait for a later frame.
@@ -361,6 +426,9 @@ pub struct Images {
     /// Keys that failed to decode; never retried.
     failed: HashSet<Key>,
     files: HashMap<i32, FileState>,
+    /// Where TDLib keeps its database and downloads: see
+    /// [`from_this_computer`]. None known, no file is.
+    tdlib_dirs: Arc<[PathBuf]>,
     /// Photos' own size in pixels, learned by decoding them: an image sent
     /// as a file comes without it.
     pixels: HashMap<i32, (u32, u32)>,
@@ -394,6 +462,7 @@ impl Images {
             building: HashMap::new(),
             failed: HashSet::new(),
             files: HashMap::new(),
+            tdlib_dirs: Arc::new([]),
             pixels: HashMap::new(),
             wanted: Vec::new(),
             wanted_avatars: Vec::new(),
@@ -510,6 +579,11 @@ impl Images {
         self.wanted.push((photo.clone(), cols, rows));
     }
 
+    /// TDLib keeps its database and downloads in `dirs`.
+    pub fn tdlib_keeps_files_in(&mut self, dirs: Arc<[PathBuf]>) {
+        self.tdlib_dirs = dirs;
+    }
+
     /// The best chat photo ready to draw, as for [`get`](Self::get). None
     /// while `covered` (a popup may be over it) with sixel or iTerm2's
     /// protocol: see [`paints_over`](Self::paints_over).
@@ -563,12 +637,11 @@ impl Images {
             match self.files.get(&photo.file_id) {
                 Some(FileState::Ready(path)) => {
                     let path = path.clone();
-                    let limits = if photo.sticker {
-                        sized(STICKER_SIDE)
-                    } else {
-                        limits()
-                    };
-                    self.build(full, move || Ok(open_within(&path, limits)?));
+                    let (sticker, tdlib_dirs) = (photo.sticker, Arc::clone(&self.tdlib_dirs));
+                    self.build(full, move || match sticker {
+                        true => Ok(open_sticker(&path)?),
+                        false => Ok(open_photo(&path, &tdlib_dirs)?),
+                    });
                 }
                 Some(FileState::Downloading | FileState::Failed) => {}
                 None => {
@@ -1380,5 +1453,71 @@ mod tests {
         assert!(decode_bytes(&png(512, 512)).is_ok());
         let error = decode_bytes(&png(5000, 1)).unwrap_err();
         assert!(matches!(error, image::ImageError::Limits(_)), "{error}");
+    }
+
+    /// Whether the image at `path` is shown, with TDLib keeping its files
+    /// in `tdlib_dirs`.
+    async fn shows(path: &std::path::Path, tdlib_dirs: &[PathBuf]) -> bool {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        images.tdlib_keeps_files_in(tdlib_dirs.into());
+        images.on_downloaded(3, Some(path.to_str().unwrap().into()));
+        images.want(&preview(3), 4, 2);
+        images.fetch(&Tg::detached(tokio::sync::mpsc::unbounded_channel().0));
+        images.on_built(rx.recv().await.unwrap());
+        images.sharp(&preview(3), 4, 2).is_some()
+    }
+
+    /// A folder of its own in the system's temp folder, removed once dropped,
+    /// even after an assert failed.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("tuigram-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_photo_you_sent_shows_though_wider_than_anyone_elses_may_be() {
+        let temp = TempDir::new("yours");
+        let dir = &temp.0;
+        let tdlib = [dir.join("db"), dir.join("files")];
+        for folder in &tdlib {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        // A Retina screenshot sent as a photo: TDLib keeps the file sent, where
+        // it is, as the photo's largest size.
+        let screenshot = dir.join("screenshot.png");
+        std::fs::write(&screenshot, png(4259, 1567)).unwrap();
+        assert!(shows(&screenshot, &tdlib).await);
+        // Someone else's as big can only be a download.
+        let downloaded = tdlib[1].join("photo.png");
+        std::fs::copy(&screenshot, &downloaded).unwrap();
+        assert!(!shows(&downloaded, &tdlib).await, "someone else's");
+        // Bigger than Telegram takes a photo: each side is within 10,000px,
+        // but not the two together.
+        let too_big = dir.join("too-big.png");
+        std::fs::write(&too_big, png(9_000, 1_001)).unwrap();
+        assert!(!shows(&too_big, &tdlib).await);
+        // Not knowing where TDLib's files are, none is yours.
+        assert!(!shows(&screenshot, &[]).await);
+        // Before TDLib made its downloads folder, nothing is in it.
+        let unmade = [tdlib[0].clone(), dir.join("not-yet")];
+        assert!(shows(&screenshot, &unmade).await);
+        // Copied with `y`.
+        let path = screenshot.to_str().unwrap();
+        assert!(open_photo(path, &tdlib).is_ok());
+        let downloaded = downloaded.to_str().unwrap();
+        assert!(open_photo(downloaded, &tdlib).is_err(), "someone else's");
     }
 }

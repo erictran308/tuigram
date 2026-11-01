@@ -250,7 +250,12 @@ pub(crate) fn demo_app(tg: Tg, images: Images, dir: &Path) -> App {
         // The demo plays nothing, and tests must make no sound.
         Player::new(unbounded_channel().0, Output::Nowhere),
         // The demo never pastes, so nothing is saved there.
-        Clipboard::new(clipboard_tx, dir.join("outbox")),
+        Clipboard::new(
+            clipboard_tx,
+            dir.join("outbox"),
+            // As for its `Images`: no photo is from this computer.
+            std::sync::Arc::new([]),
+        ),
         settings,
         dir.join("settings.toml"),
         None,

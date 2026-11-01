@@ -68,6 +68,7 @@ async fn main() -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let env_keys = config.api_keys.clone();
     let outbox = config.data_dir.join("outbox");
+    let tdlib_dirs: std::sync::Arc<[std::path::PathBuf]> = tg::tdlib_dirs(&config.data_dir).into();
     clipboard::clean_outbox(&outbox);
     let tg = tg::Tg::start(config, tx).await?;
 
@@ -119,10 +120,11 @@ async fn main() -> Result<()> {
 
     let (image_tx, image_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut images = images::Images::new(picker, image_tx);
+    images.tdlib_keeps_files_in(std::sync::Arc::clone(&tdlib_dirs));
     // Measured against the answer, to tell later when cells change size.
     images.measured(images::measure_cells());
     let (clipboard_tx, clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
-    let clipboard = clipboard::Clipboard::new(clipboard_tx, outbox);
+    let clipboard = clipboard::Clipboard::new(clipboard_tx, outbox, tdlib_dirs);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::unbounded_channel();
     let player = voice::Player::new(voice_tx, voice::Output::Speakers);
     let app = app::App::new(
