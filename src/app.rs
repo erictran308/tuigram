@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use futures::StreamExt;
 use ratatui::style::Style;
 use ratatui_textarea::{DataCursor, TextArea};
@@ -802,6 +805,9 @@ pub struct App {
     pub video_view: Option<VideoView>,
     /// Space on a video message: it plays where its thumbnail is.
     pub inline_video: Option<Inline>,
+    /// Where the panes and their rows are, for the mouse: the ui fills it
+    /// every frame.
+    pub mouse: crate::mouse::Map,
     /// The decoder thread's word reaches the app through here.
     video_tx: UnboundedSender<VideoEvent>,
     /// `I`: what a chat is, and who's in it.
@@ -972,6 +978,7 @@ impl App {
             photo_view: None,
             video_view: None,
             inline_video: None,
+            mouse: crate::mouse::Map::default(),
             video_tx,
             chat_info: None,
             text_select: None,
@@ -1276,7 +1283,7 @@ impl App {
     }
 
     fn on_terminal_event(&mut self, event: Event) {
-        if matches!(event, Event::Key(_) | Event::Paste(_) | Event::FocusGained) {
+        if matches!(event, Event::Key(_) | Event::Paste(_) | Event::FocusGained | Event::Mouse(_)) {
             self.last_input = Instant::now();
             self.last_input_wall = SystemTime::now();
         }
@@ -1291,6 +1298,7 @@ impl App {
         }
         match event {
             Event::Key(key) => self.on_key(key),
+            Event::Mouse(mouse) => self.on_mouse(mouse),
             Event::FocusGained => {
                 self.terminal_focused = true;
                 self.focus_reported = true;
@@ -2425,6 +2433,78 @@ impl App {
                 login.error = Some(message);
             }
             Screen::Main => self.status = Some(message),
+        }
+    }
+
+    /// The mouse: the wheel scrolls the pane under it, a click focuses it —
+    /// a chat or topic opens, a message becomes the cursor (and opens on a
+    /// second click, as in Telegram's apps), the composer takes the keys.
+    /// Popups and viewers keep their keys: clicks then do nothing.
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(self.screen, Screen::Main)
+            || self.over_panes()
+            || self.photo_view.is_some()
+            || self.video_view.is_some()
+        {
+            return;
+        }
+        let (x, y) = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.mouse_scroll(x, y, 1),
+            MouseEventKind::ScrollUp => self.mouse_scroll(x, y, -1),
+            MouseEventKind::Down(MouseButton::Left) => self.mouse_click(x, y),
+            _ => {}
+        }
+    }
+
+    /// The wheel over a pane moves its cursor, as `j` and `k` do.
+    fn mouse_scroll(&mut self, x: u16, y: u16, delta: isize) {
+        match self.mouse.pane_at(x, y) {
+            Some(crate::mouse::Pane::Chats) => self.move_chat_cursor(delta),
+            Some(crate::mouse::Pane::Topics) => self.move_topic_cursor(delta),
+            Some(crate::mouse::Pane::Messages) => self.move_message_cursor(delta),
+            None => {}
+        }
+    }
+
+    fn mouse_click(&mut self, x: u16, y: u16) {
+        if let Some(chat_id) = self.mouse.chat_at(x, y) {
+            self.focus = Focus::Chats;
+            self.selected = Some(chat_id);
+            if self.open.as_ref().is_none_or(|o| o.chat_id != chat_id) {
+                self.open_chat(chat_id);
+            }
+            return;
+        }
+        if let Some(topic_id) = self.mouse.topic_at(x, y) {
+            self.focus = Focus::Topics;
+            if let Some(forum) = self.forum.as_mut() {
+                forum.selected = Some(topic_id);
+            }
+            if self.open.as_ref().and_then(|o| o.topic) != Some(topic_id) {
+                self.open_selected_topic();
+            }
+            return;
+        }
+        if let Some(message_id) = self.mouse.message_at(x, y) {
+            let was_focused = self.focus == Focus::Messages;
+            let was_selected = self.open.as_ref().and_then(|o| o.selected);
+            if self.focus == Focus::Input {
+                self.leave_insert();
+            }
+            self.focus = Focus::Messages;
+            if let Some(open) = self.open.as_mut() {
+                open.selected = Some(message_id);
+            }
+            // A click on the message already under the cursor opens it, as
+            // Enter would: photos, videos, files.
+            if was_focused && was_selected == Some(message_id) {
+                self.open_selected_message();
+            }
+            return;
+        }
+        if self.mouse.over_composer(x, y) && self.open.is_some() {
+            self.start_writing();
         }
     }
 

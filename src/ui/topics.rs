@@ -40,7 +40,7 @@ pub struct TopicList<'a> {
     pub gaps: bool,
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, list: &TopicList, colors: &Colors) {
+pub fn draw(frame: &mut Frame, area: Rect, list: &TopicList, colors: &Colors, mouse: &mut crate::mouse::Map) {
     let forum = list.forum;
     let chats = list.names.chats;
     // Telegram's verdict on the forum (SCAM, FAKE, ✓) always shows: the
@@ -96,6 +96,18 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &TopicList, colors: &Colors) {
         .collect();
     let mut state = ListState::default().with_selected(selected);
     frame.render_stateful_widget(List::new(items), inner, &mut state);
+    // A topic takes two rows, plus the gap. Where each is, for the mouse.
+    let item_rows = 2 + u16::from(list.gaps);
+    let last = inner.y + inner.height;
+    for (i, topic) in topics.iter().enumerate().skip(state.offset()) {
+        let from = inner.y + (i - state.offset()) as u16 * item_rows;
+        if from >= last {
+            break;
+        }
+        mouse
+            .topic_rows
+            .push((from, (from + item_rows).min(last), topic.id));
+    }
 }
 
 /// A topic's two rows: its icon, name and unread count, then who sent its
@@ -228,7 +240,7 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw(frame, frame.area(), &list, &Colors::default()))
+            .draw(|frame| draw(frame, frame.area(), &list, &Colors::default(), &mut Default::default()))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
@@ -302,7 +314,7 @@ mod tests {
         let colors = Colors::default();
         let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
         terminal
-            .draw(|frame| draw(frame, frame.area(), &list, &colors))
+            .draw(|frame| draw(frame, frame.area(), &list, &colors, &mut Default::default()))
             .unwrap();
         let buffer = terminal.backend().buffer();
         // "You" starts after the border, the cursor bar and the indent.

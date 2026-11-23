@@ -160,6 +160,7 @@ pub fn draw(
     playing: Option<Playback>,
     glowing: &[(i64, Duration)],
     inline: &mut Option<crate::video::Inline>,
+    mouse: &mut crate::mouse::Map,
 ) {
     let chat = names.chats.get(open.chat_id);
     let secret = names.chats.secret(open.chat_id);
@@ -382,6 +383,17 @@ pub fn draw(
         super::motion::glow(frame.buffer_mut(), rows, picture, elapsed, colors);
     }
     draw_photos(frame, pane, &photos, first, images, inline, covered, colors);
+    // Where each visible message's rows are, for the mouse.
+    for p in &placed {
+        let start = p.start.max(first);
+        let end = p.end.min(first + shown_rows);
+        if start < end {
+            let from = pane.y + (start - first) as u16;
+            mouse
+                .message_rows
+                .push((from, pane.y + (end - first) as u16, p.id));
+        }
+    }
 
     let gutters = [shift(left), shift(right)];
     // The message being answered or edited stays marked while writing.
@@ -2107,6 +2119,7 @@ mod tests {
                     playing,
                     &[],
                     &mut None,
+                    &mut Default::default(),
                 )
             })
             .unwrap();
@@ -2652,6 +2665,7 @@ mod tests {
                         None,
                         &[],
                         &mut None,
+                        &mut Default::default(),
                     )
                 })
                 .unwrap();
@@ -3754,6 +3768,7 @@ mod tests {
                     None,
                     &[],
                     &mut None,
+                    &mut Default::default(),
                 )
             })
             .unwrap();
@@ -3799,6 +3814,7 @@ mod tests {
                     None,
                     &[(2, Duration::ZERO)],
                     &mut None,
+                    &mut Default::default(),
                 )
             })
             .unwrap();
@@ -3853,6 +3869,7 @@ mod tests {
                     // The first photo came first; the caption is the last's.
                     &[(1, Duration::ZERO)],
                     &mut None,
+                    &mut Default::default(),
                 )
             })
             .unwrap();

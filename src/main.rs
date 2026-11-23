@@ -12,6 +12,7 @@ mod images;
 mod info;
 mod messages;
 mod motion;
+mod mouse;
 mod notify;
 mod opus;
 mod picker;
@@ -41,8 +42,9 @@ use std::io::{Write, stdout};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use ratatui_image::picker::Picker;
@@ -90,7 +92,8 @@ async fn main() -> Result<()> {
             stdout(),
             PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
-            DisableFocusChange
+            DisableFocusChange,
+            DisableMouseCapture
         );
         notify::send(notify::RESTORE_TITLE);
         ratatui::restore();
@@ -109,6 +112,9 @@ async fn main() -> Result<()> {
     // Read receipts wait while the terminal window is in the background, on
     // terminals that report focus changes.
     execute!(stdout(), EnableFocusChange)?;
+    // Clicks and the wheel work the panes; selecting text with the mouse
+    // still works, over Shift, as in every terminal app that reads the mouse.
+    execute!(stdout(), EnableMouseCapture)?;
     // Terminals with the kitty keyboard protocol (kitty, Ghostty, WezTerm…)
     // can then report Shift-Enter separately from Enter.
     let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -146,7 +152,12 @@ async fn main() -> Result<()> {
     if enhanced {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(stdout(), DisableBracketedPaste, DisableFocusChange);
+    let _ = execute!(
+        stdout(),
+        DisableBracketedPaste,
+        DisableFocusChange,
+        DisableMouseCapture
+    );
     notify::send(notify::RESTORE_TITLE);
     ratatui::restore();
     tmux::restore();

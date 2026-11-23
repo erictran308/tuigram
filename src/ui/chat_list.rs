@@ -86,7 +86,14 @@ pub struct ChatList<'a> {
     pub gaps: bool,
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images, colors: &Colors) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    list: &ChatList,
+    images: &mut Images,
+    colors: &Colors,
+    mouse: &mut crate::mouse::Map,
+) {
     let chats = list.chats;
     let filter = chats.filter();
     let names = Names {
@@ -273,14 +280,24 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
     }
     let mut state = ListState::default().with_selected(selected);
     frame.render_stateful_widget(List::new(items), inner, &mut state);
+    // The list draws only whole chats, from where it scrolled to. The rows
+    // each is at, for the mouse.
+    let item_rows = PHOTO_ROWS + u16::from(list.gaps);
+    let offset = state.offset();
+    let last = inner.y + inner.height;
+    for (i, &(id, _)) in rows.iter().enumerate().skip(offset) {
+        let from = inner.y + (i - offset) as u16 * item_rows;
+        if from >= last {
+            break;
+        }
+        mouse.chat_rows.push((from, (from + item_rows).min(last), id));
+    }
     if photo_cols == 0 {
         return;
     }
-    // The list draws only whole chats, from where it scrolled to.
-    let item_rows = PHOTO_ROWS + u16::from(list.gaps);
     let shown = rows
         .iter()
-        .skip(state.offset())
+        .skip(offset)
         .take(usize::from(inner.height / item_rows));
     for (i, &(id, _)) in shown.enumerate() {
         let area = Rect {
@@ -720,7 +737,7 @@ mod tests {
         let colors = Colors::default();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|f| draw(f, f.area(), list, images, &colors))
+            .draw(|f| draw(f, f.area(), list, images, &colors, &mut Default::default()))
             .unwrap();
         terminal.backend().buffer().clone()
     }

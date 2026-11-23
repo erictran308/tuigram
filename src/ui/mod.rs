@@ -462,6 +462,10 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         }
         None => (None, chat_area),
     };
+    // What the mouse will point at this frame.
+    app.mouse.reset();
+    app.mouse.chats = list_area;
+    app.mouse.topics = topics_area;
 
     let list = chat_list::ChatList {
         chats: &app.chats,
@@ -482,7 +486,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 .is_some_and(|p| p.kind == PromptKind::Command || !p.completions.is_empty()),
         gaps: app.settings.chat_gaps,
     };
-    chat_list::draw(frame, list_area, &list, &mut app.images, colors);
+    chat_list::draw(frame, list_area, &list, &mut app.images, colors, &mut app.mouse);
     // The pane with the keys, for the lights round it.
     let mut keys_in = match app.focus {
         Focus::Chats => Some(list_area),
@@ -501,7 +505,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             focused: app.focus == Focus::Topics,
             gaps: app.settings.chat_gaps,
         };
-        topics::draw(frame, area, &pane, colors);
+        topics::draw(frame, area, &pane, colors, &mut app.mouse);
     }
     // Popups drawn over the messages, below. Not the toast, which only says
     // what just happened: holding photos back under it would blank them all
@@ -578,7 +582,10 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 playing,
                 &glowing,
                 &mut app.inline_video,
+                &mut app.mouse,
             );
+            app.mouse.history = history;
+            app.mouse.composer = composer;
             if let Some(panel) = panel {
                 stickers::draw(frame, panel_area, panel, &mut app.images, colors);
             }
