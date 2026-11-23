@@ -494,6 +494,17 @@ impl Images {
         self.picker.font_size()
     }
 
+    /// The terminal speaks kitty's graphics protocol, which video messages
+    /// play through.
+    pub fn kitty(&self) -> bool {
+        self.picker.protocol_type() == ProtocolType::Kitty
+    }
+
+    /// Escapes need tmux's passthrough wrapping.
+    pub fn tmux(&self) -> bool {
+        self.picker.tmux_detected()
+    }
+
     /// The terminal's window measures its cells `now` (see
     /// [`measure_cells`]): first right after the terminal answered at
     /// startup, then whenever its size may have changed. Cells change size

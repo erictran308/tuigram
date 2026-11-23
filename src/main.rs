@@ -33,6 +33,7 @@ mod theme;
 mod tmux;
 mod topics;
 mod ui;
+mod video;
 mod viewer;
 mod voice;
 
@@ -127,6 +128,7 @@ async fn main() -> Result<()> {
     let clipboard = clipboard::Clipboard::new(clipboard_tx, outbox, tdlib_dirs);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::unbounded_channel();
     let player = voice::Player::new(voice_tx, voice::Output::Speakers);
+    let (video_tx, video_rx) = tokio::sync::mpsc::unbounded_channel();
     let app = app::App::new(
         tg,
         images,
@@ -135,9 +137,10 @@ async fn main() -> Result<()> {
         settings,
         settings_path,
         env_keys,
+        video_tx,
     );
     let result = app
-        .run(&mut terminal, rx, image_rx, clipboard_rx, voice_rx)
+        .run(&mut terminal, rx, image_rx, clipboard_rx, voice_rx, video_rx)
         .await;
 
     if enhanced {

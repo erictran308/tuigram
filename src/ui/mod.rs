@@ -474,6 +474,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         // a toast only when the list is on the right, where toasts go.
         covered: app.settings_menu.is_some()
             || app.photo_view.is_some()
+            || app.video_view.is_some()
             || (app.toast.is_some() && app.settings.chat_list_side == Side::Right)
             || app
                 .prompt
@@ -644,9 +645,11 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     // Told whether one is up even with animations off, so turning them on
     // in `?` doesn't fade the popup it's in again.
     let up = app.popup_open();
-    let fading = app
-        .motion
-        .popup(up, app.settings.animations && app.photo_view.is_none(), now);
+    let fading = app.motion.popup(
+        up,
+        app.settings.animations && app.photo_view.is_none() && app.video_view.is_none(),
+        now,
+    );
     let under = fading.map(|_| frame.buffer_mut().clone());
     if let Some(menu) = &app.menu {
         draw_menu(frame, chat_area, menu, colors);
@@ -710,6 +713,10 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     }
     if let Some(view) = &mut app.photo_view {
         viewer::draw(frame, body, view, &mut app.images, colors);
+    }
+    if let Some(view) = &mut app.video_view {
+        let font = app.images.font_size();
+        crate::video::VideoView::draw(view, frame, body, font, colors);
     }
     if let Some(confirm) = &app.confirm {
         draw_confirm(frame, chat_area, confirm, colors);
@@ -2681,6 +2688,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             normal,
             "  `h/l` older/newer photo · `j/k` zoom in/out · `o` open in its app · `y` copy · `Enter` or `Esc` close",
         ),
+        _ if app.video_view.is_some() => (
+            normal,
+            "  `Space` pause · `j/k` zoom in/out · `o` open in its app · `Enter` or `Esc` close",
+        ),
         _ if app.pinned_menu.is_some() => (
             normal,
             "  `j/k` choose · `Enter` go to it · `P` unpin it · `Esc` close",
@@ -3645,6 +3656,7 @@ mod tests {
             hidden: None,
             saveable: true,
             voice: None,
+            video: None,
             service: None,
             mention: false,
             unplayed: false,

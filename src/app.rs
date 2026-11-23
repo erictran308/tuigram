@@ -13,7 +13,7 @@ use tdlib_rs::enums::{
     MessageTopic, NotificationType, OptionValue, ProxyType, Update, UserType,
 };
 use tdlib_rs::types::{Message, Proxy, UpdateNotificationGroup};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{Instant, sleep_until};
 
 use crate::attach::{self, Attachment, Dropped};
@@ -49,6 +49,7 @@ use crate::theme::{Colors, Corners, Themes};
 use crate::topics::{self, Forum};
 use crate::ui;
 use crate::viewer::{self, PhotoView};
+use crate::video::{VideoEvent, VideoView};
 use crate::voice::{Happened, Player, VoiceEvent};
 
 /// Chats requested per `loadChats` call.
@@ -186,6 +187,11 @@ pub enum Target {
         message_id: i64,
         file: MediaFile,
     },
+    /// Message `message_id`'s video message, which plays in the terminal.
+    Video {
+        message_id: i64,
+        file: MediaFile,
+    },
     Link(Link),
     /// The whole text or caption; only copied.
     Text(String),
@@ -194,7 +200,7 @@ pub enum Target {
 impl Target {
     pub fn label(&self) -> &str {
         match self {
-            Target::File(file) | Target::Voice { file, .. } | Target::Photo { file, .. } => {
+            Target::File(file) | Target::Voice { file, .. } | Target::Photo { file, .. } | Target::Video { file, .. } => {
                 &file.label
             }
             Target::Link(link) => &link.url,
@@ -350,6 +356,11 @@ fn file_target(id: i64, msg: &crate::messages::Msg, file: MediaFile) -> Target {
         }
     } else if msg.photo.as_ref().is_some_and(|p| p.file_id == file.id) {
         Target::Photo {
+            message_id: id,
+            file,
+        }
+    } else if msg.video.as_ref().is_some_and(|v| v.file_id == file.id) {
+        Target::Video {
             message_id: id,
             file,
         }
@@ -787,6 +798,10 @@ pub struct App {
     pub key_view: Option<KeyView>,
     /// Enter on a photo: it, as big as the window allows.
     pub photo_view: Option<PhotoView>,
+    /// Enter on a video message: it plays in the terminal.
+    pub video_view: Option<VideoView>,
+    /// The decoder thread's word reaches the app through here.
+    video_tx: UnboundedSender<VideoEvent>,
     /// `I`: what a chat is, and who's in it.
     pub chat_info: Option<ChatInfo>,
     /// `v`: a message's text, to select part of it and copy that.
@@ -916,6 +931,7 @@ impl App {
         settings: Settings,
         settings_path: PathBuf,
         env_keys: Option<ApiKeys>,
+        video_tx: UnboundedSender<VideoEvent>,
     ) -> Self {
         let mut chats = Chats::default();
         chats.set_highlighted(&settings.highlighted_chats);
@@ -951,6 +967,8 @@ impl App {
             timer_menu: None,
             key_view: None,
             photo_view: None,
+            video_view: None,
+            video_tx,
             chat_info: None,
             text_select: None,
             picker: None,
@@ -1052,6 +1070,7 @@ impl App {
         mut image_events: UnboundedReceiver<ImageEvent>,
         mut clipboard: UnboundedReceiver<ClipboardEvent>,
         mut voice_events: UnboundedReceiver<VoiceEvent>,
+        mut video_events: UnboundedReceiver<VideoEvent>,
     ) -> Result<()> {
         let mut keys = EventStream::new();
         let mut signals = quit_signals();
@@ -1127,6 +1146,17 @@ impl App {
             if failed.is_none() {
                 self.images.send_pictures(terminal);
             }
+            // And the video frame waiting, over the overlay's blank cells.
+            if failed.is_none()
+                && let Some(view) = self.video_view.as_mut()
+            {
+                if let Some(why) = view.error.take() {
+                    self.status = Some(format!("Can't play this video message: {why}"));
+                    self.video_view = None;
+                } else {
+                    view.send_frame(terminal);
+                }
+            }
             // Start downloads/encodes for photos the frame showed but didn't have.
             self.images.fetch(&self.tg);
             if let Some(open) = self.open.as_mut() {
@@ -1186,6 +1216,7 @@ impl App {
                 Some(event) = image_events.recv() => self.images.on_built(event),
                 Some(event) = clipboard.recv() => self.on_clipboard(event),
                 Some(event) = voice_events.recv() => self.on_voice(event),
+                Some(event) = video_events.recv() => self.on_video(event),
                 Some(event) = keys.next(), if failed.is_none() => match event {
                     Ok(event) => self.on_terminal_event(event),
                     Err(e) => {
@@ -1468,6 +1499,27 @@ impl App {
                         None => {
                             self.player.stop();
                             self.status = Some("Download failed".into());
+                        }
+                    }
+                }
+                if let Some(view) = self.video_view.as_mut()
+                    && view.waits_for(file_id)
+                {
+                    match &path {
+                        Some(path) => {
+                            view.downloaded(PathBuf::from(path));
+                            // As in Telegram's apps, the sender sees it was
+                            // played once it is.
+                            self.tg.open_content(view.chat_id, view.message_id);
+                            if let Some(open) =
+                                self.open.as_mut().filter(|o| o.chat_id == view.chat_id)
+                            {
+                                open.set_opened(view.message_id);
+                            }
+                        }
+                        None => {
+                            self.status = Some("Download failed".into());
+                            self.video_view = None;
                         }
                     }
                 }
@@ -1925,6 +1977,13 @@ impl App {
                     {
                         self.photo_view = None;
                     }
+                    if self
+                        .video_view
+                        .as_ref()
+                        .is_some_and(|v| v.lost(u.chat_id, u.message_id, msg))
+                    {
+                        self.video_view = None;
+                    }
                     // Edited: what's selected may not be in it any more.
                     if self.text_select.as_ref().is_some_and(|s| {
                         s.chat_id == u.chat_id
@@ -1984,6 +2043,13 @@ impl App {
                     .is_some_and(|v| u.message_ids.iter().any(|&id| v.lost(u.chat_id, id, None)))
                 {
                     self.photo_view = None;
+                }
+                if self
+                    .video_view
+                    .as_ref()
+                    .is_some_and(|v| u.message_ids.iter().any(|&id| v.lost(u.chat_id, id, None)))
+                {
+                    self.video_view = None;
                 }
                 if self.text_select.as_ref().is_some_and(|s| {
                     s.chat_id == u.chat_id && u.message_ids.contains(&s.message_id)
@@ -2135,6 +2201,7 @@ impl App {
                 }
             }
             Screen::Main if self.photo_view.is_some() => self.on_viewer_key(key),
+            Screen::Main if self.video_view.is_some() => self.on_video_key(key),
             Screen::Main if self.settings_menu.is_some() => self.on_settings_key(key, ctrl),
             Screen::Main if self.delete_menu.is_some() => self.on_delete_key(key),
             Screen::Main if self.react_menu.is_some() => self.on_react_key(key, ctrl),
@@ -3236,8 +3303,8 @@ impl App {
     /// In a forum, only the topic open is being read: `topic` is the one
     /// the message is in.
     fn sees(&self, chat_id: i64, topic: Option<i32>) -> bool {
-        // The photo viewer hides every chat.
-        if self.photo_view.is_some() {
+        // The photo viewer and the video player hide every chat.
+        if self.photo_view.is_some() || self.video_view.is_some() {
             return false;
         }
         if self.focus_reported {
@@ -5517,6 +5584,7 @@ impl App {
         match target {
             Target::Voice { message_id, file } => self.play_voice(message_id, file.id),
             Target::Photo { message_id, file } => self.view_photo(message_id, file),
+            Target::Video { message_id, file } => self.view_video(message_id, file),
             Target::File(file) => {
                 // TDLib answers at once if the file is already downloaded.
                 if self.opening.insert(file.id) {
@@ -5644,6 +5712,84 @@ impl App {
         }
     }
 
+    /// Plays message `message_id`'s video message in the terminal; one
+    /// that's no longer loaded, or where the terminal can't show it, opens
+    /// in its app.
+    fn view_video(&mut self, message_id: i64, file: MediaFile) {
+        if !self.images.kitty() {
+            self.status =
+                Some("Video messages play in the terminal only with kitty's protocol".into());
+            self.open_target(Target::File(file));
+            return;
+        }
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let view = match open.messages.get(&message_id) {
+            Some(msg) => VideoView::of(
+                open.chat_id,
+                message_id,
+                msg,
+                self.video_tx.clone(),
+                self.images.tmux(),
+            ),
+            None => {
+                self.open_target(Target::File(file));
+                return;
+            }
+        };
+        let Some(view) = view else {
+            self.status = Some("This video message can't be played here".into());
+            return;
+        };
+        if view.note.size > crate::video::MAX_FILE {
+            self.status = Some("Can't play this video message: it's too big".into());
+            return;
+        }
+        if open.selected.is_none() {
+            open.selected = Some(message_id);
+        }
+        self.tg.download(view.note.file_id);
+        self.video_view = Some(view);
+    }
+
+    /// The video player takes all keys while it's up.
+    fn on_video_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.video_view.as_mut() else {
+            return;
+        };
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('j' | '+' | '=') => view.zoom_in(),
+            KeyCode::Char('k' | '-') => view.zoom_out(),
+            KeyCode::Char(' ') => view.toggle(),
+            KeyCode::Char('o') => {
+                let file = view.file.clone();
+                self.video_view = None;
+                self.open_target(Target::File(file));
+            }
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => self.video_view = None,
+            _ => {}
+        }
+    }
+
+    /// Word from the video decoder: a frame, the end (looped), or why it
+    /// can't play — then the view closes.
+    fn on_video(&mut self, event: VideoEvent) {
+        let Some(view) = self.video_view.as_mut() else {
+            return;
+        };
+        if let Err(why) = view.on_event(event) {
+            self.status = Some(format!("Can't play this video message: {why}"));
+            self.video_view = None;
+        }
+    }
+
     /// Plays voice message `message_id` of the open chat, or pauses it if
     /// it's the one playing.
     fn play_voice(&mut self, message_id: i64, file_id: i32) {
@@ -5768,6 +5914,7 @@ impl App {
             || self.timer_menu.is_some()
             || self.key_view.is_some()
             || self.photo_view.is_some()
+            || self.video_view.is_some()
             || self.chat_info.is_some()
             || self.text_select.is_some()
     }
@@ -5923,7 +6070,7 @@ impl App {
         let text = match target {
             Target::Text(text) => text,
             Target::Link(link) => link.url,
-            Target::File(file) | Target::Photo { file, .. } => {
+            Target::File(file) | Target::Photo { file, .. } | Target::Video { file, .. } => {
                 // Only text gets through the terminal to the user's own
                 // computer.
                 if self.clipboard.remote {

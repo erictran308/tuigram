@@ -298,6 +298,8 @@ pub struct Msg {
     pub saveable: bool,
     /// A voice message, which Enter plays.
     pub voice: Option<Voice>,
+    /// A video message the terminal plays itself; see [`crate::video`].
+    pub video: Option<crate::video::Note>,
     /// What happened in the chat, when it's a service message: drawn in the
     /// middle, like a date, not in a bubble.
     pub service: Option<Service>,
@@ -752,6 +754,8 @@ struct Body {
     /// The media shown only while it's open, when it's that.
     hidden: Option<Hidden>,
     voice: Option<Voice>,
+    /// A video message the terminal plays itself; see [`crate::video`].
+    video: Option<crate::video::Note>,
 }
 
 /// The message as the bubble shows it. A photo or video shown only while
@@ -810,6 +814,7 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
         formatted: false,
         hidden: None,
         voice: None,
+        video: None,
         image_file: None,
     };
     let file = |id: i32, label: String| {
@@ -934,7 +939,10 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
                 body.voice = Some(voice);
             }
         }
-        C::MessageVideoNote(m) => body.file = file(m.video_note.video.id, "Video message".into()),
+        C::MessageVideoNote(m) => {
+            body.file = file(m.video_note.video.id, "Video message".into());
+            body.video = Some(crate::video::Note::new(&m.video_note));
+        }
         C::MessagePoll(m) => {
             let poll = Poll::new(&m.poll);
             body.text = poll.text();
@@ -1213,6 +1221,7 @@ impl From<Message> for Msg {
             hidden: body.hidden,
             saveable: message.can_be_saved,
             voice: body.voice,
+            video: body.video,
             image_file: body.image_file,
             service,
             mention: message.contains_unread_mention,
@@ -2800,6 +2809,7 @@ pub(crate) mod tests {
                     hidden: None,
                     saveable: true,
                     voice: None,
+                    video: None,
                     service: None,
                     mention: false,
                     unplayed: false,

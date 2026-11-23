@@ -259,6 +259,8 @@ pub(crate) fn demo_app(tg: Tg, images: Images, dir: &Path) -> App {
         settings,
         dir.join("settings.toml"),
         None,
+        // The demo plays no video: nothing ever sends on it.
+        unbounded_channel().0,
     );
     app.screen = Screen::Main;
     for (id, name) in [
@@ -716,6 +718,7 @@ fn msg(sender: i64, date: i32, text: &str) -> Msg {
         hidden: None,
         saveable: true,
         voice: None,
+        video: None,
         service: None,
         mention: false,
         unplayed: false,

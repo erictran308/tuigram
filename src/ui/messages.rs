@@ -2002,6 +2002,7 @@ mod tests {
             hidden: None,
             saveable: true,
             voice: None,
+            video: None,
             service: None,
             mention: false,
             unplayed: false,
