@@ -117,8 +117,12 @@ impl Drop for Player {
     fn drop(&mut self) {
         self.stop.store(true, Relaxed);
         let _ = self.ffmpeg.kill();
+        // Reaped too: killed or finished, a child whose exit no one waits
+        // for stays a zombie until tuigram itself exits.
+        let _ = self.ffmpeg.wait();
         if let Some(audio) = &mut self.audio {
             let _ = audio.kill();
+            let _ = audio.wait();
         }
     }
 }
