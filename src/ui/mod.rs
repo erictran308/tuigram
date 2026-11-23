@@ -577,6 +577,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 app.settings.block_gaps,
                 playing,
                 &glowing,
+                &mut app.inline_video,
             );
             if let Some(panel) = panel {
                 stickers::draw(frame, panel_area, panel, &mut app.images, colors);
@@ -2262,6 +2263,7 @@ fn draw_previews(
             cols,
             rows,
             photo,
+            id: 0,
         });
         x += cols + 1;
     }
@@ -2276,7 +2278,7 @@ fn draw_previews(
     for (slot, attachment) in slots.iter().zip(&photos) {
         images.local_file(slot.photo.file_id, &attachment.path.to_string_lossy());
     }
-    messages::draw_photos(frame, area, &slots, 0, images, covered, colors);
+    messages::draw_photos(frame, area, &slots, 0, images, &mut None, covered, colors);
     if slots.len() < photos.len() {
         let label = more(slots.len());
         let row = Rect {

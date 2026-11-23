@@ -175,6 +175,20 @@ impl Preview {
         })
     }
 
+    /// A video note's still thumbnail: the note is square, `length` pixels
+    /// across, and so is its preview.
+    fn from_video_note(note: &types::VideoNote) -> Option<Self> {
+        let thumbnail = note.thumbnail.as_ref().filter(|t| decodable(&t.format))?;
+        let side = note.length.max(1) as u32;
+        Some(Self {
+            file_id: thumbnail.file.id,
+            width: side,
+            height: side,
+            thumbnail: decode_minithumbnail(note.minithumbnail.as_ref()),
+            sticker: false,
+        })
+    }
+
     /// An image sent as a file, small: the thumbnail its sender's app made
     /// (up to 320 px), not the file, which can be tens of MB.
     fn from_document(document: &types::Document) -> Option<Self> {
@@ -941,6 +955,7 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
         }
         C::MessageVideoNote(m) => {
             body.file = file(m.video_note.video.id, "Video message".into());
+            body.preview = Preview::from_video_note(&m.video_note);
             body.video = Some(crate::video::Note::new(&m.video_note));
         }
         C::MessagePoll(m) => {

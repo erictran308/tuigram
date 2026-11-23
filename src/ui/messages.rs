@@ -140,6 +140,9 @@ pub(super) struct PhotoSlot {
     pub cols: u16,
     pub rows: u16,
     pub photo: Preview,
+    /// The message it's in; a video message's plays here. 0 on a link
+    /// preview's picture, which no player draws over.
+    pub id: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -156,6 +159,7 @@ pub fn draw(
     block_gaps: bool,
     playing: Option<Playback>,
     glowing: &[(i64, Duration)],
+    inline: &mut Option<crate::video::Inline>,
 ) {
     let chat = names.chats.get(open.chat_id);
     let secret = names.chats.secret(open.chat_id);
@@ -377,7 +381,7 @@ pub fn draw(
         };
         super::motion::glow(frame.buffer_mut(), rows, picture, elapsed, colors);
     }
-    draw_photos(frame, pane, &photos, first, images, covered, colors);
+    draw_photos(frame, pane, &photos, first, images, inline, covered, colors);
 
     let gutters = [shift(left), shift(right)];
     // The message being answered or edited stays marked while writing.
@@ -458,19 +462,41 @@ fn mark(frame: &mut Frame, gutters: [Rect; 2], msg: &Placed, top: usize, color: 
 }
 
 /// Paints photos over the rows reserved for them. `SlicedImage` draws just
-/// the visible rows of a photo that's partly scrolled out.
+/// the visible rows of a photo that's partly scrolled out. A video message
+/// playing inline takes its slot: kitty's placeholder cells, which the
+/// newest frame sent after the draw lands in.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_photos(
     frame: &mut Frame,
     area: Rect,
     photos: &[PhotoSlot],
     top: usize,
     images: &mut Images,
+    inline: &mut Option<crate::video::Inline>,
     covered: bool,
     colors: &Colors,
 ) {
     for slot in photos {
         let y = slot.line as i64 - top as i64;
         if y >= i64::from(area.height) || y + i64::from(slot.rows) <= 0 {
+            continue;
+        }
+        if let Some(player) = inline
+            .as_mut()
+            .filter(|i| i.message_id == slot.id && i.started())
+        {
+            let skip = (-y).max(0) as u16;
+            let shown = i64::from(slot.rows).min(i64::from(area.height)) - y.max(0);
+            let rect = Rect {
+                x: area.x + slot.x,
+                y: (i64::from(area.y) + y.max(0)) as u16,
+                width: slot.cols.min(area.width.saturating_sub(slot.x)),
+                height: shown.max(0) as u16,
+            };
+            if rect.height > 0 {
+                frame.render_widget(crate::video::InlineImage { skip }, rect);
+                player.seen = true;
+            }
             continue;
         }
         images.want(&slot.photo, slot.cols, slot.rows);
@@ -799,6 +825,7 @@ fn measure<'a>(
                 cols,
                 rows,
                 photo: photo.clone(),
+                id: if msg.video.is_some() { m.id } else { 0 },
             });
         }
         // A link preview's picture sits after its bar, under the text.
@@ -814,6 +841,7 @@ fn measure<'a>(
                 cols,
                 rows,
                 photo: photo.clone(),
+                id: 0,
             });
         }
         let end = bubble_start + m.service.as_ref().map_or(m.bubble.height(), Vec::len);
@@ -2078,6 +2106,7 @@ mod tests {
                     Settings::default().block_gaps,
                     playing,
                     &[],
+                    &mut None,
                 )
             })
             .unwrap();
@@ -2622,6 +2651,7 @@ mod tests {
                         true,
                         None,
                         &[],
+                        &mut None,
                     )
                 })
                 .unwrap();
@@ -3723,6 +3753,7 @@ mod tests {
                     true,
                     None,
                     &[],
+                    &mut None,
                 )
             })
             .unwrap();
@@ -3767,6 +3798,7 @@ mod tests {
                     true,
                     None,
                     &[(2, Duration::ZERO)],
+                    &mut None,
                 )
             })
             .unwrap();
@@ -3820,6 +3852,7 @@ mod tests {
                     None,
                     // The first photo came first; the caption is the last's.
                     &[(1, Duration::ZERO)],
+                    &mut None,
                 )
             })
             .unwrap();

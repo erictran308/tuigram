@@ -49,7 +49,7 @@ use crate::theme::{Colors, Corners, Themes};
 use crate::topics::{self, Forum};
 use crate::ui;
 use crate::viewer::{self, PhotoView};
-use crate::video::{VideoEvent, VideoView};
+use crate::video::{Inline, VideoEvent, VideoView};
 use crate::voice::{Happened, Player, VoiceEvent};
 
 /// Chats requested per `loadChats` call.
@@ -800,6 +800,8 @@ pub struct App {
     pub photo_view: Option<PhotoView>,
     /// Enter on a video message: it plays in the terminal.
     pub video_view: Option<VideoView>,
+    /// Space on a video message: it plays where its thumbnail is.
+    pub inline_video: Option<Inline>,
     /// The decoder thread's word reaches the app through here.
     video_tx: UnboundedSender<VideoEvent>,
     /// `I`: what a chat is, and who's in it.
@@ -923,6 +925,7 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tg: Tg,
         images: Images,
@@ -968,6 +971,7 @@ impl App {
             key_view: None,
             photo_view: None,
             video_view: None,
+            inline_video: None,
             video_tx,
             chat_info: None,
             text_select: None,
@@ -1136,6 +1140,11 @@ impl App {
             if failed.is_none() {
                 self.images.send_deletions(terminal);
             }
+            // The inline player's `seen` says its bubble was drawn: reset
+            // before the frame, checked after it.
+            if let Some(inline) = self.inline_video.as_mut() {
+                inline.seen = false;
+            }
             if failed.is_none()
                 && let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut self))
             {
@@ -1155,6 +1164,20 @@ impl App {
                     self.video_view = None;
                 } else {
                     view.send_frame(terminal);
+                }
+            }
+            // The inline player's newest frame goes to the terminal; one
+            // whose bubble wasn't drawn this frame is stopped.
+            if failed.is_none()
+                && self.inline_video.is_some()
+            {
+                let seen = self.inline_video.as_ref().is_some_and(|i| i.seen);
+                if seen {
+                    if let Some(inline) = self.inline_video.as_mut() {
+                        inline.send_frame(terminal);
+                    }
+                } else {
+                    self.inline_video = None;
                 }
             }
             // Start downloads/encodes for photos the frame showed but didn't have.
@@ -1520,6 +1543,33 @@ impl App {
                         None => {
                             self.status = Some("Download failed".into());
                             self.video_view = None;
+                        }
+                    }
+                }
+                if let Some(inline) = self.inline_video.as_mut()
+                    && inline.waits_for(file_id)
+                {
+                    match &path {
+                        Some(path) => match inline.downloaded(PathBuf::from(path)) {
+                            Ok(()) => {
+                                // As in Telegram's apps, the sender sees it
+                                // was played once it is.
+                                self.tg.open_content(inline.chat_id, inline.message_id);
+                                if let Some(open) =
+                                    self.open.as_mut().filter(|o| o.chat_id == inline.chat_id)
+                                {
+                                    open.set_opened(inline.message_id);
+                                }
+                            }
+                            Err(why) => {
+                                self.status =
+                                    Some(format!("Can't play this video message: {why}"));
+                                self.inline_video = None;
+                            }
+                        },
+                        None => {
+                            self.status = Some("Download failed".into());
+                            self.inline_video = None;
                         }
                     }
                 }
@@ -1984,6 +2034,13 @@ impl App {
                     {
                         self.video_view = None;
                     }
+                    if self
+                        .inline_video
+                        .as_ref()
+                        .is_some_and(|v| v.lost(u.chat_id, u.message_id, msg))
+                    {
+                        self.inline_video = None;
+                    }
                     // Edited: what's selected may not be in it any more.
                     if self.text_select.as_ref().is_some_and(|s| {
                         s.chat_id == u.chat_id
@@ -2050,6 +2107,13 @@ impl App {
                     .is_some_and(|v| u.message_ids.iter().any(|&id| v.lost(u.chat_id, id, None)))
                 {
                     self.video_view = None;
+                }
+                if self
+                    .inline_video
+                    .as_ref()
+                    .is_some_and(|v| u.message_ids.iter().any(|&id| v.lost(u.chat_id, id, None)))
+                {
+                    self.inline_video = None;
                 }
                 if self.text_select.as_ref().is_some_and(|s| {
                     s.chat_id == u.chat_id && u.message_ids.contains(&s.message_id)
@@ -2519,6 +2583,7 @@ impl App {
             (Focus::Topics, KeyCode::Esc) => self.focus = Focus::Chats,
             (Focus::Topics, KeyCode::Char(c)) if c == to_list => self.focus = Focus::Chats,
             (Focus::Messages, KeyCode::Enter) => self.open_selected_message(),
+            (Focus::Messages, KeyCode::Char(' ')) => self.toggle_inline_video(),
             (Focus::Messages, KeyCode::Esc) => self.focus = self.left_of_messages(),
             (Focus::Messages, KeyCode::Char(c)) if c == to_list => {
                 self.focus = self.left_of_messages();
@@ -5725,9 +5790,10 @@ impl App {
         let Some(open) = self.open.as_mut() else {
             return;
         };
+        let chat_id = open.chat_id;
         let view = match open.messages.get(&message_id) {
             Some(msg) => VideoView::of(
-                open.chat_id,
+                chat_id,
                 message_id,
                 msg,
                 self.video_tx.clone(),
@@ -5738,7 +5804,7 @@ impl App {
                 return;
             }
         };
-        let Some(view) = view else {
+        let Some(mut view) = view else {
             self.status = Some("This video message can't be played here".into());
             return;
         };
@@ -5746,11 +5812,71 @@ impl App {
             self.status = Some("Can't play this video message: it's too big".into());
             return;
         }
+        // One playing inline grows to the whole window where it is; another
+        // message's just stops.
+        if let Some(inline) = self.inline_video.take()
+            && inline.is_on(chat_id, message_id)
+        {
+            view.resume_at(inline.position());
+        }
         if open.selected.is_none() {
             open.selected = Some(message_id);
         }
         self.tg.download(view.note.file_id);
         self.video_view = Some(view);
+    }
+
+    /// Space on a video message: it plays where its thumbnail is, or pauses
+    /// if it's the one playing. One without a thumbnail's cells to play in
+    /// opens on the whole window instead.
+    fn toggle_inline_video(&mut self) {
+        if !self.images.kitty() {
+            return;
+        }
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let Some(message_id) = open.cursor_id() else {
+            return;
+        };
+        let chat_id = open.chat_id;
+        if self
+            .inline_video
+            .as_mut()
+            .is_some_and(|i| i.is_on(chat_id, message_id))
+        {
+            if let Some(inline) = self.inline_video.as_mut() {
+                inline.toggle();
+            }
+            return;
+        }
+        let Some(msg) = open.messages.get(&message_id) else {
+            return;
+        };
+        if msg.video.is_none() {
+            return;
+        }
+        let Some(file) = msg.file.clone() else { return };
+        if msg.preview.is_none() {
+            // Nowhere to play inline: the whole window, as Enter does.
+            self.view_video(message_id, file);
+            return;
+        }
+        let inline = Inline::of(
+            chat_id,
+            message_id,
+            msg,
+            self.video_tx.clone(),
+            self.images.tmux(),
+        );
+        let Some(inline) = inline else { return };
+        if inline.note.size > crate::video::MAX_FILE {
+            self.status = Some("Can't play this video message: it's too big".into());
+            return;
+        }
+        self.inline_video = None; // another message's, playing, stops
+        self.tg.download(inline.note.file_id);
+        self.inline_video = Some(inline);
     }
 
     /// The video player takes all keys while it's up.
@@ -5779,8 +5905,18 @@ impl App {
     }
 
     /// Word from the video decoder: a frame, the end (looped), or why it
-    /// can't play — then the view closes.
+    /// can't play — then the player closes. The tag says whose word it is.
     fn on_video(&mut self, event: VideoEvent) {
+        if event.tag() == crate::video::TAG_INLINE {
+            let Some(inline) = self.inline_video.as_mut() else {
+                return;
+            };
+            if let Err(why) = inline.on_event(event) {
+                self.status = Some(format!("Can't play this video message: {why}"));
+                self.inline_video = None;
+            }
+            return;
+        }
         let Some(view) = self.video_view.as_mut() else {
             return;
         };
