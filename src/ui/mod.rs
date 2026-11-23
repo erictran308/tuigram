@@ -1359,9 +1359,11 @@ fn draw_settings(
     colors: &Colors,
 ) {
     let area = frame.area();
+    let ru = settings.ru();
+    let t = |en: &'static str, ru_text: &'static str| crate::lang::pick(ru, en, ru_text);
     // Both tabs get the same size, so the tabs don't move when switching.
-    let width = (help::width() as u16 + 2).min(area.width.saturating_sub(2));
-    let height = (help::height() as u16 + 2).min(area.height.saturating_sub(2));
+    let width = (help::width(ru) as u16 + 2).min(area.width.saturating_sub(2));
+    let height = (help::height(ru) as u16 + 2).min(area.height.saturating_sub(2));
     let popup = center(area, width, height);
     let tab = |label: &'static str, active: bool| {
         if active {
@@ -1375,24 +1377,31 @@ fn draw_settings(
         }
     };
     let mut tabs = vec![Span::from(" ")];
-    tabs.extend(tab(" Shortcuts ", menu.tab == HelpTab::Shortcuts));
+    tabs.extend(tab(t(" Shortcuts ", " Клавиши "), menu.tab == HelpTab::Shortcuts));
     tabs.push(Span::from(" "));
-    tabs.extend(tab(" Settings ", menu.tab == HelpTab::Settings));
+    tabs.extend(tab(t(" Settings ", " Настройки "), menu.tab == HelpTab::Settings));
     tabs.push(Span::from(" "));
     let tabs = Line::from(tabs);
     let keys = match menu.tab {
-        HelpTab::Shortcuts => " `j/k` scroll · `Tab` settings · `Esc` close ",
-        HelpTab::Settings if menu.selected >= SettingsMenu::SOUNDS => {
-            " `Enter` or `Space` use · `Tab` shortcuts · `Esc` close "
-        }
-        HelpTab::Settings => " `Enter` or `Space` on/off · `Tab` shortcuts · `Esc` close ",
+        HelpTab::Shortcuts => t(
+            " `j/k` scroll · `Tab` settings · `Esc` close ",
+            " `j/k` листать · `Tab` настройки · `Esc` закрыть ",
+        ),
+        HelpTab::Settings if menu.selected >= SettingsMenu::SOUNDS => t(
+            " `Enter` or `Space` use · `Tab` shortcuts · `Esc` close ",
+            " `Enter` или `Space` выбрать · `Tab` клавиши · `Esc` закрыть ",
+        ),
+        HelpTab::Settings => t(
+            " `Enter` or `Space` on/off · `Tab` shortcuts · `Esc` close ",
+            " `Enter` или `Space` вкл/выкл · `Tab` клавиши · `Esc` закрыть ",
+        ),
     };
     let block = popup_block(tabs, keys, colors);
     let inner = block.inner(popup);
     frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
     if menu.tab == HelpTab::Shortcuts {
-        help::draw(frame, inner, &mut menu.scroll, colors);
+        help::draw(frame, inner, &mut menu.scroll, ru, colors);
         return;
     }
 
@@ -1424,110 +1433,141 @@ fn draw_settings(
         }
         lines.push(row(i, mark, Span::from(label.to_string())));
     };
-    lines.push(heading(" Notifications"));
+    lines.push(heading(t(" Notifications", " Уведомления")));
     add(
         &mut lines,
         SettingsMenu::NOTIFICATIONS,
         check(settings.notifications != Notifications::Off),
-        "New messages, while tuigram is in the background",
+        t(
+            "New messages, while tuigram is in the background",
+            "Новые сообщения, когда tuigram в фоне",
+        ),
     );
     lines.push(Line::default());
-    lines.push(heading(" Chat list"));
+    lines.push(heading(t(" Chat list", " Список чатов")));
     add(
         &mut lines,
         SettingsMenu::CHAT_GAPS,
         check(settings.chat_gaps),
-        "A gap between chats",
+        t("A gap between chats", "Промежуток между чатами"),
     );
     add(
         &mut lines,
         SettingsMenu::LIST_RIGHT,
         check(settings.chat_list_side == Side::Right),
-        "On the right side of the window",
+        t("On the right side of the window", "Справа в окне"),
     );
     lines.push(Line::default());
-    lines.push(heading(" Messages"));
+    lines.push(heading(t(" Messages", " Сообщения")));
     add(
         &mut lines,
         SettingsMenu::BLOCK_GAPS,
         check(settings.block_gaps),
-        "A gap between messages in a row from one person",
+        t(
+            "A gap between messages in a row from one person",
+            "Промежуток между подряд идущими сообщениями одного человека",
+        ),
     );
     lines.push(Line::default());
-    lines.push(heading(" Look"));
+    lines.push(heading(t(" Look", " Вид")));
     add(
         &mut lines,
         SettingsMenu::CORNERS,
         check(colors.rounded),
-        "Round corners (turn off if they look broken)",
+        t(
+            "Round corners (turn off if they look broken)",
+            "Круглые углы (выключите, если выглядят сломанными)",
+        ),
     );
     add(
         &mut lines,
         SettingsMenu::PILLS,
         check(colors.pills),
-        "Round pills (needs a Nerd Font)",
+        t("Round pills (needs a Nerd Font)", "Круглые «пилюли» (нужен Nerd Font)"),
     );
     add(
         &mut lines,
         SettingsMenu::ANIMATIONS,
         check(settings.animations),
-        "Animations (lights on focus, popups, toasts, new messages)",
+        t(
+            "Animations (lights on focus, popups, toasts, new messages)",
+            "Анимации (подсветка фокуса, попапы, тосты, новые сообщения)",
+        ),
     );
     lines.push(Line::default());
-    lines.push(heading(" Composer"));
+    lines.push(heading(t(" Composer", " Поле ввода")));
     add(
         &mut lines,
         SettingsMenu::AFTER_SEND,
         check(settings.normal_after_send),
-        "Back to Normal mode after sending a message",
+        t(
+            "Back to Normal mode after sending a message",
+            "Назад в обычный режим после отправки сообщения",
+        ),
     );
     add(
         &mut lines,
         SettingsMenu::WRAP_COMPOSER,
         check(settings.wrap_composer),
-        "Wrap long lines onto the next row",
+        t(
+            "Wrap long lines onto the next row",
+            "Переносить длинные строки на следующую",
+        ),
     );
     lines.push(Line::default());
-    lines.push(heading(" Secret chats"));
+    lines.push(heading(t(" Secret chats", " Секретные чаты")));
     add(
         &mut lines,
         SettingsMenu::SECRET_CHATS,
         check(settings.accept_secret_chats),
-        "Take the ones others start here, not on your phone",
+        t(
+            "Take the ones others start here, not on your phone",
+            "Принимать начатые другими здесь, а не на телефоне",
+        ),
     );
     lines.push(Line::default());
-    lines.push(heading(" Sound for new messages"));
+    lines.push(heading(t(
+        " Sound for new messages",
+        " Звук новых сообщений",
+    )));
     if over_ssh {
-        let why = " Not played over SSH: it would play on the other computer";
+        let why = t(
+            " Not played over SSH: it would play on the other computer",
+            " По SSH не играет: зазвучал бы на другом компьютере",
+        );
         lines.push(Line::from(why).fg(colors.muted));
     }
     add(
         &mut lines,
         SettingsMenu::SOUND_FOCUSED,
         check(settings.sound_when_focused),
-        "Also while tuigram's window is focused",
+        t(
+            "Also while tuigram's window is focused",
+            "Также когда окно tuigram в фокусе",
+        ),
     );
     // The dot marks the sound in use.
     let picked = settings.notification_sound.as_deref();
     let dot = |on: bool| if on { " ● " } else { " ○ " };
-    add(
-        &mut lines,
-        SettingsMenu::SOUNDS,
-        dot(picked.is_none()),
-        "None",
-    );
+    add(&mut lines, SettingsMenu::SOUNDS, dot(picked.is_none()), t("None", "Нет"));
     for (i, sound) in sounds.list.iter().enumerate() {
         let mark = dot(picked == Some(sound.id.as_str()));
         add(&mut lines, SettingsMenu::SOUNDS + 1 + i, mark, &sound.label);
     }
     if let Some(dir) = &sounds.dir {
         lines.push(Line::default());
-        lines.push(Line::from(" Your own sounds, WAV or Ogg Opus, go in").fg(colors.muted));
+        lines.push(
+            Line::from(t(
+                " Your own sounds, WAV or Ogg Opus, go in",
+                " Свои звуки, WAV или Ogg Opus, кладутся в",
+            ))
+            .fg(colors.muted),
+        );
         lines.push(Line::from(format!(" {}", short_path(dir))).fg(colors.muted));
     }
     let sounds_end = lines.len() - 1;
     lines.push(Line::default());
-    lines.push(heading(" Theme"));
+    lines.push(heading(t(" Theme", " Тема")));
     for (i, theme) in themes.list.iter().enumerate() {
         // The dot marks the theme in use.
         let mark = if theme.id == settings.theme {
@@ -1546,7 +1586,7 @@ fn draw_settings(
     }
     if let Some(dir) = &themes.dir {
         lines.push(Line::default());
-        lines.push(Line::from(" Your own themes go in").fg(colors.muted));
+        lines.push(Line::from(t(" Your own themes go in", " Свои темы кладутся в")).fg(colors.muted));
         lines.push(Line::from(format!(" {}", short_path(dir))).fg(colors.muted));
     }
     // On the last sound or theme, the lines after it show too.
@@ -2562,24 +2602,27 @@ fn draw_completions(frame: &mut Frame, area: Rect, names: &[String], colors: &Co
 }
 
 /// Ctrl-t's hint while photos are attached: what it switches them to.
-fn as_files_hint(open: &OpenChat) -> Option<&'static str> {
+fn as_files_hint(open: &OpenChat, ru: bool) -> Option<&'static str> {
     let photos = open.attachments.iter().any(|a| a.kind.is_photo());
-    photos.then_some(if open.as_files {
-        "`Ctrl-t` send as photos"
-    } else {
-        "`Ctrl-t` send as files"
+    photos.then_some(match open.as_files {
+        true => crate::lang::pick(ru, "`Ctrl-t` send as photos", "`Ctrl-t` отправить как фото"),
+        false => crate::lang::pick(ru, "`Ctrl-t` send as files", "`Ctrl-t` отправить как файлы"),
     })
 }
 
 /// Hints for keys that depend on the cursor: Enter on hidden spoilers, `gd`
 /// on a reply, and Ctrl-o / Ctrl-i after leaving a chat or a reply.
-fn jump_hints(open: &OpenChat, jumps: &Jumps) -> Vec<&'static str> {
+fn jump_hints(open: &OpenChat, jumps: &Jumps, ru: bool) -> Vec<&'static str> {
     let mut hints = Vec::new();
     let msg = open.cursor_id().and_then(|id| open.messages.get(&id));
     if msg.and_then(|m| m.hidden.as_ref()).is_some_and(|h| !h.open) {
-        hints.push("`Enter` view it");
+        hints.push(crate::lang::pick(ru, "`Enter` view it", "`Enter` посмотреть"));
     } else if open.cursor_id().is_some_and(|id| open.hides_spoilers(id)) {
-        hints.push("`Enter` show spoiler");
+        hints.push(crate::lang::pick(
+            ru,
+            "`Enter` show spoiler",
+            "`Enter` показать спойлер",
+        ));
     } else if open
         .cursor_id()
         .and_then(|id| open.messages.get(&id))
@@ -2592,13 +2635,13 @@ fn jump_hints(open: &OpenChat, jumps: &Jumps) -> Vec<&'static str> {
         .and_then(|id| open.messages.get(&id))
         .is_some_and(|m| m.reply_to.is_some());
     if on_reply {
-        hints.push("`gd` go to replied");
+        hints.push(crate::lang::pick(ru, "`gd` go to replied", "`gd` к отвеченному"));
     }
     if jumps.can_go_back() {
-        hints.push("`Ctrl-o` back");
+        hints.push(crate::lang::pick(ru, "`Ctrl-o` back", "`Ctrl-o` назад"));
     }
     if jumps.can_go_forward() {
-        hints.push("`Ctrl-i` forward");
+        hints.push(crate::lang::pick(ru, "`Ctrl-i` forward", "`Ctrl-i` вперёд"));
     }
     hints
 }
@@ -2617,63 +2660,127 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     let insert = Span::from(" INSERT ").fg(colors.bg).bg(colors.insert);
     let sticker = Span::from(" STICKERS ").fg(colors.bg).bg(colors.insert);
     let picking = app.focus == Focus::Input && app.stickers.is_some();
+    let ru = app.settings.ru();
+    let t = |en: &'static str, ru_text: &'static str| crate::lang::pick(ru, en, ru_text);
     let (mode, hints) = match app.focus {
         _ if app.resizing.is_some() => (
             Span::from(" RESIZE ").fg(colors.bg).bg(colors.accent),
             match app.settings.chat_list_side {
-                Side::Left => {
-                    "  `h` narrower · `l` wider · `=` as at first · `Enter` keep · `Esc` cancel"
-                }
-                Side::Right => {
-                    "  `h` wider · `l` narrower · `=` as at first · `Enter` keep · `Esc` cancel"
-                }
+                Side::Left => t(
+                    "  `h` narrower · `l` wider · `=` as at first · `Enter` keep · `Esc` cancel",
+                    "  `h` уже · `l` шире · `=` как было · `Enter` оставить · `Esc` отмена",
+                ),
+                Side::Right => t(
+                    "  `h` wider · `l` narrower · `=` as at first · `Enter` keep · `Esc` cancel",
+                    "  `h` шире · `l` уже · `=` как было · `Enter` оставить · `Esc` отмена",
+                ),
             },
         ),
         _ if app.confirm.is_some() => (
             normal,
             match app.confirm.as_ref().map(|c| &c.action) {
-                Some(Confirmed::Edit { .. }) => "  `y` edit · `n` or `Esc` cancel",
-                Some(Confirmed::Join(_) | Confirmed::JoinLink { .. }) => {
-                    "  `y` join · `n` or `Esc` cancel"
+                Some(Confirmed::Edit { .. }) => {
+                    t("  `y` edit · `n` or `Esc` cancel", "  `y` править · `n` или `Esc` отмена")
                 }
-                Some(Confirmed::Leave(_)) => "  `y` leave · `n` or `Esc` cancel",
-                Some(Confirmed::Logout) => "  `y` log out · `n` or `Esc` cancel",
-                Some(Confirmed::StartSecret { .. }) => "  `y` start it · `n` or `Esc` cancel",
-                Some(Confirmed::EndSecret { .. }) => "  `y` end it · `n` or `Esc` cancel",
-                Some(Confirmed::UseProxy(_)) => "  `y` use it · `n` or `Esc` cancel",
-                _ => "  `y` open · `n` or `Esc` cancel",
+                Some(Confirmed::Join(_) | Confirmed::JoinLink { .. }) => t(
+                    "  `y` join · `n` or `Esc` cancel",
+                    "  `y` вступить · `n` или `Esc` отмена",
+                ),
+                Some(Confirmed::Leave(_)) => t(
+                    "  `y` leave · `n` or `Esc` cancel",
+                    "  `y` покинуть · `n` или `Esc` отмена",
+                ),
+                Some(Confirmed::Logout) => t(
+                    "  `y` log out · `n` or `Esc` cancel",
+                    "  `y` выйти из аккаунта · `n` или `Esc` отмена",
+                ),
+                Some(Confirmed::StartSecret { .. }) => t(
+                    "  `y` start it · `n` or `Esc` cancel",
+                    "  `y` начать · `n` или `Esc` отмена",
+                ),
+                Some(Confirmed::EndSecret { .. }) => t(
+                    "  `y` end it · `n` or `Esc` cancel",
+                    "  `y` завершить · `n` или `Esc` отмена",
+                ),
+                Some(Confirmed::UseProxy(_)) => t(
+                    "  `y` use it · `n` or `Esc` cancel",
+                    "  `y` использовать · `n` или `Esc` отмена",
+                ),
+                _ => t(
+                    "  `y` open · `n` or `Esc` cancel",
+                    "  `y` открыть · `n` или `Esc` отмена",
+                ),
             },
         ),
-        _ if app.settings_menu.as_ref().map(|m| m.tab) == Some(HelpTab::Shortcuts) => {
-            (normal, "  `j/k` scroll · `Tab` settings · `Esc` close")
-        }
+        _ if app.settings_menu.as_ref().map(|m| m.tab) == Some(HelpTab::Shortcuts) => (
+            normal,
+            t(
+                "  `j/k` scroll · `Tab` settings · `Esc` close",
+                "  `j/k` листать · `Tab` настройки · `Esc` закрыть",
+            ),
+        ),
         _ if app.settings_menu.is_some() => (
             normal,
-            "  `j/k` move · `Enter` or `Space` change, saved at once · `Tab` shortcuts · `Esc` close",
+            t(
+                "  `j/k` move · `Enter` or `Space` change, saved at once · `Tab` shortcuts · `Esc` close",
+                "  `j/k` перемещение · `Enter` или `Space` изменить, сохраняется сразу · `Tab` клавиши · `Esc` закрыть",
+            ),
         ),
-        _ if app.delete_menu.is_some() => {
-            (normal, "  `j/k` choose · `Enter` delete · `Esc` cancel")
-        }
+        _ if app.delete_menu.is_some() => (
+            normal,
+            t(
+                "  `j/k` choose · `Enter` delete · `Esc` cancel",
+                "  `j/k` выбор · `Enter` удалить · `Esc` отмена",
+            ),
+        ),
         _ if app.react_menu.as_ref().is_some_and(|m| m.query.is_some()) => (
             normal,
-            "  type a name, like heart or +1 · `arrows` choose · `Enter` react · `Esc` back",
+            t(
+                "  type a name, like heart or +1 · `arrows` choose · `Enter` react · `Esc` back",
+                "  имя, например heart или +1 · `стрелки` выбор · `Enter` реакция · `Esc` назад",
+            ),
         ),
         _ if app.react_menu.is_some() => (
             normal,
-            "  `h/j/k/l` choose · `Enter` react, or take yours back · `X` take all yours back · `/` search · `Esc` close",
+            t(
+                "  `h/j/k/l` choose · `Enter` react, or take yours back · `X` take all yours back · `/` search · `Esc` close",
+                "  `h/j/k/l` выбор · `Enter` реакция или снять свою · `X` снять все свои · `/` поиск · `Esc` закрыть",
+            ),
         ),
         _ if app.vote_menu.as_ref().is_some_and(|m| m.several) => (
             normal,
-            "  `j/k` choose · `Space` tick · `Enter` vote for the ticked · `Esc` close",
+            t(
+                "  `j/k` choose · `Space` tick · `Enter` vote for the ticked · `Esc` close",
+                "  `j/k` выбор · `Space` отметить · `Enter` голосовать за отмеченные · `Esc` закрыть",
+            ),
         ),
-        _ if app.vote_menu.is_some() => (normal, "  `j/k` choose · `Enter` vote · `Esc` close"),
-        _ if app.notice.is_some() => (normal, "  `Enter` or `Esc` close"),
-        _ if app.pin_menu.is_some() => (normal, "  `j/k` choose · `Enter` pin · `Esc` cancel"),
+        _ if app.vote_menu.is_some() => (
+            normal,
+            t(
+                "  `j/k` choose · `Enter` vote · `Esc` close",
+                "  `j/k` выбор · `Enter` голосовать · `Esc` закрыть",
+            ),
+        ),
+        _ if app.notice.is_some() => {
+            (normal, t("  `Enter` or `Esc` close", "  `Enter` или `Esc` закрыть"))
+        }
+        _ if app.pin_menu.is_some() => (
+            normal,
+            t(
+                "  `j/k` choose · `Enter` pin · `Esc` cancel",
+                "  `j/k` выбор · `Enter` закрепить · `Esc` отмена",
+            ),
+        ),
         _ if app.timer_menu.is_some() => (
             normal,
-            "  `j/k` choose · `Enter` set the timer · `Esc` cancel",
+            t(
+                "  `j/k` choose · `Enter` set the timer · `Esc` cancel",
+                "  `j/k` выбор · `Enter` задать таймер · `Esc` отмена",
+            ),
         ),
-        _ if app.key_view.is_some() => (normal, "  `Enter` or `Esc` close"),
+        _ if app.key_view.is_some() => {
+            (normal, t("  `Enter` or `Esc` close", "  `Enter` или `Esc` закрыть"))
+        }
         _ if app
             .chat_info
             .as_ref()
@@ -2681,126 +2788,210 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         {
             (
                 normal,
-                "  `j/k` move · `Enter` write to them · `g/G` first/last · `Esc` close",
+                t(
+                    "  `j/k` move · `Enter` write to them · `g/G` first/last · `Esc` close",
+                    "  `j/k` перемещение · `Enter` написать · `g/G` первый/последний · `Esc` закрыть",
+                ),
             )
         }
-        _ if app.chat_info.is_some() => (normal, "  `Esc` close"),
+        _ if app.chat_info.is_some() => (normal, t("  `Esc` close", "  `Esc` закрыть")),
         _ if app.text_select.as_ref().is_some_and(TextSelect::selecting) => (
             Span::from(" VISUAL ").fg(colors.bg).bg(colors.accent),
-            "  `y` copy · `h/j/k/l` `w/b/e` `0/$` `g/G` move the end · `v` or `Esc` stop selecting",
+            t(
+                "  `y` copy · `h/j/k/l` `w/b/e` `0/$` `g/G` move the end · `v` or `Esc` stop selecting",
+                "  `y` копировать · `h/j/k/l` `w/b/e` `0/$` `g/G` конец выделения · `v` или `Esc` стоп",
+            ),
         ),
         _ if app.text_select.is_some() => (
             normal,
-            "  `v` start selecting · `h/j/k/l` move · `w/b/e` by word · `0/$` line start/end · `g/G` start/end · `Ctrl-d/u` half page · `Esc` close",
+            t(
+                "  `v` start selecting · `h/j/k/l` move · `w/b/e` by word · `0/$` line start/end · `g/G` start/end · `Ctrl-d/u` half page · `Esc` close",
+                "  `v` выделять · `h/j/k/l` перемещение · `w/b/e` по словам · `0/$` начало/конец строки · `g/G` начало/конец · `Ctrl-d/u` полстраницы · `Esc` закрыть",
+            ),
         ),
         _ if app.photo_view.is_some() => (
             normal,
-            "  `h/l` older/newer photo · `j/k` zoom in/out · `o` open in its app · `y` copy · `Enter` or `Esc` close",
+            t(
+                "  `h/l` older/newer photo · `j/k` zoom in/out · `o` open in its app · `y` copy · `Enter` or `Esc` close",
+                "  `h/l` старее/новее фото · `j/k` увеличить/уменьшить · `o` открыть в приложении · `y` копировать · `Enter` или `Esc` закрыть",
+            ),
         ),
         _ if app.video_view.is_some() => (
             normal,
-            "  `Space` pause · `j/k` zoom in/out · `o` open in its app · `Enter` or `Esc` close",
+            t(
+                "  `Space` pause · `j/k` zoom in/out · `o` open in its app · `Enter` or `Esc` close",
+                "  `Space` пауза · `j/k` увеличить/уменьшить · `o` открыть в приложении · `Enter` или `Esc` закрыть",
+            ),
         ),
         _ if app.pinned_menu.is_some() => (
             normal,
-            "  `j/k` choose · `Enter` go to it · `P` unpin it · `Esc` close",
+            t(
+                "  `j/k` choose · `Enter` go to it · `P` unpin it · `Esc` close",
+                "  `j/k` выбор · `Enter` перейти · `P` открепить · `Esc` закрыть",
+            ),
         ),
         _ if app.button_menu.as_ref().is_some_and(|m| m.reply) => (
             normal,
-            "  `h/j/k/l` choose · `Enter` send its words · `Esc` close",
+            t(
+                "  `h/j/k/l` choose · `Enter` send its words · `Esc` close",
+                "  `h/j/k/l` выбор · `Enter` отправить её текст · `Esc` закрыть",
+            ),
         ),
-        _ if app.button_menu.is_some() => {
-            (normal, "  `h/j/k/l` choose · `Enter` press · `Esc` close")
-        }
+        _ if app.button_menu.is_some() => (
+            normal,
+            t(
+                "  `h/j/k/l` choose · `Enter` press · `Esc` close",
+                "  `h/j/k/l` выбор · `Enter` нажать · `Esc` закрыть",
+            ),
+        ),
         _ if app.picker.as_ref().is_some_and(ChatPicker::forwarding) => (
             normal,
-            "  type a chat's name · `arrows` choose · `Enter` forward · `Esc` cancel",
+            t(
+                "  type a chat's name · `arrows` choose · `Enter` forward · `Esc` cancel",
+                "  имя чата · `стрелки` выбор · `Enter` переслать · `Esc` отмена",
+            ),
         ),
         _ if app.picker.is_some() => (
             normal,
-            "  type a name, @username or t.me link · `arrows` choose · `Enter` open · `Esc` cancel",
+            t(
+                "  type a name, @username or t.me link · `arrows` choose · `Enter` open · `Esc` cancel",
+                "  имя, @username или ссылка t.me · `стрелки` выбор · `Enter` открыть · `Esc` отмена",
+            ),
         ),
         Focus::Chats if !app.chats.filter().is_empty() => (
             normal,
-            "  `j/k` move · `Enter` open · `Esc` clear search · `/` search again · `i` write · `q` quit",
+            t(
+                "  `j/k` move · `Enter` open · `Esc` clear search · `/` search again · `i` write · `q` quit",
+                "  `j/k` перемещение · `Enter` открыть · `Esc` сбросить поиск · `/` искать снова · `i` написать · `q` выход",
+            ),
         ),
         Focus::Chats if !app.chats.tabs().is_empty() => (
             normal,
-            "  `j/k` move · `Enter` open · `i` write · `Tab/Shift-Tab` folders · `/` search · `s` find anyone · `p` pin · `m` mute · `a` archive · `I` info · `Ctrl-o/i` back/forward · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            t(
+                "  `j/k` move · `Enter` open · `i` write · `Tab/Shift-Tab` folders · `/` search · `s` find anyone · `p` pin · `m` mute · `a` archive · `I` info · `Ctrl-o/i` back/forward · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+                "  `j/k` перемещение · `Enter` открыть · `i` написать · `Tab/Shift-Tab` папки · `/` поиск · `s` найти любого · `p` закрепить · `m` звук · `a` архив · `I` инфо · `Ctrl-o/i` назад/вперёд · `H` выделить · `gg/G` вверх/вниз · `Ctrl-d/u` полстраницы · `Ctrl-r` ширина · `:` команды · `?` помощь · `q` выход",
+            ),
         ),
         Focus::Chats => (
             normal,
-            "  `j/k` move · `Enter` open · `i` write · `/` search · `s` find anyone · `p` pin · `m` mute · `a` archive · `I` info · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            t(
+                "  `j/k` move · `Enter` open · `i` write · `/` search · `s` find anyone · `p` pin · `m` mute · `a` archive · `I` info · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+                "  `j/k` перемещение · `Enter` открыть · `i` написать · `/` поиск · `s` найти любого · `p` закрепить · `m` звук · `a` архив · `I` инфо · `H` выделить · `gg/G` вверх/вниз · `Ctrl-d/u` полстраницы · `Ctrl-r` ширина · `:` команды · `?` помощь · `q` выход",
+            ),
         ),
         Focus::Topics => (
             normal,
-            "  `j/k` move · `Enter` open · `i` write · `h` back · `s` find anyone · `I` info · `Ctrl-o/i` back/forward · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            t(
+                "  `j/k` move · `Enter` open · `i` write · `h` back · `s` find anyone · `I` info · `Ctrl-o/i` back/forward · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+                "  `j/k` перемещение · `Enter` открыть · `i` написать · `h` назад · `s` найти любого · `I` инфо · `Ctrl-o/i` назад/вперёд · `gg/G` вверх/вниз · `Ctrl-d/u` полстраницы · `Ctrl-r` ширина · `:` команды · `?` помощь · `q` выход",
+            ),
         ),
         Focus::Messages if searching => (
             normal,
-            "  `n/N` older/newer match · `Esc` end search · `/` search again · `j/k` newer/older · `Enter` open/play media · `r` reply · `i` write · `h` back",
+            t(
+                "  `n/N` older/newer match · `Esc` end search · `/` search again · `j/k` newer/older · `Enter` open/play media · `r` reply · `i` write · `h` back",
+                "  `n/N` старее/новее · `Esc` конец поиска · `/` искать снова · `j/k` новее/старее · `Enter` открыть/играть · `r` ответить · `i` написать · `h` назад",
+            ),
         ),
         Focus::Messages if editing => (
             normal,
-            "  `i` edit · `Esc` cancel edit · `e` edit selected instead · `j/k` newer/older · `h` back",
+            t(
+                "  `i` edit · `Esc` cancel edit · `e` edit selected instead · `j/k` newer/older · `h` back",
+                "  `i` править · `Esc` отмена правки · `e` править выбранное · `j/k` новее/старее · `h` назад",
+            ),
         ),
         Focus::Messages if attaching => (
             normal,
-            "  `i` add caption · `Esc` remove files · `a` attach more · `p` paste more · `r` reply · `j/k` newer/older · `h` back",
+            t(
+                "  `i` add caption · `Esc` remove files · `a` attach more · `p` paste more · `r` reply · `j/k` newer/older · `h` back",
+                "  `i` подпись · `Esc` убрать файлы · `a` ещё файл · `p` вставить ещё · `r` ответить · `j/k` новее/старее · `h` назад",
+            ),
         ),
         Focus::Messages if replying => (
             normal,
-            "  `i` write reply · `Esc` cancel reply · `r` reply to selected instead · `j/k` newer/older · `Enter` open/play media · `h` back",
+            t(
+                "  `i` write reply · `Esc` cancel reply · `r` reply to selected instead · `j/k` newer/older · `Enter` open/play media · `h` back",
+                "  `i` написать ответ · `Esc` отмена ответа · `r` ответить выбранному · `j/k` новее/старее · `Enter` открыть/играть · `h` назад",
+            ),
         ),
         Focus::Messages => (
             normal,
-            "  `j/k` newer/older · `y` copy · `r` reply · `f` forward · `R` react · `X` unreact · `e` edit · `d` delete · `P` pin · `gp` pinned · `gu/gm/gM` unread/mention · `Enter` open/play media · `i` write · `a` attach · `p` paste · `/` search · `s` find anyone · `I` info · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+            t(
+                "  `j/k` newer/older · `y` copy · `r` reply · `f` forward · `R` react · `X` unreact · `e` edit · `d` delete · `P` pin · `gp` pinned · `gu/gm/gM` unread/mention · `Enter` open/play media · `i` write · `a` attach · `p` paste · `/` search · `s` find anyone · `I` info · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+                "  `j/k` новее/старее · `y` копировать · `r` ответить · `f` переслать · `R` реакция · `X` снять реакцию · `e` править · `d` удалить · `P` закрепить · `gp` закреплённые · `gu/gm/gM` непрочитанное/упоминание · `Enter` открыть/играть · `i` написать · `a` прикрепить · `p` вставить · `/` поиск · `s` найти любого · `I` инфо · `gg/G` старейшее/новейшее · `h` назад · `Ctrl-r` ширина · `:` команды · `?` помощь · `q` выход",
+            ),
         ),
         _ if picking && app.stickers.as_ref().is_some_and(|p| p.query.is_some()) => (
             sticker,
-            "  type an emoji or a word, like cat · `arrows` choose · `Enter` send · `Esc` back",
+            t(
+                "  type an emoji or a word, like cat · `arrows` choose · `Enter` send · `Esc` back",
+                "  эмодзи или слово, например кот · `стрелки` выбор · `Enter` отправить · `Esc` назад",
+            ),
         ),
         _ if picking => (
             sticker,
-            "  `h/j/k/l` choose · `H/L` previous/next tab · `Enter` send · `/` search · `Tab` or `Esc` back to writing",
+            t(
+                "  `h/j/k/l` choose · `H/L` previous/next tab · `Enter` send · `/` search · `Tab` or `Esc` back to writing",
+                "  `h/j/k/l` выбор · `H/L` пред./след. вкладка · `Enter` отправить · `/` поиск · `Tab` или `Esc` обратно к тексту",
+            ),
         ),
         Focus::Input if app.completion.as_ref().is_some_and(|c| !c.items.is_empty()) => (
             insert,
-            "  `Tab` insert · `arrows` choose · keep typing to narrow it down · `Enter` send · `Esc` normal mode",
+            t(
+                "  `Tab` insert · `arrows` choose · keep typing to narrow it down · `Enter` send · `Esc` normal mode",
+                "  `Tab` вставить · `стрелки` выбор · продолжайте печатать для уточнения · `Enter` отправить · `Esc` обычный режим",
+            ),
         ),
         Focus::Input if editing => (
             insert,
-            "  `Enter` save · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` cancel edit",
+            t(
+                "  `Enter` save · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` cancel edit",
+                "  `Enter` сохранить · `Alt-Enter` или `Ctrl-j` новая строка · `Esc` обычный режим · `Esc Esc` отмена правки",
+            ),
         ),
         Focus::Input if dropped => (
             insert,
-            "  `Enter` send · `Ctrl-z` paste as text instead · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` remove files",
+            t(
+                "  `Enter` send · `Ctrl-z` paste as text instead · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` remove files",
+                "  `Enter` отправить · `Ctrl-z` вставить как текст · `Alt-Enter` или `Ctrl-j` новая строка · `Esc` обычный режим · `Esc Esc` убрать файлы",
+            ),
         ),
         Focus::Input if attaching => (
             insert,
-            "  `Enter` send · `Ctrl-v` paste more · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` remove files",
+            t(
+                "  `Enter` send · `Ctrl-v` paste more · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` remove files",
+                "  `Enter` отправить · `Ctrl-v` вставить ещё · `Alt-Enter` или `Ctrl-j` новая строка · `Esc` обычный режим · `Esc Esc` убрать файлы",
+            ),
         ),
         Focus::Input if replying => (
             insert,
-            "  `Enter` send reply · `Alt-Enter` or `Ctrl-j` new line · `Tab` stickers · `Esc` normal mode · `Esc Esc` cancel reply",
+            t(
+                "  `Enter` send reply · `Alt-Enter` or `Ctrl-j` new line · `Tab` stickers · `Esc` normal mode · `Esc Esc` cancel reply",
+                "  `Enter` отправить ответ · `Alt-Enter` или `Ctrl-j` новая строка · `Tab` стикеры · `Esc` обычный режим · `Esc Esc` отмена ответа",
+            ),
         ),
         Focus::Input => (
             insert,
-            "  `Enter` send · `Alt-Enter` or `Ctrl-j` new line · `Tab` stickers · `Ctrl-v` paste photo or file · `Esc` normal mode",
+            t(
+                "  `Enter` send · `Alt-Enter` or `Ctrl-j` new line · `Tab` stickers · `Ctrl-v` paste photo or file · `Esc` normal mode",
+                "  `Enter` отправить · `Alt-Enter` или `Ctrl-j` новая строка · `Tab` стикеры · `Ctrl-v` вставить фото или файл · `Esc` обычный режим",
+            ),
         ),
     };
     // `l` goes back to a chat list on the right.
     let hints = match app.settings.chat_list_side {
         Side::Left => hints.to_string(),
-        Side::Right => hints.replace("`h` back", "`l` back"),
+        Side::Right => hints
+            .replace("`h` back", "`l` back")
+            .replace("`h` назад", "`l` назад"),
     };
     let popup = app.popup_open() || app.resizing.is_some();
     let mut context = match &app.open {
-        Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open, &app.jumps),
+        Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open, &app.jumps, ru),
         _ => Vec::new(),
     };
     if app.focus == Focus::Messages && !popup && app.unread_mentions() > 0 {
-        context.insert(0, "`gm` mention");
+        context.insert(0, crate::lang::pick(ru, "`gm` mention", "`gm` упоминание"));
     }
     let retry = app.open.as_ref().is_some_and(|o| {
         o.cursor_id()
@@ -2808,12 +2999,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             .is_some_and(|m| m.state == SendState::Failed { can_retry: true })
     });
     if app.focus == Focus::Messages && !popup && retry {
-        context.insert(0, "`Enter` send again");
+        context.insert(
+            0,
+            crate::lang::pick(ru, "`Enter` send again", "`Enter` отправить снова"),
+        );
     }
     if let Some(open) = &app.open
         && matches!(app.focus, Focus::Messages | Focus::Input)
         && !popup
-        && let Some(hint) = as_files_hint(open)
+        && let Some(hint) = as_files_hint(open, ru)
     {
         context.insert(0, hint);
     }
@@ -2834,26 +3028,65 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     }
     match app.resizing {
         Some(Resizing::List(_)) => {
-            let width = format!("  chat list {}%", app.settings.list_width());
+            let width = format!(
+                "  {} {}%",
+                crate::lang::pick(ru, "chat list", "список чатов"),
+                app.settings.list_width()
+            );
             spans.push(Span::from(width).fg(colors.fg));
         }
         Some(Resizing::Topics(_)) => {
-            let width = format!("  topics {} columns", app.settings.topics_pane_width());
+            let width = match ru {
+                true => format!("  темы: {} колонок", app.settings.topics_pane_width()),
+                false => format!("  topics {} columns", app.settings.topics_pane_width()),
+            };
             spans.push(Span::from(width).fg(colors.fg));
         }
         None => {}
     }
     if app.quit_deadline.is_some() {
-        spans.push(Span::from("  Closing… (q again to force)").fg(colors.warning));
+        spans.push(
+            Span::from(crate::lang::pick(
+                ru,
+                "  Closing… (q again to force)",
+                "  Закрытие… (ещё `q` — принудительно)",
+            ))
+            .fg(colors.warning),
+        );
     } else if !app.opening.is_empty() {
-        spans.push(Span::from("  Downloading… opens when done").fg(colors.warning));
+        spans.push(
+            Span::from(crate::lang::pick(
+                ru,
+                "  Downloading… opens when done",
+                "  Скачивание… откроется по готовности",
+            ))
+            .fg(colors.warning),
+        );
     } else if !app.copying.is_empty() {
-        spans.push(Span::from("  Downloading… copies when done").fg(colors.warning));
+        spans.push(
+            Span::from(crate::lang::pick(
+                ru,
+                "  Downloading… copies when done",
+                "  Скачивание… скопируется по готовности",
+            ))
+            .fg(colors.warning),
+        );
     } else if app.pasting {
-        spans.push(Span::from("  Reading the clipboard…").fg(colors.warning));
+        spans.push(
+            Span::from(crate::lang::pick(
+                ru,
+                "  Reading the clipboard…",
+                "  Чтение буфера обмена…",
+            ))
+            .fg(colors.warning),
+        );
     } else if let Some(finding) = &app.finding {
         let what = truncate(&finding.request, 60);
-        let looking = format!("  Looking for {what}… (Esc stops)");
+        let looking = format!(
+            "  {} {what}…{}",
+            crate::lang::pick(ru, "Looking for", "Поиск"),
+            crate::lang::pick(ru, " (Esc stops)", " (`Esc` стоп)")
+        );
         spans.push(Span::from(looking).fg(colors.warning));
     } else if let Some(message) = &app.status {
         spans.push(Span::from(format!("  {message}")).fg(colors.error));
@@ -3073,7 +3306,7 @@ mod tests {
         assert!(has(&rows, "Switch tabs in this popup"), "the last shortcut");
         assert_eq!(
             menu.scroll,
-            help::height() - 16,
+            help::height(false) - 16,
             "the popup is 2 rows shorter than the screen, then borders"
         );
 
@@ -3681,18 +3914,18 @@ mod tests {
 
         let mut jumps = Jumps::default();
         assert_eq!(
-            jump_hints(&open, &jumps),
+            jump_hints(&open, &jumps, false),
             ["`gd` go to replied"],
             "newest is a reply"
         );
         open.selected = Some(1);
-        assert!(jump_hints(&open, &jumps).is_empty());
+        assert!(jump_hints(&open, &jumps, false).is_empty());
         jumps.leave(crate::app::Jump {
             chat_id: 1,
             topic: None,
             message_id: Some(2),
         });
-        assert_eq!(jump_hints(&open, &jumps), ["`Ctrl-o` back"]);
+        assert_eq!(jump_hints(&open, &jumps, false), ["`Ctrl-o` back"]);
     }
 
     #[test]

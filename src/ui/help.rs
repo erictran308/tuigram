@@ -212,6 +212,16 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Video player",
+        &[
+            ("Space", "Play or pause, right in the message"),
+            ("j / k", "Zoom in / out"),
+            ("o", "Open the video in your computer's player"),
+            ("Enter", "Fill the window, then back to the chat"),
+            ("Esc / q", "Close"),
+        ],
+    ),
+    (
         "Bot buttons",
         &[
             ("h / j / k / l", "Move, as the buttons are laid out"),
@@ -285,9 +295,301 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
+/// The same table in Russian. One row per English row, in the same order,
+/// so both tables size the popup alike.
+const SHORTCUTS_RU: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Везде",
+        &[
+            ("?", "Эта справка и настройки"),
+            (
+                ":",
+                "Команда: info, secret, key, timer, leave, proxy или logout",
+            ),
+            ("s", "Найти чат или человека: имя, @username или ссылка t.me"),
+            (
+                "I",
+                "Что это за чат и кто в нём: Enter на человеке — написать ему",
+            ),
+            ("H", "Выделить чат или снять выделение"),
+            (
+                "Ctrl-o / Ctrl-i",
+                "Назад к чату или ответу, откуда ушли / снова вперёд",
+            ),
+            (
+                "Ctrl-r",
+                "Ширина панелей: h / l, = как было, Enter сохранить, Esc отмена",
+            ),
+            ("q", "Выход (ещё раз — не ждать)"),
+            ("Ctrl-c", "Выход, кроме режима набора текста"),
+        ],
+    ),
+    (
+        "Список чатов",
+        &[
+            ("j / k", "Вниз / вверх"),
+            ("gg / G", "Первый / последний чат"),
+            ("Ctrl-d / Ctrl-u", "Полстраницы вниз / вверх"),
+            (
+                "Enter / l",
+                "Открыть чат на первом непрочитанном (Enter / h, если список справа)",
+            ),
+            ("i", "Открыть чат и писать"),
+            ("gm", "Открыть чат на сообщении с упоминанием вас"),
+            (
+                "Tab / Shift-Tab",
+                "Следующая / предыдущая папка, затем архив",
+            ),
+            ("/", "Фильтр чатов по имени"),
+            ("p", "Закрепить / открепить чат (на всех устройствах)"),
+            ("m", "Выключить / включить уведомления чата"),
+            ("a", "В архив или обратно из архива"),
+            ("Esc", "Сбросить фильтр"),
+        ],
+    ),
+    (
+        "Темы форума",
+        &[
+            ("j / k", "Вниз / вверх"),
+            ("gg / G", "Первая / последняя тема"),
+            (
+                "Enter / l",
+                "Открыть сообщения темы (Enter / h, если список справа)",
+            ),
+            ("i", "Открыть тему и писать"),
+            ("Ctrl-r", "Ширина панели тем: h / l, = как было"),
+            (
+                "h / Esc",
+                "Назад к списку чатов (l, если список справа)",
+            ),
+        ],
+    ),
+    (
+        "Сообщения",
+        &[
+            ("j / k", "Новее / старее"),
+            ("gg / G", "Самое старое / новое"),
+            ("Ctrl-d / Ctrl-u", "Полстраницы новее / старее"),
+            (
+                "Enter",
+                "Отправить неотправленное заново, показать спойлеры, открыть фото «на один раз», играть/пауза голосового, голосовать в опросе, кнопки бота, показать фото, открыть файл или ссылку",
+            ),
+            ("y", "Скопировать текст, ссылку, фото или файл"),
+            ("v", "Выделить часть текста и скопировать её"),
+            ("r", "Ответить"),
+            ("f", "Переслать в другой чат (альбом — целиком)"),
+            ("e", "Изменить своё сообщение"),
+            (
+                "R",
+                "Реакция, или убрать свою (/ ищет эмодзи по имени)",
+            ),
+            ("X", "Убрать все свои реакции"),
+            ("d", "Удалить"),
+            ("P", "Закрепить сообщение (спросит как) или открепить"),
+            ("gp", "Закреплённые: Enter — перейти, P — открепить"),
+            ("gd", "К сообщению, на которое отвечает этот ответ"),
+            (
+                "gu",
+                "К первому непрочитанному, под чертой «Непрочитанные сообщения»",
+            ),
+            (
+                "gm / gM",
+                "К самому старому непрочитанному с упоминанием вас или ответом вам (@ в списке чатов), просмотр читает его; когда все просмотрены — к сообщению до / после курсора",
+            ),
+            (
+                "Tab",
+                "Снова вперёд, как Ctrl-i (большинство терминалов шлют Ctrl-i как Tab)",
+            ),
+            ("i", "Написать сообщение"),
+            ("a", "Приложить файл по пути (Tab дополняет)"),
+            ("p", "Вставить фото, файлы или текст из буфера"),
+            ("/", "Поиск по всему чату"),
+            (
+                "from: has:",
+                "В поиске: from:@alice, from:me или from:имя; has:photo (video, media, file, link, voice, gif, audio)",
+            ),
+            (
+                "before: after:",
+                "В поиске: before:2025-10-01, after:2025-09-01 (тот день считается)",
+            ),
+            ("n / N", "Следующее старое / новое совпадение"),
+            (
+                "Esc",
+                "Закончить поиск, отменить правку, убрать файлы, отменить ответ или назад",
+            ),
+            (
+                "h",
+                "Назад к списку чатов или темам форума (l, если список справа)",
+            ),
+        ],
+    ),
+    (
+        "Набор текста",
+        &[
+            ("Enter", "Отправить или сохранить правку"),
+            ("Alt-Enter / Ctrl-j", "Новая строка"),
+            ("Ctrl-u", "Стереть до начала строки"),
+            (
+                "**жирный**",
+                "Разметка: __курсив__ ~~зачёркнутый~~ ||спойлер|| `код` ```блок``` [текст](url)",
+            ),
+            (
+                "@имя / :smile",
+                "Подскажет людей группы или эмодзи; Tab вставляет",
+            ),
+            ("/команда", "В начале сообщения: команды ботов"),
+            ("Ctrl-v", "Вставить фото, файлы или текст из буфера"),
+            (
+                "Drop a file",
+                "Приложить его; написанный текст станет подписью",
+            ),
+            (
+                "Ctrl-z",
+                "Вернуть вставленные файлы обратно в текст пути",
+            ),
+            (
+                "Ctrl-t",
+                "Фото как файлы, без сжатия, или обратно",
+            ),
+            ("Tab", "Стикеры"),
+            (
+                "Esc / Ctrl-c",
+                "Назад в обычный режим; написанное останется черновиком чата, и на других устройствах тоже",
+            ),
+        ],
+    ),
+    (
+        "Выделение текста (v)",
+        &[
+            ("h / j / k / l", "Символ или строка на экране"),
+            ("w / b / e", "Следующее слово / слово перед / конец слова"),
+            ("0 / $", "Начало / конец строки"),
+            ("g / G", "Начало / конец текста"),
+            ("Ctrl-d / Ctrl-u", "Полстраницы вниз / вверх"),
+            (
+                "v",
+                "Начать выделение с курсора или закончить; захватывает оба конца, как в vim",
+            ),
+            ("y", "Скопировать выделенное и закрыть"),
+            ("Esc", "Закончить выделение, затем закрыть"),
+        ],
+    ),
+    (
+        "Стикеры",
+        &[
+            ("h / j / k / l", "Движение"),
+            ("H / L", "Вкладки: Недавние, Избранное, ваши наборы"),
+            ("Enter", "Отправить стикер или ответ"),
+            ("/", "Найти стикеры по эмодзи или слову"),
+            ("Tab / Esc", "Назад к набору текста"),
+        ],
+    ),
+    (
+        "Просмотр фото",
+        &[
+            ("h / l", "Фото до / после в чате"),
+            (
+                "j / k",
+                "Ближе / дальше (также + / -), вплоть до всего окна",
+            ),
+            ("o", "Открыть фото в просмотрщике компьютера"),
+            ("y", "Скопировать фото"),
+            ("Enter / Esc / q", "Закрыть"),
+        ],
+    ),
+    (
+        "Видеоплеер",
+        &[
+            ("Space", "Играть / пауза, прямо в сообщении"),
+            ("j / k", "Ближе / дальше"),
+            ("o", "Открыть видео в плеере компьютера"),
+            ("Enter", "На всё окно, затем обратно в чат"),
+            ("Esc / q", "Закрыть"),
+        ],
+    ),
+    (
+        "Кнопки ботов",
+        &[
+            ("h / j / k / l", "Движение по кнопкам, как они разложены"),
+            ("Tab / Shift-Tab", "Следующая / предыдущая кнопка"),
+            (
+                "Enter",
+                "Нажать: бот ответит, ссылка откроется (спросив), кнопка-ответ пошлёт свои слова",
+            ),
+            ("Esc / q", "Закрыть"),
+        ],
+    ),
+    (
+        "Секретные чаты",
+        &[
+            (
+                ":secret",
+                "Начать с человеком из этого чата (спросит); хранится только на этом компьютере",
+            ),
+            (
+                ":key",
+                "Его ключ картинкой, чтобы сверить с собеседником",
+            ),
+            (":timer", "Сколько живут новые сообщения после прочтения"),
+            (
+                ":leave",
+                "Завершить для обоих и удалить здесь (спросит)",
+            ),
+            (
+                "Enter",
+                "На фото 🔥: посмотреть; при переходе дальше снова скроется",
+            ),
+        ],
+    ),
+    (
+        "Строки поиска и команд",
+        &[
+            ("Enter", "Искать, оставить фильтр чата или выполнить команду"),
+            (
+                "Tab / Shift-Tab",
+                "Дополнить команду или фильтр поиска (ещё раз — следующий), или путь файла для вложения",
+            ),
+            ("Esc / Ctrl-c", "Отмена"),
+        ],
+    ),
+    (
+        "Окна пересылки и поиска",
+        &[
+            ("Печатайте", "Поиск чатов по имени или @username"),
+            ("Up / Down", "Движение (также Ctrl-p / Ctrl-n, Tab)"),
+            ("Enter", "Переслать туда или открыть"),
+            ("Esc", "Отмена"),
+        ],
+    ),
+    (
+        "Меню и окна",
+        &[
+            ("j / k", "Движение"),
+            ("Enter", "Выбрать"),
+            ("1-9", "Выбрать по номеру"),
+            (
+                "Space",
+                "Отметить настройку или применить звук или тему (Enter тоже); сохраняется сразу",
+            ),
+            ("Esc / q", "Закрыть"),
+            ("Tab / h / l", "Вкладки этого окна"),
+            (
+                "y / n",
+                "Согласиться или нет, когда спрашивают про файл, ссылку или вступление",
+            ),
+        ],
+    ),
+];
+
+/// The table in the language set: Russian where translated, else the
+/// English original. Both hold every group, one row per row.
+fn table(ru: bool) -> &'static [(&'static str, &'static [(&'static str, &'static str)])] {
+    if ru { SHORTCUTS_RU } else { SHORTCUTS }
+}
+
 /// The longest key, which sets where the descriptions start.
-fn key_width() -> usize {
-    SHORTCUTS
+fn key_width(ru: bool) -> usize {
+    table(ru)
         .iter()
         .flat_map(|(_, keys)| keys.iter())
         .map(|(key, _)| key.width())
@@ -296,10 +598,10 @@ fn key_width() -> usize {
 }
 
 /// The shortcuts as lines: a heading per group, then each key and what it does.
-fn lines(colors: &Colors) -> Vec<Line<'static>> {
-    let key_width = key_width();
+fn lines(colors: &Colors, ru: bool) -> Vec<Line<'static>> {
+    let key_width = key_width(ru);
     let mut lines = Vec::new();
-    for (i, (group, keys)) in SHORTCUTS.iter().enumerate() {
+    for (i, (group, keys)) in table(ru).iter().enumerate() {
         if i > 0 {
             lines.push(Line::default());
         }
@@ -316,20 +618,20 @@ fn lines(colors: &Colors) -> Vec<Line<'static>> {
 
 /// Columns the widest line takes, plus one for the scrollbar, for sizing the
 /// popup.
-pub fn width() -> usize {
-    let what = SHORTCUTS
+pub fn width(ru: bool) -> usize {
+    let what = table(ru)
         .iter()
         .flat_map(|(_, keys)| keys.iter())
         .map(|(_, what)| what.width())
         .max()
         .unwrap_or(0);
     // Indent, the keys, a gap, then the descriptions.
-    3 + key_width() + 2 + what + 1
+    3 + key_width(ru) + 2 + what + 1
 }
 
 /// Rows the list takes, for sizing the popup.
-pub fn height() -> usize {
-    SHORTCUTS
+pub fn height(ru: bool) -> usize {
+    table(ru)
         .iter()
         .map(|(_, keys)| keys.len() + 2)
         .sum::<usize>()
@@ -338,8 +640,8 @@ pub fn height() -> usize {
 
 /// Draws the list from row `scroll`, first pulling `scroll` back if it's
 /// past the end.
-pub fn draw(frame: &mut Frame, area: Rect, scroll: &mut usize, colors: &Colors) {
-    let lines = lines(colors);
+pub fn draw(frame: &mut Frame, area: Rect, scroll: &mut usize, ru: bool, colors: &Colors) {
+    let lines = lines(colors, ru);
     let max = lines.len().saturating_sub(usize::from(area.height));
     *scroll = (*scroll).min(max);
     frame.render_widget(Paragraph::new(lines).scroll((*scroll as u16, 0)), area);
@@ -352,16 +654,20 @@ mod tests {
 
     #[test]
     fn height_counts_every_line() {
-        assert_eq!(height(), lines(&Colors::default()).len());
+        for ru in [false, true] {
+            assert_eq!(height(ru), lines(&Colors::default(), ru).len());
+        }
     }
 
     #[test]
     fn width_leaves_room_for_every_line_and_the_scrollbar() {
-        let widest = lines(&Colors::default())
-            .iter()
-            .map(Line::width)
-            .max()
-            .unwrap();
-        assert_eq!(width(), widest + 1);
+        for ru in [false, true] {
+            let widest = lines(&Colors::default(), ru)
+                .iter()
+                .map(Line::width)
+                .max()
+                .unwrap();
+            assert_eq!(width(ru), widest + 1);
+        }
     }
 }

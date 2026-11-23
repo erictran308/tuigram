@@ -10,6 +10,7 @@ mod demo;
 mod draft;
 mod images;
 mod info;
+mod lang;
 mod messages;
 mod motion;
 mod mouse;

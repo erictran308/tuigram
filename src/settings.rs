@@ -54,6 +54,9 @@ pub struct Settings {
     pub chat_gaps: bool,
     /// Which side of the window the chat list is on.
     pub chat_list_side: Side,
+    /// The interface's language where translated so far: "en" or "ru".
+    /// What isn't translated stays English either way.
+    pub language: String,
     /// The chat list's share of the window's width, in percent. Ctrl-r
     /// changes it; see [`Settings::list_width`].
     pub chat_list_width: u16,
@@ -90,6 +93,7 @@ impl Default for Settings {
             block_gaps: true,
             chat_gaps: true,
             chat_list_side: Side::Left,
+            language: "en".into(),
             chat_list_width: DEFAULT_LIST_WIDTH,
             topics_width: DEFAULT_TOPICS_WIDTH,
             accept_secret_chats: false,
@@ -125,6 +129,11 @@ const TOPICS_WIDTHS: std::ops::RangeInclusive<u16> = 20..=80;
 const TOPICS_STEP: u16 = 2;
 
 impl Settings {
+    /// The interface speaks Russian where translated.
+    pub fn ru(&self) -> bool {
+        self.language == "ru"
+    }
+
     /// Defaults if the file doesn't exist yet; an error if it can't be read.
     pub fn load(path: &Path) -> Result<Self> {
         let text = match std::fs::read_to_string(path) {
@@ -213,6 +222,7 @@ mod tests {
             notification_sound: Some("chime".into()),
             sound_when_focused: true,
             normal_after_send: true,
+            language: "en".into(),
             wrap_composer: false,
             block_gaps: false,
             chat_gaps: false,
@@ -226,7 +236,7 @@ mod tests {
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nanimations = false\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnotification_sound = \"chime\"\nsound_when_focused = true\nnormal_after_send = true\nwrap_composer = false\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40\ntopics_width = 26\naccept_secret_chats = true"
+            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nanimations = false\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnotification_sound = \"chime\"\nsound_when_focused = true\nnormal_after_send = true\nwrap_composer = false\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nlanguage = \"en\"\nchat_list_width = 40\ntopics_width = 26\naccept_secret_chats = true"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
 
