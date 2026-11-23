@@ -2664,6 +2664,7 @@ impl App {
             (Focus::Topics, KeyCode::Char(c)) if c == to_list => self.focus = Focus::Chats,
             (Focus::Messages, KeyCode::Enter) => self.open_selected_message(),
             (Focus::Messages, KeyCode::Char(' ')) => self.toggle_inline_video(),
+            (Focus::Messages, KeyCode::Char('z')) => self.zoom_inline_video(),
             (Focus::Messages, KeyCode::Esc) => self.focus = self.left_of_messages(),
             (Focus::Messages, KeyCode::Char(c)) if c == to_list => {
                 self.focus = self.left_of_messages();
@@ -5909,8 +5910,7 @@ impl App {
     /// Space on a video message: it plays where its thumbnail is, or pauses
     /// if it's the one playing. One without a thumbnail's cells to play in
     /// opens on the whole window instead.
-    fn toggle_inline_video(&mut self) {
-        if !self.images.kitty() {
+    fn toggle_inline_video(&mut self) {        if !self.images.kitty() {
             return;
         }
         let Some(open) = self.open.as_mut() else {
@@ -5959,6 +5959,23 @@ impl App {
         self.inline_video = Some(inline);
     }
 
+    /// z on the message whose video plays inline: twice as big each way,
+    /// pushing the messages around it apart, or back to the thumbnail's
+    /// size.
+    fn zoom_inline_video(&mut self) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let Some(message_id) = open.cursor_id() else {
+            return;
+        };
+        if let Some(inline) = self.inline_video.as_mut()
+            && inline.is_on(open.chat_id, message_id)
+        {
+            inline.toggle_zoom();
+        }
+    }
+
     /// The video player takes all keys while it's up.
     fn on_video_key(&mut self, key: KeyEvent) {
         let Some(view) = self.video_view.as_mut() else {
@@ -5984,8 +6001,9 @@ impl App {
         }
     }
 
-    /// Word from the video decoder: a frame, the end (looped), or why it
-    /// can't play — then the player closes. The tag says whose word it is.
+    /// Word from the video decoder: a frame, the end (each plays once), or
+    /// why it can't play — then the player closes. The tag says whose word
+    /// it is.
     fn on_video(&mut self, event: VideoEvent) {
         if event.tag() == crate::video::TAG_INLINE {
             let Some(inline) = self.inline_video.as_mut() else {
@@ -6002,6 +6020,11 @@ impl App {
         };
         if let Err(why) = view.on_event(event) {
             self.status = Some(format!("Can't play this video message: {why}"));
+            self.video_view = None;
+            return;
+        }
+        // Played out: it plays once, then the chat is back.
+        if view.finished() {
             self.video_view = None;
         }
     }

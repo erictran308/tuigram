@@ -303,6 +303,8 @@ pub struct VideoView {
     pixels: Option<(u32, u32)>,
     /// A frame waits to be sent to the terminal.
     pending: bool,
+    /// It played out: video messages play once, then the app closes the view.
+    done: bool,
     /// Why it can't play, once: the app shows it and closes the view.
     pub error: Option<String>,
     /// Escapes go through tmux's passthrough when detected.
@@ -336,6 +338,7 @@ impl VideoView {
             rect: None,
             pixels: None,
             pending: false,
+            done: false,
             error: None,
             tmux,
         })
@@ -411,9 +414,9 @@ impl VideoView {
         self.zoom.map_or(1.0, |i| SIZES[i])
     }
 
-    /// Word from the decoder: a frame to send, the end (looped, as
-    /// Telegram's apps loop video messages), or why it can't play — `Err`
-    /// closes the view.
+    /// Word from the decoder: a frame to send, the end (it plays once, then
+    /// the app closes the view), or why it can't play — `Err` closes the
+    /// view too.
     pub fn on_event(&mut self, event: VideoEvent) -> Result<(), String> {
         match event {
             VideoEvent::Frame(_) => {
@@ -422,12 +425,16 @@ impl VideoView {
             }
             VideoEvent::Ended(_) => {
                 self.player = None;
-                self.start = 0.0;
-                self.pixels = None; // restarts on the next frame drawn
+                self.done = true;
                 Ok(())
             }
             VideoEvent::Failed(_, why) => Err(why),
         }
+    }
+
+    /// It played to the end.
+    pub fn finished(&self) -> bool {
+        self.done
     }
 
     /// The picture's cells within `inner`, centered, keeping the video's
@@ -487,8 +494,9 @@ impl VideoView {
         frame.render_widget(Paragraph::new(Span::from(title)).block(block), area);
         frame.render_widget(Clear, at);
 
-        let needs_restart =
-            self.path.is_some() && (self.player.is_none() || self.pixels != Some(pixels));
+        let needs_restart = self.path.is_some()
+            && !self.done
+            && (self.player.is_none() || self.pixels != Some(pixels));
         if needs_restart && self.error.is_none() {
             let position = if self.player.is_some() {
                 self.position()
@@ -565,9 +573,11 @@ impl Drop for VideoView {
 const INLINE_KITTY_ID: u32 = 0x7000_0001;
 
 /// A video message playing where its thumbnail sits in the chat, as in
-/// Telegram's apps. Space starts (and pauses) it; it stops once its bubble
-/// isn't drawn — scrolled away, or the chat left. Enter grows it to the
-/// whole terminal (see [`VideoView`]).
+/// Telegram's apps. Space starts (and pauses) it, z blows it up to twice
+/// the cells each way, pushing the messages around it apart; it stops once
+/// its bubble isn't drawn — scrolled away, or the chat left — and plays
+/// once, then the still is back. Enter grows it to the whole terminal
+/// (see [`VideoView`]).
 pub struct Inline {
     pub chat_id: i64,
     /// The message it's in.
@@ -582,6 +592,8 @@ pub struct Inline {
     tx: UnboundedSender<VideoEvent>,
     /// A frame waits to be sent to the terminal.
     pending: bool,
+    /// z blew it up to twice the thumbnail's cells each way.
+    medium: bool,
     /// The bubble's picture cells were drawn this frame; ui sets it, the
     /// app stops the player when a whole frame went by without it.
     pub seen: bool,
@@ -610,6 +622,7 @@ impl Inline {
             player: None,
             tx,
             pending: false,
+            medium: false,
             seen: false,
             tmux,
         })
@@ -649,11 +662,36 @@ impl Inline {
         self.player.as_ref().map_or(0, |p| p.frames.load(Relaxed)) as f64 / self.fps
     }
 
-    /// Play or pause.
+    /// Play or pause; after it played out, play it again from the start.
     pub fn toggle(&mut self) {
-        if let Some(player) = &mut self.player {
-            player.toggle();
+        match &mut self.player {
+            Some(player) => player.toggle(),
+            None => {
+                if let Some(path) = &self.path {
+                    self.player = spawn(
+                        path,
+                        0.0,
+                        self.side,
+                        self.side,
+                        TAG_INLINE,
+                        self.tx.clone(),
+                    )
+                    .ok();
+                }
+            }
         }
+    }
+
+    /// Twice as big in the chat, pushing the messages around it apart, or
+    /// back to the thumbnail's size. The decoder is untouched: kitty scales
+    /// the placement.
+    pub fn toggle_zoom(&mut self) {
+        self.medium = !self.medium;
+    }
+
+    /// It takes twice the thumbnail's cells each way.
+    pub fn medium(&self) -> bool {
+        self.medium
     }
 
     /// Message `message_id` of chat `chat_id`, now `msg`, no longer has the
@@ -664,8 +702,8 @@ impl Inline {
             && msg.and_then(|m| m.video.as_ref()).map(|v| v.file_id) != Some(self.note.file_id)
     }
 
-    /// Word from the decoder: a frame to send, or the end — looped, as
-    /// Telegram's apps loop video messages.
+    /// Word from the decoder: a frame to send, or the end — it plays once,
+    /// then the bubble shows the still again until Space starts it over.
     pub fn on_event(&mut self, event: VideoEvent) -> Result<(), String> {
         match event {
             VideoEvent::Frame(_) => {
@@ -674,10 +712,6 @@ impl Inline {
             }
             VideoEvent::Ended(_) => {
                 self.player = None;
-                let Some(path) = &self.path else { return Ok(()) };
-                self.player =
-                    Some(spawn(path, 0.0, self.side, self.side, TAG_INLINE, self.tx.clone())
-                        .map_err(|e| format!("{e:#}"))?);
                 Ok(())
             }
             VideoEvent::Failed(_, why) => Err(why),

@@ -292,6 +292,12 @@ pub fn draw(
     .areas(inner);
     let show_names = chat.is_none_or(|c| !c.is_channel);
     let font = images.font_size();
+    // A video message playing inline at the bigger size reserves twice the
+    // cells each way, pushing the messages around it apart.
+    let medium = inline
+        .as_ref()
+        .filter(|i| i.started() && i.medium())
+        .map(|i| i.message_id);
     let mut laid = measure(
         open,
         names,
@@ -302,6 +308,7 @@ pub fn draw(
         images.draws_photos(),
         colors,
         playing,
+        medium,
     );
 
     let height = body.height as usize;
@@ -620,6 +627,8 @@ fn measure<'a>(
     thumbnails: bool,
     colors: &Colors,
     playing: Option<Playback>,
+    // The message whose video plays inline at twice the size, if any.
+    medium: Option<i64>,
 ) -> Laid<'a> {
     // Text width inside a bubble, after one column of padding each side.
     let max_text = (width * BUBBLE_WIDTH_PERCENT / 100)
@@ -733,7 +742,19 @@ fn measure<'a>(
             }),
             SendState::Failed { .. } => Some("not sent".into()),
         };
-        let photo = msg.preview.as_ref().map(|p| photo_cells(p, max_text, font));
+        let photo = msg.preview.as_ref().map(|p| {
+            let (cols, rows) = photo_cells(p, max_text, font);
+            // The inline player's bigger size: twice the cells each way,
+            // the pane's width and twice the usual height as the limit.
+            if medium == Some(id) && msg.video.is_some() {
+                (
+                    cols.saturating_mul(2).min(max_text as u16),
+                    rows.saturating_mul(2).min(2 * MAX_PHOTO_ROWS as u16),
+                )
+            } else {
+                (cols, rows)
+            }
+        });
         let matches = caption.map_or(Vec::new(), |c| search::find(&c.text, query));
         // An album's reactions go under it, where its time is, whichever
         // photos they're on.
@@ -951,7 +972,7 @@ fn layout(
     colors: &Colors,
 ) -> (Vec<Line<'static>>, Vec<Placed>, Vec<PhotoSlot>) {
     let mut laid = measure(
-        open, names, show_names, gaps, width, font, true, colors, None,
+        open, names, show_names, gaps, width, font, true, colors, None, None,
     );
     let placed = laid.placed.clone();
     let photos = std::mem::take(&mut laid.photos);
@@ -2721,6 +2742,57 @@ mod tests {
             .filter(|c| c.bg == Color::Rgb(255, 0, 0) || c.fg == Color::Rgb(255, 0, 0))
             .count();
         assert_eq!(red_cells, 40 * 15, "the whole 40x15 photo is drawn");
+    }
+
+    #[test]
+    fn a_video_message_playing_big_reserves_twice_the_cells() {
+        let mut open = OpenChat::new(42);
+        open.messages.insert(
+            1,
+            Msg {
+                preview: Some(Preview {
+                    file_id: 7,
+                    width: 240,
+                    height: 240,
+                    thumbnail: None,
+                    sticker: false,
+                }),
+                video: Some(crate::video::Note {
+                    file_id: 7,
+                    size: 1000,
+                    duration: 10,
+                    length: 240,
+                }),
+                ..msg(false, 1_790_000_000, "")
+            },
+        );
+        let users = HashMap::new();
+        let chats = Chats::default();
+        let names = Names {
+            users: &users,
+            chats: &chats,
+        };
+        let font = images().font_size();
+        let colors = Colors::default();
+        let small = measure(&open, &names, true, false, 80, font, true, &colors, None, None);
+        let big = measure(
+            &open,
+            &names,
+            true,
+            false,
+            80,
+            font,
+            true,
+            &colors,
+            None,
+            Some(1),
+        );
+        let (small, big) = (&small.photos[0], &big.photos[0]);
+        assert_eq!(
+            (big.cols, big.rows),
+            (small.cols * 2, small.rows * 2),
+            "twice each way"
+        );
     }
 
     #[test]
