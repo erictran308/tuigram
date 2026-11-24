@@ -80,9 +80,16 @@ pub const TAG_INLINE: u8 = 1;
 /// take, so one's deletions never touch the other's.
 const KITTY_ID: u32 = 0x7000_0000;
 
-/// Where the frame file lives: tmpfs, so kitty reads it at memory speed.
+/// Where the frame file lives: tmpfs, so kitty reads it at memory speed;
+/// the system temp dir where there is no /dev/shm (macOS, Windows).
 fn frame_dir() -> PathBuf {
-    PathBuf::from(format!("/dev/shm/tuigram-video-{}", std::process::id()))
+    let shm = PathBuf::from("/dev/shm");
+    let dir = if shm.is_dir() {
+        shm
+    } else {
+        std::env::temp_dir()
+    };
+    dir.join(format!("tuigram-video-{}", std::process::id()))
 }
 
 /// What plays: ffmpeg feeding frames, mpv on the sound. Both pause and
@@ -97,6 +104,10 @@ struct Player {
 }
 
 impl Player {
+    /// Play or pause: the decoder and the sound freeze together. Unix
+    /// signals do it; Windows has nothing like them, so there pause just
+    /// isn't there.
+    #[cfg(unix)]
     fn toggle(&mut self) {
         let signal = if self.paused {
             libc::SIGCONT
@@ -112,6 +123,9 @@ impl Player {
         }
         self.paused = !self.paused;
     }
+
+    #[cfg(not(unix))]
+    fn toggle(&mut self) {}
 }
 
 impl Drop for Player {
