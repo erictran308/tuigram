@@ -448,6 +448,7 @@ mod tests {
             rows: 2,
             thumbnail: false,
             avatar: true,
+            round: false,
         };
         let red = image::RgbaImage::from_pixel(40, 40, image::Rgba([255, 0, 0, 255]));
         images.insert_ready(key, red.into());

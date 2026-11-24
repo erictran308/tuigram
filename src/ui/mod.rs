@@ -3697,7 +3697,8 @@ mod tests {
                 rows: 4,
                 thumbnail: false,
                 avatar: false,
-            round: false,};
+                round: false,
+            };
             let red = image::RgbImage::from_pixel(cols.into(), 8, image::Rgb([255, 0, 0]));
             images.insert_ready(key, red.into());
         }

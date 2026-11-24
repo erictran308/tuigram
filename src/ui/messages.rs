@@ -2658,7 +2658,8 @@ mod tests {
             rows,
             thumbnail: false,
             avatar: false,
-        round: false,};
+            round: false,
+        };
         let red = image::RgbImage::from_pixel(80, 60, image::Rgb([255, 0, 0]));
         images.insert_ready(key, red.into());
         let mut painted = |covered| {
@@ -2733,7 +2734,8 @@ mod tests {
             rows: rows_,
             thumbnail: false,
             avatar: false,
-        round: false,};
+            round: false,
+        };
         images.insert_ready(key, red.into());
         let buf = render_buffer(&mut open, false, &mut images);
         let red_cells = buf
@@ -2825,7 +2827,8 @@ mod tests {
             rows,
             thumbnail: false,
             avatar: false,
-        round: false,};
+            round: false,
+        };
         images.insert_ready(key, red.into());
 
         // Following the newest message pushes the top of the photo off screen.

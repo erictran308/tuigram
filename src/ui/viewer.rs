@@ -237,7 +237,8 @@ mod tests {
             rows: shot.rows,
             thumbnail: false,
             avatar: false,
-        round: false,};
+            round: false,
+        };
         images.insert_ready(key, DynamicImage::new_rgb8(20, 10));
         let ready = title(&mut view, &mut images);
         assert!(
