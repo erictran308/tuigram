@@ -84,7 +84,10 @@ async fn main() -> Result<()> {
     // (caught there), ends the app: the terminal is put back, then
     // the message is printed without control characters, since it can quote
     // text from a message. Carrying on after a background thread died would
-    // leave the screen restored under a running app.
+    // leave the screen restored under a running app. Everything here may
+    // fail with the terminal already gone: it's ignored, a panic inside the
+    // hook would abort (ratatui's `restore()` prints on failure, and that
+    // print panics on a closed stderr).
     std::panic::set_hook(Box::new(|info| {
         if images::panic_is_contained() {
             return;
@@ -97,9 +100,13 @@ async fn main() -> Result<()> {
             DisableMouseCapture
         );
         notify::send(notify::RESTORE_TITLE);
-        ratatui::restore();
+        let _ = ratatui::try_restore();
         tmux::restore();
-        eprintln!("tuigram crashed: {}", text::clean(&info.to_string()));
+        let _ = writeln!(
+            std::io::stderr(),
+            "tuigram crashed: {}",
+            text::clean(&info.to_string())
+        );
         tg::offline_now();
         std::process::exit(101);
     }));
@@ -160,7 +167,10 @@ async fn main() -> Result<()> {
         DisableMouseCapture
     );
     notify::send(notify::RESTORE_TITLE);
-    ratatui::restore();
+    // The terminal may be gone already (its window closed with tuigram in
+    // it): restoring then fails, and ratatui's `restore()` would panic
+    // printing that.
+    let _ = ratatui::try_restore();
     tmux::restore();
     result
 }
