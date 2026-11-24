@@ -293,17 +293,17 @@ pub fn draw(
     let show_names = chat.is_none_or(|c| !c.is_channel);
     let font = images.font_size();
     // A video message playing inline at the bigger size reserves twice the
-    // cells each way, pushing the messages around it apart.
-    let medium = inline
-        .as_ref()
-        .filter(|i| i.started() && i.medium())
-        .map(|i| i.message_id);
+    // cells each way, pushing the messages around it apart. Set by z, so it
+    // holds while the file downloads and after it played out, not only while
+    // the decoder runs.
+    let medium = inline.as_ref().filter(|i| i.medium()).map(|i| i.message_id);
     let mut laid = measure(
         open,
         names,
         show_names,
         block_gaps,
         body.width as usize,
+        body.height as usize,
         font,
         images.draws_photos(),
         colors,
@@ -570,6 +570,33 @@ fn photo_cells(photo: &Preview, max_cols: usize, font: FontSize) -> (u16, u16) {
     (cols.round().max(1.0) as u16, rows.round().max(1.0) as u16)
 }
 
+/// Cells for a video message playing inline at the bigger size: twice the
+/// thumbnail's each way, but capped together, so the box stays square in
+/// pixels (a note is round; an oblong box would squash it) and fits the
+/// pane: more rows than it has would cut the bottom off.
+fn medium_cells(
+    small_cols: u16,
+    small_rows: u16,
+    max_cols: usize,
+    pane_rows: usize,
+    font: FontSize,
+) -> (u16, u16) {
+    let (fw, fh) = (f64::from(font.width.max(1)), f64::from(font.height.max(1)));
+    // The name, the time and the gap above the bubble take rows too.
+    let limit_rows = (2 * MAX_PHOTO_ROWS).min(pane_rows.saturating_sub(3)).max(2);
+    let mut cols = f64::from(small_cols) * 2.0;
+    let mut rows = f64::from(small_rows) * 2.0;
+    if cols > max_cols as f64 {
+        cols = max_cols as f64;
+        rows = cols * fw / fh;
+    }
+    if rows > limit_rows as f64 {
+        rows = limit_rows as f64;
+        cols = rows * fh / fw;
+    }
+    (cols.round().max(1.0) as u16, rows.round().max(1.0) as u16)
+}
+
 /// Picks the first visible line: stick to the bottom while following new
 /// messages, otherwise scroll as little as possible to keep the cursor in view.
 fn scroll_top(
@@ -623,6 +650,9 @@ fn measure<'a>(
     show_names: bool,
     gaps: bool,
     width: usize,
+    // Rows the pane has: the bigger size of an inline player is capped to
+    // fit, so its bottom is never cut off.
+    pane_rows: usize,
     font: FontSize,
     thumbnails: bool,
     colors: &Colors,
@@ -744,13 +774,9 @@ fn measure<'a>(
         };
         let photo = msg.preview.as_ref().map(|p| {
             let (cols, rows) = photo_cells(p, max_text, font);
-            // The inline player's bigger size: twice the cells each way,
-            // the pane's width and twice the usual height as the limit.
+            // The inline player's bigger size, capped to fit the pane.
             if medium == Some(id) && msg.video.is_some() {
-                (
-                    cols.saturating_mul(2).min(max_text as u16),
-                    rows.saturating_mul(2).min(2 * MAX_PHOTO_ROWS as u16),
-                )
+                medium_cells(cols, rows, max_text, pane_rows, font)
             } else {
                 (cols, rows)
             }
@@ -972,7 +998,7 @@ fn layout(
     colors: &Colors,
 ) -> (Vec<Line<'static>>, Vec<Placed>, Vec<PhotoSlot>) {
     let mut laid = measure(
-        open, names, show_names, gaps, width, font, true, colors, None, None,
+        open, names, show_names, gaps, width, 1000, font, true, colors, None, None,
     );
     let placed = laid.placed.clone();
     let photos = std::mem::take(&mut laid.photos);
@@ -2777,7 +2803,7 @@ mod tests {
         let font = images().font_size();
         let colors = Colors::default();
         let small = measure(
-            &open, &names, true, false, 80, font, true, &colors, None, None,
+            &open, &names, true, false, 80, 1000, font, true, &colors, None, None,
         );
         let big = measure(
             &open,
@@ -2785,6 +2811,7 @@ mod tests {
             true,
             false,
             80,
+            1000,
             font,
             true,
             &colors,

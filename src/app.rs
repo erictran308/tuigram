@@ -6143,9 +6143,10 @@ impl App {
         self.inline_video = Some(inline);
     }
 
-    /// z on the message whose video plays inline: twice as big each way,
-    /// pushing the messages around it apart, or back to the thumbnail's
-    /// size.
+    /// z on a video message: it plays inline at twice the cells each way,
+    /// pushing the messages around it apart; z again, back to the
+    /// thumbnail's size. Works while it downloads and after it played out,
+    /// not only mid-playback. Not playing yet: starts it, zoomed.
     fn zoom_inline_video(&mut self) {
         let Some(open) = self.open.as_ref() else {
             return;
@@ -6153,8 +6154,29 @@ impl App {
         let Some(message_id) = open.cursor_id() else {
             return;
         };
-        if let Some(inline) = self.inline_video.as_mut()
-            && inline.is_on(open.chat_id, message_id)
+        let chat_id = open.chat_id;
+        if let Some(inline) = self
+            .inline_video
+            .as_mut()
+            .filter(|i| i.is_on(chat_id, message_id))
+        {
+            inline.toggle_zoom();
+            return;
+        }
+        if !open
+            .messages
+            .get(&message_id)
+            .is_some_and(|m| m.video.is_some())
+        {
+            return;
+        }
+        self.toggle_inline_video();
+        // The "large" size opened the whole-window player instead; a "medium"
+        // start is zoomed already.
+        if let Some(inline) = self
+            .inline_video
+            .as_mut()
+            .filter(|i| i.is_on(chat_id, message_id) && !i.medium())
         {
             inline.toggle_zoom();
         }

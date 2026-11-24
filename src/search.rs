@@ -50,19 +50,22 @@ pub enum Has {
     File,
     Link,
     Voice,
+    /// A video message: the round ones.
+    Note,
     Gif,
     Audio,
 }
 
 impl Has {
     /// Every kind, by the word `has:` takes.
-    pub const ALL: [(&'static str, Has); 8] = [
+    pub const ALL: [(&'static str, Has); 9] = [
         ("photo", Has::Photo),
         ("video", Has::Video),
         ("media", Has::Media),
         ("file", Has::File),
         ("link", Has::Link),
         ("voice", Has::Voice),
+        ("note", Has::Note),
         ("gif", Has::Gif),
         ("audio", Has::Audio),
     ];
@@ -75,6 +78,7 @@ impl Has {
             Has::File => SearchMessagesFilter::Document,
             Has::Link => SearchMessagesFilter::Url,
             Has::Voice => SearchMessagesFilter::VoiceNote,
+            Has::Note => SearchMessagesFilter::VideoNote,
             Has::Gif => SearchMessagesFilter::Animation,
             Has::Audio => SearchMessagesFilter::Audio,
         }
@@ -113,7 +117,7 @@ pub fn parse(typed: &str) -> Result<Query, String> {
                     .into_iter()
                     .find(|(name, _)| value.eq_ignore_ascii_case(name))
                     .ok_or(
-                        "has:/type: takes photo, video, media, file, link, voice, gif or audio",
+                        "has:/type: takes photo, video, media, file, link, voice, note, gif or audio",
                     )?;
                 query.has = Some(kind.1);
             }
