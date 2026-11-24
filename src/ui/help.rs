@@ -122,10 +122,13 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("i", "Write a message"),
             ("a", "Attach a file by its path (Tab completes it)"),
             ("p", "Paste a photo, files or text from the clipboard"),
-            ("/", "Search the whole chat"),
+            (
+                "/",
+                "Search the whole chat; a has:/type: search lists every match in a media browser",
+            ),
             (
                 "from: has:",
-                "In a search: from:@alice, from:me or from:a name; has:photo (video, media, file, link, voice, gif, audio)",
+                "In a search: from:@alice, from:me, from:this or from:a name; has:photo (video, media, file, link, voice, gif, audio)",
             ),
             (
                 "before: after:",
@@ -414,10 +417,13 @@ const SHORTCUTS_RU: &[(&str, &[(&str, &str)])] = &[
             ("i", "Написать сообщение"),
             ("a", "Приложить файл по пути (Tab дополняет)"),
             ("p", "Вставить фото, файлы или текст из буфера"),
-            ("/", "Поиск по всему чату"),
+            (
+                "/",
+                "Поиск по всему чату; с has:/type: — все совпадения списком, как «Вложения»",
+            ),
             (
                 "from: has:",
-                "В поиске: from:@alice, from:me или from:имя; has:photo (video, media, file, link, voice, gif, audio)",
+                "В поиске: from:@alice, from:me, from:this или from:имя; has:photo (video, media, file, link, voice, gif, audio)",
             ),
             (
                 "before: after:",

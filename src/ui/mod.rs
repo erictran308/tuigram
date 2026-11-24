@@ -709,6 +709,9 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         };
         draw_pinned(frame, chat_area, menu, open, &names, colors);
     }
+    if app.media_menu.is_some() {
+        draw_media(frame, chat_area, app, colors);
+    }
     if let Some(menu) = &mut app.react_menu {
         let yours: Vec<String> = app
             .open
@@ -2107,6 +2110,76 @@ fn draw_pinned(
     );
 }
 
+/// The media browser: every match of a `/` search with `has:`/`type:`, in
+/// one list. New pages stream in while it's open.
+fn draw_media(frame: &mut Frame, area: Rect, app: &App, colors: &Colors) {
+    let Some(menu) = &app.media_menu else {
+        return;
+    };
+    let ru = app.settings.ru();
+    let names = messages::Names {
+        users: &app.users,
+        chats: &app.chats,
+    };
+    let width = 64.min(area.width);
+    let rows = (menu.rows.len() as u16).clamp(1, area.height.saturating_sub(2));
+    let popup = center(area, width, rows + 2);
+    let count = if menu.total >= 0 {
+        menu.total.to_string()
+    } else if menu.done {
+        menu.rows.len().to_string()
+    } else {
+        format!("{}…", menu.rows.len())
+    };
+    let title = format!(" {} ({count}) ", menu.query);
+    let keys = crate::lang::pick(
+        ru,
+        " `Enter` go to · `Esc` close ",
+        " `Enter` перейти · `Esc` закрыть ",
+    );
+    let block = popup_block(title, keys, colors);
+    let inner = block.inner(popup);
+    frame.render_widget(Cover, popup);
+    frame.render_widget(block, popup);
+    if menu.rows.is_empty() {
+        let text = if menu.loading {
+            crate::lang::pick(ru, " Searching… ", " Ищу… ")
+        } else {
+            crate::lang::pick(ru, " Nothing found ", " Ничего не найдено ")
+        };
+        frame.render_widget(Paragraph::new(text).fg(colors.muted), inner);
+        return;
+    }
+    let items: Vec<ListItem> = menu
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let bar = if i == menu.selected {
+                Span::from("▌").fg(colors.accent)
+            } else {
+                Span::from(" ")
+            };
+            let who = truncate(&names.author(row.sender, row.outgoing), 16);
+            let when = chrono::TimeZone::timestamp_opt(&chrono::Local, i64::from(row.date), 0)
+                .single()
+                .map_or(String::new(), |t| t.format("%-d %b").to_string());
+            let head = format!("{who} · {when}  ");
+            let room = (inner.width as usize).saturating_sub(1 + head.width());
+            ListItem::new(Line::from(vec![
+                bar,
+                Span::from(head).fg(colors.muted),
+                Span::from(truncate(&row.label, room)),
+            ]))
+        })
+        .collect();
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(Style::new().bg(colors.selection)),
+        inner,
+        &mut ListState::default().with_selected(Some(menu.selected)),
+    );
+}
+
 /// A bot's alert, answering a button: its words, wrapped, until Enter.
 fn draw_notice(frame: &mut Frame, area: Rect, notice: &Notice, colors: &Colors) {
     let width = 56.min(area.width);
@@ -2889,6 +2962,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             t(
                 "  `j/k` choose · `Enter` go to it · `P` unpin it · `Esc` close",
                 "  `j/k` выбор · `Enter` перейти · `P` открепить · `Esc` закрыть",
+            ),
+        ),
+        _ if app.media_menu.is_some() => (
+            normal,
+            t(
+                "  `j/k` choose · `Enter` go to it · `Esc` close",
+                "  `j/k` выбор · `Enter` перейти · `Esc` закрыть",
             ),
         ),
         _ if app.button_menu.as_ref().is_some_and(|m| m.reply) => (

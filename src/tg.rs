@@ -308,6 +308,9 @@ impl Mentions {
 /// Messages matching a search, newest first.
 pub struct Found {
     pub ids: Vec<i64>,
+    /// The messages themselves, for the media browser's rows; only those
+    /// whose ids are in `ids`.
+    pub messages: Vec<types::Message>,
     /// TDLib's estimate of how many match in all; -1 if unknown.
     pub total: i32,
     /// Pass as `from` to get the next page; 0 when there are no more.
@@ -2275,6 +2278,7 @@ async fn search_page(
             Err(e) if e.code == 404 => {
                 return Ok(Found {
                     ids: Vec::new(),
+                    messages: Vec::new(),
                     total: 0,
                     next_from: 0,
                     next_offset: String::new(),
@@ -2298,11 +2302,12 @@ async fn search_page(
     .map_err(|e| e.message)?;
     let mut page = Found {
         ids: Vec::new(),
+        messages: Vec::new(),
         total: found.total_count,
         next_from: found.next_from_message_id,
         next_offset: String::new(),
     };
-    page.keep_dates(ask, &found.messages);
+    page.keep_dates(ask, found.messages);
     Ok(page)
 }
 
@@ -2328,18 +2333,19 @@ async fn secret_search_page(
     .map_err(|e| e.message)?;
     let mut page = Found {
         ids: Vec::new(),
+        messages: Vec::new(),
         total: found.total_count,
         next_from: 0,
         next_offset: found.next_offset,
     };
-    page.keep_dates(ask, &found.messages);
+    page.keep_dates(ask, found.messages);
     Ok(page)
 }
 
 impl Found {
     /// Keeps the messages of a page, newest first, sent between the days
     /// `ask` gives; one from before `after:` ends the search.
-    fn keep_dates(&mut self, ask: &Query, messages: &[types::Message]) {
+    fn keep_dates(&mut self, ask: &Query, messages: Vec<types::Message>) {
         for m in messages {
             if ask.after.is_some_and(|after| m.date < after) {
                 self.next_from = 0;
@@ -2348,6 +2354,7 @@ impl Found {
             }
             if ask.before.is_none_or(|before| m.date < before) {
                 self.ids.push(m.id);
+                self.messages.push(m);
             }
         }
         // TDLib counts every date.

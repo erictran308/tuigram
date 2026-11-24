@@ -40,7 +40,7 @@ use crate::pins::{PinMenu, Pinned, PinnedMenu, Place};
 use crate::poll::{Vote, VoteMenu};
 use crate::proxy;
 use crate::reactions::{self, ReactMenu, ReactionKind};
-use crate::search::{self, MessageSearch, Who};
+use crate::search::{self, MediaMenu, MessageSearch, Who};
 use crate::secret::{KeyView, Secret, SecretState, TimerMenu};
 use crate::select::{self, TextSelect};
 use crate::settings::{self, Settings, Side, VideoNoteSize};
@@ -61,6 +61,9 @@ const CHAT_PAGE: i32 = 50;
 const HISTORY_PAGE: i32 = 50;
 /// Search results requested per `searchChatMessages` call.
 const SEARCH_PAGE: i32 = 50;
+/// The most the media browser pages in: a chat's whole history of files
+/// can be tens of thousands, and past this a `before:` search narrows it.
+const MEDIA_ROWS_MAX: usize = 500;
 /// Keep requesting history until at least this many messages are loaded.
 /// TDLib often answers the first request with only what it has cached.
 const MIN_LOADED: usize = 30;
@@ -802,6 +805,8 @@ pub struct App {
     pub pin_menu: Option<PinMenu>,
     /// `gp`: the chat's pinned messages, to go to.
     pub pinned_menu: Option<PinnedMenu>,
+    /// The media browser a `/` search with `has:`/`type:` opens.
+    pub media_menu: Option<MediaMenu>,
     /// `:timer`: how long messages in a secret chat last.
     pub timer_menu: Option<TimerMenu>,
     /// `:key`: a secret chat's key, to compare.
@@ -981,6 +986,7 @@ impl App {
             notice: None,
             pin_menu: None,
             pinned_menu: None,
+            media_menu: None,
             timer_menu: None,
             key_view: None,
             photo_view: None,
@@ -1805,6 +1811,15 @@ impl App {
     }
 
     fn on_found(&mut self, place: (i64, Option<i32>), query: &str, found: Option<Found>) {
+        // A page the media browser asked for goes to it.
+        if self
+            .media_menu
+            .as_ref()
+            .is_some_and(|m| m.loading && m.query == query)
+        {
+            self.on_media_found(place, found);
+            return;
+        }
         // Ignore results for a search that was replaced or ended meanwhile.
         let Some(open) = self.open.as_mut().filter(|o| o.place() == place) else {
             return;
@@ -1828,6 +1843,59 @@ impl App {
             // The error is in the status bar. Without a match, end the search.
             None if search.results.is_empty() => open.search = None,
             None => {}
+        }
+    }
+
+    /// A page of the media browser's search: the rows are listed, and the
+    /// next page is asked for until there are no more (or MEDIA_ROWS_MAX).
+    fn on_media_found(&mut self, place: (i64, Option<i32>), found: Option<Found>) {
+        let Some(open) = self.open.as_ref().filter(|o| o.place() == place) else {
+            // The chat the search was in is gone: the list means nothing.
+            self.media_menu = None;
+            return;
+        };
+        let (chat_id, topic) = (open.chat_id, open.topic);
+        let secret = self.chats.is_secret(chat_id);
+        let next = {
+            let Some(menu) = self.media_menu.as_mut() else {
+                return;
+            };
+            menu.loading = false;
+            match found {
+                Some(found) => {
+                    menu.add(found);
+                    if !menu.done && menu.rows.len() < MEDIA_ROWS_MAX {
+                        menu.loading = true;
+                        Some((
+                            menu.query.clone(),
+                            menu.ask.clone(),
+                            menu.next_from,
+                            menu.next_offset.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                // The error is in the status bar. An empty list goes away.
+                None => {
+                    if menu.rows.is_empty() {
+                        self.media_menu = None;
+                    }
+                    None
+                }
+            }
+        };
+        if let Some((query, ask, from, offset)) = next {
+            self.tg.search_messages(
+                chat_id,
+                topic,
+                secret,
+                query,
+                ask,
+                from,
+                offset,
+                SEARCH_PAGE,
+            );
         }
     }
 
@@ -2310,6 +2378,7 @@ impl App {
             Screen::Main if self.vote_menu.is_some() => self.on_vote_key(key),
             Screen::Main if self.button_menu.is_some() => self.on_button_key(key),
             Screen::Main if self.pin_menu.is_some() => self.on_pin_key(key),
+            Screen::Main if self.media_menu.is_some() => self.on_media_key(key, ctrl),
             Screen::Main if self.pinned_menu.is_some() => self.on_pinned_key(key),
             Screen::Main if self.timer_menu.is_some() => self.on_timer_key(key),
             Screen::Main if self.chat_info.is_some() => self.on_info_key(key, ctrl),
@@ -3324,6 +3393,11 @@ impl App {
                     })
                     .and_then(|ask| self.resolve_sender(ask));
                 match ask {
+                    Ok(ask) if ask.has.is_some() => {
+                        // A media filter opens the browser: every match in
+                        // one list, as Telegram's "shared media" shows it.
+                        self.open_media_menu(query, ask);
+                    }
                     Ok(ask) => {
                         if let Some(open) = self.open.as_mut() {
                             open.search = Some(MessageSearch::new(query, ask));
@@ -4303,6 +4377,7 @@ impl App {
         self.button_menu = None;
         self.pin_menu = None;
         self.pinned_menu = None;
+        self.media_menu = None;
         self.timer_menu = None;
         self.key_view = None;
         self.photo_view = None;
@@ -4518,6 +4593,58 @@ impl App {
         self.pinned_menu = PinnedMenu::new(&open.pinned);
         if self.pinned_menu.is_none() {
             self.status = Some("No pinned messages in this chat".into());
+        }
+    }
+
+    /// A `/` search with `has:`/`type:` opens the media browser: every
+    /// match of the search in the open chat, in one list. Pages are asked
+    /// for until Telegram says there are no more (or MEDIA_ROWS_MAX).
+    fn open_media_menu(&mut self, query: String, ask: search::Query) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let mut menu = MediaMenu::new(query, ask);
+        menu.loading = true;
+        let secret = self.chats.is_secret(open.chat_id);
+        self.tg.search_messages(
+            open.chat_id,
+            open.topic,
+            secret,
+            menu.query.clone(),
+            menu.ask.clone(),
+            0,
+            String::new(),
+            SEARCH_PAGE,
+        );
+        self.media_menu = Some(menu);
+    }
+
+    /// The media browser takes all keys while it's up: Enter goes to the
+    /// message under the cursor, where its file opens as any message's.
+    fn on_media_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let Some(menu) = self.media_menu.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => menu.move_by(1),
+            KeyCode::Char('k') | KeyCode::Up => menu.move_by(-1),
+            KeyCode::Char('d') if ctrl => menu.move_by(20),
+            KeyCode::Char('u') if ctrl => menu.move_by(-20),
+            KeyCode::Char('g') => menu.jump(false),
+            KeyCode::Char('G') => menu.jump(true),
+            KeyCode::Enter | KeyCode::Char('l') => {
+                let id = menu.current().map(|r| r.id);
+                self.media_menu = None;
+                if let Some(id) = id {
+                    // Ctrl-o comes back.
+                    if let Some(here) = self.here() {
+                        self.jumps.leave(here);
+                    }
+                    self.jump_to_message(id);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'h') => self.media_menu = None,
+            _ => {}
         }
     }
 
@@ -8500,6 +8627,33 @@ mod tests {
         press(&mut app, KeyCode::Enter, none);
         assert_eq!(app.status.as_deref(), Some("Only one has: at a time"));
         assert!(app.open.as_ref().unwrap().search.is_none(), "nothing asked");
+    }
+
+    #[test]
+    fn a_search_with_a_media_filter_opens_the_media_browser() {
+        let mut app = test_app("media-browser");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        press(&mut app, KeyCode::Char('/'), none);
+        for c in "type:file".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Enter, none);
+        let menu = app.media_menu.as_ref().expect("the browser opened");
+        assert_eq!(menu.query, "type:file");
+        assert!(menu.loading, "the first page was asked for");
+        assert!(app.open.as_ref().unwrap().search.is_none(), "no n/N search");
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.media_menu.is_none());
+
+        // A text-only search stays the n/N kind.
+        press(&mut app, KeyCode::Char('/'), none);
+        for c in "hello".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.media_menu.is_none());
+        assert!(app.open.as_ref().unwrap().search.is_some());
     }
 
     #[test]

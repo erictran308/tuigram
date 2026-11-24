@@ -7,7 +7,7 @@ use std::ops::Range;
 use chrono::{Local, NaiveDate, TimeZone};
 use tdlib_rs::enums::SearchMessagesFilter;
 
-use crate::messages::Sender;
+use crate::messages::{Msg, Sender};
 use crate::tg::Found;
 
 /// What a `/` search in a chat asks TDLib for: its words, and the filters
@@ -82,7 +82,7 @@ impl Has {
 }
 
 /// The filters a search takes, as typed.
-pub const FILTERS: [&str; 4] = ["from:", "has:", "before:", "after:"];
+pub const FILTERS: [&str; 5] = ["from:", "has:", "type:", "before:", "after:"];
 
 /// Reads a `/` search typed in a chat: filters anywhere among the words,
 /// each at most once. Says what's wrong with one that can't be read.
@@ -96,18 +96,25 @@ pub fn parse(typed: &str) -> Result<Query, String> {
             words.push(token);
             continue;
         };
+        let value = &token[key.len()..];
+        // The same filter under another name.
+        let key = if key == "type:" { "has:" } else { key };
         if seen.contains(&key) {
             return Err(format!("Only one {key} at a time"));
         }
         seen.push(key);
-        let value = &token[key.len()..];
         match key {
+            // `from:this` is everyone in the chat the search is in: no
+            // sender filter at all.
+            "from:" if value.eq_ignore_ascii_case("this") => {}
             "from:" => query.from = Some(who(value)?),
             "has:" => {
                 let kind = Has::ALL
                     .into_iter()
                     .find(|(name, _)| value.eq_ignore_ascii_case(name))
-                    .ok_or("has: takes photo, video, media, file, link, voice, gif or audio")?;
+                    .ok_or(
+                        "has:/type: takes photo, video, media, file, link, voice, gif or audio",
+                    )?;
                 query.has = Some(kind.1);
             }
             "before:" => query.before = Some(day_start(value)?),
@@ -172,6 +179,7 @@ pub fn complete(typed: &str, people: &[String], today: &str) -> Vec<String> {
     };
     match FILTERS.into_iter().find(|f| lower.starts_with(f)) {
         Some("has:") => with("has:", Has::ALL.iter().map(|(name, _)| *name).collect()),
+        Some("type:") => with("type:", Has::ALL.iter().map(|(name, _)| *name).collect()),
         Some("from:") => with("from:", people.iter().map(String::as_str).collect()),
         Some(key) if lower == key => vec![format!("{head}{key}{today}")],
         Some(_) => Vec::new(),
@@ -291,6 +299,118 @@ impl MessageSearch {
     }
 }
 
+/// One match in the media browser: what a `/` search with `has:` or
+/// `type:` lists.
+pub struct MediaRow {
+    pub id: i64,
+    /// What it holds: the file's name, "Photo", "Video message"…
+    pub label: String,
+    pub sender: Sender,
+    pub outgoing: bool,
+    pub date: i32,
+}
+
+impl MediaRow {
+    fn of(message: tdlib_rs::types::Message) -> Self {
+        let id = message.id;
+        let msg = Msg::from(message);
+        let label = if msg.video.is_some() {
+            "Video message".into()
+        } else if msg.voice.is_some() {
+            "Voice message".into()
+        } else if let Some(file) = &msg.file {
+            file.label.clone()
+        } else if msg.photo.is_some() {
+            "Photo".into()
+        } else {
+            msg.snippet()
+        };
+        Self {
+            id,
+            label,
+            sender: msg.sender,
+            outgoing: msg.outgoing,
+            date: msg.date,
+        }
+    }
+}
+
+/// The media browser: every match of a `/` search with `has:`/`type:` in
+/// one list, paged from Telegram until done. Enter goes to the message.
+pub struct MediaMenu {
+    /// The search as typed, to match TDLib's answers and for the title.
+    pub query: String,
+    /// What TDLib is asked for.
+    pub ask: Query,
+    /// Matches, newest first, as far as fetched.
+    pub rows: Vec<MediaRow>,
+    pub selected: usize,
+    /// TDLib's estimate of how many match in all; -1 if unknown.
+    pub total: i32,
+    /// Where the next page of results starts.
+    pub next_from: i64,
+    /// Or this, for words found in a secret chat.
+    pub next_offset: String,
+    /// Every match has been fetched.
+    pub done: bool,
+    /// A page of results is being fetched.
+    pub loading: bool,
+}
+
+impl MediaMenu {
+    pub fn new(query: String, ask: Query) -> Self {
+        Self {
+            query,
+            ask,
+            rows: Vec::new(),
+            selected: 0,
+            total: -1,
+            next_from: 0,
+            next_offset: String::new(),
+            done: false,
+            loading: false,
+        }
+    }
+
+    pub fn add(&mut self, found: Found) {
+        self.total = found.total;
+        self.next_from = found.next_from;
+        self.next_offset = found.next_offset;
+        // Neither means no more pages.
+        self.done = self.next_from == 0 && self.next_offset.is_empty();
+        for message in found.messages {
+            if self.rows.iter().any(|r| r.id == message.id) {
+                continue;
+            }
+            self.rows.push(MediaRow::of(message));
+        }
+    }
+
+    /// Down (`delta` > 0) or up the list.
+    pub fn move_by(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected = self
+            .selected
+            .saturating_add_signed(delta)
+            .min(self.rows.len() - 1);
+    }
+
+    /// The first or the last row.
+    pub fn jump(&mut self, last: bool) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected = if last { self.rows.len() - 1 } else { 0 };
+    }
+
+    /// The row under the cursor.
+    pub fn current(&self) -> Option<&MediaRow> {
+        self.rows.get(self.selected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +440,50 @@ mod tests {
     }
 
     #[test]
+    fn the_media_browser_moves_by_rows() {
+        let mut menu = MediaMenu::new("type:file".into(), parse("type:file").unwrap());
+        assert!(menu.current().is_none());
+        menu.move_by(1);
+        menu.jump(true);
+
+        let row = |id| MediaRow {
+            id,
+            label: format!("file {id}"),
+            sender: Sender::User(1),
+            outgoing: false,
+            date: 0,
+        };
+        menu.rows = vec![row(9), row(7), row(5)];
+        assert_eq!(menu.current().unwrap().id, 9);
+        menu.move_by(1);
+        assert_eq!(menu.current().unwrap().id, 7);
+        menu.move_by(10);
+        assert_eq!(menu.current().unwrap().id, 5, "no further than the last");
+        menu.move_by(-10);
+        assert_eq!(menu.current().unwrap().id, 9, "no further than the first");
+        menu.jump(true);
+        assert_eq!(menu.current().unwrap().id, 5);
+        menu.jump(false);
+        assert_eq!(menu.current().unwrap().id, 9);
+    }
+
+    #[test]
+    fn type_is_has_and_from_this_is_everyone_here() {
+        let query = parse("type:file").unwrap();
+        assert_eq!(query.has, Some(Has::File));
+        assert_eq!(query.from, None);
+
+        // Everyone in the chat the search is in: no sender filter.
+        let query = parse("type:file from:this").unwrap();
+        assert_eq!(query.has, Some(Has::File));
+        assert_eq!(query.from, None);
+
+        let query = parse("type:Video from:@Maya").unwrap();
+        assert_eq!(query.has, Some(Has::Video));
+        assert_eq!(query.from, Some(Who::Username("Maya".into())));
+    }
+
+    #[test]
     fn filters_mix_with_the_words_in_any_order() {
         let query = parse("trail FROM:@Maya has:Photo before:2025-10-01 map").unwrap();
         assert_eq!(query.words, "trail map");
@@ -346,7 +510,12 @@ mod tests {
     fn a_filter_that_cant_be_read_says_why() {
         let why = |typed| parse(typed).unwrap_err();
         assert_eq!(why("has:photo has:video"), "Only one has: at a time");
-        assert!(why("has:sticker").starts_with("has: takes photo"));
+        assert_eq!(
+            why("has:photo type:video"),
+            "Only one has: at a time",
+            "type: is the same filter"
+        );
+        assert!(why("has:sticker").starts_with("has:/type: takes photo"));
         assert!(why("from: hi").starts_with("from: takes me"));
         assert_eq!(
             why("hi before:10/01/2025"),
@@ -363,9 +532,10 @@ mod tests {
     fn tab_finishes_the_last_word_with_a_filter_or_what_it_takes() {
         let people = ["me".to_string(), "@maya".to_string(), "@leo".to_string()];
         let tab = |typed| complete(typed, &people, "2026-10-07");
-        assert_eq!(tab(""), ["from:", "has:", "before:", "after:"]);
+        assert_eq!(tab(""), ["from:", "has:", "type:", "before:", "after:"]);
         assert_eq!(tab("trail h"), ["trail has:"]);
         assert_eq!(tab("has:v"), ["has:video", "has:voice"]);
+        assert_eq!(tab("type:v"), ["type:video", "type:voice"]);
         assert_eq!(tab("from:"), ["from:me", "from:@maya", "from:@leo"]);
         assert_eq!(tab("trail from:@M"), ["trail from:@maya"]);
         assert_eq!(tab("before:"), ["before:2026-10-07"]);
@@ -384,6 +554,7 @@ mod tests {
         assert_eq!(search.position(), "searching…");
         search.add(Found {
             ids: vec![9, 7],
+            messages: Vec::new(),
             total: 3,
             next_from: 7,
             next_offset: String::new(),
@@ -391,6 +562,7 @@ mod tests {
         assert!(!search.done);
         search.add(Found {
             ids: vec![7, 2],
+            messages: Vec::new(),
             total: 3,
             next_from: 0,
             next_offset: String::new(),
@@ -406,6 +578,7 @@ mod tests {
         let mut search = MessageSearch::new("hi".into(), parse("hi").unwrap());
         search.add(Found {
             ids: vec![9, 7],
+            messages: Vec::new(),
             total: 3,
             next_from: 0,
             next_offset: "7".into(),
@@ -414,6 +587,7 @@ mod tests {
         assert_eq!(search.next_offset, "7");
         search.add(Found {
             ids: vec![2],
+            messages: Vec::new(),
             total: 3,
             next_from: 0,
             next_offset: String::new(),
