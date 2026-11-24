@@ -43,7 +43,7 @@ use crate::reactions::{self, ReactMenu, ReactionKind};
 use crate::search::{self, MessageSearch, Who};
 use crate::secret::{KeyView, Secret, SecretState, TimerMenu};
 use crate::select::{self, TextSelect};
-use crate::settings::{self, Settings, Side};
+use crate::settings::{self, Settings, Side, VideoNoteSize};
 use crate::stickers::{self, Source, StickerPanel};
 use crate::term::Terminal;
 use crate::text;
@@ -489,16 +489,20 @@ pub struct SettingsMenu {
 }
 
 impl SettingsMenu {
-    /// The notifications row, the first one.
-    pub const NOTIFICATIONS: usize = 0;
+    /// The interface language row, the first one.
+    pub const LANGUAGE: usize = 0;
+    /// The notifications row.
+    pub const NOTIFICATIONS: usize = Self::LANGUAGE + 1;
     /// The "gap between chats" row.
     pub const CHAT_GAPS: usize = Self::NOTIFICATIONS + 1;
     /// The "chat list on the right" row.
     pub const LIST_RIGHT: usize = Self::CHAT_GAPS + 1;
     /// The "gap between messages" row.
     pub const BLOCK_GAPS: usize = Self::LIST_RIGHT + 1;
+    /// The "video message size on Space" row.
+    pub const VIDEO_SIZE: usize = Self::BLOCK_GAPS + 1;
     /// The "round corners" row.
-    pub const CORNERS: usize = Self::BLOCK_GAPS + 1;
+    pub const CORNERS: usize = Self::VIDEO_SIZE + 1;
     /// The "round pills, with a Nerd Font" row.
     pub const PILLS: usize = Self::CORNERS + 1;
     /// The "animations" row.
@@ -2497,9 +2501,19 @@ impl App {
                 open.selected = Some(message_id);
             }
             // A click on the message already under the cursor opens it, as
-            // Enter would: photos, videos, files.
+            // Enter would: photos, videos, files. A video message plays as
+            // Space plays it, at the size the settings pick.
             if was_focused && was_selected == Some(message_id) {
-                self.open_selected_message();
+                let is_note = self
+                    .open
+                    .as_ref()
+                    .and_then(|o| o.messages.get(&message_id))
+                    .is_some_and(|m| m.video.is_some());
+                if is_note {
+                    self.toggle_inline_video();
+                } else {
+                    self.open_selected_message();
+                }
             }
             return;
         }
@@ -5908,11 +5922,11 @@ impl App {
     }
 
     /// Space on a video message: it plays where its thumbnail is, or pauses
-    /// if it's the one playing. One without a thumbnail's cells to play in
-    /// opens on the whole window instead.
-    fn toggle_inline_video(&mut self) {        if !self.images.kitty() {
-            return;
-        }
+    /// if it's the one playing. The size comes from the settings: the
+    /// bubble's, twice that, or the whole window, as Enter does. One
+    /// without a thumbnail's cells to play in opens on the whole window
+    /// too.
+    fn toggle_inline_video(&mut self) {
         let Some(open) = self.open.as_mut() else {
             return;
         };
@@ -5937,25 +5951,40 @@ impl App {
             return;
         }
         let Some(file) = msg.file.clone() else { return };
-        if msg.preview.is_none() {
-            // Nowhere to play inline: the whole window, as Enter does.
+        // The "large" size, and notes with no cells to play in, take the
+        // whole window, as Enter does.
+        if self.settings.video_note_size == VideoNoteSize::Large || msg.preview.is_none() {
             self.view_video(message_id, file);
             return;
         }
-        let inline = Inline::of(
+        if !self.images.kitty() {
+            self.status = Some(
+                "This terminal can't play video messages in the chat; Enter plays one on the whole window"
+                    .into(),
+            );
+            return;
+        }
+        let Some(mut inline) = Inline::of(
             chat_id,
             message_id,
             msg,
             self.video_tx.clone(),
             self.images.tmux(),
-        );
-        let Some(inline) = inline else { return };
+        ) else {
+            return;
+        };
         if inline.note.size > crate::video::MAX_FILE {
             self.status = Some("Can't play this video message: it's too big".into());
             return;
         }
+        // The "medium" size starts twice the thumbnail's cells each way.
+        if self.settings.video_note_size == VideoNoteSize::Medium {
+            inline.toggle_zoom();
+        }
+        let file_id = inline.note.file_id;
         self.inline_video = None; // another message's, playing, stops
-        self.tg.download(inline.note.file_id);
+        self.tg.download(file_id);
+        self.status = Some("Downloading the video message…".into());
         self.inline_video = Some(inline);
     }
 
@@ -6712,6 +6741,9 @@ impl App {
                     }
                 },
             },
+            SettingsMenu::LANGUAGE => {
+                settings.language = if settings.ru() { "en" } else { "ru" }.into();
+            }
             SettingsMenu::NOTIFICATIONS => {
                 // Back on, they go out the way they did before, e.g. "bell".
                 let on = match menu.saved_notifications {
@@ -6732,6 +6764,9 @@ impl App {
                 };
             }
             SettingsMenu::BLOCK_GAPS => settings.block_gaps = !settings.block_gaps,
+            SettingsMenu::VIDEO_SIZE => {
+                settings.video_note_size = settings.video_note_size.next();
+            }
             SettingsMenu::CORNERS => {
                 // Picked for good either way: a terminal the guess got
                 // wrong stays as the user set it.
@@ -7330,6 +7365,11 @@ mod tests {
         // tells Telegram something when it changes.
         let selected = |app: &App| app.settings_menu.as_ref().unwrap().selected;
         app.settings_menu.as_mut().unwrap().selected = SettingsMenu::BLOCK_GAPS;
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_eq!(selected(&app), SettingsMenu::VIDEO_SIZE);
+        // The video message size cycles: small, medium, large, small again.
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(saved().video_note_size, crate::settings::VideoNoteSize::Medium);
         press(&mut app, KeyCode::Char('j'), none);
         assert_eq!(selected(&app), SettingsMenu::CORNERS);
         let rounded = app.rounded;

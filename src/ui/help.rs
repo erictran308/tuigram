@@ -214,7 +214,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "Video player",
         &[
-            ("Space", "Play (once) or pause, right in the message"),
+            ("Space", "Play (once) or pause, right in the message (size in Settings)"),
             ("z", "Twice as big in the chat, or back"),
             ("j / k", "Zoom in / out, on the whole window"),
             ("o", "Open the video in your computer's player"),
@@ -501,7 +501,7 @@ const SHORTCUTS_RU: &[(&str, &[(&str, &str)])] = &[
     (
         "Видеоплеер",
         &[
-            ("Space", "Играть (один раз) / пауза, прямо в сообщении"),
+            ("Space", "Играть (один раз) / пауза, прямо в сообщении (размер — в настройках)"),
             ("z", "Вдвое больше в чате, или обратно"),
             ("j / k", "Ближе / дальше, на всём окне"),
             ("o", "Открыть видео в плеере компьютера"),
