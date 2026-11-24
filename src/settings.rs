@@ -57,6 +57,8 @@ pub struct Settings {
     /// The interface's language where translated so far: "en" or "ru".
     /// What isn't translated stays English either way.
     pub language: String,
+    /// How big a video message plays on Space; see [`VideoNoteSize`].
+    pub video_note_size: VideoNoteSize,
     /// The chat list's share of the window's width, in percent. Ctrl-r
     /// changes it; see [`Settings::list_width`].
     pub chat_list_width: u16,
@@ -94,6 +96,7 @@ impl Default for Settings {
             chat_gaps: true,
             chat_list_side: Side::Left,
             language: "en".into(),
+            video_note_size: VideoNoteSize::Small,
             chat_list_width: DEFAULT_LIST_WIDTH,
             topics_width: DEFAULT_TOPICS_WIDTH,
             accept_secret_chats: false,
@@ -110,6 +113,29 @@ pub enum Side {
     #[default]
     Left,
     Right,
+}
+
+/// How big a video message plays on Space: inline at its bubble's size
+/// ("small", as in Telegram's apps), twice that inline ("medium"), or on
+/// the whole window ("large").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoNoteSize {
+    #[default]
+    Small,
+    Medium,
+    Large,
+}
+
+impl VideoNoteSize {
+    /// The next size, wrapping: small → medium → large → small.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Small => Self::Medium,
+            Self::Medium => Self::Large,
+            Self::Large => Self::Small,
+        }
+    }
 }
 
 /// The chat list's width, in percent of the window, at first and after `=`.
@@ -223,6 +249,7 @@ mod tests {
             sound_when_focused: true,
             normal_after_send: true,
             language: "en".into(),
+            video_note_size: VideoNoteSize::Medium,
             wrap_composer: false,
             block_gaps: false,
             chat_gaps: false,
@@ -236,7 +263,7 @@ mod tests {
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nanimations = false\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnotification_sound = \"chime\"\nsound_when_focused = true\nnormal_after_send = true\nwrap_composer = false\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nlanguage = \"en\"\nchat_list_width = 40\ntopics_width = 26\naccept_secret_chats = true"
+            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nanimations = false\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnotification_sound = \"chime\"\nsound_when_focused = true\nnormal_after_send = true\nwrap_composer = false\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nlanguage = \"en\"\nvideo_note_size = \"medium\"\nchat_list_width = 40\ntopics_width = 26\naccept_secret_chats = true"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
 
@@ -266,6 +293,7 @@ mod tests {
         assert_eq!(old.chat_list_width, DEFAULT_LIST_WIDTH);
         assert_eq!(old.topics_width, DEFAULT_TOPICS_WIDTH);
         assert_eq!(old.chat_list_side, Side::Left);
+        assert_eq!(old.video_note_size, VideoNoteSize::Small);
         assert_eq!(old.corners, Corners::Auto);
         assert!(!old.nerd_font);
         assert!(old.animations);

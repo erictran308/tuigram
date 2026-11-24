@@ -31,7 +31,7 @@ use crate::reactions::{self, ReactMenu};
 use crate::search;
 use crate::secret::{self, KeyView, TimerMenu};
 use crate::select::TextSelect;
-use crate::settings::{Settings, Side};
+use crate::settings::{Settings, Side, VideoNoteSize};
 use crate::text;
 use crate::theme::{Colors, Themes};
 use crate::topics::Topic;
@@ -1392,8 +1392,8 @@ fn draw_settings(
             " `Enter` или `Space` выбрать · `Tab` клавиши · `Esc` закрыть ",
         ),
         HelpTab::Settings => t(
-            " `Enter` or `Space` on/off · `Tab` shortcuts · `Esc` close ",
-            " `Enter` или `Space` вкл/выкл · `Tab` клавиши · `Esc` закрыть ",
+            " `Enter` or `Space` change · `Tab` shortcuts · `Esc` close ",
+            " `Enter` или `Space` изменить · `Tab` клавиши · `Esc` закрыть ",
         ),
     };
     let block = popup_block(tabs, keys, colors);
@@ -1433,6 +1433,14 @@ fn draw_settings(
         }
         lines.push(row(i, mark, Span::from(label.to_string())));
     };
+    lines.push(heading(t(" Interface", " Интерфейс")));
+    let lang = if settings.ru() {
+        " [Русский] "
+    } else {
+        " [English] "
+    };
+    add(&mut lines, SettingsMenu::LANGUAGE, lang, t("Language", "Язык"));
+    lines.push(Line::default());
     lines.push(heading(t(" Notifications", " Уведомления")));
     add(
         &mut lines,
@@ -1466,6 +1474,20 @@ fn draw_settings(
         t(
             "A gap between messages in a row from one person",
             "Промежуток между подряд идущими сообщениями одного человека",
+        ),
+    );
+    let size = match settings.video_note_size {
+        VideoNoteSize::Small => t(" [small] ", " [маленький] "),
+        VideoNoteSize::Medium => t(" [medium] ", " [средний] "),
+        VideoNoteSize::Large => t(" [large] ", " [большой] "),
+    };
+    add(
+        &mut lines,
+        SettingsMenu::VIDEO_SIZE,
+        size,
+        t(
+            "Video messages play on Space",
+            "Видеосообщения играют по Space",
         ),
     );
     lines.push(Line::default());
@@ -3675,7 +3697,7 @@ mod tests {
                 rows: 4,
                 thumbnail: false,
                 avatar: false,
-            };
+            round: false,};
             let red = image::RgbImage::from_pixel(cols.into(), 8, image::Rgb([255, 0, 0]));
             images.insert_ready(key, red.into());
         }
@@ -4495,7 +4517,7 @@ mod tests {
         assert!(row(&rows, "Notifications").contains("Notifications"));
         assert!(row(&rows, "New messages").contains("▌ [✓] New messages"));
         assert!(
-            row(&rows, "Space on/off").contains("Esc close"),
+            row(&rows, "Space change").contains("Esc close"),
             "key hints"
         );
 
@@ -4544,7 +4566,7 @@ mod tests {
         assert!(row(&rows, "A gap between messages").contains("  [✓] A gap between messages"));
         assert!(row(&rows, "Composer").contains("Composer"));
         assert!(row(&rows, "Back to Normal").contains("▌ [ ] Back to Normal mode after sending"));
-        assert!(row(&rows, "Space on/off").contains("Esc close"));
+        assert!(row(&rows, "Space change").contains("Esc close"));
 
         let rows = draw(false, true);
         assert!(row(&rows, "A gap between chats").contains("[ ] A gap between chats"));
