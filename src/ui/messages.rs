@@ -504,6 +504,9 @@ pub(super) fn draw_photos(
             .as_mut()
             .filter(|i| i.message_id == slot.id && i.started())
         {
+            // The whole slot, not the part on screen: the frame is fit into
+            // it, and cells scrolled away just don't show their slices.
+            player.placement = Some((slot.cols, slot.rows));
             let skip = (-y).max(0) as u16;
             let shown = i64::from(slot.rows).min(i64::from(area.height)) - y.max(0);
             let rect = Rect {

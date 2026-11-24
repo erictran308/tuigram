@@ -631,6 +631,11 @@ pub struct Inline {
     /// The bubble's picture cells were drawn this frame; ui sets it, the
     /// app stops the player when a whole frame went by without it.
     pub seen: bool,
+    /// The slot's size in cells, set by the ui when it draws the
+    /// placeholder cells: kitty's virtual placement is made exactly that
+    /// big (`c`/`r` on the transmit), or it guesses a size from the cells
+    /// it has seen — a guess a partial redraw breaks, cutting the picture.
+    pub placement: Option<(u16, u16)>,
     tmux: bool,
 }
 
@@ -658,6 +663,7 @@ impl Inline {
             pending: false,
             medium: false,
             seen: false,
+            placement: None,
             tmux,
         })
     }
@@ -752,14 +758,18 @@ impl Inline {
         }
     }
 
-    /// Sends the newest frame to the terminal as a virtual placement: the
-    /// bubble's placeholder cells (see [`InlineImage`]) say where it shows,
-    /// so it follows the text as it scrolls. Called after each frame
-    /// ratatui draws.
+    /// Sends the newest frame to the terminal as a virtual placement sized
+    /// to the slot's cells (`c`/`r`): kitty fits the frame into it, keeping
+    /// the aspect. The bubble's placeholder cells (see [`InlineImage`]) say
+    /// where it shows, so it follows the text as it scrolls. Called after
+    /// each frame ratatui draws.
     pub fn send_frame(&mut self, terminal: &mut Terminal) {
         if !self.pending || self.player.is_none() {
             return;
         }
+        let Some((c, r)) = self.placement else {
+            return;
+        };
         self.pending = false;
         let file = frame_dir().join(format!("frame{TAG_INLINE}.rgb"));
         use base64::Engine;
@@ -768,7 +778,7 @@ impl Inline {
         let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
         let (s, v) = (self.side, self.side);
         let code = format!(
-            "{start}{escape}_Gq=2,i={INLINE_KITTY_ID},a=T,U=1,f=32,t=f,s={s},v={v};{path}{escape}\\{end}"
+            "{start}{escape}_Gq=2,i={INLINE_KITTY_ID},a=T,U=1,f=32,t=f,s={s},v={v},c={c},r={r};{path}{escape}\\{end}"
         );
         let _ = term::send(terminal, [code]);
     }
