@@ -34,13 +34,13 @@ pub(super) fn draw(
     );
     let (cols, rows) = (shot.cols, shot.rows);
     // The largest photo, and the bubble's until that's downloaded.
-    images.want(&view.photo, cols, rows);
+    images.want(&view.photo, cols, rows, false);
     let stand_in = view
         .stand_in
         .clone()
         .filter(|_| !images.downloaded(&view.photo));
     if let Some(stand_in) = &stand_in {
-        images.want(stand_in, cols, rows);
+        images.want(stand_in, cols, rows, false);
     }
     let sharp = std::iter::once(&view.photo)
         .chain(&stand_in)
@@ -82,7 +82,7 @@ pub(super) fn draw(
         return;
     }
     if let Some(stand_in) = &stand_in
-        && images.draw(frame, inner, at, |i| i.get(stand_in, cols, rows))
+        && images.draw(frame, inner, at, |i| i.get(stand_in, cols, rows, false))
     {
         return;
     }
@@ -237,7 +237,7 @@ mod tests {
             rows: shot.rows,
             thumbnail: false,
             avatar: false,
-        };
+        round: false,};
         images.insert_ready(key, DynamicImage::new_rgb8(20, 10));
         let ready = title(&mut view, &mut images);
         assert!(

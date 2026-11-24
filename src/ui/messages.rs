@@ -518,7 +518,7 @@ pub(super) fn draw_photos(
             }
             continue;
         }
-        images.want(&slot.photo, slot.cols, slot.rows);
+        images.want(&slot.photo, slot.cols, slot.rows, slot.id != 0);
         // Sixel and iTerm2 images are painted from one cell outside the
         // popup, and a later repaint would cover the popup's text, which
         // isn't sent again. So under a popup they wait until it closes.
@@ -527,7 +527,7 @@ pub(super) fn draw_photos(
         }
         let position = SignedPosition::from((slot.x as i16, y as i16));
         if images.draw(frame, area, position, |i| {
-            i.get(&slot.photo, slot.cols, slot.rows)
+            i.get(&slot.photo, slot.cols, slot.rows, slot.id != 0)
         }) {
             continue;
         }
@@ -2658,7 +2658,7 @@ mod tests {
             rows,
             thumbnail: false,
             avatar: false,
-        };
+        round: false,};
         let red = image::RgbImage::from_pixel(80, 60, image::Rgb([255, 0, 0]));
         images.insert_ready(key, red.into());
         let mut painted = |covered| {
@@ -2733,7 +2733,7 @@ mod tests {
             rows: rows_,
             thumbnail: false,
             avatar: false,
-        };
+        round: false,};
         images.insert_ready(key, red.into());
         let buf = render_buffer(&mut open, false, &mut images);
         let red_cells = buf
@@ -2825,7 +2825,7 @@ mod tests {
             rows,
             thumbnail: false,
             avatar: false,
-        };
+        round: false,};
         images.insert_ready(key, red.into());
 
         // Following the newest message pushes the top of the photo off screen.

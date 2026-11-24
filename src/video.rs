@@ -1,6 +1,7 @@
 //! Video messages played in the terminal itself: ffmpeg decodes frames to
-//! raw RGB in a tmpfs file at the video's own rate, kitty's protocol puts
-//! each where the overlay's blank area is, and mpv plays the sound.
+//! raw RGBA in a tmpfs file at the video's own rate, the circle outside the
+//! round frame goes transparent, kitty's protocol puts each where the
+//! overlay's blank area is, and mpv plays the sound.
 //! Zooming restarts the decoder at the same position with a bigger frame.
 //! Everything but the few calls app.rs makes lives here.
 
@@ -127,9 +128,10 @@ impl Drop for Player {
     }
 }
 
-/// Reads frames from `pipe` (width × height × 3 bytes each) into the tmpfs
-/// file, atomically: a half-written one never reaches the terminal. At the
-/// video's own rate, since ffmpeg runs with `-re`.
+/// Reads frames from `pipe` (width × height × 4 bytes each, RGBA) into the
+/// tmpfs file, atomically: a half-written one never reaches the terminal.
+/// At the video's own rate, since ffmpeg runs with `-re`. The pixels
+/// outside the frame's circle go transparent: video messages are round.
 fn pump_frames(
     mut pipe: impl Read,
     width: u32,
@@ -139,7 +141,7 @@ fn pump_frames(
     tag: u8,
     tx: UnboundedSender<VideoEvent>,
 ) {
-    let size = width as usize * height as usize * 3;
+    let size = width as usize * height as usize * 4;
     let dir = frame_dir();
     let tmp = dir.join(format!("frame{tag}.tmp"));
     let out = dir.join(format!("frame{tag}.rgb"));
@@ -158,6 +160,7 @@ fn pump_frames(
             }
             return;
         }
+        mask_circle(&mut buf, width, height);
         let written = std::fs::write(&tmp, &buf).and_then(|()| std::fs::rename(&tmp, &out));
         if let Err(e) = written {
             let _ = tx.send(VideoEvent::Failed(
@@ -169,6 +172,26 @@ fn pump_frames(
         frames.fetch_add(1, Relaxed);
         if tx.send(VideoEvent::Frame(tag)).is_err() {
             return;
+        }
+    }
+}
+
+/// Sets each pixel's alpha by how much of it the frame's inscribed circle
+/// covers: the corners go transparent, and kitty draws what's under them —
+/// the bubble. The edge is a shade, not a step, so it doesn't look jagged.
+/// ffmpeg's frames are opaque, so only the alpha byte is written.
+fn mask_circle(buf: &mut [u8], width: u32, height: u32) {
+    let (w, h) = (f64::from(width), f64::from(height));
+    let (cx, cy) = ((w - 1.0) / 2.0, (h - 1.0) / 2.0);
+    let r = w.min(h) / 2.0;
+    for y in 0..height {
+        // Pixels of this row inside the circle have |x - cx| <= half.
+        let half = (r * r - (f64::from(y) - cy).powi(2)).max(0.0).sqrt();
+        let (lo, hi) = (cx - half, cx + half + 1.0);
+        for x in 0..width {
+            let xf = f64::from(x);
+            let cover = (hi.min(xf + 1.0) - lo.max(xf)).clamp(0.0, 1.0);
+            buf[(y as usize * width as usize + x as usize) * 4 + 3] = (cover * 255.0) as u8;
         }
     }
 }
@@ -209,7 +232,7 @@ fn spawn(
             "-f",
             "rawvideo",
             "-pix_fmt",
-            "rgb24",
+            "rgba",
             "pipe:1",
         ])
         .stdin(Stdio::null())
@@ -547,7 +570,7 @@ impl VideoView {
             // cursor.
             format!("\x1b[{};{}H", at.y + 1, at.x + 1),
             format!(
-                "{start}{escape}_Ga=T,t=f,f=24,s={w},v={h},i={KITTY_ID},q=2,c={},r={};{path}{escape}\\{end}",
+                "{start}{escape}_Ga=T,t=f,f=32,s={w},v={h},i={KITTY_ID},q=2,c={},r={};{path}{escape}\\{end}",
                 at.width, at.height
             ),
         ];
@@ -734,7 +757,7 @@ impl Inline {
         let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
         let (s, v) = (self.side, self.side);
         let code = format!(
-            "{start}{escape}_Gq=2,i={INLINE_KITTY_ID},a=T,U=1,f=24,t=f,s={s},v={v};{path}{escape}\\{end}"
+            "{start}{escape}_Gq=2,i={INLINE_KITTY_ID},a=T,U=1,f=32,t=f,s={s},v={v};{path}{escape}\\{end}"
         );
         let _ = term::send(terminal, [code]);
     }
@@ -1110,3 +1133,22 @@ fn diacritic(y: u16) -> char {
         .unwrap_or_else(|| &DIACRITICS[0])
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_mask_leaves_the_circle_and_hides_the_corners() {
+        let (w, h) = (16, 16);
+        let mut buf = vec![255u8; w * h * 4];
+        mask_circle(&mut buf, w as u32, h as u32);
+        let alpha = |x: usize, y: usize| buf[(y * w + x) * 4 + 3];
+        assert_eq!(alpha(0, 0), 0, "the corner");
+        assert_eq!(alpha(15, 15), 0, "the other corner");
+        assert_eq!(alpha(8, 8), 255, "the center");
+        assert_eq!(alpha(8, 0), 255, "the circle's top");
+        // The edge is a shade, not a step.
+        let edge = (1..15).map(|x| alpha(x, 1)).find(|&a| a > 0 && a < 255);
+        assert!(edge.is_some(), "a half-covered pixel on the edge");
+    }
+}

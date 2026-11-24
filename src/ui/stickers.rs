@@ -180,9 +180,9 @@ fn draw_grid(
             ..slot
         };
         if pictures && let Some(preview) = &sticker.preview {
-            images.want(preview, cols, IMAGE_ROWS);
+            images.want(preview, cols, IMAGE_ROWS, false);
             let at = SignedPosition::from((0, 0));
-            if images.draw(frame, picture, at, |i| i.get(preview, cols, IMAGE_ROWS)) {
+            if images.draw(frame, picture, at, |i| i.get(preview, cols, IMAGE_ROWS, false)) {
                 continue;
             }
         }
