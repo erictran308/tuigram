@@ -182,7 +182,9 @@ fn draw_grid(
         if pictures && let Some(preview) = &sticker.preview {
             images.want(preview, cols, IMAGE_ROWS, false);
             let at = SignedPosition::from((0, 0));
-            if images.draw(frame, picture, at, |i| i.get(preview, cols, IMAGE_ROWS, false)) {
+            if images.draw(frame, picture, at, |i| {
+                i.get(preview, cols, IMAGE_ROWS, false)
+            }) {
                 continue;
             }
         }

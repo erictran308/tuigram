@@ -486,7 +486,14 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 .is_some_and(|p| p.kind == PromptKind::Command || !p.completions.is_empty()),
         gaps: app.settings.chat_gaps,
     };
-    chat_list::draw(frame, list_area, &list, &mut app.images, colors, &mut app.mouse);
+    chat_list::draw(
+        frame,
+        list_area,
+        &list,
+        &mut app.images,
+        colors,
+        &mut app.mouse,
+    );
     // The pane with the keys, for the lights round it.
     let mut keys_in = match app.focus {
         Focus::Chats => Some(list_area),
@@ -1377,9 +1384,15 @@ fn draw_settings(
         }
     };
     let mut tabs = vec![Span::from(" ")];
-    tabs.extend(tab(t(" Shortcuts ", " Клавиши "), menu.tab == HelpTab::Shortcuts));
+    tabs.extend(tab(
+        t(" Shortcuts ", " Клавиши "),
+        menu.tab == HelpTab::Shortcuts,
+    ));
     tabs.push(Span::from(" "));
-    tabs.extend(tab(t(" Settings ", " Настройки "), menu.tab == HelpTab::Settings));
+    tabs.extend(tab(
+        t(" Settings ", " Настройки "),
+        menu.tab == HelpTab::Settings,
+    ));
     tabs.push(Span::from(" "));
     let tabs = Line::from(tabs);
     let keys = match menu.tab {
@@ -1439,7 +1452,12 @@ fn draw_settings(
     } else {
         " [English] "
     };
-    add(&mut lines, SettingsMenu::LANGUAGE, lang, t("Language", "Язык"));
+    add(
+        &mut lines,
+        SettingsMenu::LANGUAGE,
+        lang,
+        t("Language", "Язык"),
+    );
     lines.push(Line::default());
     lines.push(heading(t(" Notifications", " Уведомления")));
     add(
@@ -1505,7 +1523,10 @@ fn draw_settings(
         &mut lines,
         SettingsMenu::PILLS,
         check(colors.pills),
-        t("Round pills (needs a Nerd Font)", "Круглые «пилюли» (нужен Nerd Font)"),
+        t(
+            "Round pills (needs a Nerd Font)",
+            "Круглые «пилюли» (нужен Nerd Font)",
+        ),
     );
     add(
         &mut lines,
@@ -1571,7 +1592,12 @@ fn draw_settings(
     // The dot marks the sound in use.
     let picked = settings.notification_sound.as_deref();
     let dot = |on: bool| if on { " ● " } else { " ○ " };
-    add(&mut lines, SettingsMenu::SOUNDS, dot(picked.is_none()), t("None", "Нет"));
+    add(
+        &mut lines,
+        SettingsMenu::SOUNDS,
+        dot(picked.is_none()),
+        t("None", "Нет"),
+    );
     for (i, sound) in sounds.list.iter().enumerate() {
         let mark = dot(picked == Some(sound.id.as_str()));
         add(&mut lines, SettingsMenu::SOUNDS + 1 + i, mark, &sound.label);
@@ -1608,7 +1634,9 @@ fn draw_settings(
     }
     if let Some(dir) = &themes.dir {
         lines.push(Line::default());
-        lines.push(Line::from(t(" Your own themes go in", " Свои темы кладутся в")).fg(colors.muted));
+        lines.push(
+            Line::from(t(" Your own themes go in", " Свои темы кладутся в")).fg(colors.muted),
+        );
         lines.push(Line::from(format!(" {}", short_path(dir))).fg(colors.muted));
     }
     // On the last sound or theme, the lines after it show too.
@@ -2638,7 +2666,11 @@ fn jump_hints(open: &OpenChat, jumps: &Jumps, ru: bool) -> Vec<&'static str> {
     let mut hints = Vec::new();
     let msg = open.cursor_id().and_then(|id| open.messages.get(&id));
     if msg.and_then(|m| m.hidden.as_ref()).is_some_and(|h| !h.open) {
-        hints.push(crate::lang::pick(ru, "`Enter` view it", "`Enter` посмотреть"));
+        hints.push(crate::lang::pick(
+            ru,
+            "`Enter` view it",
+            "`Enter` посмотреть",
+        ));
     } else if open.cursor_id().is_some_and(|id| open.hides_spoilers(id)) {
         hints.push(crate::lang::pick(
             ru,
@@ -2657,7 +2689,11 @@ fn jump_hints(open: &OpenChat, jumps: &Jumps, ru: bool) -> Vec<&'static str> {
         .and_then(|id| open.messages.get(&id))
         .is_some_and(|m| m.reply_to.is_some());
     if on_reply {
-        hints.push(crate::lang::pick(ru, "`gd` go to replied", "`gd` к отвеченному"));
+        hints.push(crate::lang::pick(
+            ru,
+            "`gd` go to replied",
+            "`gd` к отвеченному",
+        ));
     }
     if jumps.can_go_back() {
         hints.push(crate::lang::pick(ru, "`Ctrl-o` back", "`Ctrl-o` назад"));
@@ -2701,9 +2737,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         _ if app.confirm.is_some() => (
             normal,
             match app.confirm.as_ref().map(|c| &c.action) {
-                Some(Confirmed::Edit { .. }) => {
-                    t("  `y` edit · `n` or `Esc` cancel", "  `y` править · `n` или `Esc` отмена")
-                }
+                Some(Confirmed::Edit { .. }) => t(
+                    "  `y` edit · `n` or `Esc` cancel",
+                    "  `y` править · `n` или `Esc` отмена",
+                ),
                 Some(Confirmed::Join(_) | Confirmed::JoinLink { .. }) => t(
                     "  `y` join · `n` or `Esc` cancel",
                     "  `y` вступить · `n` или `Esc` отмена",
@@ -2783,9 +2820,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
                 "  `j/k` выбор · `Enter` голосовать · `Esc` закрыть",
             ),
         ),
-        _ if app.notice.is_some() => {
-            (normal, t("  `Enter` or `Esc` close", "  `Enter` или `Esc` закрыть"))
-        }
+        _ if app.notice.is_some() => (
+            normal,
+            t("  `Enter` or `Esc` close", "  `Enter` или `Esc` закрыть"),
+        ),
         _ if app.pin_menu.is_some() => (
             normal,
             t(
@@ -2800,9 +2838,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
                 "  `j/k` выбор · `Enter` задать таймер · `Esc` отмена",
             ),
         ),
-        _ if app.key_view.is_some() => {
-            (normal, t("  `Enter` or `Esc` close", "  `Enter` или `Esc` закрыть"))
-        }
+        _ if app.key_view.is_some() => (
+            normal,
+            t("  `Enter` or `Esc` close", "  `Enter` или `Esc` закрыть"),
+        ),
         _ if app
             .chat_info
             .as_ref()

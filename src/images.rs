@@ -1192,7 +1192,10 @@ mod tests {
         assert!(!images.measured(measure(20, 40)), "only once");
         images.build(key(7), || Ok(DynamicImage::new_rgba8(8, 8)));
         images.on_built(rx.recv().await.unwrap());
-        assert!(images.get(&preview(7), 4, 2, false).is_some(), "the new size");
+        assert!(
+            images.get(&preview(7), 4, 2, false).is_some(),
+            "the new size"
+        );
     }
 
     #[tokio::test]
@@ -1262,12 +1265,18 @@ mod tests {
         images.insert_ready(key(0), DynamicImage::new_rgba8(8, 8));
         for id in 1..MAX_READY as i32 + 10 {
             images.frame += 1;
-            assert!(images.get(&preview(0), 4, 2, false).is_some(), "still drawn");
+            assert!(
+                images.get(&preview(0), 4, 2, false).is_some(),
+                "still drawn"
+            );
             images.insert_ready(key(id), DynamicImage::new_rgba8(8, 8));
         }
         assert_eq!(images.ready.len(), MAX_READY);
         assert!(images.get(&preview(0), 4, 2, false).is_some());
-        assert!(images.get(&preview(1), 4, 2, false).is_none(), "the oldest went");
+        assert!(
+            images.get(&preview(1), 4, 2, false).is_none(),
+            "the oldest went"
+        );
     }
 
     #[tokio::test]
@@ -1308,7 +1317,10 @@ mod tests {
         images.want(&photo, 4, 2, false);
         images.fetch(&Tg::detached(tokio::sync::mpsc::unbounded_channel().0));
         images.on_built(rx.recv().await.unwrap());
-        assert!(images.get(&photo, 4, 2, false).is_some(), "read by its contents");
+        assert!(
+            images.get(&photo, 4, 2, false).is_some(),
+            "read by its contents"
+        );
         assert_eq!(size(images.measured_photo(&photo)), (80, 60));
         std::fs::remove_dir_all(&dir).unwrap();
     }

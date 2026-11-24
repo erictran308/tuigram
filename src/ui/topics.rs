@@ -40,7 +40,13 @@ pub struct TopicList<'a> {
     pub gaps: bool,
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, list: &TopicList, colors: &Colors, mouse: &mut crate::mouse::Map) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    list: &TopicList,
+    colors: &Colors,
+    mouse: &mut crate::mouse::Map,
+) {
     let forum = list.forum;
     let chats = list.names.chats;
     // Telegram's verdict on the forum (SCAM, FAKE, ✓) always shows: the
@@ -240,7 +246,15 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw(frame, frame.area(), &list, &Colors::default(), &mut Default::default()))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    &list,
+                    &Colors::default(),
+                    &mut Default::default(),
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)

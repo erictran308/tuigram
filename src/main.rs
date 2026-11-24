@@ -154,7 +154,14 @@ async fn main() -> Result<()> {
         video_tx,
     );
     let result = app
-        .run(&mut terminal, rx, image_rx, clipboard_rx, voice_rx, video_rx)
+        .run(
+            &mut terminal,
+            rx,
+            image_rx,
+            clipboard_rx,
+            voice_rx,
+            video_rx,
+        )
         .await;
 
     if enhanced {

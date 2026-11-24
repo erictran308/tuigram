@@ -51,8 +51,8 @@ use crate::tg::{Deletable, EditText, Found, Invite, Mentions, Missed, Page, Tagg
 use crate::theme::{Colors, Corners, Themes};
 use crate::topics::{self, Forum};
 use crate::ui;
-use crate::viewer::{self, PhotoView};
 use crate::video::{Inline, VideoEvent, VideoView};
+use crate::viewer::{self, PhotoView};
 use crate::voice::{Happened, Player, VoiceEvent};
 
 /// Chats requested per `loadChats` call.
@@ -203,9 +203,10 @@ pub enum Target {
 impl Target {
     pub fn label(&self) -> &str {
         match self {
-            Target::File(file) | Target::Voice { file, .. } | Target::Photo { file, .. } | Target::Video { file, .. } => {
-                &file.label
-            }
+            Target::File(file)
+            | Target::Voice { file, .. }
+            | Target::Photo { file, .. }
+            | Target::Video { file, .. } => &file.label,
             Target::Link(link) => &link.url,
             Target::Text(_) => "Whole message",
         }
@@ -779,6 +780,8 @@ pub struct App {
     pub player: Player,
     /// Files being downloaded to open in their default app when done.
     pub opening: HashSet<i32>,
+    /// Files being downloaded to show in the file manager when done.
+    pub revealing: HashSet<i32>,
     clipboard: Clipboard,
     /// Files being downloaded to copy when done, by file id.
     pub copying: HashMap<i32, MediaFile>,
@@ -965,6 +968,7 @@ impl App {
             images,
             player,
             opening: HashSet::new(),
+            revealing: HashSet::new(),
             clipboard,
             copying: HashMap::new(),
             pasting: false,
@@ -1178,16 +1182,18 @@ impl App {
                 }
             }
             // The inline player's newest frame goes to the terminal; one
-            // whose bubble wasn't drawn this frame is stopped.
-            if failed.is_none()
-                && self.inline_video.is_some()
-            {
-                let seen = self.inline_video.as_ref().is_some_and(|i| i.seen);
+            // whose bubble wasn't drawn this frame is stopped. One still
+            // waiting for its download has nothing drawn to see: it stays.
+            if failed.is_none() && self.inline_video.is_some() {
+                let (seen, started) = self
+                    .inline_video
+                    .as_ref()
+                    .map_or((false, false), |i| (i.seen, i.started()));
                 if seen {
                     if let Some(inline) = self.inline_video.as_mut() {
                         inline.send_frame(terminal);
                     }
-                } else {
+                } else if started {
                     self.inline_video = None;
                 }
             }
@@ -1287,7 +1293,10 @@ impl App {
     }
 
     fn on_terminal_event(&mut self, event: Event) {
-        if matches!(event, Event::Key(_) | Event::Paste(_) | Event::FocusGained | Event::Mouse(_)) {
+        if matches!(
+            event,
+            Event::Key(_) | Event::Paste(_) | Event::FocusGained | Event::Mouse(_)
+        ) {
             self.last_input = Instant::now();
             self.last_input_wall = SystemTime::now();
         }
@@ -1511,6 +1520,12 @@ impl App {
                         None => self.status = Some("Download failed".into()),
                     }
                 }
+                if self.revealing.remove(&file_id) {
+                    match &path {
+                        Some(path) => reveal_in_file_manager(path),
+                        None => self.status = Some("Download failed".into()),
+                    }
+                }
                 if let Some(file) = self.copying.remove(&file_id) {
                     match &path {
                         // Pasted in a file manager, the copy keeps the mark,
@@ -1574,8 +1589,7 @@ impl App {
                                 }
                             }
                             Err(why) => {
-                                self.status =
-                                    Some(format!("Can't play this video message: {why}"));
+                                self.status = Some(format!("Can't play this video message: {why}"));
                                 self.inline_video = None;
                             }
                         },
@@ -2261,6 +2275,18 @@ impl App {
             return;
         }
         self.status = None;
+        // Cyrillic keycaps read as their QWERTY twins outside typing, so
+        // moves and commands work in whichever layout is on. Typing —
+        // Insert mode, prompts, the picker, the login — gets the letters
+        // as they are.
+        let typing = matches!(self.screen, Screen::Login(_))
+            || self.prompt.is_some()
+            || self.picker.is_some()
+            || self.focus == Focus::Input;
+        let key = match (typing, key.code) {
+            (false, KeyCode::Char(c)) => KeyEvent::new(KeyCode::Char(qwerty(c)), key.modifiers),
+            _ => key,
+        };
         match self.screen {
             Screen::Login(_) => self.on_login_key(key),
             Screen::Main if self.confirm.is_some() => self.on_confirm_key(key),
@@ -2641,6 +2667,7 @@ impl App {
             (Focus::Messages, KeyCode::Char('r')) => self.reply_to_selected(),
             (Focus::Messages, KeyCode::Char('e')) => self.edit_selected(),
             (Focus::Messages, KeyCode::Char('y')) => self.copy_selected(),
+            (Focus::Messages, KeyCode::Char('O')) => self.reveal_selected_file(),
             (Focus::Messages, KeyCode::Char('v')) if !ctrl => self.open_text_select(),
             (Focus::Messages, KeyCode::Char('a')) => self.open_prompt(PromptKind::Attach),
             (Focus::Messages, KeyCode::Char('p')) if pending_g => self.open_pinned_menu(),
@@ -3870,6 +3897,7 @@ impl App {
         self.images.forget_files();
         self.player.stop();
         self.opening.clear();
+        self.revealing.clear();
         self.copying.clear();
         self.close_popups();
         self.finding = None;
@@ -6058,6 +6086,27 @@ impl App {
         }
     }
 
+    /// `O` on a message: its file shows in the file manager, picked where
+    /// the manager takes the hint. Downloads it first if it isn't here yet.
+    fn reveal_selected_file(&mut self) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let file = open
+            .cursor_id()
+            .and_then(|id| open.messages.get(&id))
+            .and_then(openable_file)
+            .cloned();
+        let Some(file) = file else {
+            self.status = Some("No file in this message".into());
+            return;
+        };
+        // TDLib answers at once if the file is already downloaded.
+        if self.revealing.insert(file.id) {
+            self.tg.download(file.id);
+        }
+    }
+
     /// Plays voice message `message_id` of the open chat, or pauses it if
     /// it's the one playing.
     fn play_voice(&mut self, message_id: i64, file_id: i32) {
@@ -7231,6 +7280,93 @@ fn open_externally(target: &str) -> std::io::Result<()> {
     }
 }
 
+/// The QWERTY key a Cyrillic keycap sits on: `н` is `y`, `р` is `h`, so
+/// commands work without switching layouts. Anything else is left alone.
+fn qwerty(c: char) -> char {
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    let mapped = match lower {
+        'й' => 'q',
+        'ц' => 'w',
+        'у' => 'e',
+        'к' => 'r',
+        'е' => 't',
+        'н' => 'y',
+        'г' => 'u',
+        'ш' => 'i',
+        'щ' => 'o',
+        'з' => 'p',
+        'х' => '[',
+        'ъ' => ']',
+        'ё' => '`',
+        'ф' => 'a',
+        'ы' => 's',
+        'в' => 'd',
+        'а' => 'f',
+        'п' => 'g',
+        'р' => 'h',
+        'о' => 'j',
+        'л' => 'k',
+        'д' => 'l',
+        'ж' => ';',
+        'э' => '\'',
+        'я' => 'z',
+        'ч' => 'x',
+        'с' => 'c',
+        'м' => 'v',
+        'и' => 'b',
+        'т' => 'n',
+        'ь' => 'm',
+        'б' => ',',
+        'ю' => '.',
+        _ => return c,
+    };
+    if c.is_uppercase() {
+        mapped.to_ascii_uppercase()
+    } else {
+        mapped
+    }
+}
+
+/// Shows `path` in the file manager rather than opening it: the file
+/// itself picked where the manager answers org.freedesktop.FileManager1
+/// (Nautilus, Dolphin, Nemo…), its folder opened where none does.
+fn reveal_in_file_manager(path: &str) {
+    let uri = format!("file://{}", percent_encode(path));
+    let shown = std::process::Command::new("dbus-send")
+        .args([
+            "--session",
+            "--dest=org.freedesktop.FileManager1",
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1.ShowItems",
+            &format!("array:string:{uri}"),
+            "string:",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !matches!(shown, Ok(status) if status.success())
+        && let Some(dir) = Path::new(path).parent()
+    {
+        let _ = open::that_detached(dir);
+    }
+}
+
+/// The path part of a `file://` URI: bytes outside a small safe set as
+/// %XX, since the file manager's DBus door takes a URI, not a path.
+fn percent_encode(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(char::from(b));
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Marks a downloaded file as coming from the internet, as browsers do, so
 /// the system's own checks apply when it's opened: Gatekeeper on macOS,
 /// SmartScreen and Office's Protected View on Windows. Best effort.
@@ -7369,7 +7505,10 @@ mod tests {
         assert_eq!(selected(&app), SettingsMenu::VIDEO_SIZE);
         // The video message size cycles: small, medium, large, small again.
         press(&mut app, KeyCode::Enter, none);
-        assert_eq!(saved().video_note_size, crate::settings::VideoNoteSize::Medium);
+        assert_eq!(
+            saved().video_note_size,
+            crate::settings::VideoNoteSize::Medium
+        );
         press(&mut app, KeyCode::Char('j'), none);
         assert_eq!(selected(&app), SettingsMenu::CORNERS);
         let rounded = app.rounded;
@@ -9690,6 +9829,36 @@ mod tests {
         assert_eq!(
             app.status.as_deref(),
             Some("Messages in secret chats can't be forwarded")
+        );
+    }
+
+    #[test]
+    fn commands_work_in_the_cyrillic_layout_too() {
+        assert_eq!(qwerty('н'), 'y');
+        assert_eq!(qwerty('Н'), 'Y');
+        assert_eq!(qwerty('р'), 'h');
+        assert_eq!(qwerty('ю'), '.');
+        assert_eq!(qwerty('a'), 'a');
+        assert_eq!(qwerty('/'), '/');
+
+        // `н` sits on `y`: it copies as y does, no layout switch needed.
+        let mut app = test_app("layout");
+        app.focus = Focus::Messages;
+        plain_message(&mut app);
+        press(&mut app, KeyCode::Char('н'), KeyModifiers::NONE);
+        assert!(app.toast.is_some(), "copied as y copies");
+
+        // Typing is untouched: Insert mode takes the letters as they are.
+        app.focus = Focus::Input;
+        press(&mut app, KeyCode::Char('ы'), KeyModifiers::NONE);
+        assert_eq!(app.composer.lines().join("\n"), "ы");
+    }
+
+    #[test]
+    fn a_file_uri_encodes_what_breaks_one() {
+        assert_eq!(
+            percent_encode("/tmp/a b/файл.pdf"),
+            "/tmp/a%20b/%D1%84%D0%B0%D0%B9%D0%BB.pdf"
         );
     }
 

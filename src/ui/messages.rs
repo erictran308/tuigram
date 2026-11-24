@@ -2776,7 +2776,9 @@ mod tests {
         };
         let font = images().font_size();
         let colors = Colors::default();
-        let small = measure(&open, &names, true, false, 80, font, true, &colors, None, None);
+        let small = measure(
+            &open, &names, true, false, 80, font, true, &colors, None, None,
+        );
         let big = measure(
             &open,
             &names,

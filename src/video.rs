@@ -485,10 +485,7 @@ impl VideoView {
             width: cols,
             height: rows,
         };
-        let pixels = (
-            (f64::from(cols) * fw) as u32,
-            (f64::from(rows) * fh) as u32,
-        );
+        let pixels = ((f64::from(cols) * fw) as u32, (f64::from(rows) * fh) as u32);
         (rect, pixels)
     }
 
@@ -667,8 +664,15 @@ impl Inline {
         let (_, fps) = probe(&path);
         self.fps = fps;
         self.player = Some(
-            spawn(&path, 0.0, self.side, self.side, TAG_INLINE, self.tx.clone())
-                .map_err(|e| format!("{e:#}"))?,
+            spawn(
+                &path,
+                0.0,
+                self.side,
+                self.side,
+                TAG_INLINE,
+                self.tx.clone(),
+            )
+            .map_err(|e| format!("{e:#}"))?,
         );
         self.path = Some(path);
         Ok(())
@@ -691,15 +695,8 @@ impl Inline {
             Some(player) => player.toggle(),
             None => {
                 if let Some(path) = &self.path {
-                    self.player = spawn(
-                        path,
-                        0.0,
-                        self.side,
-                        self.side,
-                        TAG_INLINE,
-                        self.tx.clone(),
-                    )
-                    .ok();
+                    self.player =
+                        spawn(path, 0.0, self.side, self.side, TAG_INLINE, self.tx.clone()).ok();
                 }
             }
         }

@@ -290,7 +290,9 @@ pub fn draw(
         if from >= last {
             break;
         }
-        mouse.chat_rows.push((from, (from + item_rows).min(last), id));
+        mouse
+            .chat_rows
+            .push((from, (from + item_rows).min(last), id));
     }
     if photo_cols == 0 {
         return;
