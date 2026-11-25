@@ -2142,10 +2142,12 @@ fn draw_media(frame: &mut Frame, area: Rect, app: &App, colors: &Colors) {
     frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
     if menu.rows.is_empty() {
-        let text = if menu.loading {
-            crate::lang::pick(ru, " Searching… ", " Ищу… ")
+        let text = if let Some(why) = &menu.error {
+            format!(" {why} ")
+        } else if menu.loading {
+            crate::lang::pick(ru, " Searching… ", " Ищу… ").into()
         } else {
-            crate::lang::pick(ru, " Nothing found ", " Ничего не найдено ")
+            crate::lang::pick(ru, " Nothing found ", " Ничего не найдено ").into()
         };
         frame.render_widget(Paragraph::new(text).fg(colors.muted), inner);
         return;

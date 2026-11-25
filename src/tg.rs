@@ -54,12 +54,12 @@ pub enum TgEvent {
         page: Page,
         messages: Option<Vec<types::Message>>,
     },
-    /// A page of message search results. `None` if the request failed.
+    /// A page of message search results. `Err` is why the request failed.
     Found {
         chat_id: i64,
         topic: Option<i32>,
         query: String,
-        found: Option<Found>,
+        found: Result<Found, String>,
     },
     /// The message that `message_id` replies to; `None` if TDLib couldn't find it.
     Replied {
@@ -902,13 +902,6 @@ impl Tg {
             let found = match secret && !ask.words.is_empty() {
                 true => secret_search_page(chat_id, &ask, offset, limit, client_id).await,
                 false => search_page(chat_id, topic, &ask, from, limit, client_id).await,
-            };
-            let found = match found {
-                Ok(found) => Some(found),
-                Err(why) => {
-                    let _ = tx.send(TgEvent::Error(why));
-                    None
-                }
             };
             let _ = tx.send(TgEvent::Found {
                 chat_id,

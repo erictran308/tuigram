@@ -1813,7 +1813,7 @@ impl App {
         }
     }
 
-    fn on_found(&mut self, place: (i64, Option<i32>), query: &str, found: Option<Found>) {
+    fn on_found(&mut self, place: (i64, Option<i32>), query: &str, found: Result<Found, String>) {
         // A page the media browser asked for goes to it.
         if self
             .media_menu
@@ -1837,21 +1837,25 @@ impl App {
         search.loading = false;
         let wanted = search.wanted.take();
         match found {
-            Some(found) => {
+            Ok(found) => {
                 search.add(found);
                 if let Some(index) = wanted {
                     self.go_to_match(index);
                 }
             }
             // The error is in the status bar. Without a match, end the search.
-            None if search.results.is_empty() => open.search = None,
-            None => {}
+            Err(why) => {
+                self.status = Some(why);
+                if open.search.as_ref().is_some_and(|s| s.results.is_empty()) {
+                    open.search = None;
+                }
+            }
         }
     }
 
     /// A page of the media browser's search: the rows are listed, and the
     /// next page is asked for until there are no more (or MEDIA_ROWS_MAX).
-    fn on_media_found(&mut self, place: (i64, Option<i32>), found: Option<Found>) {
+    fn on_media_found(&mut self, place: (i64, Option<i32>), found: Result<Found, String>) {
         let Some(open) = self.open.as_ref().filter(|o| o.place() == place) else {
             // The chat the search was in is gone: the list means nothing.
             self.media_menu = None;
@@ -1865,7 +1869,7 @@ impl App {
             };
             menu.loading = false;
             match found {
-                Some(found) => {
+                Ok(found) => {
                     menu.add(found);
                     if !menu.done && menu.rows.len() < MEDIA_ROWS_MAX {
                         menu.loading = true;
@@ -1879,11 +1883,11 @@ impl App {
                         None
                     }
                 }
-                // The error is in the status bar. An empty list goes away.
-                None => {
-                    if menu.rows.is_empty() {
-                        self.media_menu = None;
-                    }
+                // The window stays, saying why: an error only in the status
+                // bar, with the window closing at once, was too easy to miss.
+                Err(why) => {
+                    menu.error = Some(why.clone());
+                    self.status = Some(why);
                     None
                 }
             }
@@ -8782,6 +8786,29 @@ mod tests {
         press(&mut app, KeyCode::Enter, none);
         assert!(app.media_menu.is_none());
         assert!(app.open.as_ref().unwrap().search.is_some());
+    }
+
+    #[test]
+    fn a_failed_media_search_says_so_in_its_window() {
+        let mut app = test_app("media-error");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        press(&mut app, KeyCode::Char('/'), none);
+        for c in "has:file".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.media_menu.is_some());
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        app.on_tg(TgEvent::Found {
+            chat_id,
+            topic: None,
+            query: "has:file".into(),
+            found: Err("Nobody on Telegram is called @x".into()),
+        });
+        assert!(app.media_menu.is_some(), "the window stays");
+        let text = screen(&mut app).join("\n");
+        assert!(text.contains("Nobody on Telegram"), "says why: {text}");
     }
 
     #[test]

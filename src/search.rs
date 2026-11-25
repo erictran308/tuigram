@@ -361,6 +361,8 @@ pub struct MediaMenu {
     pub done: bool,
     /// A page of results is being fetched.
     pub loading: bool,
+    /// Why the search failed, if it did: shown in the window.
+    pub error: Option<String>,
 }
 
 impl MediaMenu {
@@ -375,6 +377,7 @@ impl MediaMenu {
             next_offset: String::new(),
             done: false,
             loading: false,
+            error: None,
         }
     }
 
