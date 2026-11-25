@@ -2937,21 +2937,30 @@ impl App {
     }
 
     /// Whom Tab offers after `from:` in a search: you, then the @usernames
-    /// of the people whose messages are loaded, newest first.
+    /// of the people whose messages are loaded, newest first, then of the
+    /// chats in the list, so any of them is a few Tabs away.
     fn search_people(&self) -> Vec<String> {
         let mut people = vec!["me".to_string()];
-        let Some(open) = &self.open else {
-            return people;
-        };
-        for msg in open.messages.values().rev() {
-            if let Sender::User(id) = msg.sender
-                && !self.chats.is_saved(id)
-                && let Some(name) = self.chats.user_username(id)
-            {
-                let name = format!("@{name}");
-                if !people.contains(&name) {
-                    people.push(name);
+        if let Some(open) = &self.open {
+            for msg in open.messages.values().rev() {
+                if let Sender::User(id) = msg.sender
+                    && !self.chats.is_saved(id)
+                    && let Some(name) = self.chats.user_username(id)
+                {
+                    let name = format!("@{name}");
+                    if !people.contains(&name) {
+                        people.push(name);
+                    }
                 }
+            }
+        }
+        for &id in self.chats.ids() {
+            let Some(name) = self.chats.username(id) else {
+                continue;
+            };
+            let name = format!("@{name}");
+            if !people.contains(&name) {
+                people.push(name);
             }
         }
         people
@@ -8724,6 +8733,28 @@ mod tests {
         press(&mut app, KeyCode::Enter, none);
         assert_eq!(app.status.as_deref(), Some("Only one has: at a time"));
         assert!(app.open.as_ref().unwrap().search.is_none(), "nothing asked");
+    }
+
+    #[test]
+    fn from_tab_offers_the_usernames_of_chats_in_the_list() {
+        let mut app = test_app("from-tab-chats");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        let (_, other) = two_chats(&app);
+        app.chats.add_local(other, "Hiking", None).peer = Some(Peer::Supergroup(9));
+        app.chats.set_username(
+            Peer::Supergroup(9),
+            Some(&tdlib_rs::types::Usernames {
+                active_usernames: vec!["hikingclub".into()],
+                ..Default::default()
+            }),
+        );
+        press(&mut app, KeyCode::Char('/'), none);
+        for c in "from:@h".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(app.prompt.as_ref().unwrap().query(), "from:@hikingclub");
     }
 
     #[test]
