@@ -2134,8 +2134,8 @@ fn draw_media(frame: &mut Frame, area: Rect, app: &App, colors: &Colors) {
     let title = format!(" {} ({count}) ", menu.query);
     let keys = crate::lang::pick(
         ru,
-        " `Enter` go to · `Esc` close ",
-        " `Enter` перейти · `Esc` закрыть ",
+        " `Enter` go to · `O` show file · `Esc` close ",
+        " `Enter` перейти · `O` показать · `Esc` закрыть ",
     );
     let block = popup_block(title, keys, colors);
     let inner = block.inner(popup);
@@ -2165,10 +2165,11 @@ fn draw_media(frame: &mut Frame, area: Rect, app: &App, colors: &Colors) {
                 .single()
                 .map_or(String::new(), |t| t.format("%-d %b").to_string());
             let head = format!("{who} · {when}  ");
-            let room = (inner.width as usize).saturating_sub(1 + head.width());
+            let room = (inner.width as usize).saturating_sub(3 + head.width());
             ListItem::new(Line::from(vec![
                 bar,
                 Span::from(head).fg(colors.muted),
+                Span::from(if row.downloaded { "✓ " } else { "  " }).fg(colors.accent),
                 Span::from(truncate(&row.label, room)),
             ]))
         })
@@ -3523,6 +3524,7 @@ mod tests {
                     id: 1,
                     label: "Photo".into(),
                     photo: true,
+                    downloaded: false,
                 }),
             ],
             selected: 0,
@@ -3552,6 +3554,7 @@ mod tests {
                     id: 1,
                     label: "Photo".into(),
                     photo: true,
+                    downloaded: false,
                 }),
                 Target::Link("https://example.com/a".into()),
                 Target::Link("https://docs.rs".into()),

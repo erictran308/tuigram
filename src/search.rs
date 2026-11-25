@@ -310,6 +310,8 @@ pub struct MediaRow {
     pub date: i32,
     /// Its file's number, for `O` to show it in the file manager.
     pub file_id: Option<i32>,
+    /// The file is on this computer already.
+    pub downloaded: bool,
 }
 
 impl MediaRow {
@@ -334,6 +336,7 @@ impl MediaRow {
             outgoing: msg.outgoing,
             date: msg.date,
             file_id: msg.file.as_ref().map(|f| f.id),
+            downloaded: msg.file.as_ref().is_some_and(|f| f.downloaded),
         }
     }
 }
@@ -387,6 +390,9 @@ impl MediaMenu {
             }
             self.rows.push(MediaRow::of(message));
         }
+        // Newest at the top, however the pages came in.
+        self.rows
+            .sort_by(|a, b| b.date.cmp(&a.date).then(b.id.cmp(&a.id)));
     }
 
     /// Down (`delta` > 0) or up the list.
@@ -456,6 +462,7 @@ mod tests {
             outgoing: false,
             date: 0,
             file_id: Some(id as i32),
+            downloaded: false,
         };
         menu.rows = vec![row(9), row(7), row(5)];
         assert_eq!(menu.current().unwrap().id, 9);

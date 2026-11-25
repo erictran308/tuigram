@@ -115,6 +115,7 @@ mod tests {
                 id: 1,
                 label: "Photo".into(),
                 photo: true,
+                downloaded: false,
             },
             cant_copy: None,
             zoom: None,

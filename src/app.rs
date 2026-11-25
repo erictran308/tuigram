@@ -7534,27 +7534,46 @@ fn qwerty(c: char) -> char {
 
 /// Shows `path` in the file manager rather than opening it: the file
 /// itself picked where the manager answers org.freedesktop.FileManager1
-/// (Nautilus, Dolphin, Nemo…), its folder opened where none does.
+/// (Nautilus, Dolphin, Nemo…), its folder opened where none does. A
+/// manager the bus has to start answers the call that woke it with a mere
+/// "started", losing what it was told to show: so it's started first,
+/// then told, in a thread that can wait for it to wake.
 fn reveal_in_file_manager(path: &str) {
-    let uri = format!("file://{}", percent_encode(path));
-    let shown = std::process::Command::new("dbus-send")
-        .args([
-            "--session",
-            "--dest=org.freedesktop.FileManager1",
-            "/org/freedesktop/FileManager1",
-            "org.freedesktop.FileManager1.ShowItems",
-            &format!("array:string:{uri}"),
-            "string:",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    if !matches!(shown, Ok(status) if status.success())
-        && let Some(dir) = Path::new(path).parent()
-    {
-        let _ = open::that_detached(dir);
-    }
+    let path = path.to_string();
+    std::thread::spawn(move || {
+        let uri = format!("file://{}", percent_encode(&path));
+        let run = |args: &[String]| {
+            std::process::Command::new("dbus-send")
+                .arg("--session")
+                .arg("--print-reply")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+        };
+        let started = run(&[
+            "--dest=org.freedesktop.DBus".into(),
+            "/org/freedesktop/DBus".into(),
+            "org.freedesktop.DBus.StartServiceByName".into(),
+            "string:org.freedesktop.FileManager1".into(),
+            "uint32:0".into(),
+        ]);
+        let shown = matches!(started, Ok(s) if s.success())
+            && matches!(
+                run(&[
+                    "--dest=org.freedesktop.FileManager1".into(),
+                    "/org/freedesktop/FileManager1".into(),
+                    "org.freedesktop.FileManager1.ShowItems".into(),
+                    format!("array:string:{uri}"),
+                    "string:".into(),
+                ]),
+                Ok(s) if s.success()
+            );
+        if !shown && let Some(dir) = Path::new(&path).parent() {
+            let _ = open::that_detached(dir);
+        }
+    });
 }
 
 /// The path part of a `file://` URI: bytes outside a small safe set as
@@ -9872,6 +9891,7 @@ mod tests {
             outgoing: false,
             date: 0,
             file_id: Some(42),
+            downloaded: true,
         }];
         app.media_menu = Some(menu);
         app.focus = Focus::Messages;
@@ -9882,6 +9902,8 @@ mod tests {
             app.status.as_deref(),
             Some("Downloading to show in the file manager…")
         );
+        let text = screen(&mut app).join("\n");
+        assert!(text.contains("✓ file"), "on disk is marked: {text}");
     }
 
     #[test]
@@ -10369,6 +10391,7 @@ mod tests {
             id: 30,
             label: "Voice message".into(),
             photo: false,
+            downloaded: false,
         });
         msg.links.clear();
         msg.source_text.clear();
@@ -10402,6 +10425,7 @@ mod tests {
             id: 30,
             label: "Voice message".into(),
             photo: false,
+            downloaded: false,
         });
         msg.voice = Some(crate::voice::Voice {
             file_id: 30,
@@ -10441,6 +10465,7 @@ mod tests {
             id: file_id + 1,
             label: "Photo".into(),
             photo: true,
+            downloaded: false,
         });
     }
 
@@ -10740,6 +10765,7 @@ mod tests {
             id: 7,
             label: "notes.pdf".into(),
             photo: false,
+            downloaded: false,
         }));
         assert_eq!(
             app.status.as_deref(),

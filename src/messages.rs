@@ -738,6 +738,8 @@ pub struct MediaFile {
     pub label: String,
     /// A photo: copied as an image, not as a file.
     pub photo: bool,
+    /// It's on this computer already, so it opens and shows at once.
+    pub downloaded: bool,
 }
 
 /// An image sent as a file, uncompressed. Its bubble shows its picture like
@@ -831,11 +833,12 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
         video: None,
         image_file: None,
     };
-    let file = |id: i32, label: String| {
+    let file = |id: i32, label: String, downloaded: bool| {
         Some(MediaFile {
             id,
             label,
             photo: false,
+            downloaded,
         })
     };
     // The text or caption whose links count.
@@ -885,6 +888,8 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
                 id: p.file_id,
                 label: "Photo".into(),
                 photo: true,
+                downloaded: largest(&m.photo)
+                    .is_some_and(|s| s.photo.local.is_downloading_completed),
             });
             source = Some(&m.caption);
         }
@@ -900,21 +905,33 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
                 }
             }
             let label = format!("Video {}", duration(m.video.duration));
-            body.file = file(m.video.video.id, label);
+            body.file = file(
+                m.video.video.id,
+                label,
+                m.video.video.local.is_downloading_completed,
+            );
             source = Some(&m.caption);
         }
         C::MessageAnimation(m) => {
             body.editable = Editable::Caption {
                 above: m.show_caption_above_media,
             };
-            body.file = file(m.animation.animation.id, "GIF".into());
+            body.file = file(
+                m.animation.animation.id,
+                "GIF".into(),
+                m.animation.animation.local.is_downloading_completed,
+            );
             source = Some(&m.caption);
         }
         C::MessageDocument(m) => {
             body.editable = Editable::Caption { above: false };
             let d = &m.document;
             let name = text::clean(&d.file_name);
-            body.file = file(d.document.id, format!("File: {name}"));
+            body.file = file(
+                d.document.id,
+                format!("File: {name}"),
+                d.document.local.is_downloading_completed,
+            );
             if let Some(preview) = Preview::from_document(d).filter(|_| is_picture(d)) {
                 body.text = m.caption.text.clone();
                 body.photo = has_extension(&d.file_name, VIEWED_EXTENSIONS)
@@ -938,12 +955,20 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             } else {
                 &a.title
             };
-            body.file = file(a.audio.id, format!("Audio: {}", text::clean(name)));
+            body.file = file(
+                a.audio.id,
+                format!("Audio: {}", text::clean(name)),
+                a.audio.local.is_downloading_completed,
+            );
             body.editable = Editable::Caption { above: false };
             source = Some(&m.caption);
         }
         C::MessageVoiceNote(m) => {
-            body.file = file(m.voice_note.voice.id, "Voice message".into());
+            body.file = file(
+                m.voice_note.voice.id,
+                "Voice message".into(),
+                m.voice_note.voice.local.is_downloading_completed,
+            );
             body.editable = Editable::Caption { above: false };
             source = Some(&m.caption);
             let voice = Voice::new(&m.voice_note, m.is_listened);
@@ -954,7 +979,11 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             }
         }
         C::MessageVideoNote(m) => {
-            body.file = file(m.video_note.video.id, "Video message".into());
+            body.file = file(
+                m.video_note.video.id,
+                "Video message".into(),
+                m.video_note.video.local.is_downloading_completed,
+            );
             body.preview = Preview::from_video_note(&m.video_note);
             body.video = Some(crate::video::Note::new(&m.video_note));
         }
@@ -969,7 +998,11 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             if body.preview.is_some() {
                 body.text = String::new();
             }
-            body.file = file(m.sticker.sticker.id, "Sticker".into());
+            body.file = file(
+                m.sticker.sticker.id,
+                "Sticker".into(),
+                m.sticker.sticker.local.is_downloading_completed,
+            );
         }
         _ => {}
     }
@@ -2947,6 +2980,7 @@ pub(crate) mod tests {
             id: 3,
             label: "Photo".into(),
             photo: true,
+            downloaded: false,
         });
         assert_eq!(msg.snippet(), "Photo", "a photo without a caption");
     }
@@ -2959,6 +2993,7 @@ pub(crate) mod tests {
             id: 5,
             label: "File: map.pdf".into(),
             photo: false,
+            downloaded: false,
         });
         let mut file = types::File {
             id: 5,
