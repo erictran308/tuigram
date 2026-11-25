@@ -2972,8 +2972,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         _ if app.media_menu.is_some() => (
             normal,
             t(
-                "  `j/k` choose · `Enter` go to it · `Esc` close",
-                "  `j/k` выбор · `Enter` перейти · `Esc` закрыть",
+                "  `j/k` choose · `Enter` go to it · `O` show the file · `Esc` close",
+                "  `j/k` выбор · `Enter` перейти · `O` показать файл · `Esc` закрыть",
             ),
         ),
         _ if app.button_menu.as_ref().is_some_and(|m| m.reply) => (

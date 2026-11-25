@@ -2355,7 +2355,15 @@ impl App {
             || self.picker.is_some()
             || self.focus == Focus::Input;
         let key = match (typing, key.code) {
-            (false, KeyCode::Char(c)) => KeyEvent::new(KeyCode::Char(qwerty(c)), key.modifiers),
+            (false, KeyCode::Char(c)) => {
+                // A terminal may report a shifted letter as the small one
+                // with a Shift modifier: it's the capital it types.
+                let c = match key.modifiers.contains(KeyModifiers::SHIFT) {
+                    true => c.to_uppercase().next().unwrap_or(c),
+                    false => c,
+                };
+                KeyEvent::new(KeyCode::Char(qwerty(c)), key.modifiers)
+            }
             _ => key,
         };
         match self.screen {
@@ -4678,6 +4686,19 @@ impl App {
                 }
             }
             KeyCode::Esc | KeyCode::Char('q' | 'h') => self.media_menu = None,
+            // As `O` on its message: downloaded first if need be, then
+            // shown in the file manager.
+            KeyCode::Char('O') => {
+                let file_id = menu.current().and_then(|r| r.file_id);
+                match file_id {
+                    Some(id) if self.revealing.insert(id) => {
+                        self.tg.download(id);
+                        self.status = Some("Downloading to show in the file manager…".into());
+                    }
+                    Some(_) => {}
+                    None => self.status = Some("No file in this message".into()),
+                }
+            }
             _ => {}
         }
     }
@@ -9817,6 +9838,50 @@ mod tests {
         assert!(app.open.is_none(), "nothing open on the right");
         assert!(app.focus == Focus::Chats);
         press(&mut app, KeyCode::Char('Q'), KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn a_shifted_letter_reported_as_shift_and_the_small_one_is_the_capital() {
+        // Some terminals report Shift-q as `q` with a Shift modifier: the
+        // capital it types is meant.
+        let mut app = test_app("shiftletter");
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::SHIFT);
+        assert!(app.open.is_none(), "closed as Q closes");
+        assert!(app.quit_deadline.is_none(), "not quit as q quits");
+
+        // `й` sits on `q`: Shift-й is Q too, whichever layout is on.
+        let mut app = test_app("shiftcyr");
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('й'), KeyModifiers::SHIFT);
+        assert!(app.open.is_none(), "closed as Q closes");
+        assert!(app.quit_deadline.is_none());
+    }
+
+    #[test]
+    fn o_in_the_media_browser_shows_the_file_in_its_manager() {
+        let mut app = test_app("mediao");
+        let mut menu = crate::search::MediaMenu::new(
+            "has:file".into(),
+            crate::search::parse("has:file").unwrap(),
+        );
+        menu.rows = vec![crate::search::MediaRow {
+            id: 1,
+            label: "file".into(),
+            sender: crate::messages::Sender::User(1),
+            outgoing: false,
+            date: 0,
+            file_id: Some(42),
+        }];
+        app.media_menu = Some(menu);
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('O'), KeyModifiers::NONE);
+        assert!(app.media_menu.is_some(), "the list stays");
+        assert!(app.revealing.contains(&42), "downloading to show");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Downloading to show in the file manager…")
+        );
     }
 
     #[test]

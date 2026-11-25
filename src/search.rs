@@ -308,6 +308,8 @@ pub struct MediaRow {
     pub sender: Sender,
     pub outgoing: bool,
     pub date: i32,
+    /// Its file's number, for `O` to show it in the file manager.
+    pub file_id: Option<i32>,
 }
 
 impl MediaRow {
@@ -331,6 +333,7 @@ impl MediaRow {
             sender: msg.sender,
             outgoing: msg.outgoing,
             date: msg.date,
+            file_id: msg.file.as_ref().map(|f| f.id),
         }
     }
 }
@@ -452,6 +455,7 @@ mod tests {
             sender: Sender::User(1),
             outgoing: false,
             date: 0,
+            file_id: Some(id as i32),
         };
         menu.rows = vec![row(9), row(7), row(5)];
         assert_eq!(menu.current().unwrap().id, 9);
