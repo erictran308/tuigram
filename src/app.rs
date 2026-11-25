@@ -805,7 +805,7 @@ pub struct App {
     pub pin_menu: Option<PinMenu>,
     /// `gp`: the chat's pinned messages, to go to.
     pub pinned_menu: Option<PinnedMenu>,
-    /// The media browser a `/` search with `has:`/`type:` opens.
+    /// The media browser a `/` search with `has:` opens.
     pub media_menu: Option<MediaMenu>,
     /// `:timer`: how long messages in a secret chat last.
     pub timer_menu: Option<TimerMenu>,
@@ -1528,7 +1528,10 @@ impl App {
                 }
                 if self.revealing.remove(&file_id) {
                     match &path {
-                        Some(path) => reveal_in_file_manager(path),
+                        Some(path) => {
+                            reveal_in_file_manager(path);
+                            self.status = Some("Shown in the file manager".into());
+                        }
                         None => self.status = Some("Download failed".into()),
                     }
                 }
@@ -2752,6 +2755,7 @@ impl App {
             (Focus::Messages, KeyCode::Char('R')) => self.open_react_menu(),
             (Focus::Messages, KeyCode::Char('X')) => self.remove_reactions(),
             (Focus::Messages, KeyCode::Char('J')) => self.join_open_chat(),
+            (Focus::Messages, KeyCode::Char('Q')) => self.close_open_chat(),
             (Focus::Messages, KeyCode::Char('f')) => self.forward_selected(),
             (Focus::Chats, KeyCode::Enter) => self.open_selected_chat(),
             (Focus::Chats, KeyCode::Char(c)) if c == to_chat => self.open_selected_chat(),
@@ -2772,6 +2776,7 @@ impl App {
                 self.start_writing();
             }
             (Focus::Topics, KeyCode::Esc) => self.focus = Focus::Chats,
+            (Focus::Topics, KeyCode::Char('Q')) => self.close_open_chat(),
             (Focus::Topics, KeyCode::Char(c)) if c == to_list => self.focus = Focus::Chats,
             (Focus::Messages, KeyCode::Enter) => self.open_selected_message(),
             (Focus::Messages, KeyCode::Char(' ')) => self.toggle_inline_video(),
@@ -4414,6 +4419,16 @@ impl App {
         }
     }
 
+    /// `Q`: closes the open chat, leaving only the chat list on screen.
+    fn close_open_chat(&mut self) {
+        if self.open.is_none() && self.forum.is_none() {
+            return;
+        }
+        self.close_chat_popups();
+        self.leave_chat();
+        self.focus = Focus::Chats;
+    }
+
     /// Before the messages shown give way to others: you stop typing in
     /// them, and a voice message in them stops playing.
     fn leave_messages(&mut self) {
@@ -4615,7 +4630,7 @@ impl App {
         }
     }
 
-    /// A `/` search with `has:`/`type:` opens the media browser: every
+    /// A `/` search with `has:` opens the media browser: every
     /// match of the search in the open chat, in one list. Pages are asked
     /// for until Telegram says there are no more (or MEDIA_ROWS_MAX).
     fn open_media_menu(&mut self, query: String, ask: search::Query) {
@@ -6272,6 +6287,7 @@ impl App {
         // TDLib answers at once if the file is already downloaded.
         if self.revealing.insert(file.id) {
             self.tg.download(file.id);
+            self.status = Some("Downloading to show in the file manager…".into());
         }
     }
 
@@ -8676,12 +8692,12 @@ mod tests {
         app.focus = Focus::Messages;
         let none = KeyModifiers::NONE;
         press(&mut app, KeyCode::Char('/'), none);
-        for c in "type:file".chars() {
+        for c in "has:file".chars() {
             press(&mut app, KeyCode::Char(c), none);
         }
         press(&mut app, KeyCode::Enter, none);
         let menu = app.media_menu.as_ref().expect("the browser opened");
-        assert_eq!(menu.query, "type:file");
+        assert_eq!(menu.query, "has:file");
         assert!(menu.loading, "the first page was asked for");
         assert!(app.open.as_ref().unwrap().search.is_none(), "no n/N search");
         press(&mut app, KeyCode::Esc, none);
@@ -9790,6 +9806,17 @@ mod tests {
         app.chats.set_member(77, true);
         press(&mut app, KeyCode::Char('J'), KeyModifiers::NONE);
         assert!(app.confirm.is_none(), "already in");
+    }
+
+    #[test]
+    fn q_closes_the_chat_leaving_the_list() {
+        let mut app = test_app("qclose");
+        assert!(app.open.is_some());
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('Q'), KeyModifiers::NONE);
+        assert!(app.open.is_none(), "nothing open on the right");
+        assert!(app.focus == Focus::Chats);
+        press(&mut app, KeyCode::Char('Q'), KeyModifiers::NONE);
     }
 
     #[test]

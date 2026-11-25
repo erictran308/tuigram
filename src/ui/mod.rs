@@ -2110,8 +2110,8 @@ fn draw_pinned(
     );
 }
 
-/// The media browser: every match of a `/` search with `has:`/`type:`, in
-/// one list. New pages stream in while it's open.
+/// The media browser: every match of a `/` search with `has:`, in one
+/// list. New pages stream in while it's open.
 fn draw_media(frame: &mut Frame, area: Rect, app: &App, colors: &Colors) {
     let Some(menu) = &app.media_menu else {
         return;

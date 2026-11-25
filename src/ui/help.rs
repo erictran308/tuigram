@@ -125,7 +125,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("p", "Paste a photo, files or text from the clipboard"),
             (
                 "/",
-                "Search the whole chat; a has:/type: search lists every match in a media browser",
+                "Search the whole chat; a has: search lists every match in a media browser",
             ),
             (
                 "from: has:",
@@ -136,6 +136,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "In a search: before:2025-10-01, after:2025-09-01 (that day counts)",
             ),
             ("n / N", "Next older / newer match"),
+            ("Q", "Close the chat, leaving only the chat list"),
             (
                 "Esc",
                 "End the search, cancel the edit, remove the files, cancel the reply, or go back",
@@ -421,7 +422,7 @@ const SHORTCUTS_RU: &[(&str, &[(&str, &str)])] = &[
             ("p", "Вставить фото, файлы или текст из буфера"),
             (
                 "/",
-                "Поиск по всему чату; с has:/type: — все совпадения списком, как «Вложения»",
+                "Поиск по всему чату; с has: — все совпадения списком, как «Вложения»",
             ),
             (
                 "from: has:",
@@ -432,6 +433,7 @@ const SHORTCUTS_RU: &[(&str, &[(&str, &str)])] = &[
                 "В поиске: before:2025-10-01, after:2025-09-01 (тот день считается)",
             ),
             ("n / N", "Следующее старое / новое совпадение"),
+            ("Q", "Закрыть чат, оставив только список чатов"),
             (
                 "Esc",
                 "Закончить поиск, отменить правку, убрать файлы, отменить ответ или назад",

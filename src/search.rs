@@ -86,7 +86,7 @@ impl Has {
 }
 
 /// The filters a search takes, as typed.
-pub const FILTERS: [&str; 5] = ["from:", "has:", "type:", "before:", "after:"];
+pub const FILTERS: [&str; 4] = ["from:", "has:", "before:", "after:"];
 
 /// Reads a `/` search typed in a chat: filters anywhere among the words,
 /// each at most once. Says what's wrong with one that can't be read.
@@ -101,8 +101,6 @@ pub fn parse(typed: &str) -> Result<Query, String> {
             continue;
         };
         let value = &token[key.len()..];
-        // The same filter under another name.
-        let key = if key == "type:" { "has:" } else { key };
         if seen.contains(&key) {
             return Err(format!("Only one {key} at a time"));
         }
@@ -117,7 +115,7 @@ pub fn parse(typed: &str) -> Result<Query, String> {
                     .into_iter()
                     .find(|(name, _)| value.eq_ignore_ascii_case(name))
                     .ok_or(
-                        "has:/type: takes photo, video, media, file, link, voice, note, gif or audio",
+                        "has: takes photo, video, media, file, link, voice, note, gif or audio",
                     )?;
                 query.has = Some(kind.1);
             }
@@ -183,7 +181,6 @@ pub fn complete(typed: &str, people: &[String], today: &str) -> Vec<String> {
     };
     match FILTERS.into_iter().find(|f| lower.starts_with(f)) {
         Some("has:") => with("has:", Has::ALL.iter().map(|(name, _)| *name).collect()),
-        Some("type:") => with("type:", Has::ALL.iter().map(|(name, _)| *name).collect()),
         Some("from:") => with("from:", people.iter().map(String::as_str).collect()),
         Some(key) if lower == key => vec![format!("{head}{key}{today}")],
         Some(_) => Vec::new(),
@@ -303,8 +300,7 @@ impl MessageSearch {
     }
 }
 
-/// One match in the media browser: what a `/` search with `has:` or
-/// `type:` lists.
+/// One match in the media browser: what a `/` search with `has:` lists.
 pub struct MediaRow {
     pub id: i64,
     /// What it holds: the file's name, "Photo", "Video message"…
@@ -339,8 +335,8 @@ impl MediaRow {
     }
 }
 
-/// The media browser: every match of a `/` search with `has:`/`type:` in
-/// one list, paged from Telegram until done. Enter goes to the message.
+/// The media browser: every match of a `/` search with `has:` in one
+/// list, paged from Telegram until done. Enter goes to the message.
 pub struct MediaMenu {
     /// The search as typed, to match TDLib's answers and for the title.
     pub query: String,
@@ -445,7 +441,7 @@ mod tests {
 
     #[test]
     fn the_media_browser_moves_by_rows() {
-        let mut menu = MediaMenu::new("type:file".into(), parse("type:file").unwrap());
+        let mut menu = MediaMenu::new("has:file".into(), parse("has:file").unwrap());
         assert!(menu.current().is_none());
         menu.move_by(1);
         menu.jump(true);
@@ -472,17 +468,17 @@ mod tests {
     }
 
     #[test]
-    fn type_is_has_and_from_this_is_everyone_here() {
-        let query = parse("type:file").unwrap();
+    fn from_this_is_everyone_here() {
+        let query = parse("has:file").unwrap();
         assert_eq!(query.has, Some(Has::File));
         assert_eq!(query.from, None);
 
         // Everyone in the chat the search is in: no sender filter.
-        let query = parse("type:file from:this").unwrap();
+        let query = parse("has:file from:this").unwrap();
         assert_eq!(query.has, Some(Has::File));
         assert_eq!(query.from, None);
 
-        let query = parse("type:Video from:@Maya").unwrap();
+        let query = parse("has:Video from:@Maya").unwrap();
         assert_eq!(query.has, Some(Has::Video));
         assert_eq!(query.from, Some(Who::Username("Maya".into())));
     }
@@ -514,12 +510,7 @@ mod tests {
     fn a_filter_that_cant_be_read_says_why() {
         let why = |typed| parse(typed).unwrap_err();
         assert_eq!(why("has:photo has:video"), "Only one has: at a time");
-        assert_eq!(
-            why("has:photo type:video"),
-            "Only one has: at a time",
-            "type: is the same filter"
-        );
-        assert!(why("has:sticker").starts_with("has:/type: takes photo"));
+        assert!(why("has:sticker").starts_with("has: takes photo"));
         assert!(why("from: hi").starts_with("from: takes me"));
         assert_eq!(
             why("hi before:10/01/2025"),
@@ -536,10 +527,9 @@ mod tests {
     fn tab_finishes_the_last_word_with_a_filter_or_what_it_takes() {
         let people = ["me".to_string(), "@maya".to_string(), "@leo".to_string()];
         let tab = |typed| complete(typed, &people, "2026-10-07");
-        assert_eq!(tab(""), ["from:", "has:", "type:", "before:", "after:"]);
+        assert_eq!(tab(""), ["from:", "has:", "before:", "after:"]);
         assert_eq!(tab("trail h"), ["trail has:"]);
         assert_eq!(tab("has:v"), ["has:video", "has:voice"]);
-        assert_eq!(tab("type:v"), ["type:video", "type:voice"]);
         assert_eq!(tab("from:"), ["from:me", "from:@maya", "from:@leo"]);
         assert_eq!(tab("trail from:@M"), ["trail from:@maya"]);
         assert_eq!(tab("before:"), ["before:2026-10-07"]);
