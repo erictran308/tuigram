@@ -2788,6 +2788,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     let editing = app.open.as_ref().is_some_and(|o| o.editing.is_some());
     let attaching = app.open.as_ref().is_some_and(|o| !o.attachments.is_empty());
     let dropped = app.open.as_ref().is_some_and(|o| o.dropped.is_some());
+    // Viewing a public group or channel from outside: it can be joined.
+    let joinable = app
+        .open
+        .as_ref()
+        .is_some_and(|o| !app.chats.joined(o.chat_id));
     let insert = Span::from(" INSERT ").fg(colors.bg).bg(colors.insert);
     let sticker = Span::from(" STICKERS ").fg(colors.bg).bg(colors.insert);
     let picking = app.focus == Focus::Input && app.stickers.is_some();
@@ -3053,6 +3058,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             t(
                 "  `i` write reply · `Esc` cancel reply · `r` reply to selected instead · `j/k` newer/older · `Enter` open/play media · `h` back",
                 "  `i` написать ответ · `Esc` отмена ответа · `r` ответить выбранному · `j/k` новее/старее · `Enter` открыть/играть · `h` назад",
+            ),
+        ),
+        Focus::Messages if joinable => (
+            normal,
+            t(
+                "  you're not in this chat · `J` join · `j/k` newer/older · `Enter` open/play media · `s` find anyone · `h` back",
+                "  вы не в этом чате · `J` вступить · `j/k` новее/старее · `Enter` открыть/играть · `s` найти любого · `h` назад",
             ),
         ),
         Focus::Messages => (

@@ -1542,8 +1542,9 @@ impl Tg {
         });
     }
 
-    /// Searches your contacts, and Telegram's public chats, for the `s`
-    /// picker. TDLib sends the users and chats it finds as updates first.
+    /// Searches your contacts, your chats on Telegram's servers, and
+    /// Telegram's public chats, for the `s` picker. TDLib sends the users
+    /// and chats it finds as updates first.
     pub fn find_chats(&self, query: String) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
@@ -1555,12 +1556,29 @@ impl Tg {
                     Ok(enums::Users::Users(u)) => u.user_ids,
                     Err(_) => Vec::new(),
                 };
-            // Too short a query, or one searched too often, is an error;
-            // either way nothing was found.
-            let chat_ids = match functions::search_public_chats(query.clone(), client_id).await {
+            // Chats of yours the local cache doesn't know yet: people you
+            // wrote to before, groups you're in.
+            let mut chat_ids = match functions::search_chats_on_server(
+                query.clone(),
+                CONTACT_SEARCH_LIMIT,
+                client_id,
+            )
+            .await
+            {
                 Ok(enums::Chats::Chats(c)) => c.chat_ids,
                 Err(_) => Vec::new(),
             };
+            // Too short a query, or one searched too often, is an error;
+            // either way nothing was found.
+            let public = match functions::search_public_chats(query.clone(), client_id).await {
+                Ok(enums::Chats::Chats(c)) => c.chat_ids,
+                Err(_) => Vec::new(),
+            };
+            for id in public {
+                if !chat_ids.contains(&id) {
+                    chat_ids.push(id);
+                }
+            }
             let _ = tx.send(TgEvent::ChatsFound {
                 query,
                 chat_ids,

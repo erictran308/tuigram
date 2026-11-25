@@ -2751,6 +2751,7 @@ impl App {
             (Focus::Messages, KeyCode::Char('d')) => self.open_delete_menu(),
             (Focus::Messages, KeyCode::Char('R')) => self.open_react_menu(),
             (Focus::Messages, KeyCode::Char('X')) => self.remove_reactions(),
+            (Focus::Messages, KeyCode::Char('J')) => self.join_open_chat(),
             (Focus::Messages, KeyCode::Char('f')) => self.forward_selected(),
             (Focus::Chats, KeyCode::Enter) => self.open_selected_chat(),
             (Focus::Chats, KeyCode::Char(c)) if c == to_chat => self.open_selected_chat(),
@@ -3072,9 +3073,15 @@ impl App {
             self.focus = Focus::Input;
             return;
         }
-        let title = self.chats.title(open.chat_id).unwrap_or("this chat");
+        self.confirm_join(open.chat_id);
+    }
+
+    /// Asks to join the public group or channel `chat_id`, which joining
+    /// a channel is subscribing to.
+    fn confirm_join(&mut self, chat_id: i64) {
+        let title = self.chats.title(chat_id).unwrap_or("this chat");
         // Only a channel's admins write in it; joining one is following it.
-        let channel = self.chats.get(open.chat_id).is_some_and(|c| c.is_channel);
+        let channel = self.chats.get(chat_id).is_some_and(|c| c.is_channel);
         let (ask, why) = if channel {
             (
                 "Join this channel?",
@@ -3089,10 +3096,22 @@ impl App {
         let mut confirm = Confirm::new(
             ask,
             vec![format!("You're not in {title}."), why.into()],
-            Confirmed::Join(open.chat_id),
+            Confirmed::Join(chat_id),
         );
-        confirm.badge = self.chats.badge(open.chat_id);
+        confirm.badge = self.chats.badge(chat_id);
         self.confirm = Some(confirm);
+    }
+
+    /// `J`: join the open public group or channel, as Telegram's Join
+    /// button does.
+    fn join_open_chat(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        if self.chats.joined(open.chat_id) {
+            return;
+        }
+        self.confirm_join(open.chat_id);
     }
 
     /// Why nothing can be sent in a secret chat now: it waits for the
@@ -9754,6 +9773,23 @@ mod tests {
         app.chats.set_member(77, true);
         press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
         assert!(app.focus == Focus::Input, "once you're in");
+    }
+
+    #[test]
+    fn j_joins_the_public_chat_you_are_viewing() {
+        let mut app = test_app("jjoin");
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        app.chats.add_local(chat_id, "Weekend Hike", None).peer = Some(Peer::Supergroup(77));
+        app.chats.set_member(77, false);
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('J'), KeyModifiers::NONE);
+        let confirm = app.confirm.as_ref().expect("asks");
+        assert!(matches!(confirm.action, Confirmed::Join(id) if id == chat_id));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        app.chats.set_member(77, true);
+        press(&mut app, KeyCode::Char('J'), KeyModifiers::NONE);
+        assert!(app.confirm.is_none(), "already in");
     }
 
     #[test]
