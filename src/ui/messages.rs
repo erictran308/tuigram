@@ -507,13 +507,12 @@ pub(super) fn draw_photos(
             // The whole slot, not the part on screen: the frame is fit into
             // it, and cells scrolled away just don't show their slices.
             player.placement = Some((slot.cols, slot.rows));
-            let skip = (-y).max(0) as u16;
-            let shown = i64::from(slot.rows).min(i64::from(area.height)) - y.max(0);
+            let (skip, shown) = visible_rows(slot.rows, y, area.height);
             let rect = Rect {
                 x: area.x + slot.x,
                 y: (i64::from(area.y) + y.max(0)) as u16,
                 width: slot.cols.min(area.width.saturating_sub(slot.x)),
-                height: shown.max(0) as u16,
+                height: shown,
             };
             if rect.height > 0 {
                 frame.render_widget(crate::video::InlineImage { skip }, rect);
@@ -552,6 +551,17 @@ pub(super) fn draw_photos(
             frame.render_widget(Line::from(label).fg(colors.subtle).centered(), row);
         }
     }
+}
+
+/// The part of a photo slot's `rows` visible in a pane `height` rows tall,
+/// the slot starting at `y` (negative once its top scrolled past): the first
+/// visible row, and how many rows show. The placeholder cells kitty's
+/// protocol gives an inline player's frame must cover the slot exactly — a
+/// row without one shows nothing, cutting the frame's bottom off.
+fn visible_rows(rows: u16, y: i64, height: u16) -> (u16, u16) {
+    let skip = (-y).max(0);
+    let shown = (y + i64::from(rows)).min(i64::from(height)) - y.max(0);
+    (skip as u16, shown.max(0) as u16)
 }
 
 /// Size of a photo in cells: as wide as allowed (but not past its own pixels),
@@ -4038,5 +4048,19 @@ mod tests {
         let day1 = Local.timestamp_opt(1_790_000_000, 0).unwrap();
         let date = day1.format("%a %-d %b %Y").to_string();
         assert_eq!(rows.iter().filter(|r| r.contains(&date)).count(), 1);
+    }
+
+    #[test]
+    fn an_inline_players_visible_rows_cover_the_whole_slot() {
+        // All of it: nothing scrolled away, nothing past the bottom.
+        assert_eq!(visible_rows(20, 8, 40), (0, 20));
+        // The slot fills the pane from its top row.
+        assert_eq!(visible_rows(20, 0, 40), (0, 20));
+        // Five rows scrolled past the top: the rest shows.
+        assert_eq!(visible_rows(20, -5, 40), (5, 15));
+        // Only up to the pane's bottom row.
+        assert_eq!(visible_rows(20, 30, 40), (0, 10));
+        // Scrolled past the top and reaching past the bottom at once.
+        assert_eq!(visible_rows(60, -5, 40), (5, 40));
     }
 }
