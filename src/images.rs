@@ -16,7 +16,9 @@ use anyhow::Result;
 use image::imageops::FilterType;
 use image::{DynamicImage, RgbaImage};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
+use ratatui::widgets::Widget;
 use ratatui_image::picker::cap_parser::Parser;
 use ratatui_image::picker::{Capability, Picker, ProtocolType};
 use ratatui_image::protocol::kitty::Kitty;
@@ -447,6 +449,11 @@ pub struct Images {
     /// The codes sending the kitty images this frame drew for the first
     /// time: see [`Images::take_transmit`].
     transmits: Vec<String>,
+    /// Kitty images encoded since the terminal was sent them: kitty draws
+    /// a placeholder naming an image it doesn't have yet blank, and
+    /// doesn't revisit the cell when the image arrives after the frame,
+    /// so they're sent before that frame (see [`Images::prime_transmits`]).
+    untransmitted: Vec<Key>,
 }
 
 impl Images {
@@ -472,6 +479,7 @@ impl Images {
             dropped: Dropped::default(),
             kitty_budget: KITTY_BUDGET,
             transmits: Vec::new(),
+            untransmitted: Vec::new(),
         }
     }
 
@@ -816,6 +824,9 @@ impl Images {
         {
             self.ready.remove(&oldest);
         }
+        if image.kitty.is_some() {
+            self.untransmitted.push(key);
+        }
         self.ready.insert(key, (image, self.frame));
     }
 
@@ -843,6 +854,9 @@ impl Images {
                 .map(|(&k, _)| k)
         {
             self.avatars.remove(&oldest);
+        }
+        if image.kitty.is_some() {
+            self.untransmitted.push(key);
         }
         let avatar = Avatar {
             image,
@@ -874,6 +888,48 @@ impl Images {
         if let Some(code) = self.deletions() {
             let _ = term::send(terminal, [code]);
         }
+    }
+
+    /// Sends the images encoded for kitty's protocol since the last frame,
+    /// before the frame that would draw their placeholders: kitty draws a
+    /// placeholder naming an image it doesn't have yet blank and doesn't
+    /// revisit the cell when the image arrives after it, so a photo that
+    /// finished decoding with the viewer open stayed "Loading…" until a
+    /// resize redrew every cell.
+    pub fn prime_transmits(&mut self, terminal: &mut Terminal) {
+        let codes = self.pending_transmits();
+        if !codes.is_empty() {
+            let _ = term::send(terminal, codes);
+        }
+    }
+
+    /// The codes sending the [`Images::untransmitted`] images, rendering
+    /// each off-screen so its transmit code is made, which its first cell
+    /// then holds; the placeholders a frame draws later name an image the
+    /// terminal already has.
+    fn pending_transmits(&mut self) -> Vec<String> {
+        let mut codes = Vec::new();
+        for key in std::mem::take(&mut self.untransmitted) {
+            let image = match key.avatar {
+                true => self.avatars.get(&key).map(|a| &a.image.image),
+                false => self.ready.get(&key).map(|(e, _)| &e.image),
+            };
+            let Some(image) = image else {
+                continue;
+            };
+            let area = Rect::new(0, 0, key.cols.max(1), key.rows.max(1));
+            let mut buf = Buffer::empty(area);
+            SlicedImage::new(image, SignedPosition::from((0, 0))).render(area, &mut buf);
+            'cells: for y in 0..area.height {
+                for x in 0..area.width {
+                    if let Some(code) = transmit_in(&mut buf[(x, y)]) {
+                        codes.push(code);
+                        break 'cells;
+                    }
+                }
+            }
+        }
+        codes
     }
 
     /// Draws the image `pick` gives (from [`get`](Self::get),
@@ -1361,6 +1417,34 @@ mod tests {
         images.clear();
         assert_eq!(images.deletions(), Some(delete(1)));
         assert_eq!(images.deletions(), None, "told once");
+    }
+
+    #[test]
+    fn a_kitty_image_is_sent_before_the_frame_drawing_its_placeholders() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+        use ratatui_image::sliced::{SignedPosition, SlicedImage};
+
+        let mut images = kitty();
+        images.insert_ready(key(7), photo());
+        let codes = images.pending_transmits();
+        assert_eq!(codes.len(), 1, "made once, off-screen");
+        assert!(codes[0].contains("i=1,a=T"), "{codes:?}");
+        assert!(images.pending_transmits().is_empty(), "sent once");
+
+        // The frame then draws placeholders only, naming an image the
+        // terminal already has.
+        let image = images.get(&preview(7), 4, 2, false).unwrap();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
+        SlicedImage::new(image, SignedPosition::from((0, 0))).render(buf.area, &mut buf);
+        assert!(!buf[(0, 0)].symbol().starts_with('\x1b'), "no code left");
+        assert!(buf[(0, 0)].symbol().contains(PLACEHOLDER));
+
+        // One dropped before it could be sent is skipped.
+        images.insert_ready(key(8), photo());
+        images.clear();
+        assert!(images.pending_transmits().is_empty());
     }
 
     #[test]

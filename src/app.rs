@@ -1160,6 +1160,9 @@ impl App {
             // like it, not once writing to the terminal failed.
             if failed.is_none() {
                 self.images.send_deletions(terminal);
+                // Images encoded since the last frame reach the terminal
+                // ahead of the frame drawing their placeholders.
+                self.images.prime_transmits(terminal);
             }
             // The inline player's `seen` says its bubble was drawn: reset
             // before the frame, checked after it.
