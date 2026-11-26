@@ -140,9 +140,32 @@ A t.me link in a message (`picker::telegram_link`, judged by its real host) open
 
 **Themes (`theme.rs`).** A theme is a TOML file: a 16-color `[palette]` (neutral names: `bg`, `surface`, `comment`, …, `blue`, `accent`), optional `[colors]` setting single `Colors` roles (a palette name, `#rrggbb` or `reset`), and optional `inherits`. `theme::colors` works out every role from the palette (own bubbles are `bg` tinted with `blue`, less on a light `bg`), so a palette alone is a whole theme. The built-in ones are `themes/*.toml`, embedded with `include_str!` (`BUILT_IN`); the user's are `.toml` files in `themes/` in the data directory, read by `Themes::load` at startup and again whenever `?` opens, so edits show without a restart. A user's file named like a built-in theme replaces it, and `inherits` of its own name then means the built-in one. `Settings.theme` is a theme's file name; one that's missing or broken leaves `Colors::default()` (Mocha) in use with a status message (`App::use_saved_theme`), but stays saved so fixing the file is enough. `App.colors` holds the colors in use. Drawing code uses `Colors` roles (`accent`, `own_bubble`, `search`, …), never palette names. Add a role when a new kind of thing needs a color, and to the README's table. The `?` popup lists the themes after the checkboxes, since the user's can make a long list, and scrolls (`SettingsMenu.settings_scroll`).
 
+## How to work
+
+Most bugs a review finds break a rule this file already states, so more rule text isn't the cure. These are the steps that stop one while the code is being written.
+
+1. **Fix the class, not the case.** Reproduce the bug, then ask why until the answer is a wrong decision in the code. `rg` every other place that makes the same decision and fix them in the one function they share. A guard, default, clamp, `unwrap_or` or `let _ =` added where the symptom showed is a fix only when the state it handles is allowed to exist; otherwise find what produced that state. Never widen an existing check (`SAFE_TO_OPEN`, `App::busy`, a size limit) to make new code fit.
+2. **Every answer may come late, twice, or after its context is gone.** TDLib answers, image encodes, downloads, pastes and timers arrive after the user may have moved on. Before handling one, ask what it does if it comes twice, after the chat or topic changed, after a logout, or while a popup holds the keys, and act on the state as it is now, never on what the request meant to do. That's why answers carry what was asked (`Page`, `generation`, `App.finding`) and anything that takes the keys checks `App::busy`.
+3. **A table before another branch.** When a change adds one more arm to an `if` chain, a second flag that must agree with the first, or the same check in a second file, put the fact in one list or table and read it from there (`SAFE_TO_OPEN`, `PICTURE_EXTENSIONS`, `SHORTCUTS`, `App::popup_open`). Leave code alone that's local, clear and not growing.
+4. **One checked step at a time.** A fix starts with the test that fails without it: watch it fail, then fix. Longer work is cut into steps that each end in a check you ran (`cargo test <name>`, `cargo clippy --all-targets`), green before the next begins. A fix made after a review is a step like any other: that's where the next review's bugs come from.
+5. **Prove it as far as you can.** The real session is off-limits, so done means exercised as far as that allows: the screen rendered into a `TestBackend` and asserted on cells, the event fed to an `App` with a `detached` client, a `--demo` scene for the user to look at. A clean build and green tests aren't that on their own. Read a check's output whole (piping `cargo test` through `rg` can hide a red test), and when a check surprises you, doubt how you looked before you doubt the code. Say what you couldn't run, and ask the user to try what only the live app shows.
+6. **A test must be able to fail.** Break the behavior a new test guards, watch it go red, restore. The expected value comes from the requirement, never from the code under test or from data the test built itself, and a "never happens" assertion is paired with the case where it does.
+
+## KISS, DRY and comments
+
+The house style is the plainest idiom that works: no premature abstraction, no speculative settings or flags, no error handling for cases that can't happen. Simplifying without changing behavior is welcome.
+
+Reach for the one home a job already has before writing another:
+- Text from another user, shown or copied: `text::clean` (`one_line` for a single row); in a notification, `notify::escape`.
+- A link or file leaving tuigram: `open_externally`, never a shell; a downloaded file: `mark_downloaded`; a link's host: `link_host`.
+- Boxes: `ui::bordered`; labels on a background: `ui::pill`; a popup starts with `ui::Cover` and goes in both `App::popup_open` and `App::close_popups`.
+- A TDLib request: `Tg::spawn` or `Tg::task`, never awaited by the UI; decoding a sender's bytes: `images::contained`; reading a file the user names: `config::read_small`.
+- What goes out to other people (read receipts, online status, typing, files) goes out from the one place Security names. A second caller is a bug even when it works.
+
+Comments say why, never what: the code names itself. A new or changed `//` comment is at most 2 lines and doesn't restate identifiers or the task at hand; longer rationale goes in this file. Keep the rationale that's real: gotchas, invariants, why TDLib is asked in this order. Doc comments (`///`) describe behavior as the user sees it, at any length. Comments already in the tree stay as they are until their code changes. When behavior changes, `rg` its identifiers and its old wording across comments, this file, the README, the status bar hints and `SHORTCUTS` in the same commit, and a comment saying something is guaranteed names what guarantees it.
+
 ## Conventions
 
 - Rust 2024 edition; `let` chains are used freely.
-- Comments explain why, in plain sentences; doc comments describe behavior as the user sees it.
 - Test names are sentences (`own_messages_sit_on_the_right_and_others_on_the_left`). UI tests render into a `TestBackend` buffer and assert on rows/cells.
 - tdlib-rs `Message` has no `Default`, so logic that takes messages is written to accept already-converted `Msg`s where it needs testing (see `OpenChat::add_page`).
