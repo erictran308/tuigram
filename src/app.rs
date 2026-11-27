@@ -6269,6 +6269,7 @@ impl App {
                 self.video_tx.clone(),
                 self.images.tmux(),
                 self.pepper.clone(),
+                &self.colors,
             ),
             None => {
                 self.open_target(Target::File(file));
@@ -6357,6 +6358,7 @@ impl App {
             self.video_tx.clone(),
             self.images.tmux(),
             self.pepper.clone(),
+            &self.colors,
         ) else {
             return;
         };
@@ -10613,7 +10615,15 @@ mod tests {
         let open = app.open.as_mut().unwrap();
         let msg = open.messages.get_mut(&id).unwrap();
         msg.saveable = false;
-        app.video_view = VideoView::of(chat_id, id, msg, app.video_tx.clone(), false, None);
+        app.video_view = VideoView::of(
+            chat_id,
+            id,
+            msg,
+            app.video_tx.clone(),
+            false,
+            None,
+            &app.colors,
+        );
         press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
         assert!(app.video_view.is_some(), "it stays");
         assert_eq!(
@@ -10640,7 +10650,15 @@ mod tests {
         press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
         assert!(app.inline_video.is_some());
         let msg = &app.open.as_ref().unwrap().messages[&id];
-        app.video_view = VideoView::of(chat_id, id, msg, app.video_tx.clone(), false, None);
+        app.video_view = VideoView::of(
+            chat_id,
+            id,
+            msg,
+            app.video_tx.clone(),
+            false,
+            None,
+            &app.colors,
+        );
         let (_, other) = two_chats(&app);
         app.open_chat(other);
         assert!(app.inline_video.is_none(), "its chat was left");
@@ -10649,7 +10667,15 @@ mod tests {
         let mut app = test_app("video-logout");
         let (chat_id, id) = video_message(&mut app);
         let msg = &app.open.as_ref().unwrap().messages[&id];
-        app.video_view = VideoView::of(chat_id, id, msg, app.video_tx.clone(), false, None);
+        app.video_view = VideoView::of(
+            chat_id,
+            id,
+            msg,
+            app.video_tx.clone(),
+            false,
+            None,
+            &app.colors,
+        );
         app.forget_session();
         assert!(app.video_view.is_none(), "the session ended");
     }

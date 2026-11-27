@@ -1,12 +1,12 @@
 //! Video messages played in the terminal itself. In Pepper, Pepper's own
 //! player draws the video straight into a box of cells and plays the sound
 //! (`crate::pepper`). Elsewhere ffmpeg decodes frames to raw RGBA in a folder
-//! of the player's own, at the video's own pace, the circle outside the round
-//! frame goes transparent, kitty's protocol puts each where the overlay's
-//! blank area is, and mpv plays the sound; and where pepper-play can't play
-//! one, it plays that way too. Zooming restarts the decoder at the same
-//! position with a bigger frame. Everything but the few calls app.rs makes
-//! lives here.
+//! of the player's own, at the video's own pace, the corners outside the
+//! round frame take the bubble's color, kitty's protocol puts each where the
+//! overlay's blank area is, and mpv plays the sound; and where pepper-play
+//! can't play one, it plays that way too. Zooming restarts the decoder at
+//! the same position with a bigger frame. Everything but the few calls
+//! app.rs makes lives here.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui_image::FontSize;
@@ -39,13 +40,18 @@ pub const MAX_FILE: u64 = 256 << 20;
 /// the frames shown tell where it is.
 const FPS: f64 = 30.0;
 
+/// The biggest side a video message is decoded at, in pixels. The sender
+/// says how big theirs is, and each frame takes side × side × 4 bytes;
+/// Telegram's apps record a few hundred.
+const MAX_SIDE: i32 = 1024;
+
 /// A video message, as TDLib describes it.
 #[derive(Clone)]
 pub struct Note {
     pub file_id: i32,
     pub size: u64,
     pub duration: i32,
-    /// Diameter in pixels: video notes are square.
+    /// Diameter in pixels: video notes are square. At most [`MAX_SIDE`].
     pub length: u32,
 }
 
@@ -56,7 +62,7 @@ impl Note {
             file_id: note.video.id,
             size: u64::try_from(size).unwrap_or(0),
             duration: note.duration.max(0),
-            length: note.length.max(1) as u32,
+            length: note.length.clamp(1, MAX_SIDE) as u32,
         }
     }
 }
@@ -73,6 +79,8 @@ pub struct VideoEvent {
 pub enum News {
     /// A new frame waits in the player's frame file.
     Frame,
+    /// Another second went by: the time shown is drawn again.
+    Moved,
     /// The video played out.
     Ended,
     Failed(String),
@@ -290,13 +298,11 @@ impl Drop for Player {
 
 /// Reads frames from `pipe` (width × height × 4 bytes each, RGBA) into
 /// `dir`'s frame file, atomically: a half-written one never reaches the
-/// terminal. At the video's own pace, since ffmpeg runs with `-re`. The
-/// pixels outside the frame's circle go transparent: video messages are round.
-#[allow(clippy::too_many_arguments)]
+/// terminal. At the video's own pace, since ffmpeg runs with `-re`, and
+/// already round ([`round_graph`]).
 fn pump_frames(
     mut pipe: impl Read,
-    width: u32,
-    height: u32,
+    (width, height): (u32, u32),
     dir: &Path,
     frames: &AtomicU64,
     stop: &AtomicBool,
@@ -321,7 +327,6 @@ fn pump_frames(
             }
             return;
         }
-        mask_circle(&mut buf, width, height);
         let written = std::fs::write(&tmp, &buf).and_then(|()| std::fs::rename(&tmp, &out));
         if let Err(e) = written {
             send(News::Failed(format!(
@@ -337,22 +342,25 @@ fn pump_frames(
     }
 }
 
-/// Sets each pixel's alpha by how much of it the frame's inscribed circle
-/// covers: the corners go transparent, and kitty draws what's under them —
-/// the bubble. The edge is a shade, not a step, so it doesn't look jagged.
-/// ffmpeg's frames are opaque, so only the alpha byte is written.
-fn mask_circle(buf: &mut [u8], width: u32, height: u32) {
-    let (w, h) = (f64::from(width), f64::from(height));
-    let (cx, cy) = ((w - 1.0) / 2.0, (h - 1.0) / 2.0);
-    let r = w.min(h) / 2.0;
-    for y in 0..height {
-        // Pixels of this row inside the circle have |x - cx| <= half.
-        let half = (r * r - (f64::from(y) - cy).powi(2)).max(0.0).sqrt();
-        let (lo, hi) = (cx - half, cx + half + 1.0);
-        for x in 0..width {
-            let xf = f64::from(x);
-            let cover = (hi.min(xf + 1.0) - lo.max(xf)).clamp(0.0, 1.0);
-            buf[(y as usize * width as usize + x as usize) * 4 + 3] = (cover * 255.0) as u8;
+/// How a video message is cut round: a square of `side` pixels, with what's
+/// outside the circle painted `backdrop`.
+#[derive(Clone, Copy)]
+struct Round {
+    side: u32,
+    backdrop: [u8; 3],
+}
+
+impl Round {
+    /// `note` on `bubble`; on black where that's a color the terminal picks,
+    /// which has no RGB to read.
+    fn of(note: &Note, bubble: Color) -> Self {
+        let backdrop = match bubble {
+            Color::Rgb(r, g, b) => [r, g, b],
+            _ => [0, 0, 0],
+        };
+        Self {
+            side: note.length,
+            backdrop,
         }
     }
 }
@@ -412,39 +420,68 @@ fn mpv_args(path: &Path, start: &str) -> Vec<String> {
 }
 
 /// pepper-play's arguments to play `path` from `start` seconds, driven over
-/// the socket it gets as fd 3.
+/// the socket it gets as fd 3, cut as `round` says.
 #[cfg(unix)]
-fn pepper_args(path: &Path, start: &str) -> Vec<String> {
+fn pepper_args(path: &Path, start: &str, round: Round) -> Vec<String> {
+    let [r, g, b] = round.backdrop;
+    let graph = round_graph(round);
     let mut args: Vec<String> = STRICT.map(String::from).into();
     args.extend([
         "--keep-open=no".into(),
         "--input-ipc-client=fd://3".into(),
         format!("--start={start}"),
+        // The filter takes frames in memory, not on the graphics chip.
+        "--hwdec=no".into(),
+        // Length-prefixed, as mpv takes a value with brackets and commas in it.
+        format!("--vf=lavfi=graph=%{}%{graph}", graph.len()),
+        // Where the box isn't the picture's shape, the bars on its sides.
+        format!("--background-color=#{r:02x}{g:02x}{b:02x}"),
     ]);
     args.extend(["--".into(), path.to_string_lossy().into_owned()]);
     args
 }
 
-/// Starts playing `path` from `start` seconds: through Pepper's player
-/// `pepper` where there's one and it starts, else as kitty frames scaled
-/// into width × height pixels.
+/// The filter, for ffmpeg and mpv alike, scaling the picture to a square of
+/// `round.side` pixels and cutting it round: a sender's video can come with
+/// its corners white. The circle is drawn once and laid on each frame, over
+/// the backdrop, and the edge is a shade, not a step. It ends with the video.
+fn round_graph(
+    Round {
+        side,
+        backdrop: [r, g, b],
+    }: Round,
+) -> String {
+    let cover = "clip(min(W,H)/2-hypot(X-(W-1)/2,Y-(H-1)/2)+0.5,0,1)";
+    format!(
+        "scale={side}:{side},split[a][b];\
+         [b]drawbox=c=0x{r:02x}{g:02x}{b:02x}:t=fill[back];\
+         color=black:s={side}x{side}:r=1:d=1,format=gray,geq=lum='255*{cover}',loop=-1:1[circle];\
+         [a]format=rgba[video];\
+         [video][circle]alphamerge=shortest=1[cut];\
+         [back][cut]overlay"
+    )
+}
+
+/// Starts playing `path` from `start` seconds, cut as `round` says: through
+/// Pepper's player `pepper` where there's one and it starts, else as kitty
+/// frames of `round.side` pixels.
 fn spawn(
     path: &Path,
     start: f64,
-    (width, height): (u32, u32),
+    round: Round,
     tag: u8,
     tx: UnboundedSender<VideoEvent>,
     pepper: Option<&Path>,
 ) -> Result<Run> {
     #[cfg(unix)]
     if let Some(play) = pepper
-        && let Ok(player) = spawn_pepper(play, path, start, tag, tx.clone())
+        && let Ok(player) = spawn_pepper(play, path, start, round, tag, tx.clone())
     {
         return Ok(Run::Pepper(player));
     }
     #[cfg(not(unix))]
     let _ = pepper;
-    spawn_frames(path, start, width, height, tag, tx).map(Run::Frames)
+    spawn_frames(path, start, round, tag, tx).map(Run::Frames)
 }
 
 /// Starts pepper-play on `path` from `start` seconds. Its words come back
@@ -454,6 +491,7 @@ fn spawn_pepper(
     play: &Path,
     path: &Path,
     start: f64,
+    round: Round,
     tag: u8,
     tx: UnboundedSender<VideoEvent>,
 ) -> Result<PepperPlayer> {
@@ -465,7 +503,7 @@ fn spawn_pepper(
     let fd = theirs.as_raw_fd();
     let mut command = Command::new(play);
     command
-        .args(pepper_args(path, &format!("{start:.3}")))
+        .args(pepper_args(path, &format!("{start:.3}"), round))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -570,7 +608,12 @@ fn read_pepper(
                     return;
                 }
             }
-            Some(Said::At(at)) => seconds.store(at.to_bits(), Relaxed),
+            Some(Said::At(at)) => {
+                let before = f64::from_bits(seconds.swap(at.to_bits(), Relaxed));
+                if at.floor() != before.floor() && !send(News::Moved) {
+                    return;
+                }
+            }
             Some(Said::Ended) => {
                 send(News::Ended);
                 return;
@@ -590,24 +633,20 @@ fn read_pepper(
     });
 }
 
-/// Starts decoding `path` from `start` seconds, scaled into width × height
-/// pixels, with the sound in mpv. No audio rather than no video when mpv
-/// is missing.
+/// Starts decoding `path` from `start` seconds into round frames of
+/// `round.side` pixels, with the sound in mpv. No audio rather than no video
+/// when mpv is missing.
 fn spawn_frames(
     path: &Path,
     start: f64,
-    width: u32,
-    height: u32,
+    round: Round,
     tag: u8,
     tx: UnboundedSender<VideoEvent>,
 ) -> Result<Player> {
     let dir = crate::config::new_private_dir(&frames_parent(), "tuigram-video")?;
-    // Fit into the box, padded to it: the frame's size never changes, so
-    // the reader can count bytes.
-    let filter = format!(
-        "fps={FPS},scale={width}:{height}:force_original_aspect_ratio=decrease,\
-         pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
-    );
+    // Always that square: the frame's size never changes, so the reader can
+    // count bytes.
+    let filter = format!("fps={FPS},{}", round_graph(round));
     let start = format!("{start:.3}");
     let ffmpeg = Command::new("ffmpeg")
         .args(ffmpeg_args(path, &start, &filter))
@@ -646,9 +685,9 @@ fn spawn_frames(
         .spawn()
         .ok();
     let (frames, stop) = (Arc::clone(&player.frames), Arc::clone(&player.stop));
-    let (dir, run) = (player.dir.clone(), player.run);
+    let (dir, run, side) = (player.dir.clone(), player.run, round.side);
     player.pump = Some(std::thread::spawn(move || {
-        pump_frames(pipe, width, height, &dir, &frames, &stop, (tag, run), &tx);
+        pump_frames(pipe, (side, side), &dir, &frames, &stop, (tag, run), &tx);
     }));
     Ok(player)
 }
@@ -665,6 +704,8 @@ pub struct VideoView {
     /// Why `o` doesn't hand the file to another app: Telegram says it
     /// can't be saved.
     pub cant_copy: Option<&'static str>,
+    /// How the picture is cut: on the color of others' bubbles.
+    round: Round,
     /// Playing it is to tell its sender, once a frame of it shows: see
     /// [`VideoView::tell_now`].
     pub tell: bool,
@@ -681,9 +722,9 @@ pub struct VideoView {
     zoom: Option<usize>,
     /// The cells the picture filled last frame.
     rect: Option<Rect>,
-    /// The pixel size the running player decodes at: a change (zoom, the
-    /// window resized) restarts it at the same position.
-    pixels: Option<(u32, u32)>,
+    /// The square the running player decodes at, in pixels: a change (zoomed
+    /// or resized below the video's own size) restarts it at the same position.
+    side: Option<u32>,
     /// A frame waits to be sent to the terminal.
     pending: bool,
     /// A frame of it came from the decoder.
@@ -706,6 +747,7 @@ impl VideoView {
         tx: UnboundedSender<VideoEvent>,
         tmux: bool,
         pepper: Option<PathBuf>,
+        colors: &Colors,
     ) -> Option<Self> {
         let note = msg.video.clone()?;
         let file = msg.file.clone().filter(|f| f.id == note.file_id)?;
@@ -713,6 +755,7 @@ impl VideoView {
             chat_id,
             message_id,
             file,
+            round: Round::of(&note, colors.other_bubble),
             note,
             cant_copy: crate::viewer::cant_copy(msg),
             tell: false,
@@ -723,7 +766,7 @@ impl VideoView {
             start: 0.0,
             zoom: None,
             rect: None,
-            pixels: None,
+            side: None,
             pending: false,
             framed: false,
             done: false,
@@ -823,6 +866,7 @@ impl VideoView {
                 self.framed = true;
                 Ok(())
             }
+            News::Moved => Ok(()),
             News::Ended => {
                 self.player = None;
                 self.done = true;
@@ -874,12 +918,20 @@ impl VideoView {
         (rect, pixels)
     }
 
+    /// The square kitty frames are decoded at for a picture of `pixels`: no
+    /// bigger than the video, since the terminal scales a frame to its cells,
+    /// and a bigger one only costs, each frame, to make, write and read.
+    fn frame_side(&self, (w, h): (u32, u32)) -> u32 {
+        self.round.side.min(w).min(h).max(1)
+    }
+
     /// The overlay: a blank board the frames land on, with a title. The
     /// player (re)starts once the picture's size is known or it changed.
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, font: FontSize, colors: &Colors) {
         let block = crate::ui::bordered(colors);
         let inner = block.inner(area);
         let (at, pixels) = self.layout(inner, font);
+        let side = self.frame_side(pixels);
         self.rect = Some(at);
         let now = self.position().min(f64::from(self.note.duration)) as u32;
         let of = self.note.duration.max(0) as u32;
@@ -907,7 +959,7 @@ impl VideoView {
             && self
                 .player
                 .as_ref()
-                .is_none_or(|p| p.frames().is_some() && self.pixels != Some(pixels));
+                .is_none_or(|p| p.frames().is_some() && self.side != Some(side));
         if needs_restart && self.error.is_none() {
             let position = if self.player.is_some() {
                 self.position()
@@ -919,7 +971,7 @@ impl VideoView {
             match spawn(
                 &self.path.clone().unwrap(),
                 position,
-                pixels,
+                Round { side, ..self.round },
                 TAG_VIEW,
                 self.tx.clone(),
                 self.pepper.as_deref(),
@@ -930,7 +982,7 @@ impl VideoView {
                     }
                     self.player = Some(player);
                     self.start = position;
-                    self.pixels = Some(pixels);
+                    self.side = Some(side);
                 }
                 Err(e) => self.error = Some(format!("{e:#}")),
             }
@@ -950,7 +1002,7 @@ impl VideoView {
         let Some(player) = self.player.as_ref().and_then(Run::frames) else {
             return;
         };
-        let (Some(at), Some((w, h))) = (self.rect, self.pixels) else {
+        let (Some(at), Some(side)) = (self.rect, self.side) else {
             return;
         };
         if !self.pending {
@@ -964,7 +1016,7 @@ impl VideoView {
             // cursor.
             format!("\x1b[{};{}H", at.y + 1, at.x + 1),
             format!(
-                "{start}{escape}_Ga=T,t=f,f=32,s={w},v={h},i={KITTY_ID},q=2,c={},r={};{path}{escape}\\{end}",
+                "{start}{escape}_Ga=T,t=f,f=32,s={side},v={side},i={KITTY_ID},q=2,c={},r={};{path}{escape}\\{end}",
                 at.width, at.height
             ),
         ];
@@ -1010,8 +1062,9 @@ pub struct Inline {
     pub tell: bool,
     /// The downloaded file, once TDLib brings it.
     path: Option<PathBuf>,
-    /// The square the decoder scales to, in pixels: the note's own size.
-    side: u32,
+    /// How the picture is cut: at the note's own side, the square the
+    /// decoder scales to, on the color of the bubble it's in.
+    round: Round,
     player: Option<Run>,
     /// Pepper's player, while it's the one to try: see [`crate::pepper`].
     pepper: Option<PathBuf>,
@@ -1046,13 +1099,21 @@ impl Inline {
         tx: UnboundedSender<VideoEvent>,
         tmux: bool,
         pepper: Option<PathBuf>,
+        colors: &Colors,
     ) -> Option<Self> {
         let note = msg.video.clone()?;
         msg.preview.as_ref()?;
         Some(Self {
             chat_id,
             message_id,
-            side: note.length,
+            round: Round::of(
+                &note,
+                if msg.outgoing {
+                    colors.own_bubble
+                } else {
+                    colors.other_bubble
+                },
+            ),
             note,
             tell: false,
             path: None,
@@ -1091,9 +1152,8 @@ impl Inline {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let side = (self.side, self.side);
         let pepper = self.pepper.as_deref();
-        let run = spawn(path, 0.0, side, TAG_INLINE, self.tx.clone(), pepper);
+        let run = spawn(path, 0.0, self.round, TAG_INLINE, self.tx.clone(), pepper);
         self.player = Some(run.map_err(|e| format!("{e:#}"))?);
         self.framed = false;
         Ok(())
@@ -1168,6 +1228,7 @@ impl Inline {
                 self.framed = true;
                 Ok(())
             }
+            News::Moved => Ok(()),
             News::Ended => {
                 self.player = None;
                 Ok(())
@@ -1206,7 +1267,7 @@ impl Inline {
         self.pending = false;
         let path = kitty_path(&player.frame_file());
         let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
-        let (s, v) = (self.side, self.side);
+        let (s, v) = (self.round.side, self.round.side);
         let code = format!(
             "{start}{escape}_Gq=2,i={INLINE_KITTY_ID},a=T,U=1,f=32,t=f,s={s},v={v},c={c},r={r};{path}{escape}\\{end}"
         );
@@ -1585,19 +1646,45 @@ fn diacritic(y: u16) -> char {
 mod tests {
     use super::*;
 
+    /// A message with a video message `length` pixels wide.
+    fn note_msg(length: u32) -> Msg {
+        let (_, mut msg) = crate::messages::tests::page([1]).remove(0);
+        msg.file = Some(MediaFile {
+            id: 5,
+            label: "Video message".into(),
+            photo: false,
+            downloaded: true,
+        });
+        msg.video = Some(Note {
+            file_id: 5,
+            size: 10,
+            duration: 1,
+            length,
+        });
+        msg
+    }
+
     #[test]
-    fn the_mask_leaves_the_circle_and_hides_the_corners() {
-        let (w, h) = (16, 16);
-        let mut buf = vec![255u8; w * h * 4];
-        mask_circle(&mut buf, w as u32, h as u32);
-        let alpha = |x: usize, y: usize| buf[(y * w + x) * 4 + 3];
-        assert_eq!(alpha(0, 0), 0, "the corner");
-        assert_eq!(alpha(15, 15), 0, "the other corner");
-        assert_eq!(alpha(8, 8), 255, "the center");
-        assert_eq!(alpha(8, 0), 255, "the circle's top");
-        // The edge is a shade, not a step.
-        let edge = (1..15).map(|x| alpha(x, 1)).find(|&a| a > 0 && a < 255);
-        assert!(edge.is_some(), "a half-covered pixel on the edge");
+    fn the_whole_window_plays_frames_no_bigger_than_the_video() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let msg = note_msg(400);
+        let view = VideoView::of(1, 1, &msg, tx, false, None, &Colors::default()).unwrap();
+        // The terminal scales them to the cells.
+        assert_eq!(view.frame_side((1400, 1380)), 400);
+        assert_eq!(view.frame_side((300, 320)), 300, "smaller ones shrink");
+    }
+
+    #[test]
+    fn the_circle_is_drawn_once_on_the_bubbles_color_and_ends_with_the_video() {
+        let graph = round_graph(Round {
+            side: 400,
+            backdrop: [0x31, 0x32, 0x44],
+        });
+        assert!(graph.starts_with("scale=400:400,"), "{graph}");
+        assert!(graph.contains("drawbox=c=0x313244:t=fill"), "{graph}");
+        assert!(graph.contains("r=1:d=1,"), "one circle: {graph}");
+        assert!(graph.contains("loop=-1:1"), "laid on every frame: {graph}");
+        assert!(graph.contains("alphamerge=shortest=1"), "{graph}");
     }
 
     #[test]
@@ -1617,7 +1704,14 @@ mod tests {
 
         let mut players = vec![mpv_args(path, "0.000")];
         #[cfg(unix)]
-        players.push(pepper_args(path, "0.000"));
+        players.push(pepper_args(
+            path,
+            "0.000",
+            Round {
+                side: 400,
+                backdrop: [0, 0, 0],
+            },
+        ));
         for args in players {
             for wanted in [
                 "--no-config",
@@ -1636,6 +1730,47 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pepper_play_cuts_the_picture_round_on_the_bubbles_color() {
+        let round = Round {
+            side: 400,
+            backdrop: [0x31, 0x32, 0x44],
+        };
+        let args = pepper_args(Path::new("/f.mp4"), "0.000", round);
+        assert!(args.iter().any(|a| a == "--hwdec=no"), "{args:?}");
+        assert!(
+            args.iter().any(|a| a == "--background-color=#313244"),
+            "{args:?}"
+        );
+        let vf = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--vf=lavfi=graph=%"));
+        let (len, graph) = vf.and_then(|v| v.split_once('%')).unwrap();
+        // mpv reads as many bytes as the prefix says.
+        assert_eq!(len.parse::<usize>().unwrap(), graph.len());
+        assert_eq!(graph, round_graph(round));
+    }
+
+    #[test]
+    fn a_senders_word_on_its_videos_size_is_kept_within_reason() {
+        let note = |length| {
+            Note::new(&VideoNote {
+                duration: 8,
+                waveform: String::new(),
+                length,
+                minithumbnail: None,
+                thumbnail: None,
+                speech_recognition_result: None,
+                video: tdlib_rs::types::File::default(),
+            })
+        };
+        assert_eq!(note(400).length, 400);
+        // Each frame takes side × side × 4 bytes.
+        assert_eq!(note(60_000).length, MAX_SIDE as u32);
+        assert_eq!(note(-5).length, 1);
+    }
+
     #[test]
     fn frames_go_into_the_players_own_folder_tagged_with_its_run() {
         let dir = crate::config::new_private_dir(&std::env::temp_dir(), "tuigram-test").unwrap();
@@ -1645,8 +1780,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         pump_frames(
             &pipe[..],
-            2,
-            2,
+            (2, 2),
             &dir,
             &AtomicU64::new(0),
             &stop,
@@ -1673,6 +1807,7 @@ mod tests {
             r#"{"event": "property-change", "id": 1, "name": "time-pos", "data": 0.5}"#,
             r#"{"event": "playback-restart"}"#,
             r#"{"event": "property-change", "id": 1, "name": "time-pos", "data": 1.92}"#,
+            r#"{"event": "property-change", "id": 1, "name": "time-pos", "data": 1.95}"#,
             r#"{"event": "playback-restart"}"#,
             r#"{"event": "end-file", "reason": "eof", "playlist_entry_id": 1}"#,
         ];
@@ -1682,8 +1817,12 @@ mod tests {
         let events: Vec<VideoEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(events.iter().all(|e| e.tag == TAG_VIEW && e.run == 3));
         let news: Vec<&News> = events.iter().map(|e| &e.news).collect();
-        assert!(matches!(news[..], [News::Frame, News::Ended]), "one start");
-        assert_eq!(f64::from_bits(seconds.load(Relaxed)), 1.92);
+        // The time shown is drawn again each second, not each frame.
+        assert!(
+            matches!(news[..], [News::Frame, News::Moved, News::Ended]),
+            "one start, one second"
+        );
+        assert_eq!(f64::from_bits(seconds.load(Relaxed)), 1.95);
 
         let failed = r#"{"event": "end-file", "reason": "error", "file_error": "loading failed"}"#;
         assert_eq!(said(failed), Some(Said::Failed("loading failed".into())));
@@ -1696,24 +1835,13 @@ mod tests {
     #[test]
     fn a_video_message_pepper_play_cant_play_plays_as_kitty_frames() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_, mut msg) = crate::messages::tests::page([1]).remove(0);
-        msg.file = Some(MediaFile {
-            id: 5,
-            label: "Video message".into(),
-            photo: false,
-            downloaded: true,
-        });
-        msg.video = Some(Note {
-            file_id: 5,
-            size: 10,
-            duration: 1,
-            length: 240,
-        });
+        let msg = note_msg(240);
         // A pepper-play that quits at once, as one without libmpv does.
         let quits = PathBuf::from("/bin/sh");
-        let mut view = VideoView::of(1, 1, &msg, tx.clone(), false, Some(quits)).unwrap();
+        let colors = Colors::default();
+        let mut view = VideoView::of(1, 1, &msg, tx.clone(), false, Some(quits), &colors).unwrap();
         let path = Path::new("/nowhere/file_5.mp4");
-        let run = spawn(path, 0.0, (8, 8), TAG_VIEW, tx, view.pepper.as_deref()).unwrap();
+        let run = spawn(path, 0.0, view.round, TAG_VIEW, tx, view.pepper.as_deref()).unwrap();
         assert!(run.frames().is_none(), "Pepper's player first");
         view.player = Some(run);
         let event = rx.blocking_recv().unwrap();

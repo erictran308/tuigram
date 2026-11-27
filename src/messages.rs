@@ -996,6 +996,8 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             );
             body.preview = Preview::from_video_note(&m.video_note);
             body.video = Some(crate::video::Note::new(&m.video_note));
+            // Its length before the label, as a video's bubble has it.
+            body.text = format!("▶ {} {}", duration(m.video_note.duration), body.text);
         }
         C::MessagePoll(m) => {
             let poll = Poll::new(&m.poll);
@@ -2176,6 +2178,31 @@ pub(crate) mod tests {
             (10, "Video 1:05"),
             "Enter opens the video itself"
         );
+    }
+
+    #[test]
+    fn a_video_message_says_how_long_it_is_before_its_label() {
+        let note = |is_secret| {
+            MessageContent::MessageVideoNote(types::MessageVideoNote {
+                video_note: types::VideoNote {
+                    duration: 28,
+                    waveform: String::new(),
+                    length: 400,
+                    minithumbnail: None,
+                    thumbnail: None,
+                    speech_recognition_result: None,
+                    video: types::File {
+                        id: 11,
+                        ..Default::default()
+                    },
+                },
+                is_viewed: false,
+                is_secret,
+            })
+        };
+        assert_eq!(body(&note(false)).text, "▶ 0:28 [Video message]");
+        // One seen only while open isn't played here.
+        assert!(!body(&note(true)).text.contains('▶'));
     }
 
     #[test]
