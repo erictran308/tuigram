@@ -134,12 +134,15 @@ jobs:
         run: cargo build --release --locked --no-default-features --features local-tdlib --target ${{ matrix.target }}
 
       # tdlib-rs copies the TDLib it builds with into its build output; it
-      # must match the checked zip file for file.
+      # must match the checked zip file for file. Cargo before 1.100 keeps
+      # build scripts' output in build/<crate>-<hash>/out, from 1.100 on in
+      # build/<crate>/<hash>/out.
       - name: Check the linked TDLib is the checked one
         shell: bash
         run: |
           shopt -s nullglob
-          dirs=(target/${{ matrix.target }}/release/build/*/out/tdlib)
+          build=target/${{ matrix.target }}/release/build
+          dirs=("$build"/*/out/tdlib "$build"/*/*/out/tdlib)
           if [ ${#dirs[@]} -eq 0 ]; then
             echo "::error::Found no TDLib in tdlib-rs's build output"
             exit 1
