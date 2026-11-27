@@ -17,6 +17,7 @@ use crate::buttons::Keyboard;
 use crate::chats::content_text_as_sent;
 use crate::complete::Commands;
 use crate::images::Thumbnail;
+use crate::lang;
 use crate::pins::Pinned;
 use crate::poll::Poll;
 use crate::reactions::{self, Reaction, ReactionKind};
@@ -376,7 +377,7 @@ impl Msg {
         match &self.file {
             _ if !text.is_empty() => text,
             Some(file) => file.label.clone(),
-            None => "Message".into(),
+            None => lang::t("Message").into(),
         }
     }
 
@@ -797,7 +798,12 @@ fn shown_while_open(content: &MessageContent) -> bool {
 
 /// Where media seen only while open, which tuigram can't show that way,
 /// can be.
-pub const ON_PHONE: &str = "watch it in Telegram on your phone";
+pub const ON_PHONE: &str = lang::key("watch it in Telegram on your phone");
+
+/// [`ON_PHONE`] in the language set.
+pub fn on_phone() -> &'static str {
+    lang::t(ON_PHONE)
+}
 
 /// Media that expired: a view-once photo once it was opened.
 fn expired(content: &MessageContent) -> bool {
@@ -853,20 +859,23 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
     };
     match content {
         C::MessagePhoto(m) if cover && m.is_secret => {
-            body.text = labeled("[Photo · Enter to view]".into(), &m.caption);
+            let label = lang::t("[Photo · Enter to view]");
+            body.text = labeled(label.into(), &m.caption);
             source = Some(&m.caption);
         }
         // Only another app could play these, and it would keep them.
         C::MessageVideo(m) if m.is_secret => {
-            body.text = labeled(format!("[Video · {ON_PHONE}]"), &m.caption);
+            let video = lang::t("Video");
+            body.text = labeled(format!("[{video} · {}]", on_phone()), &m.caption);
             source = Some(&m.caption);
         }
         C::MessageAnimation(m) if m.is_secret => {
-            body.text = labeled(format!("[GIF · {ON_PHONE}]"), &m.caption);
+            body.text = labeled(format!("[GIF · {}]", on_phone()), &m.caption);
             source = Some(&m.caption);
         }
         C::MessageVideoNote(m) if m.is_secret => {
-            body.text = format!("[Video message · {ON_PHONE}]");
+            let note = lang::t("Video message");
+            body.text = format!("[{note} · {}]", on_phone());
         }
         C::MessageText(m) => {
             source = Some(&m.text);
@@ -886,7 +895,7 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             body.photo = Preview::largest(&m.photo).filter(|_| !m.is_secret);
             body.file = body.photo.as_ref().map(|p| MediaFile {
                 id: p.file_id,
-                label: "Photo".into(),
+                label: lang::t("Photo").into(),
                 photo: true,
                 downloaded: largest(&m.photo)
                     .is_some_and(|s| s.photo.local.is_downloading_completed),
@@ -904,7 +913,8 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
                     body.text = format!("{}\n{}", body.text, m.caption.text);
                 }
             }
-            let label = format!("Video {}", duration(m.video.duration));
+            let video = lang::t("Video");
+            let label = format!("{video} {}", duration(m.video.duration));
             body.file = file(
                 m.video.video.id,
                 label,
@@ -929,7 +939,7 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             let name = text::clean(&d.file_name);
             body.file = file(
                 d.document.id,
-                format!("File: {name}"),
+                format!("{}: {name}", lang::t("File")),
                 d.document.local.is_downloading_completed,
             );
             if let Some(preview) = Preview::from_document(d).filter(|_| is_picture(d)) {
@@ -957,7 +967,7 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             };
             body.file = file(
                 a.audio.id,
-                format!("Audio: {}", text::clean(name)),
+                format!("{}: {}", lang::t("Audio"), text::clean(name)),
                 a.audio.local.is_downloading_completed,
             );
             body.editable = Editable::Caption { above: false };
@@ -966,7 +976,7 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
         C::MessageVoiceNote(m) => {
             body.file = file(
                 m.voice_note.voice.id,
-                "Voice message".into(),
+                lang::t("Voice message").into(),
                 m.voice_note.voice.local.is_downloading_completed,
             );
             body.editable = Editable::Caption { above: false };
@@ -981,7 +991,7 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
         C::MessageVideoNote(m) => {
             body.file = file(
                 m.video_note.video.id,
-                "Video message".into(),
+                lang::t("Video message").into(),
                 m.video_note.video.local.is_downloading_completed,
             );
             body.preview = Preview::from_video_note(&m.video_note);
@@ -1000,7 +1010,7 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             }
             body.file = file(
                 m.sticker.sticker.id,
-                "Sticker".into(),
+                lang::t("Sticker").into(),
                 m.sticker.sticker.local.is_downloading_completed,
             );
         }
@@ -1490,10 +1500,10 @@ impl OpenChat {
     pub fn cant_edit(&self, id: i64) -> Option<&'static str> {
         let msg = self.messages.get(&id)?;
         match msg.state {
-            SendState::Pending => Some("Wait until it's sent"),
-            SendState::Failed { .. } => Some("This message wasn't sent"),
+            SendState::Pending => Some(lang::t("Wait until it's sent")),
+            SendState::Failed { .. } => Some(lang::t("This message wasn't sent")),
             SendState::Sent if msg.editable == Editable::No => {
-                Some("This message has no text to edit")
+                Some(lang::t("This message has no text to edit"))
             }
             SendState::Sent => None,
         }
@@ -1646,19 +1656,19 @@ impl OpenChat {
     /// Where `gd` goes from the message under the cursor: (the reply, the
     /// message it answers), or why it can't go anywhere.
     pub fn replied_jump(&self) -> Result<(i64, i64), &'static str> {
-        let from = self.cursor_id().ok_or("No message selected")?;
+        let from = self.cursor_id().ok_or(lang::t("No message selected"))?;
         let reply = self
             .messages
             .get(&from)
             .and_then(|m| m.reply_to.as_ref())
-            .ok_or("Not a reply")?;
+            .ok_or(lang::t("Not a reply"))?;
         let to = reply
             .message_id
-            .ok_or("It answers a message in another chat")?;
+            .ok_or(lang::t("It answers a message in another chat"))?;
         if !self.messages.contains_key(&to)
             && matches!(self.replied.get(&from), Some(Fetched::Missing))
         {
-            return Err("The message it answers was deleted");
+            return Err(lang::t("The message it answers was deleted"));
         }
         Ok((from, to))
     }
@@ -2166,6 +2176,43 @@ pub(crate) mod tests {
             (10, "Video 1:05"),
             "Enter opens the video itself"
         );
+    }
+
+    #[test]
+    fn in_russian_media_are_named_in_russian() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let file = body(&video(ThumbnailFormat::Jpeg, "")).file.unwrap();
+        assert_eq!(file.label, "Видео 1:05");
+        assert_eq!(body(&video(ThumbnailFormat::Mpeg4, "")).text, "[Видео]");
+        let covered = body(&secret_photo("тебе"));
+        assert_eq!(covered.text, "[Фото · Enter — открыть]\nтебе");
+        let mut secret_video = video(ThumbnailFormat::Jpeg, "");
+        if let MessageContent::MessageVideo(v) = &mut secret_video {
+            v.is_secret = true;
+        }
+        assert_eq!(
+            body(&secret_video).text,
+            "[Видео · смотрите в Telegram на телефоне]"
+        );
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_vietnamese_media_are_named_in_vietnamese() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let file = body(&video(ThumbnailFormat::Jpeg, "")).file.unwrap();
+        assert_eq!(file.label, "Video 1:05");
+        let covered = body(&secret_photo("gửi bạn"));
+        assert_eq!(covered.text, "[Ảnh · Enter để xem]\ngửi bạn");
+        let mut secret_video = video(ThumbnailFormat::Jpeg, "");
+        if let MessageContent::MessageVideo(v) = &mut secret_video {
+            v.is_secret = true;
+        }
+        assert_eq!(
+            body(&secret_video).text,
+            "[Video · xem trong Telegram trên điện thoại]"
+        );
+        crate::lang::set(crate::lang::Lang::En);
     }
 
     #[test]

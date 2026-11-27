@@ -27,6 +27,7 @@ use ratatui_image::{FontSize, Resize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chats::ChatPhoto;
+use crate::lang;
 use crate::messages::Preview;
 use crate::term::{self, Terminal};
 use crate::tg::Tg;
@@ -292,7 +293,7 @@ pub fn panic_is_contained() -> bool {
 pub fn contained<T>(decode: impl FnOnce() -> Result<T>) -> Result<T> {
     DECODING.with(|d| d.set(true));
     let result = catch_unwind(AssertUnwindSafe(decode))
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("the image couldn't be decoded")));
+        .unwrap_or_else(|_| Err(anyhow::anyhow!(lang::t("the image couldn't be decoded"))));
     DECODING.with(|d| d.set(false));
     result
 }

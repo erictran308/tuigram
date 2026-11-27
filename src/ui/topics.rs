@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
+use crate::lang;
 use crate::theme::Colors;
 use crate::topics::{Forum, Topic};
 
@@ -23,9 +24,13 @@ const ICON: &str = "●";
 /// On the right of a pinned topic with nothing unread.
 const PINNED: &str = "📌";
 /// Before what was left written in a topic.
-const DRAFT: &str = "Draft: ";
+fn draft_label() -> &'static str {
+    lang::t("Draft: ")
+}
 /// After a closed topic's name.
-const CLOSED: &str = " closed";
+fn closed_label() -> &'static str {
+    lang::t(" closed")
+}
 /// Columns a topic's name keeps at least, before "closed" makes way.
 const MIN_NAME: usize = 6;
 
@@ -54,9 +59,9 @@ pub fn draw(
     // is of the forum on screen.
     let badge = chats.badge(forum.chat_id);
     let after = if forum.loading.is_some() {
-        " · topics loading… "
+        lang::t(" · topics loading… ")
     } else {
-        " · topics "
+        lang::t(" · topics ")
     };
     let badge_w = badge.map_or(0, |b| b.mark().width());
     let room = usize::from(area.width.saturating_sub(3)).saturating_sub(badge_w + after.width());
@@ -79,9 +84,9 @@ pub fn draw(
     let topics = forum.topics();
     if topics.is_empty() {
         let empty = if forum.all_loaded() {
-            "No topics"
+            lang::t("No topics")
         } else {
-            "Loading…"
+            lang::t("Loading…")
         };
         frame.render_widget(Paragraph::new(empty).fg(colors.muted).centered(), inner);
         return;
@@ -156,8 +161,9 @@ fn rows(
     // The icon and a space after it.
     let icon_w = 2;
     // In a narrow pane, "closed" goes before the counts or the name would.
-    let closed = topic.closed && width >= icon_w + CLOSED.width() + badges_w + MIN_NAME;
-    let closed_w = if closed { CLOSED.width() } else { 0 };
+    let closed_label = closed_label();
+    let closed = topic.closed && width >= icon_w + closed_label.width() + badges_w + MIN_NAME;
+    let closed_w = if closed { closed_label.width() } else { 0 };
     let name = truncate(
         &topic.name,
         width.saturating_sub(icon_w + closed_w + badges_w + 1),
@@ -165,7 +171,7 @@ fn rows(
     let pad = width.saturating_sub(icon_w + name.width() + closed_w + badges_w);
     let mut first = vec![bar.clone(), icon, Span::from(" "), Span::from(name).bold()];
     if closed {
-        first.push(Span::from(CLOSED).fg(colors.muted));
+        first.push(Span::from(closed_label).fg(colors.muted));
     }
     first.push(Span::from(" ".repeat(pad)));
     first.extend(badges);
@@ -182,8 +188,8 @@ fn rows(
     };
     // As in the chat list, in place of the newest message.
     if let Some(draft) = topic.draft.as_ref().filter(|_| list.open != Some(topic.id)) {
-        second.push(Span::from(DRAFT).fg(colors.error));
-        let text = truncate(&draft.snippet(), room.saturating_sub(DRAFT.width()));
+        second.push(Span::from(draft_label()).fg(colors.error));
+        let text = truncate(&draft.snippet(), room.saturating_sub(draft_label().width()));
         second.push(Span::from(text).fg(colors.subtle));
         return vec![
             Line::from(first).style(row_style),
@@ -193,7 +199,7 @@ fn rows(
     let who = match topic.from {
         _ if topic.preview.is_empty() => None,
         Some(sender) => Some(Span::from(list.names.get(sender)).fg(colors.fg)),
-        None if topic.yours => Some(Span::from("You").fg(colors.primary)),
+        None if topic.yours => Some(Span::from(lang::t("You")).fg(colors.primary)),
         None => None,
     };
     let mut used = 0;

@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, ApiKeys};
+use crate::lang;
 use crate::notify::Notifications;
 use crate::theme::{self, Corners};
 
@@ -54,8 +55,8 @@ pub struct Settings {
     pub chat_gaps: bool,
     /// Which side of the window the chat list is on.
     pub chat_list_side: Side,
-    /// The interface's language where translated so far: "en" or "ru".
-    /// What isn't translated stays English either way.
+    /// The interface's language: "en", "ru" or "vi" (`crate::lang::Lang`).
+    /// What isn't translated yet stays English.
     pub language: String,
     /// How big a video message plays on Space; see [`VideoNoteSize`].
     pub video_note_size: VideoNoteSize,
@@ -155,9 +156,9 @@ const TOPICS_WIDTHS: std::ops::RangeInclusive<u16> = 20..=80;
 const TOPICS_STEP: u16 = 2;
 
 impl Settings {
-    /// The interface speaks Russian where translated.
-    pub fn ru(&self) -> bool {
-        self.language == "ru"
+    /// The interface's language.
+    pub fn lang(&self) -> crate::lang::Lang {
+        crate::lang::Lang::of(&self.language)
     }
 
     /// Defaults if the file doesn't exist yet; an error if it can't be read.
@@ -218,7 +219,10 @@ impl Settings {
             file.sync_all()?;
             std::fs::rename(&new, path)
         };
-        write().with_context(|| format!("cannot write {}", config::shown(path)))
+        write().with_context(|| {
+            let cant = lang::t("cannot write");
+            format!("{cant} {}", config::shown(path))
+        })
     }
 }
 

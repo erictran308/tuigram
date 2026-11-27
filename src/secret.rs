@@ -11,6 +11,8 @@ use base64::Engine;
 use tdlib_rs::enums::{MessageContent, MessageSelfDestructType, SecretChatState};
 use tdlib_rs::types::{self, Message};
 
+use crate::lang;
+
 /// A secret chat, from `updateSecretChat`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Secret {
@@ -56,8 +58,11 @@ impl Secret {
     pub fn cant_send(&self, name: &str) -> Option<String> {
         match self.state {
             SecretState::Ready => None,
-            SecretState::Pending => Some(format!("Waiting for {name} to come online")),
-            SecretState::Closed => Some("This secret chat has ended".into()),
+            SecretState::Pending => Some(lang::f(
+                "Waiting for {name} to come online",
+                &[("name", &name)],
+            )),
+            SecretState::Closed => Some(lang::t("This secret chat has ended").into()),
         }
     }
 }
@@ -127,32 +132,34 @@ const WEEK: i32 = 7 * DAY;
 /// do; 0 turns it off.
 pub const TIMERS: [i32; 13] = [0, 1, 2, 3, 4, 5, 10, 15, 30, MINUTE, HOUR, DAY, WEEK];
 
-/// A timer in words, for the `:timer` popup: "Off", "1 second", "1 week".
+/// A timer in words, for the `:timer` popup: "Off", "1 second", "1 week";
+/// in Russian "Выкл.", "1 секунда", "1 неделя".
 pub fn timer_words(secs: i32) -> String {
-    let (count, unit) = match secs {
-        ..=0 => return "Off".into(),
-        s if s % WEEK == 0 => (s / WEEK, "week"),
-        s if s % DAY == 0 => (s / DAY, "day"),
-        s if s % HOUR == 0 => (s / HOUR, "hour"),
-        s if s % MINUTE == 0 => (s / MINUTE, "minute"),
-        s => (s, "second"),
-    };
-    if count == 1 {
-        format!("1 {unit}")
-    } else {
-        format!("{count} {unit}s")
+    match secs {
+        ..=0 => lang::t("Off").into(),
+        s if s % WEEK == 0 => lang::n((s / WEEK).into(), "{n} week", "{n} weeks", &[]),
+        s if s % DAY == 0 => lang::n((s / DAY).into(), "{n} day", "{n} days", &[]),
+        s if s % HOUR == 0 => lang::n((s / HOUR).into(), "{n} hour", "{n} hours", &[]),
+        s if s % MINUTE == 0 => lang::n((s / MINUTE).into(), "{n} minute", "{n} minutes", &[]),
+        s => lang::n(s.into(), "{n} second", "{n} seconds", &[]),
     }
+}
+
+/// `n` of a unit in short, as `timer_label` and countdowns write it:
+/// `template` is one of "{n}s", "{n}m", "{n}h", "{n}d" and "{n}w".
+fn short(template: &'static str, n: impl std::fmt::Display) -> String {
+    lang::f(template, &[("n", &n)])
 }
 
 /// A timer in short, for a chat's title and a bubble: "30s", "1m", "1w".
 pub fn timer_label(secs: i32) -> String {
     match secs {
-        ..=0 => "off".into(),
-        s if s % WEEK == 0 => format!("{}w", s / WEEK),
-        s if s % DAY == 0 => format!("{}d", s / DAY),
-        s if s % HOUR == 0 => format!("{}h", s / HOUR),
-        s if s % MINUTE == 0 => format!("{}m", s / MINUTE),
-        s => format!("{s}s"),
+        ..=0 => lang::t("off").into(),
+        s if s % WEEK == 0 => short(lang::key("{n}w"), s / WEEK),
+        s if s % DAY == 0 => short(lang::key("{n}d"), s / DAY),
+        s if s % HOUR == 0 => short(lang::key("{n}h"), s / HOUR),
+        s if s % MINUTE == 0 => short(lang::key("{n}m"), s / MINUTE),
+        s => short(lang::key("{n}s"), s),
     }
 }
 
@@ -244,7 +251,7 @@ impl Destruct {
                 Some(left) => format!("🔥 {}", countdown(left).0),
                 None => "🔥".into(),
             },
-            None if self.after == 0 => "🔥 once".into(),
+            None if self.after == 0 => lang::t("🔥 once").into(),
             None => format!("🔥 {}", timer_label(self.after)),
         }
     }
@@ -268,10 +275,24 @@ fn left(ends: SystemTime, now: SystemTime) -> Option<f64> {
 fn countdown(left: f64) -> (String, f64) {
     let s = left.ceil().max(1.0) as u64;
     let (label, unit) = match s {
-        0..60 => (format!("{s}s"), 1),
+        0..60 => (short(lang::key("{n}s"), s), 1),
         60..3600 => (format!("{}:{:02}", s / 60, s % 60), 1),
-        3600..86400 => (format!("{}h {:02}m", s / 3600, s % 3600 / 60), 60),
-        _ => (format!("{}d {}h", s / 86400, s % 86400 / 3600), 3600),
+        3600..86400 => (
+            format!(
+                "{} {}",
+                short(lang::key("{n}h"), s / 3600),
+                short(lang::key("{n}m"), format!("{:02}", s % 3600 / 60))
+            ),
+            60,
+        ),
+        _ => (
+            format!(
+                "{} {}",
+                short(lang::key("{n}d"), s / 86400),
+                short(lang::key("{n}h"), s % 86400 / 3600)
+            ),
+            3600,
+        ),
     };
     // It says the same until there's a whole unit less.
     let next = left - ((s / unit * unit) as f64 - 1.0);
@@ -320,6 +341,55 @@ mod tests {
         assert_eq!(timer_words(WEEK), "1 week");
         assert_eq!(timer_words(0), "Off");
         assert_eq!(timer_label(90), "90s");
+    }
+
+    #[test]
+    fn in_russian_timers_take_the_form_for_their_number() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        assert_eq!(timer_words(0), "Выкл.");
+        assert_eq!(timer_words(1), "1 секунда");
+        assert_eq!(timer_words(3), "3 секунды");
+        assert_eq!(timer_words(15), "15 секунд");
+        assert_eq!(timer_words(DAY), "1 день");
+        assert_eq!(timer_words(WEEK), "1 неделя");
+        assert_eq!(timer_label(30), "30с");
+        assert_eq!(timer_label(WEEK), "1нед");
+        assert_eq!(countdown(5.0 * 3600.0 + 190.0).0, "5ч 03м");
+        let once = Destruct {
+            after: 0,
+            on_open: true,
+            ends: None,
+        };
+        assert_eq!(once.label(SystemTime::UNIX_EPOCH), "🔥 один раз");
+        let pending = Secret {
+            user_id: 1,
+            state: SecretState::Pending,
+            outbound: true,
+            key_hash: Vec::new(),
+        };
+        assert_eq!(
+            pending.cant_send("Майя").unwrap(),
+            "Ждём, когда Майя появится в сети"
+        );
+    }
+
+    #[test]
+    fn in_vietnamese_timers_are_written_in_words() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        assert_eq!(timer_words(0), "Tắt");
+        assert_eq!(timer_words(15), "15 giây");
+        assert_eq!(timer_words(WEEK), "1 tuần");
+        assert_eq!(timer_label(30), "30 giây");
+        assert_eq!(timer_label(DAY), "1 ngày");
+        assert_eq!(countdown(5.0 * 3600.0 + 190.0).0, "5 giờ 03 phút");
+        assert_eq!(countdown(245.0).0, "4:05");
+        let pending = Secret {
+            user_id: 1,
+            state: SecretState::Pending,
+            outbound: true,
+            key_hash: Vec::new(),
+        };
+        assert_eq!(pending.cant_send("Mai").unwrap(), "Đang chờ Mai trực tuyến");
     }
 
     #[test]

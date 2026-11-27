@@ -22,6 +22,7 @@ use crate::chats::{Badge, List, Peer};
 use crate::config::{ApiKeys, Config};
 use crate::draft;
 use crate::info::{self, About, Member};
+use crate::lang;
 use crate::messages::Sender;
 use crate::reactions::{self, Available, ReactionKind};
 use crate::search::{Has, Query, Who};
@@ -1625,7 +1626,7 @@ impl Tg {
                             .await
                             .map_err(|e| Missed::Said(e.message))?;
                     if info.chat_id == 0 {
-                        return Err(Missed::Said("That message can't be found".into()));
+                        return Err(Missed::Said(lang::t("That message can't be found").into()));
                     }
                     // In a forum, a link can lead to a topic, or a message
                     // in one.
@@ -1928,15 +1929,12 @@ impl Tg {
                 }
             };
             if let Err(e) = set.await {
-                let what = if accept {
-                    "take"
+                let why = if accept {
+                    lang::t("Couldn't take the secret chats others start")
                 } else {
-                    "leave to your phone"
+                    lang::t("Couldn't leave to your phone the secret chats others start")
                 };
-                let why = format!(
-                    "Couldn't {what} the secret chats others start: {}",
-                    e.message
-                );
+                let why = format!("{why}: {}", e.message);
                 let _ = tx.send(TgEvent::Error(why));
             }
         });
@@ -2452,7 +2450,8 @@ async fn public_chat(username: &str, client_id: i32) -> Result<i64, String> {
     match functions::search_public_chat(username.to_string(), client_id).await {
         Ok(enums::Chat::Chat(chat)) => Ok(chat.id),
         Err(e) if e.code == 400 => Err(format!(
-            "Nobody on Telegram is called @{}",
+            "{} @{}",
+            lang::t("Nobody on Telegram is called"),
             crate::text::clean(username)
         )),
         Err(e) => Err(e.message),

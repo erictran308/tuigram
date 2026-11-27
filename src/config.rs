@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::lang;
 use crate::{attach, text};
 
 /// Telegram API credentials from https://my.telegram.org. Release binaries
@@ -153,12 +154,13 @@ pub fn read_small(path: &Path, max: u64) -> std::result::Result<Vec<u8>, String>
     use std::io::Read;
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_file() {
-        return Err("not a file".into());
+        return Err(lang::t("not a file").into());
     }
     if meta.len() > max {
+        let bigger = lang::t("bigger than");
         return Err(match max >> 20 {
-            0 => format!("bigger than {} KB", max >> 10),
-            mb => format!("bigger than {mb} MB"),
+            0 => format!("{bigger} {} {}", max >> 10, lang::t("KB")),
+            mb => format!("{bigger} {mb} {}", lang::t("MB")),
         });
     }
     let mut bytes = Vec::new();

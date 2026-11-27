@@ -6,6 +6,7 @@ use std::ops::Not;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use crate::lang;
 use crate::messages::Preview;
 use crate::text;
 use crate::tg::Upload;
@@ -88,19 +89,24 @@ impl Attachment {
             .map(|n| text::clean(&n.to_string_lossy()))
             .unwrap_or_else(|| text::clean(&path.display().to_string()));
         let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => format!("No such file: {name}"),
-            _ => format!("Can't read {name}: {e}"),
+            std::io::ErrorKind::NotFound => {
+                format!("{}: {name}", lang::t("No such file"))
+            }
+            _ => cant_read(&name, &e),
         })?;
         if meta.is_dir() {
-            return Err(format!("{name} is a folder"));
+            return Err(lang::f("{name} is a folder", &[("name", &name)]));
         }
         if meta.len() == 0 {
-            return Err(format!("{name} is empty"));
+            return Err(lang::f("{name} is empty", &[("name", &name)]));
         }
-        let path = std::fs::canonicalize(path).map_err(|e| format!("Can't read {name}: {e}"))?;
+        let path = std::fs::canonicalize(path).map_err(|e| cant_read(&name, &e))?;
         // TDLib takes paths as JSON text.
         if path.to_str().is_none() {
-            return Err(format!("Can't send {name}: its path isn't valid UTF-8"));
+            return Err(lang::f(
+                "Can't send {name}: its path isn't valid UTF-8",
+                &[("name", &name)],
+            ));
         }
         // The name of what goes out: for a link, that's what it points to,
         // which a link's own name could pass off as something else.
@@ -113,7 +119,7 @@ impl Attachment {
         };
         let identity = std::fs::symlink_metadata(&path)
             .map(|meta| Identity::of(&meta))
-            .map_err(|e| format!("Can't read {name}: {e}"))?;
+            .map_err(|e| cant_read(&name, &e))?;
         Ok(Self {
             path,
             name,
@@ -410,11 +416,22 @@ pub fn complete(typed: &str) -> Completion {
     }
 }
 
-/// A file size the way Telegram shows one: "340 KB", "2.1 MB".
+/// Why a file can't be read, for the status bar.
+fn cant_read(name: &str, e: &std::io::Error) -> String {
+    format!("{} {name}: {e}", lang::t("Can't read"))
+}
+
+/// A file size the way Telegram shows one: "340 KB", "2.1 MB"; in Russian
+/// "340 КБ", "2,1 МБ", in Vietnamese "2,1 MB".
 pub fn size_label(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    const UNITS: [&str; 4] = [
+        lang::key("KB"),
+        lang::key("MB"),
+        lang::key("GB"),
+        lang::key("TB"),
+    ];
     if bytes < 1024 {
-        return format!("{bytes} B");
+        return format!("{bytes} {}", lang::t("B"));
     }
     let mut size = bytes as f64 / 1024.0;
     let mut unit = 0;
@@ -422,10 +439,17 @@ pub fn size_label(bytes: u64) -> String {
         size /= 1024.0;
         unit += 1;
     }
+    let name = lang::t(UNITS[unit]);
     if size < 10.0 {
-        format!("{size:.1} {}", UNITS[unit])
+        let size = format!("{size:.1}");
+        // Russian and Vietnamese write a decimal comma.
+        let size = match lang::current() {
+            lang::Lang::En => size,
+            lang::Lang::Ru | lang::Lang::Vi => size.replace('.', ","),
+        };
+        format!("{size} {name}")
     } else {
-        format!("{size:.0} {}", UNITS[unit])
+        format!("{size:.0} {name}")
     }
 }
 
@@ -694,5 +718,42 @@ mod tests {
         assert_eq!(size_label(340 * 1024), "340 KB");
         assert_eq!(size_label(2_200_000), "2.1 MB");
         assert_eq!(size_label(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn in_russian_sizes_and_refusals_read_as_russian_writes_them() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        assert_eq!(size_label(512), "512 Б");
+        assert_eq!(size_label(2_200_000), "2,1 МБ");
+        assert_eq!(size_label(340 * 1024), "340 КБ");
+        let dir = TempDir::new("refused-ru");
+        assert_eq!(
+            Attachment::new(&dir.file("empty.txt", b"")).unwrap_err(),
+            "empty.txt — пустой файл"
+        );
+        assert_eq!(
+            Attachment::new(&dir.0.join("gone.txt")).unwrap_err(),
+            "Нет такого файла: gone.txt"
+        );
+    }
+
+    #[test]
+    fn in_vietnamese_sizes_take_a_decimal_comma_and_refusals_are_vietnamese() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        assert_eq!(size_label(512), "512 B");
+        assert_eq!(size_label(2_200_000), "2,1 MB");
+        assert_eq!(size_label(340 * 1024), "340 KB");
+        let dir = TempDir::new("refused-vi");
+        assert_eq!(
+            Attachment::new(&dir.file("empty.txt", b"")).unwrap_err(),
+            "empty.txt là tệp trống"
+        );
+        assert_eq!(
+            Attachment::new(&dir.0).unwrap_err(),
+            format!(
+                "{} là một thư mục",
+                dir.0.file_name().unwrap().to_string_lossy()
+            )
+        );
     }
 }

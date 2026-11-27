@@ -228,10 +228,11 @@ fn alert(notes: &[Note]) -> Alert {
             chats.push(&note.chat);
         }
     }
+    let new = |n: usize| crate::lang::n(n as i64, "{n} new message", "{n} new messages", &[]);
     let (title, body) = match (notes, chats.as_slice()) {
         ([note], _) => (note.chat.clone(), note.text.clone()),
-        (_, [chat]) => (chat.to_string(), format!("{} new messages", notes.len())),
-        _ => (format!("{} new messages", notes.len()), chats.join(", ")),
+        (_, [chat]) => (chat.to_string(), new(notes.len())),
+        _ => (new(notes.len()), chats.join(", ")),
     };
     Alert {
         title: cut(&text::flat(&title), MAX_TITLE),
@@ -377,6 +378,36 @@ mod tests {
             notifier.due(later).unwrap(),
             alert("3 new messages", "Bob, Dev team")
         );
+    }
+
+    #[test]
+    fn in_russian_messages_together_are_counted_in_russian() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let mut notifier = Notifier::default();
+        let now = Instant::now();
+        for (id, chat_id, chat) in [(1, 10, "Alice"), (2, 20, "Bob"), (3, 10, "Alice")] {
+            notifier.add(note(id, chat_id, chat, "привет"), now);
+        }
+        assert_eq!(
+            notifier.due(now).unwrap(),
+            alert("3 новых сообщения", "Alice, Bob")
+        );
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_vietnamese_messages_together_are_counted_in_vietnamese() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let mut notifier = Notifier::default();
+        let now = Instant::now();
+        for (id, chat_id, chat) in [(1, 10, "Alice"), (2, 20, "Bob"), (3, 10, "Alice")] {
+            notifier.add(note(id, chat_id, chat, "chào"), now);
+        }
+        assert_eq!(
+            notifier.due(now).unwrap(),
+            alert("3 tin nhắn mới", "Alice, Bob")
+        );
+        crate::lang::set(crate::lang::Lang::En);
     }
 
     #[test]

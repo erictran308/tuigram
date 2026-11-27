@@ -11,6 +11,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::lang;
 use crate::text;
 use crate::voice::{OggOpus, RATE};
 
@@ -32,13 +33,14 @@ const KINDS: [&str; 3] = ["wav", "ogg", "opus"];
 type Make = fn() -> Vec<f32>;
 
 /// tuigram's own sounds: what `settings.toml` calls each, what the `?`
-/// popup does, and how it's made.
+/// popup calls it (in English, put in the language set where shown), and
+/// how it's made.
 const BUILT_IN: [(&str, &str, Make); 5] = [
-    ("ding", "Ding", ding),
-    ("chime", "Chime", chime),
-    ("trill", "Trill", trill),
-    ("pop", "Pop", pop),
-    ("knock", "Knock", knock),
+    ("ding", lang::key("Ding"), ding),
+    ("chime", lang::key("Chime"), chime),
+    ("trill", lang::key("Trill"), trill),
+    ("pop", lang::key("Pop"), pop),
+    ("knock", lang::key("Knock"), knock),
 ];
 
 /// A sound to pick in the `?` popup.
@@ -109,7 +111,7 @@ impl Sounds {
             .iter()
             .map(|&(id, label, make)| Sound {
                 id: id.into(),
-                label: label.into(),
+                label: lang::t(label).into(),
                 source: user.remove(id).map_or(Source::BuiltIn(make), Source::File),
             })
             .collect();
@@ -129,7 +131,11 @@ impl Sounds {
     /// The sound called `id`, ready to play, or why it can't be.
     pub fn samples(&self, id: &str) -> Result<Arc<[i16]>, String> {
         let Some(sound) = self.list.iter().find(|sound| sound.id == id) else {
-            return Err(format!("there is no sound called {:?}", text::clean(id)));
+            let name = format!("{:?}", text::clean(id));
+            return Err(lang::f(
+                "there is no sound called {name}",
+                &[("name", &name)],
+            ));
         };
         let samples = match &sound.source {
             Source::BuiltIn(make) => level(&make()),
@@ -175,10 +181,10 @@ fn read(path: &Path) -> Result<Vec<i16>, String> {
     } else if bytes.starts_with(b"OggS") {
         ogg(&bytes)?
     } else {
-        return Err("it's neither WAV nor Ogg".into());
+        return Err(lang::t("it's neither WAV nor Ogg").into());
     };
     if samples.is_empty() {
-        return Err("it has no sound".into());
+        return Err(no_sound());
     }
     Ok(faded(samples))
 }
@@ -195,7 +201,7 @@ struct Format {
 /// The sound of a WAV file, its channels mixed into one.
 fn wav(bytes: &[u8]) -> Result<Vec<i16>, String> {
     if bytes.get(8..12) != Some(b"WAVE") {
-        return Err("it isn't a WAV file".into());
+        return Err(lang::t("it isn't a WAV file").into());
     }
     let mut format = None;
     let mut at: usize = 12;
@@ -207,7 +213,7 @@ fn wav(bytes: &[u8]) -> Result<Vec<i16>, String> {
         match &head[..4] {
             b"fmt " => format = Some(wav_format(body)?),
             b"data" => {
-                let format = format.ok_or("its sound comes before its format")?;
+                let format = format.ok_or(lang::t("its sound comes before its format"))?;
                 return Ok(resampled(&wav_samples(&format, body), format.rate));
             }
             _ => {}
@@ -215,11 +221,15 @@ fn wav(bytes: &[u8]) -> Result<Vec<i16>, String> {
         // Chunks take an even number of bytes.
         at = start.saturating_add(len).saturating_add(len & 1);
     }
-    Err("it has no sound".into())
+    Err(no_sound())
+}
+
+fn no_sound() -> String {
+    lang::t("it has no sound").into()
 }
 
 fn wav_format(body: &[u8]) -> Result<Format, String> {
-    let short = || "its format is cut short".to_string();
+    let short = || lang::t("its format is cut short").to_string();
     let u16_at = |i: usize| body.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let (Some(tag), Some(channels), Some(bits)) = (u16_at(0), u16_at(2), u16_at(14)) else {
         return Err(short());
@@ -236,11 +246,18 @@ fn wav_format(body: &[u8]) -> Result<Format, String> {
     let float = match (tag, bits) {
         (1, 8 | 16 | 24 | 32) => false,
         (3, 32 | 64) => true,
-        (1 | 3, _) => return Err(format!("{bits}-bit samples can't be played")),
-        _ => return Err("it's compressed, which can't be played: save it as PCM".into()),
+        (1 | 3, _) => {
+            return Err(lang::f(
+                "{bits}-bit samples can't be played",
+                &[("bits", &bits)],
+            ));
+        }
+        _ => {
+            return Err(lang::t("it's compressed, which can't be played: save it as PCM").into());
+        }
     };
     if channels == 0 || !(1000..=384_000).contains(&rate) {
-        return Err("its format is broken".into());
+        return Err(lang::t("its format is broken").into());
     }
     Ok(Format {
         float,
@@ -313,7 +330,7 @@ fn ogg(bytes: &[u8]) -> Result<Vec<i16>, String> {
     match crate::images::contained(|| Ok(decode())) {
         Ok(Ok(samples)) => Ok(samples),
         Ok(Err(e)) => Err(format!("{e:#}")),
-        Err(_) => Err("it couldn't be decoded".into()),
+        Err(_) => Err(lang::t("it couldn't be decoded").into()),
     }
 }
 
@@ -526,6 +543,33 @@ mod tests {
         let mut cut = wav_file(1, 1, RATE, 16, &data);
         cut.truncate(cut.len() - 2);
         assert_eq!(wav(&cut).unwrap().len(), 2, "what's there plays");
+    }
+
+    #[test]
+    fn in_russian_sounds_are_named_and_refused_in_russian() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let sounds = Sounds::built_in();
+        let labels: Vec<&str> = sounds.list.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["Динь", "Перезвон", "Трель", "Хлопок", "Стук"]);
+        assert_eq!(sounds.list[0].id, "ding", "settings.toml still says ding");
+        assert_eq!(wav(b"RIFF").unwrap_err(), "это не файл WAV");
+        let twelve = wav(&wav_file(1, 1, RATE, 12, &pcm16(&[1]))).unwrap_err();
+        assert_eq!(twelve, "12-битные сэмплы не воспроизводятся");
+    }
+
+    #[test]
+    fn in_vietnamese_sounds_are_named_and_refused_in_vietnamese() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let sounds = Sounds::built_in();
+        let labels: Vec<&str> = sounds.list.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["Ting", "Chuông", "Líu lo", "Bụp", "Gõ cửa"]);
+        assert_eq!(wav(b"RIFF").unwrap_err(), "đây không phải tệp WAV");
+        let twelve = wav(&wav_file(1, 1, RATE, 12, &pcm16(&[1]))).unwrap_err();
+        assert_eq!(twelve, "không phát được mẫu 12-bit");
+        assert_eq!(
+            sounds.samples("nope").unwrap_err(),
+            "không có âm thanh nào tên \"nope\""
+        );
     }
 
     #[test]

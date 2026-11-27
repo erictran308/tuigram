@@ -7,647 +7,466 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
+use crate::lang;
 use crate::theme::Colors;
 
-/// Every keyboard shortcut, grouped by where it works. Keep this in step
-/// with the key handling in `app.rs` (and the status bar hints).
+/// Every keyboard shortcut, grouped by where it works, in English: titles,
+/// descriptions and keys written in words are put in the language set where
+/// they're drawn. Keep this in step with the key handling in `app.rs` (and
+/// the status bar hints).
 const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     (
-        "Everywhere",
+        lang::key("Everywhere"),
         &[
-            ("?", "This help, and settings"),
+            ("?", lang::key("This help, and settings")),
             (
                 ":",
-                "Type a command: info, secret, key, timer, leave, proxy or logout",
-            ),
-            ("s", "Find a chat or person: a name, @username or t.me link"),
-            (
-                "I",
-                "What the chat is, and who's in it: Enter on someone writes to them",
-            ),
-            ("H", "Highlight or unhighlight the selected chat"),
-            (
-                "Ctrl-o / Ctrl-i",
-                "Back to the chat or reply you left / forward again",
-            ),
-            (
-                "Ctrl-r",
-                "Resize the panes: h / l, = as at first, Enter keeps, Esc cancels",
-            ),
-            ("q", "Quit (press again to stop waiting)"),
-            ("Ctrl-c", "Quit, except while writing"),
-            (
-                "",
-                "Keys work in the Cyrillic layout too: н is y, р is h; typing takes letters as they are",
-            ),
-        ],
-    ),
-    (
-        "Chat list",
-        &[
-            ("j / k", "Move down / up"),
-            ("gg / G", "First / last chat"),
-            ("Ctrl-d / Ctrl-u", "Half a page down / up"),
-            (
-                "Enter / l",
-                "Open the chat, at its first unread message (Enter / h with the list on the right)",
-            ),
-            ("i", "Open the chat and write"),
-            ("gm", "Open the chat at a message that mentions you"),
-            (
-                "Tab / Shift-Tab",
-                "Next / previous folder, then the archive",
-            ),
-            ("/", "Filter chats by name"),
-            ("p", "Pin or unpin the chat (on all your devices)"),
-            ("m", "Mute or unmute the chat"),
-            ("a", "Archive the chat, or move it out of the archive"),
-            ("Esc", "Clear the filter"),
-        ],
-    ),
-    (
-        "Forum topics",
-        &[
-            ("j / k", "Move down / up"),
-            ("gg / G", "First / last topic"),
-            (
-                "Enter / l",
-                "Open the topic's messages (Enter / h with the list on the right)",
-            ),
-            ("i", "Open the topic and write"),
-            ("Ctrl-r", "Resize the topics pane: h / l, = as at first"),
-            (
-                "h / Esc",
-                "Back to the chat list (l with the list on the right)",
-            ),
-        ],
-    ),
-    (
-        "Messages",
-        &[
-            ("j / k", "Newer / older message"),
-            ("gg / G", "Oldest / newest message"),
-            ("Ctrl-d / Ctrl-u", "Half a page newer / older"),
-            (
-                "Enter",
-                "Send a message that wasn't sent again, show spoilers, view a photo shown only while open, play or pause a voice message, vote in a poll, list a bot's buttons, show the photo, or open the file or link",
-            ),
-            ("y", "Copy the text, a link, or the photo or file"),
-            ("O", "Show the file in the file manager"),
-            ("v", "Show the text to select part of it and copy that"),
-            ("r", "Reply"),
-            ("f", "Forward to another chat (an album goes whole)"),
-            ("e", "Edit your message"),
-            (
-                "R",
-                "React, or take your reaction back (/ finds an emoji by name)",
-            ),
-            ("X", "Take back all your reactions"),
-            ("J", "Join the public group or channel you're viewing"),
-            ("d", "Delete"),
-            ("P", "Pin the message (asks how), or unpin it"),
-            ("gp", "Pinned messages: Enter goes to one, P unpins it"),
-            ("gd", "Go to the message a reply answers"),
-            (
-                "gu",
-                "Go to the first unread message, under the \"Unread messages\" line",
-            ),
-            (
-                "gm / gM",
-                "Go to the oldest unread message that mentions you or answers yours (@ in the chat list), and seeing it reads it; once you've seen them all, to the one before / after the cursor",
-            ),
-            (
-                "Tab",
-                "Forward again, as Ctrl-i (most terminals send Ctrl-i as Tab)",
-            ),
-            ("i", "Write a message"),
-            ("a", "Attach a file by its path (Tab completes it)"),
-            ("p", "Paste a photo, files or text from the clipboard"),
-            (
-                "/",
-                "Search the whole chat; a has: search lists every match in a media browser",
-            ),
-            (
-                "from: has:",
-                "In a search: from:@alice, from:me, from:this or from:a name; has:photo (video, media, file, link, voice, note, gif, audio)",
-            ),
-            (
-                "before: after:",
-                "In a search: before:2025-10-01, after:2025-09-01 (that day counts)",
-            ),
-            ("n / N", "Next older / newer match"),
-            ("Q", "Close the chat, leaving only the chat list"),
-            (
-                "Esc",
-                "End the search, cancel the edit, remove the files, cancel the reply, or go back",
-            ),
-            (
-                "h",
-                "Back to the chat list, or a forum's topics (l with the list on the right)",
-            ),
-        ],
-    ),
-    (
-        "Writing",
-        &[
-            ("Enter", "Send, or save the edit"),
-            ("Alt-Enter / Ctrl-j", "New line"),
-            ("Ctrl-u", "Delete back to the start of the line"),
-            (
-                "**bold**",
-                "Formatting: __italic__ ~~strike~~ ||spoiler|| `code` ```block``` [text](url)",
-            ),
-            (
-                "@name / :smile",
-                "Suggests people in the group, or emoji; Tab puts one in",
-            ),
-            ("/command", "Starting a message: the bots' commands"),
-            ("Ctrl-v", "Paste a photo, files or text from the clipboard"),
-            (
-                "Drop a file",
-                "Attach it; the text you write is its caption",
-            ),
-            (
-                "Ctrl-z",
-                "Turn files just pasted back into their path as text",
-            ),
-            (
-                "Ctrl-t",
-                "Send attached photos as files, uncompressed, or back",
-            ),
-            ("Tab", "Stickers"),
-            (
-                "Esc / Ctrl-c",
-                "Back to Normal mode; what's written stays as the chat's draft, on your other devices too",
-            ),
-        ],
-    ),
-    (
-        "Selecting text (v)",
-        &[
-            ("h / j / k / l", "Move a character, or a row on screen"),
-            ("w / b / e", "Next word / word before / end of the word"),
-            ("0 / $", "Start / end of the line"),
-            ("g / G", "Start / end of the text"),
-            ("Ctrl-d / Ctrl-u", "Half a page down / up"),
-            (
-                "v",
-                "Start selecting where the cursor is, or stop; it takes in both ends, as in vim",
-            ),
-            ("y", "Copy what's selected and close"),
-            ("Esc", "Stop selecting, then close"),
-        ],
-    ),
-    (
-        "Stickers",
-        &[
-            ("h / j / k / l", "Move"),
-            ("H / L", "Previous / next tab: Recent, Favorites, your sets"),
-            ("Enter", "Send the sticker, or the reply"),
-            ("/", "Find stickers by emoji or word"),
-            ("Tab / Esc", "Back to writing"),
-        ],
-    ),
-    (
-        "Photo viewer",
-        &[
-            ("h / l", "The photo before / after it in the chat"),
-            (
-                "j / k",
-                "Zoom in / out (also + / -), up to filling the window",
-            ),
-            ("o", "Open the photo in your computer's viewer"),
-            ("y", "Copy the photo"),
-            ("Enter / Esc / q", "Close"),
-        ],
-    ),
-    (
-        "Video player",
-        &[
-            (
-                "Space",
-                "Play (once) or pause, right in the message (size in Settings)",
-            ),
-            ("z", "Twice as big in the chat, or back"),
-            ("j / k", "Zoom in / out, on the whole window"),
-            ("o", "Open the video in your computer's player"),
-            ("Enter", "Fill the window; it closes once played"),
-            ("Esc / q", "Close"),
-        ],
-    ),
-    (
-        "Bot buttons",
-        &[
-            ("h / j / k / l", "Move, as the buttons are laid out"),
-            ("Tab / Shift-Tab", "Next / previous button"),
-            (
-                "Enter",
-                "Press it: the bot answers, a link opens (asking first), a reply button sends its words",
-            ),
-            ("Esc / q", "Close"),
-        ],
-    ),
-    (
-        "Secret chats",
-        &[
-            (
-                ":secret",
-                "Start one with the person in this chat (asks first); it's kept on this computer only",
-            ),
-            (
-                ":key",
-                "Its key as a picture, to compare with the other person's",
-            ),
-            (":timer", "How long new messages last once they're seen"),
-            (
-                ":leave",
-                "End it for both of you, and delete it here (asks first)",
-            ),
-            (
-                "Enter",
-                "On a 🔥 photo: view it; it's covered again when you move on",
-            ),
-        ],
-    ),
-    (
-        "Search and command prompts",
-        &[
-            ("Enter", "Search, keep the chat filter, or run the command"),
-            (
-                "Tab / Shift-Tab",
-                "Complete a command or a search filter (again for the next one), or the path of a file to attach",
-            ),
-            ("Esc / Ctrl-c", "Cancel"),
-        ],
-    ),
-    (
-        "Forward and find popups",
-        &[
-            ("Type", "Search chats by name, or @username"),
-            ("Up / Down", "Move (also Ctrl-p / Ctrl-n, Tab)"),
-            ("Enter", "Forward there, or open it"),
-            ("Esc", "Cancel"),
-        ],
-    ),
-    (
-        "Menus and popups",
-        &[
-            ("j / k", "Move"),
-            ("Enter", "Choose"),
-            ("1-9", "Choose by number"),
-            (
-                "Space",
-                "Tick a setting, or use a sound or a theme (Enter too); saved at once",
-            ),
-            ("Esc / q", "Close"),
-            ("Tab / h / l", "Switch tabs in this popup"),
-            (
-                "y / n",
-                "Go ahead or not, when asked about a file, a link or joining",
-            ),
-        ],
-    ),
-];
-
-/// The same table in Russian. One row per English row, in the same order,
-/// so both tables size the popup alike.
-const SHORTCUTS_RU: &[(&str, &[(&str, &str)])] = &[
-    (
-        "Везде",
-        &[
-            ("?", "Эта справка и настройки"),
-            (
-                ":",
-                "Команда: info, secret, key, timer, leave, proxy или logout",
+                lang::key("Type a command: info, secret, key, timer, leave, proxy or logout"),
             ),
             (
                 "s",
-                "Найти чат или человека: имя, @username или ссылка t.me",
+                lang::key("Find a chat or person: a name, @username or t.me link"),
             ),
             (
                 "I",
-                "Что это за чат и кто в нём: Enter на человеке — написать ему",
+                lang::key("What the chat is, and who's in it: Enter on someone writes to them"),
             ),
-            ("H", "Выделить чат или снять выделение"),
+            ("H", lang::key("Highlight or unhighlight the selected chat")),
             (
                 "Ctrl-o / Ctrl-i",
-                "Назад к чату или ответу, откуда ушли / снова вперёд",
+                lang::key("Back to the chat or reply you left / forward again"),
             ),
             (
                 "Ctrl-r",
-                "Ширина панелей: h / l, = как было, Enter сохранить, Esc отмена",
+                lang::key("Resize the panes: h / l, = as at first, Enter keeps, Esc cancels"),
             ),
-            ("q", "Выход (ещё раз — не ждать)"),
-            ("Ctrl-c", "Выход, кроме режима набора текста"),
+            ("q", lang::key("Quit (press again to stop waiting)")),
+            ("Ctrl-c", lang::key("Quit, except while writing")),
             (
                 "",
-                "Клавиши работают и в русской раскладке: н — это y, р — это h; при наборе текста буквы как есть",
+                lang::key(
+                    "Keys work in the Cyrillic layout too: н is y, р is h; typing takes letters as they are",
+                ),
             ),
         ],
     ),
     (
-        "Список чатов",
+        lang::key("Chat list"),
         &[
-            ("j / k", "Вниз / вверх"),
-            ("gg / G", "Первый / последний чат"),
-            ("Ctrl-d / Ctrl-u", "Полстраницы вниз / вверх"),
+            ("j / k", lang::key("Move down / up")),
+            ("gg / G", lang::key("First / last chat")),
+            ("Ctrl-d / Ctrl-u", lang::key("Half a page down / up")),
             (
                 "Enter / l",
-                "Открыть чат на первом непрочитанном (Enter / h, если список справа)",
+                lang::key(
+                    "Open the chat, at its first unread message (Enter / h with the list on the right)",
+                ),
             ),
-            ("i", "Открыть чат и писать"),
-            ("gm", "Открыть чат на сообщении с упоминанием вас"),
+            ("i", lang::key("Open the chat and write")),
+            (
+                "gm",
+                lang::key("Open the chat at a message that mentions you"),
+            ),
             (
                 "Tab / Shift-Tab",
-                "Следующая / предыдущая папка, затем архив",
+                lang::key("Next / previous folder, then the archive"),
             ),
-            ("/", "Фильтр чатов по имени"),
-            ("p", "Закрепить / открепить чат (на всех устройствах)"),
-            ("m", "Выключить / включить уведомления чата"),
-            ("a", "В архив или обратно из архива"),
-            ("Esc", "Сбросить фильтр"),
+            ("/", lang::key("Filter chats by name")),
+            (
+                "p",
+                lang::key("Pin or unpin the chat (on all your devices)"),
+            ),
+            ("m", lang::key("Mute or unmute the chat")),
+            (
+                "a",
+                lang::key("Archive the chat, or move it out of the archive"),
+            ),
+            ("Esc", lang::key("Clear the filter")),
         ],
     ),
     (
-        "Темы форума",
+        lang::key("Forum topics"),
         &[
-            ("j / k", "Вниз / вверх"),
-            ("gg / G", "Первая / последняя тема"),
+            ("j / k", lang::key("Move down / up")),
+            ("gg / G", lang::key("First / last topic")),
             (
                 "Enter / l",
-                "Открыть сообщения темы (Enter / h, если список справа)",
+                lang::key("Open the topic's messages (Enter / h with the list on the right)"),
             ),
-            ("i", "Открыть тему и писать"),
-            ("Ctrl-r", "Ширина панели тем: h / l, = как было"),
-            ("h / Esc", "Назад к списку чатов (l, если список справа)"),
+            ("i", lang::key("Open the topic and write")),
+            (
+                "Ctrl-r",
+                lang::key("Resize the topics pane: h / l, = as at first"),
+            ),
+            (
+                "h / Esc",
+                lang::key("Back to the chat list (l with the list on the right)"),
+            ),
         ],
     ),
     (
-        "Сообщения",
+        lang::key("Messages"),
         &[
-            ("j / k", "Новее / старее"),
-            ("gg / G", "Самое старое / новое"),
-            ("Ctrl-d / Ctrl-u", "Полстраницы новее / старее"),
+            ("j / k", lang::key("Newer / older message")),
+            ("gg / G", lang::key("Oldest / newest message")),
+            ("Ctrl-d / Ctrl-u", lang::key("Half a page newer / older")),
             (
                 "Enter",
-                "Отправить неотправленное заново, показать спойлеры, открыть фото «на один раз», играть/пауза голосового, голосовать в опросе, кнопки бота, показать фото, открыть файл или ссылку",
+                lang::key(
+                    "Send a message that wasn't sent again, show spoilers, view a photo shown only while open, play or pause a voice message, vote in a poll, list a bot's buttons, show the photo, or open the file or link",
+                ),
             ),
-            ("y", "Скопировать текст, ссылку, фото или файл"),
-            ("O", "Показать файл в файловом менеджере"),
-            ("v", "Выделить часть текста и скопировать её"),
-            ("r", "Ответить"),
-            ("f", "Переслать в другой чат (альбом — целиком)"),
-            ("e", "Изменить своё сообщение"),
-            ("R", "Реакция, или убрать свою (/ ищет эмодзи по имени)"),
-            ("X", "Убрать все свои реакции"),
-            ("J", "Вступить в группу или канал, который смотрите"),
-            ("d", "Удалить"),
-            ("P", "Закрепить сообщение (спросит как) или открепить"),
-            ("gp", "Закреплённые: Enter — перейти, P — открепить"),
-            ("gd", "К сообщению, на которое отвечает этот ответ"),
+            (
+                "y",
+                lang::key("Copy the text, a link, or the photo or file"),
+            ),
+            ("O", lang::key("Show the file in the file manager")),
+            (
+                "v",
+                lang::key("Show the text to select part of it and copy that"),
+            ),
+            ("r", lang::key("Reply")),
+            (
+                "f",
+                lang::key("Forward to another chat (an album goes whole)"),
+            ),
+            ("e", lang::key("Edit your message")),
+            (
+                "R",
+                lang::key("React, or take your reaction back (/ finds an emoji by name)"),
+            ),
+            ("X", lang::key("Take back all your reactions")),
+            (
+                "J",
+                lang::key("Join the public group or channel you're viewing"),
+            ),
+            ("d", lang::key("Delete")),
+            ("P", lang::key("Pin the message (asks how), or unpin it")),
+            (
+                "gp",
+                lang::key("Pinned messages: Enter goes to one, P unpins it"),
+            ),
+            ("gd", lang::key("Go to the message a reply answers")),
             (
                 "gu",
-                "К первому непрочитанному, под чертой «Непрочитанные сообщения»",
+                lang::key("Go to the first unread message, under the \"Unread messages\" line"),
             ),
             (
                 "gm / gM",
-                "К самому старому непрочитанному с упоминанием вас или ответом вам (@ в списке чатов), просмотр читает его; когда все просмотрены — к сообщению до / после курсора",
+                lang::key(
+                    "Go to the oldest unread message that mentions you or answers yours (@ in the chat list), and seeing it reads it; once you've seen them all, to the one before / after the cursor",
+                ),
             ),
             (
                 "Tab",
-                "Снова вперёд, как Ctrl-i (большинство терминалов шлют Ctrl-i как Tab)",
+                lang::key("Forward again, as Ctrl-i (most terminals send Ctrl-i as Tab)"),
             ),
-            ("i", "Написать сообщение"),
-            ("a", "Приложить файл по пути (Tab дополняет)"),
-            ("p", "Вставить фото, файлы или текст из буфера"),
+            ("i", lang::key("Write a message")),
+            (
+                "a",
+                lang::key("Attach a file by its path (Tab completes it)"),
+            ),
+            (
+                "p",
+                lang::key("Paste a photo, files or text from the clipboard"),
+            ),
             (
                 "/",
-                "Поиск по всему чату; с has: — все совпадения списком, как «Вложения»",
+                lang::key(
+                    "Search the whole chat; a has: search lists every match in a media browser",
+                ),
             ),
             (
                 "from: has:",
-                "В поиске: from:@alice, from:me, from:this или from:имя; has:photo (video, media, file, link, voice, note, gif, audio)",
+                lang::key(
+                    "In a search: from:@alice, from:me, from:this or from:a name; has:photo (video, media, file, link, voice, note, gif, audio)",
+                ),
             ),
             (
                 "before: after:",
-                "В поиске: before:2025-10-01, after:2025-09-01 (тот день считается)",
+                lang::key("In a search: before:2025-10-01, after:2025-09-01 (that day counts)"),
             ),
-            ("n / N", "Следующее старое / новое совпадение"),
-            ("Q", "Закрыть чат, оставив только список чатов"),
+            ("n / N", lang::key("Next older / newer match")),
+            ("Q", lang::key("Close the chat, leaving only the chat list")),
             (
                 "Esc",
-                "Закончить поиск, отменить правку, убрать файлы, отменить ответ или назад",
+                lang::key(
+                    "End the search, cancel the edit, remove the files, cancel the reply, or go back",
+                ),
             ),
             (
                 "h",
-                "Назад к списку чатов или темам форума (l, если список справа)",
+                lang::key(
+                    "Back to the chat list, or a forum's topics (l with the list on the right)",
+                ),
             ),
         ],
     ),
     (
-        "Набор текста",
+        lang::key("Writing"),
         &[
-            ("Enter", "Отправить или сохранить правку"),
-            ("Alt-Enter / Ctrl-j", "Новая строка"),
-            ("Ctrl-u", "Стереть до начала строки"),
+            ("Enter", lang::key("Send, or save the edit")),
+            ("Alt-Enter / Ctrl-j", lang::key("New line")),
+            ("Ctrl-u", lang::key("Delete back to the start of the line")),
             (
-                "**жирный**",
-                "Разметка: __курсив__ ~~зачёркнутый~~ ||спойлер|| `код` ```блок``` [текст](url)",
+                lang::key("**bold**"),
+                lang::key(
+                    "Formatting: __italic__ ~~strike~~ ||spoiler|| `code` ```block``` [text](url)",
+                ),
             ),
             (
-                "@имя / :smile",
-                "Подскажет людей группы или эмодзи; Tab вставляет",
+                lang::key("@name / :smile"),
+                lang::key("Suggests people in the group, or emoji; Tab puts one in"),
             ),
-            ("/команда", "В начале сообщения: команды ботов"),
-            ("Ctrl-v", "Вставить фото, файлы или текст из буфера"),
             (
-                "Drop a file",
-                "Приложить его; написанный текст станет подписью",
+                lang::key("/command"),
+                lang::key("Starting a message: the bots' commands"),
             ),
-            ("Ctrl-z", "Вернуть вставленные файлы обратно в текст пути"),
-            ("Ctrl-t", "Фото как файлы, без сжатия, или обратно"),
-            ("Tab", "Стикеры"),
+            (
+                "Ctrl-v",
+                lang::key("Paste a photo, files or text from the clipboard"),
+            ),
+            (
+                lang::key("Drop a file"),
+                lang::key("Attach it; the text you write is its caption"),
+            ),
+            (
+                "Ctrl-z",
+                lang::key("Turn files just pasted back into their path as text"),
+            ),
+            (
+                "Ctrl-t",
+                lang::key("Send attached photos as files, uncompressed, or back"),
+            ),
+            ("Tab", lang::key("Stickers")),
             (
                 "Esc / Ctrl-c",
-                "Назад в обычный режим; написанное останется черновиком чата, и на других устройствах тоже",
+                lang::key(
+                    "Back to Normal mode; what's written stays as the chat's draft, on your other devices too",
+                ),
             ),
         ],
     ),
     (
-        "Выделение текста (v)",
+        lang::key("Selecting text (v)"),
         &[
-            ("h / j / k / l", "Символ или строка на экране"),
-            ("w / b / e", "Следующее слово / слово перед / конец слова"),
-            ("0 / $", "Начало / конец строки"),
-            ("g / G", "Начало / конец текста"),
-            ("Ctrl-d / Ctrl-u", "Полстраницы вниз / вверх"),
+            (
+                "h / j / k / l",
+                lang::key("Move a character, or a row on screen"),
+            ),
+            (
+                "w / b / e",
+                lang::key("Next word / word before / end of the word"),
+            ),
+            ("0 / $", lang::key("Start / end of the line")),
+            ("g / G", lang::key("Start / end of the text")),
+            ("Ctrl-d / Ctrl-u", lang::key("Half a page down / up")),
             (
                 "v",
-                "Начать выделение с курсора или закончить; захватывает оба конца, как в vim",
+                lang::key(
+                    "Start selecting where the cursor is, or stop; it takes in both ends, as in vim",
+                ),
             ),
-            ("y", "Скопировать выделенное и закрыть"),
-            ("Esc", "Закончить выделение, затем закрыть"),
+            ("y", lang::key("Copy what's selected and close")),
+            ("Esc", lang::key("Stop selecting, then close")),
         ],
     ),
     (
-        "Стикеры",
+        lang::key("Stickers"),
         &[
-            ("h / j / k / l", "Движение"),
-            ("H / L", "Вкладки: Недавние, Избранное, ваши наборы"),
-            ("Enter", "Отправить стикер или ответ"),
-            ("/", "Найти стикеры по эмодзи или слову"),
-            ("Tab / Esc", "Назад к набору текста"),
+            ("h / j / k / l", lang::key("Move")),
+            (
+                "H / L",
+                lang::key("Previous / next tab: Recent, Favorites, your sets"),
+            ),
+            (
+                "Enter",
+                lang::key("Send the sticker (as the reply, if you're replying)"),
+            ),
+            ("/", lang::key("Find stickers by emoji or word")),
+            ("Tab / Esc", lang::key("Back to writing")),
         ],
     ),
     (
-        "Просмотр фото",
+        lang::key("Photo viewer"),
         &[
-            ("h / l", "Фото до / после в чате"),
+            (
+                "h / l",
+                lang::key("The photo before / after it in the chat"),
+            ),
             (
                 "j / k",
-                "Ближе / дальше (также + / -), вплоть до всего окна",
+                lang::key("Zoom in / out (also + / -), up to filling the window"),
             ),
-            ("o", "Открыть фото в просмотрщике компьютера"),
-            ("y", "Скопировать фото"),
-            ("Enter / Esc / q", "Закрыть"),
+            ("o", lang::key("Open the photo in your computer's viewer")),
+            ("y", lang::key("Copy the photo")),
+            ("Enter / Esc / q", lang::key("Close")),
         ],
     ),
     (
-        "Видеоплеер",
+        lang::key("Video player"),
         &[
             (
                 "Space",
-                "Играть (один раз) / пауза, прямо в сообщении (размер — в настройках)",
+                lang::key("Play (once) or pause, right in the message (size in Settings)"),
             ),
-            ("z", "Вдвое больше в чате, или обратно"),
-            ("j / k", "Ближе / дальше, на всём окне"),
-            ("o", "Открыть видео в плеере компьютера"),
-            ("Enter", "На всё окно; закроется после проигрывания"),
-            ("Esc / q", "Закрыть"),
+            ("z", lang::key("Twice as big in the chat, or back")),
+            ("j / k", lang::key("Zoom in / out, on the whole window")),
+            ("o", lang::key("Open the video in your computer's player")),
+            ("Enter", lang::key("Fill the window; it closes once played")),
+            ("Esc / q", lang::key("Close")),
         ],
     ),
     (
-        "Кнопки ботов",
+        lang::key("Bot buttons"),
         &[
-            ("h / j / k / l", "Движение по кнопкам, как они разложены"),
-            ("Tab / Shift-Tab", "Следующая / предыдущая кнопка"),
+            (
+                "h / j / k / l",
+                lang::key("Move, as the buttons are laid out"),
+            ),
+            ("Tab / Shift-Tab", lang::key("Next / previous button")),
             (
                 "Enter",
-                "Нажать: бот ответит, ссылка откроется (спросив), кнопка-ответ пошлёт свои слова",
+                lang::key(
+                    "Press it: the bot answers, a link opens (asking first), a reply button sends its words",
+                ),
             ),
-            ("Esc / q", "Закрыть"),
+            ("Esc / q", lang::key("Close")),
         ],
     ),
     (
-        "Секретные чаты",
+        lang::key("Secret chats"),
         &[
             (
                 ":secret",
-                "Начать с человеком из этого чата (спросит); хранится только на этом компьютере",
+                lang::key(
+                    "Start one with the person in this chat (asks first); it's kept on this computer only",
+                ),
             ),
-            (":key", "Его ключ картинкой, чтобы сверить с собеседником"),
-            (":timer", "Сколько живут новые сообщения после прочтения"),
-            (":leave", "Завершить для обоих и удалить здесь (спросит)"),
+            (
+                ":key",
+                lang::key("Its key as a picture, to compare with the other person's"),
+            ),
+            (
+                ":timer",
+                lang::key("How long new messages last once they're seen"),
+            ),
+            (
+                ":leave",
+                lang::key("End it for both of you, and delete it here (asks first)"),
+            ),
             (
                 "Enter",
-                "На фото 🔥: посмотреть; при переходе дальше снова скроется",
+                lang::key("On a 🔥 photo: view it; it's covered again when you move on"),
             ),
         ],
     ),
     (
-        "Строки поиска и команд",
+        lang::key("Search and command prompts"),
         &[
             (
                 "Enter",
-                "Искать, оставить фильтр чата или выполнить команду",
+                lang::key("Search, keep the chat filter, or run the command"),
             ),
             (
                 "Tab / Shift-Tab",
-                "Дополнить команду или фильтр поиска (ещё раз — следующий), или путь файла для вложения",
+                lang::key(
+                    "Complete a command or a search filter (again for the next one), or the path of a file to attach",
+                ),
             ),
-            ("Esc / Ctrl-c", "Отмена"),
+            ("Esc / Ctrl-c", lang::key("Cancel")),
         ],
     ),
     (
-        "Окна пересылки и поиска",
+        lang::key("Forward and find popups"),
         &[
-            ("Печатайте", "Поиск чатов по имени или @username"),
-            ("Up / Down", "Движение (также Ctrl-p / Ctrl-n, Tab)"),
-            ("Enter", "Переслать туда или открыть"),
-            ("Esc", "Отмена"),
+            (
+                lang::key("Type"),
+                lang::key("Search chats by name, or @username"),
+            ),
+            ("Up / Down", lang::key("Move (also Ctrl-p / Ctrl-n, Tab)")),
+            ("Enter", lang::key("Forward there, or open it")),
+            ("Esc", lang::key("Cancel")),
         ],
     ),
     (
-        "Меню и окна",
+        lang::key("Menus and popups"),
         &[
-            ("j / k", "Движение"),
-            ("Enter", "Выбрать"),
-            ("1-9", "Выбрать по номеру"),
+            ("j / k", lang::key("Move")),
+            ("Enter", lang::key("Choose")),
+            ("1-9", lang::key("Choose by number")),
             (
                 "Space",
-                "Отметить настройку или применить звук или тему (Enter тоже); сохраняется сразу",
+                lang::key("Tick a setting, or use a sound or a theme (Enter too); saved at once"),
             ),
-            ("Esc / q", "Закрыть"),
-            ("Tab / h / l", "Вкладки этого окна"),
+            ("Esc / q", lang::key("Close")),
+            ("Tab / h / l", lang::key("Switch tabs in this popup")),
             (
                 "y / n",
-                "Согласиться или нет, когда спрашивают про файл, ссылку или вступление",
+                lang::key("Go ahead or not, when asked about a file, a link or joining"),
             ),
         ],
     ),
 ];
 
-/// The table in the language set: Russian where translated, else the
-/// English original. Both hold every group, one row per row.
-fn table(ru: bool) -> &'static [(&'static str, &'static [(&'static str, &'static str)])] {
-    if ru { SHORTCUTS_RU } else { SHORTCUTS }
+/// A key as the language set writes it: only keys written in words, such as
+/// "Drop a file", have other words; the rest are looked up and stay as they are.
+fn key_text(key: &'static str) -> &'static str {
+    lang::t(key)
 }
 
 /// The longest key, which sets where the descriptions start.
-fn key_width(ru: bool) -> usize {
-    table(ru)
+fn key_width() -> usize {
+    SHORTCUTS
         .iter()
         .flat_map(|(_, keys)| keys.iter())
-        .map(|(key, _)| key.width())
+        .map(|&(key, _)| key_text(key).width())
         .max()
         .unwrap_or(0)
 }
 
-/// The shortcuts as lines: a heading per group, then each key and what it does.
-fn lines(colors: &Colors, ru: bool) -> Vec<Line<'static>> {
-    let key_width = key_width(ru);
+/// The shortcuts as lines, in the language set: a heading per group, then
+/// each key and what it does.
+fn lines(colors: &Colors) -> Vec<Line<'static>> {
+    let key_width = key_width();
     let mut lines = Vec::new();
-    for (i, (group, keys)) in table(ru).iter().enumerate() {
+    for (i, &(group, keys)) in SHORTCUTS.iter().enumerate() {
         if i > 0 {
             lines.push(Line::default());
         }
-        lines.push(Line::from(format!(" {group}")).fg(colors.accent).bold());
-        for (key, what) in keys.iter() {
+        lines.push(
+            Line::from(format!(" {}", lang::t(group)))
+                .fg(colors.accent)
+                .bold(),
+        );
+        for &(key, what) in keys {
+            let key = key_text(key);
+            let pad = " ".repeat(key_width - key.width());
             lines.push(Line::from(vec![
-                Span::from(format!("   {key:<key_width$}  ")).fg(colors.primary),
-                Span::from(*what),
+                Span::from(format!("   {key}{pad}  ")).fg(colors.primary),
+                Span::from(lang::t(what)),
             ]));
         }
     }
     lines
 }
 
-/// Columns the widest line takes, plus one for the scrollbar, for sizing the
-/// popup.
-pub fn width(ru: bool) -> usize {
-    let what = table(ru)
+/// Columns the widest line takes in the language set, plus one for the
+/// scrollbar, for sizing the popup.
+pub fn width() -> usize {
+    let what = SHORTCUTS
         .iter()
         .flat_map(|(_, keys)| keys.iter())
-        .map(|(_, what)| what.width())
+        .map(|&(_, what)| lang::t(what).width())
         .max()
         .unwrap_or(0);
     // Indent, the keys, a gap, then the descriptions.
-    3 + key_width(ru) + 2 + what + 1
+    3 + key_width() + 2 + what + 1
 }
 
 /// Rows the list takes, for sizing the popup.
-pub fn height(ru: bool) -> usize {
-    table(ru)
+pub fn height() -> usize {
+    SHORTCUTS
         .iter()
         .map(|(_, keys)| keys.len() + 2)
         .sum::<usize>()
@@ -656,8 +475,8 @@ pub fn height(ru: bool) -> usize {
 
 /// Draws the list from row `scroll`, first pulling `scroll` back if it's
 /// past the end.
-pub fn draw(frame: &mut Frame, area: Rect, scroll: &mut usize, ru: bool, colors: &Colors) {
-    let lines = lines(colors, ru);
+pub fn draw(frame: &mut Frame, area: Rect, scroll: &mut usize, colors: &Colors) {
+    let lines = lines(colors);
     let max = lines.len().saturating_sub(usize::from(area.height));
     *scroll = (*scroll).min(max);
     frame.render_widget(Paragraph::new(lines).scroll((*scroll as u16, 0)), area);
@@ -667,31 +486,47 @@ pub fn draw(frame: &mut Frame, area: Rect, scroll: &mut usize, ru: bool, colors:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::Lang;
 
     #[test]
-    fn height_counts_every_line() {
-        for ru in [false, true] {
-            assert_eq!(height(ru), lines(&Colors::default(), ru).len());
+    fn height_counts_every_line_in_every_language() {
+        for language in Lang::ALL {
+            lang::set(language);
+            assert_eq!(height(), lines(&Colors::default()).len(), "{language:?}");
         }
     }
 
     #[test]
-    fn width_leaves_room_for_every_line_and_the_scrollbar() {
-        for ru in [false, true] {
-            let widest = lines(&Colors::default(), ru)
+    fn width_leaves_room_for_every_line_and_the_scrollbar_in_every_language() {
+        for language in Lang::ALL {
+            lang::set(language);
+            let widest = lines(&Colors::default())
                 .iter()
                 .map(Line::width)
                 .max()
                 .unwrap();
-            assert_eq!(width(ru), widest + 1);
+            assert_eq!(width(), widest + 1, "{language:?}");
         }
     }
 
     #[test]
-    fn the_russian_table_has_a_row_for_every_english_one() {
-        assert_eq!(SHORTCUTS.len(), SHORTCUTS_RU.len(), "sections");
-        for ((title, en), (_, ru)) in SHORTCUTS.iter().zip(SHORTCUTS_RU) {
-            assert_eq!(en.len(), ru.len(), "{title}");
-        }
+    fn keys_written_in_words_are_translated_and_the_rest_stay() {
+        let text = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let row = |key: &str| {
+            let lines = lines(&Colors::default());
+            lines.iter().map(text).find(|l| l.contains(key)).unwrap()
+        };
+        lang::set(Lang::Ru);
+        assert!(row("Перетащить файл").contains("Прикрепить его"));
+        assert!(row("Alt-Enter / Ctrl-j").contains("Новая строка"));
+
+        lang::set(Lang::Vi);
+        assert_eq!(row("Mọi nơi"), " Mọi nơi");
+        assert!(row("Alt-Enter / Ctrl-j").contains("Xuống dòng"));
     }
 }

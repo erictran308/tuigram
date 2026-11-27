@@ -17,6 +17,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::chats::{self, Chats, Tab};
 use crate::images::Images;
+use crate::lang;
 use crate::theme::Colors;
 
 use super::messages::Names;
@@ -59,14 +60,18 @@ fn with_logo(title: String, width: u16, colors: &Colors) -> Line<'static> {
 /// After a muted chat's name.
 const MUTED: &str = " 🔕";
 /// After the name of a chat the MTProto proxy in use put in the list.
-const SPONSORED: &str = " proxy sponsor";
+fn sponsored_label() -> &'static str {
+    lang::t(" proxy sponsor")
+}
 /// On the right of a pinned chat with nothing unread.
 const PINNED: &str = "📌";
 /// In place of the count of a chat marked as unread, with nothing in it
 /// unread.
 const MARKED_UNREAD: &str = "●";
 /// Before what was left written in a chat.
-const DRAFT: &str = "Draft: ";
+fn draft_label() -> &'static str {
+    lang::t("Draft: ")
+}
 /// A folder's tab shows at most this many columns of its name.
 const TAB_NAME_COLS: usize = 16;
 
@@ -100,17 +105,21 @@ pub fn draw(
         users: list.users,
         chats,
     };
+    let shown = chats.ids().len();
     let mut title = if filter.is_empty() {
-        format!("Chats ({}) ", chats.ids().len())
+        lang::f("Chats ({n}) ", &[("n", &shown)])
     } else {
-        format!(
-            "Chats ({} of {}) /{filter} ",
-            chats.ids().len(),
-            chats.total()
+        lang::f(
+            "Chats ({n} of {total}) /{filter} ",
+            &[
+                ("n", &shown),
+                ("total", &chats.total()),
+                ("filter", &filter),
+            ],
         )
     };
     if list.loading {
-        title.push_str("loading… ");
+        title.push_str(lang::t("loading… "));
     }
     let block = super::bordered(colors)
         .title(with_logo(title, area.width, colors))
@@ -207,7 +216,11 @@ pub fn draw(
             // Like Telegram's verdict, the title is cut to leave room for
             // it, so a long one can't hide it.
             let sponsored = chats.sponsored(id);
-            let sponsored_w = if sponsored { SPONSORED.width() } else { 0 };
+            let sponsored_w = if sponsored {
+                sponsored_label().width()
+            } else {
+                0
+            };
             let secret = chats.is_secret(id);
             let lock_w = if secret { LOCK_WIDTH } else { 0 };
             let badge_w: usize = badges.iter().map(|b| b.content.width()).sum();
@@ -227,7 +240,7 @@ pub fn draw(
                 first.push(super::badge_span(mark, colors));
             }
             if sponsored {
-                first.push(Span::from(SPONSORED).fg(colors.muted));
+                first.push(Span::from(sponsored_label()).fg(colors.muted));
             }
             if muted {
                 first.push(Span::from(MUTED).fg(colors.muted));
@@ -247,8 +260,8 @@ pub fn draw(
                 }
                 // As in Telegram, in place of the last message.
                 (None, Some(draft)) if list.open != Some(id) => {
-                    second.push(Span::from(DRAFT).fg(colors.error));
-                    let room = width.saturating_sub(DRAFT.width());
+                    second.push(Span::from(draft_label()).fg(colors.error));
+                    let room = width.saturating_sub(draft_label().width());
                     second.push(Span::from(truncate(&draft.snippet(), room)).fg(colors.subtle));
                 }
                 (None, _) => {
@@ -268,10 +281,10 @@ pub fn draw(
 
     let empty = match () {
         _ if !items.is_empty() => None,
-        _ if !filter.is_empty() => Some("No chats match"),
-        _ if list.loading => Some("Loading…"),
+        _ if !filter.is_empty() => Some(lang::t("No chats match")),
+        _ if list.loading => Some(lang::t("Loading…")),
         // The main list is empty only until it loads.
-        _ if chats.shown() != chats::List::Main => Some("No chats here"),
+        _ if chats.shown() != chats::List::Main => Some(lang::t("No chats here")),
         _ => None,
     };
     if let Some(empty) = empty {
@@ -967,6 +980,63 @@ mod tests {
             cells(&buf, 1, 3, 38).contains("No chats here"),
             "Alice isn't in Games"
         );
+    }
+
+    #[test]
+    fn in_russian_the_list_names_its_own_tabs_but_not_your_folders() {
+        use tdlib_rs::types::{ChatFolderInfo, ChatFolderName, FormattedText};
+        crate::lang::set(crate::lang::Lang::Ru);
+        crate::tg::quiet();
+        let mut chats = Chats::default();
+        chats.add_local(1, "Alice", None).is_private = true;
+        chats.add_local(2, "Climbing club", None);
+        chats.add_local(3, "Old news", None);
+        chats.add_local_to(chats::List::Archive, 3);
+        let work = ChatFolderInfo {
+            id: 1,
+            name: ChatFolderName {
+                text: FormattedText {
+                    text: "Work".into(),
+                    entities: Vec::new(),
+                },
+                animate_custom_emoji: false,
+            },
+            ..ChatFolderInfo::default()
+        };
+        chats.set_folders(&[work], 0);
+        let user = |user_id| MessageSender::User(MessageSenderUser { user_id });
+        chats.set_action(1, None, &user(7), &ChatAction::Typing);
+        chats.keep_draft(2, crate::draft::Draft::new("до встречи", None));
+        chats.refresh();
+        let draw = |chats: &Chats| {
+            let buf = render(
+                &list(chats, None),
+                &mut images(ProtocolType::Halfblocks),
+                40,
+                14,
+            );
+            let rows: Vec<String> = (0..buf.area.height)
+                .map(|y| cells(&buf, 0, y, 40))
+                .collect();
+            (buf, rows)
+        };
+        let (buf, rows) = draw(&chats);
+        assert!(rows[0].contains("Чаты (3)"), "{rows:#?}");
+        // The folder's name is yours, whatever the language.
+        assert_eq!(cells(&buf, 1, 1, 38).trim_end(), " Все чаты   Work   Архив");
+        assert!(row_has(&rows, "печатает…"), "{rows:#?}");
+        assert!(row_has(&rows, "Черновик: до встречи"), "{rows:#?}");
+
+        chats.show(chats::List::Archive);
+        chats.refresh();
+        let (buf, rows) = draw(&chats);
+        assert_eq!(buf[(20, 1)].bg, Colors::default().accent, "{rows:#?}");
+        assert!(row_has(&rows, "Old news"));
+    }
+
+    /// Some row has `needle` in it.
+    fn row_has(rows: &[String], needle: &str) -> bool {
+        rows.iter().any(|r| r.contains(needle))
     }
 
     #[test]

@@ -25,6 +25,7 @@ use ratatui_image::picker::cap_parser::Parser;
 use tdlib_rs::types::VideoNote;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::lang;
 use crate::messages::{MediaFile, Msg};
 use crate::term::{self, Terminal};
 use crate::theme::Colors;
@@ -315,7 +316,7 @@ fn pump_frames(
             if !stop.load(Relaxed) {
                 send(match e.kind() {
                     std::io::ErrorKind::UnexpectedEof => News::Ended,
-                    _ => News::Failed(format!("decoding broke: {e}")),
+                    _ => News::Failed(format!("{}: {e}", lang::t("decoding broke"))),
                 });
             }
             return;
@@ -324,7 +325,8 @@ fn pump_frames(
         let written = std::fs::write(&tmp, &buf).and_then(|()| std::fs::rename(&tmp, &out));
         if let Err(e) = written {
             send(News::Failed(format!(
-                "the frame file can't be written: {e}"
+                "{}: {e}",
+                lang::t("the frame file can't be written")
             )));
             return;
         }
@@ -536,7 +538,7 @@ fn said(line: &str) -> Option<Said> {
         "end-file" if said.get("reason")? == "error" => {
             let why = said.get("file_error").and_then(|e| e.as_str());
             Some(Said::Failed(crate::text::clean(
-                why.unwrap_or("it can't be played"),
+                why.unwrap_or(lang::t("it can't be played")),
             )))
         }
         "end-file" => Some(Said::Ended),
@@ -617,7 +619,7 @@ fn spawn_frames(
         Ok(ffmpeg) => ffmpeg,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&dir);
-            return Err(e).context("ffmpeg isn't installed");
+            return Err(e).context(lang::t("ffmpeg isn't installed"));
         }
     };
     // From here on, dropping the player cleans up after it.
@@ -760,9 +762,9 @@ impl VideoView {
     /// Playing; paused; waiting for the file.
     pub fn status(&self) -> &'static str {
         match &self.player {
-            None => "loading…",
-            Some(p) if p.paused() => "paused",
-            Some(_) => "playing",
+            None => lang::t("loading…"),
+            Some(p) if p.paused() => lang::t("paused"),
+            Some(_) => lang::t("playing"),
         }
     }
 
@@ -882,11 +884,12 @@ impl VideoView {
         let now = self.position().min(f64::from(self.note.duration)) as u32;
         let of = self.note.duration.max(0) as u32;
         let mut title = format!(
-            " {} · {} · {}:{:02} of {}:{:02}",
+            " {} · {} · {}:{:02} {} {}:{:02}",
             self.file.label,
             self.status(),
             now / 60,
             now % 60,
+            lang::t("of"),
             of / 60,
             of % 60
         );

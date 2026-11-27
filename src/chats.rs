@@ -19,6 +19,7 @@ use tdlib_rs::types::{
 
 use crate::draft::Draft;
 use crate::images::Thumbnail;
+use crate::lang;
 use crate::messages::{Sender, decode_minithumbnail, without_spoilers};
 use crate::search;
 use crate::secret::Secret;
@@ -57,8 +58,9 @@ pub struct Chat {
     /// no photo.
     accent: i32,
     /// Who is typing (or recording, sending a photo, …) right now, in the
-    /// order they started, with what they're doing, e.g. "typing", and in a
-    /// forum the topic they're doing it in.
+    /// order they started, with what they're doing in English, e.g. "typing"
+    /// ([`doing_words`] words it in the language set), and in a forum the
+    /// topic they're doing it in.
     pub activity: Vec<(Sender, &'static str, Option<i32>)>,
     /// The person or group the chat is with, for its [`Badge`].
     pub peer: Option<Peer>,
@@ -119,9 +121,13 @@ pub struct Tab {
 }
 
 /// What the tab of the main list is called, as in Telegram.
-const ALL_CHATS: &str = "All";
+fn all_chats() -> &'static str {
+    lang::t("All")
+}
 /// And the archive's.
-const ARCHIVE: &str = "Archive";
+fn archive() -> &'static str {
+    lang::t("Archive")
+}
 
 impl Chat {
     /// TDLib's order of the chat in a list; 0 if it isn't in it.
@@ -196,8 +202,8 @@ impl Badge {
     /// The mark after the name, with its leading space.
     pub fn mark(self) -> &'static str {
         match self {
-            Badge::Scam => " SCAM",
-            Badge::Fake => " FAKE",
+            Badge::Scam => lang::t(" SCAM"),
+            Badge::Fake => lang::t(" FAKE"),
             Badge::Official => " ✓",
         }
     }
@@ -226,7 +232,9 @@ impl ChatPhoto {
 }
 
 /// What Telegram calls your chat with yourself.
-const SAVED_MESSAGES: &str = "Saved Messages";
+fn saved_messages() -> &'static str {
+    lang::t("Saved Messages")
+}
 
 #[derive(Default)]
 pub struct Chats {
@@ -626,13 +634,13 @@ impl Chats {
             .iter()
             .map(|(id, name)| tab(List::Folder(*id), name))
             .collect();
-        tabs.insert(self.main_at.min(tabs.len()), tab(List::Main, ALL_CHATS));
+        tabs.insert(self.main_at.min(tabs.len()), tab(List::Main, all_chats()));
         let archived = self
             .by_id
             .values()
             .any(|c| c.positions.contains_key(&List::Archive));
         if archived || self.shown == List::Archive {
-            tabs.push(tab(List::Archive, ARCHIVE));
+            tabs.push(tab(List::Archive, archive()));
         }
         if tabs.len() == 1 { Vec::new() } else { tabs }
     }
@@ -941,7 +949,7 @@ impl Chats {
 
     pub fn title(&self, chat_id: i64) -> Option<&str> {
         if self.is_saved(chat_id) {
-            return Some(SAVED_MESSAGES);
+            return Some(saved_messages());
         }
         self.by_id.get(&chat_id).map(|c| c.title.as_str())
     }
@@ -1033,24 +1041,50 @@ fn scope_index(scope: &NotificationSettingsScope) -> usize {
 
 /// What a chat action shows as, in Telegram's words: "Alice is
 /// *typing*". `None` to stop showing one. Watching an emoji's animation shows
-/// nothing, as in Telegram, which plays it instead.
+/// nothing, as in Telegram, which plays it instead. In English here;
+/// [`doing_words`] words it in the language set.
 fn activity(action: &ChatAction) -> Option<&'static str> {
     Some(match action {
-        ChatAction::Typing => "typing",
-        ChatAction::RecordingVideo => "recording a video",
-        ChatAction::UploadingVideo(_) => "sending a video",
-        ChatAction::RecordingVoiceNote => "recording a voice message",
-        ChatAction::UploadingVoiceNote(_) => "sending a voice message",
-        ChatAction::UploadingPhoto(_) => "sending a photo",
-        ChatAction::UploadingDocument(_) => "sending a file",
-        ChatAction::ChoosingSticker => "choosing a sticker",
-        ChatAction::ChoosingLocation => "choosing a location",
-        ChatAction::ChoosingContact => "choosing a contact",
-        ChatAction::StartPlayingGame => "playing a game",
-        ChatAction::RecordingVideoNote => "recording a video message",
-        ChatAction::UploadingVideoNote(_) => "sending a video message",
+        ChatAction::Typing => lang::key("typing"),
+        ChatAction::RecordingVideo => lang::key("recording a video"),
+        ChatAction::UploadingVideo(_) => lang::key("sending a video"),
+        ChatAction::RecordingVoiceNote => lang::key("recording a voice message"),
+        ChatAction::UploadingVoiceNote(_) => lang::key("sending a voice message"),
+        ChatAction::UploadingPhoto(_) => lang::key("sending a photo"),
+        ChatAction::UploadingDocument(_) => lang::key("sending a file"),
+        ChatAction::ChoosingSticker => lang::key("choosing a sticker"),
+        ChatAction::ChoosingLocation => lang::key("choosing a location"),
+        ChatAction::ChoosingContact => lang::key("choosing a contact"),
+        ChatAction::StartPlayingGame => lang::key("playing a game"),
+        ChatAction::RecordingVideoNote => lang::key("recording a video message"),
+        ChatAction::UploadingVideoNote(_) => lang::key("sending a video message"),
         ChatAction::WatchingAnimations(_) | ChatAction::Cancel => return None,
     })
+}
+
+/// `doing`, a chat action's English words from [`activity`], in the language
+/// set: for one person, or for `several`, whose verb differs in Russian
+/// ("печатает", "печатают"). English's "is"/"are" go around it.
+pub fn doing_words(doing: &'static str, several: bool) -> &'static str {
+    if !several {
+        return lang::t(doing);
+    }
+    match doing {
+        "typing" => lang::tc("several", "typing"),
+        "recording a video" => lang::tc("several", "recording a video"),
+        "sending a video" => lang::tc("several", "sending a video"),
+        "recording a voice message" => lang::tc("several", "recording a voice message"),
+        "sending a voice message" => lang::tc("several", "sending a voice message"),
+        "sending a photo" => lang::tc("several", "sending a photo"),
+        "sending a file" => lang::tc("several", "sending a file"),
+        "choosing a sticker" => lang::tc("several", "choosing a sticker"),
+        "choosing a location" => lang::tc("several", "choosing a location"),
+        "choosing a contact" => lang::tc("several", "choosing a contact"),
+        "playing a game" => lang::tc("several", "playing a game"),
+        "recording a video message" => lang::tc("several", "recording a video message"),
+        "sending a video message" => lang::tc("several", "sending a video message"),
+        _ => lang::t(doing),
+    }
 }
 
 /// How much of the last message a chat list row keeps.
@@ -1060,7 +1094,7 @@ const PREVIEW_CHARS: usize = 300;
 fn preview(message: &Message) -> String {
     let text = snippet(message);
     if message.is_outgoing {
-        format!("You: {text}")
+        format!("{}: {text}", lang::t("You"))
     } else {
         text
     }
@@ -1099,24 +1133,37 @@ fn labeled_text(content: &MessageContent, text: impl Fn(&FormattedText) -> Strin
     };
     match content {
         MessageContent::MessageText(m) => text(&m.text),
-        MessageContent::MessagePhoto(m) => labeled("Photo", &m.caption),
-        MessageContent::MessageVideo(m) => labeled("Video", &m.caption),
+        MessageContent::MessagePhoto(m) => labeled(lang::t("Photo"), &m.caption),
+        MessageContent::MessageVideo(m) => labeled(lang::t("Video"), &m.caption),
         MessageContent::MessageAnimation(m) => labeled("GIF", &m.caption),
-        MessageContent::MessageDocument(m) => {
-            labeled(&format!("File: {}", m.document.file_name), &m.caption)
+        MessageContent::MessageDocument(m) => labeled(
+            &format!("{}: {}", lang::t("File"), m.document.file_name),
+            &m.caption,
+        ),
+        MessageContent::MessageAudio(m) => labeled(lang::t("Audio"), &m.caption),
+        MessageContent::MessageVoiceNote(m) => labeled(lang::t("Voice message"), &m.caption),
+        MessageContent::MessageVideoNote(_) => {
+            format!("[{}]", lang::t("Video message"))
         }
-        MessageContent::MessageAudio(m) => labeled("Audio", &m.caption),
-        MessageContent::MessageVoiceNote(m) => labeled("Voice message", &m.caption),
-        MessageContent::MessageVideoNote(_) => "[Video message]".into(),
-        MessageContent::MessageSticker(m) => format!("[Sticker {}]", m.sticker.emoji),
-        MessageContent::MessagePoll(m) => labeled("Poll", &m.poll.question),
-        MessageContent::MessageLocation(_) => "[Location]".into(),
-        MessageContent::MessageContact(_) => "[Contact]".into(),
-        MessageContent::MessageExpiredPhoto => "[Photo expired]".into(),
-        MessageContent::MessageExpiredVideo => "[Video expired]".into(),
-        MessageContent::MessageExpiredVideoNote => "[Video message expired]".into(),
-        MessageContent::MessageExpiredVoiceNote => "[Voice message expired]".into(),
-        _ => "[Message]".into(),
+        MessageContent::MessageSticker(m) => {
+            format!("[{} {}]", lang::t("Sticker"), m.sticker.emoji)
+        }
+        MessageContent::MessagePoll(m) => labeled(lang::t("Poll"), &m.poll.question),
+        MessageContent::MessageLocation(_) => format!("[{}]", lang::t("Location")),
+        MessageContent::MessageContact(_) => format!("[{}]", lang::t("Contact")),
+        MessageContent::MessageExpiredPhoto => {
+            format!("[{}]", lang::t("Photo expired"))
+        }
+        MessageContent::MessageExpiredVideo => {
+            format!("[{}]", lang::t("Video expired"))
+        }
+        MessageContent::MessageExpiredVideoNote => {
+            format!("[{}]", lang::t("Video message expired"))
+        }
+        MessageContent::MessageExpiredVoiceNote => {
+            format!("[{}]", lang::t("Voice message expired"))
+        }
+        _ => format!("[{}]", lang::t("Message")),
     }
 }
 
@@ -1144,6 +1191,61 @@ mod tests {
 
     fn user(user_id: i64) -> MessageSender {
         MessageSender::User(types::MessageSenderUser { user_id })
+    }
+
+    #[test]
+    fn in_russian_media_saved_messages_and_typing_have_russian_words() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let mut list = chats(&[(1, 50, 0)]);
+        list.set_action(1, None, &user(7), &ChatAction::Typing);
+        let doing = list.get(1).unwrap().activity[0].1;
+        assert_eq!(doing_words(doing, false), "печатает");
+        assert_eq!(doing_words(doing, true), "печатают", "for several");
+        let photo = MessageContent::MessagePhoto(types::MessagePhoto {
+            caption: FormattedText {
+                text: "закат".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(content_text(&photo), "[Фото] закат");
+        assert_eq!(
+            content_text(&MessageContent::MessageExpiredVoiceNote),
+            "[Срок действия голосового сообщения истёк]"
+        );
+        list.set_my_id(1);
+        assert_eq!(list.title(1), Some("Избранное"));
+        crate::lang::set(crate::lang::Lang::En);
+        assert_eq!(doing_words(doing, false), "typing", "back in English");
+    }
+
+    #[test]
+    fn in_vietnamese_media_saved_messages_and_typing_have_vietnamese_words() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let mut list = chats(&[(1, 50, 0)]);
+        list.set_action(1, None, &user(7), &ChatAction::RecordingVoiceNote);
+        let doing = list.get(1).unwrap().activity[0].1;
+        assert_eq!(doing_words(doing, false), "đang ghi âm");
+        assert_eq!(
+            doing_words(doing, true),
+            "đang ghi âm",
+            "the same for several"
+        );
+        let photo = MessageContent::MessagePhoto(types::MessagePhoto {
+            caption: FormattedText {
+                text: "hoàng hôn".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(content_text(&photo), "[Ảnh] hoàng hôn");
+        assert_eq!(
+            content_text(&MessageContent::MessageExpiredVoiceNote),
+            "[Tin nhắn thoại đã hết hạn]"
+        );
+        list.set_my_id(1);
+        assert_eq!(list.title(1), Some("Tin nhắn đã lưu"));
+        crate::lang::set(crate::lang::Lang::En);
     }
 
     #[test]

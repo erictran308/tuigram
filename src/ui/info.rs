@@ -12,13 +12,24 @@ use super::messages::{Names, seen_label, wrap};
 use super::{Cover, badge_span, center, lock_spans, popup_block, title_style, truncate};
 use crate::chats::Peer;
 use crate::info::{ChatInfo, Member, Role, Roster};
+use crate::lang;
 use crate::messages::Sender;
 use crate::theme::Colors;
 
 /// The popup's width at most, borders included.
 const WIDTH: u16 = 64;
-/// Columns the labels on the left take: "In common", and a space.
+/// Columns the labels on the left take at least, as English has them: "In
+/// common", and room after it.
 const LABEL: usize = 11;
+/// The labels on the left, put in the language set where they're drawn.
+const LABELS: [&str; 6] = [
+    lang::key("Username"),
+    lang::key("Link"),
+    lang::key("Phone"),
+    lang::key("Bio"),
+    lang::key("About"),
+    lang::key("In common"),
+];
 /// Rows a bio or description takes at most, so the members keep room.
 const MAX_BIO_ROWS: usize = 5;
 /// Columns an admin's title takes at most: Telegram allows 16.
@@ -34,34 +45,43 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, info: &ChatInfo, names: &Names
         head.push(Line::from(truncate(&about, text_w)).fg(colors.muted));
     }
     head.push(Line::default());
-    let value_w = text_w.saturating_sub(LABEL).max(1);
+    // As wide as the longest label in the language set, and a space.
+    let label_w = LABELS
+        .iter()
+        .map(|label| lang::t(label).width() + 1)
+        .fold(LABEL, usize::max);
+    let value_w = text_w.saturating_sub(label_w).max(1);
     let field = |label: &str, value: String| {
         Line::from(vec![
-            Span::from(format!("{label:<LABEL$}")).fg(colors.muted),
+            Span::from(format!("{label:<label_w$}")).fg(colors.muted),
             Span::from(truncate(&value, value_w)),
         ])
     };
     let peer = chats.get(info.chat_id).and_then(|c| c.peer);
     let person = matches!(peer, Some(Peer::User(_)));
     match &info.about {
-        None if info.failed => head.push(Line::from("Couldn't get it").fg(colors.muted)),
-        None => head.push(Line::from("Loading…").fg(colors.muted)),
+        None if info.failed => head.push(Line::from(lang::t("Couldn't get it")).fg(colors.muted)),
+        None => head.push(Line::from(lang::t("Loading…")).fg(colors.muted)),
         Some(about) => {
             if let Some(name) = chats.username(info.chat_id) {
                 head.push(match person {
-                    true => field("Username", format!("@{name}")),
-                    false => field("Link", format!("t.me/{name}")),
+                    true => field(lang::t("Username"), format!("@{name}")),
+                    false => field(lang::t("Link"), format!("t.me/{name}")),
                 });
             }
             if !about.phone.is_empty() {
-                head.push(field("Phone", format!("+{}", about.phone)));
+                head.push(field(lang::t("Phone"), format!("+{}", about.phone)));
             }
             if !about.bio.is_empty() {
                 let bot = match peer {
                     Some(Peer::User(id)) => chats.is_bot(id),
                     _ => false,
                 };
-                let label = if person && !bot { "Bio" } else { "About" };
+                let label = if person && !bot {
+                    lang::t("Bio")
+                } else {
+                    lang::t("About")
+                };
                 let mut rows = wrap(&about.bio, value_w);
                 if rows.len() > MAX_BIO_ROWS {
                     rows.truncate(MAX_BIO_ROWS);
@@ -75,7 +95,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, info: &ChatInfo, names: &Names
             }
             if about.common_groups > 0 {
                 let groups = count(about.common_groups, "group");
-                head.push(field("In common", groups));
+                head.push(field(lang::t("In common"), groups));
             }
             if head.last().is_some_and(|l| l.width() > 0) {
                 head.push(Line::default());
@@ -100,11 +120,11 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, info: &ChatInfo, names: &Names
     let height = (2 + head_rows + section + member_rows).min(area.height);
     let popup = center(area, width, height);
     let keys = if listed && !info.members.is_empty() {
-        " `j/k` move · `Enter` write to them · `Esc` close "
+        lang::t(" `j/k` move · `Enter` write to them · `Esc` close ")
     } else {
-        " `Esc` close "
+        lang::t(" `Esc` close ")
     };
-    let block = popup_block(" Info ", keys, colors);
+    let block = popup_block(lang::t(" Info "), keys, colors);
     let inner = block.inner(popup);
     frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
@@ -125,7 +145,11 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, info: &ChatInfo, names: &Names
     }
 
     let channel = chats.get(info.chat_id).is_some_and(|c| c.is_channel);
-    let word = if channel { "Subscribers" } else { "Members" };
+    let word = if channel {
+        lang::t("Subscribers")
+    } else {
+        lang::t("Members")
+    };
     let total = info
         .about
         .as_ref()
@@ -142,9 +166,9 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, info: &ChatInfo, names: &Names
     }
     if info.members.is_empty() {
         let text = if info.loading_members() {
-            "Loading…"
+            lang::t("Loading…")
         } else {
-            "Nobody to show"
+            lang::t("Nobody to show")
         };
         frame.render_widget(Line::from(text).fg(colors.muted), margin(members_area));
         return;
@@ -210,15 +234,16 @@ fn subtitle(info: &ChatInfo, names: &Names) -> Option<String> {
         .map(|seen| seen_label(seen, Local::now().timestamp()).0);
     let (kind, someone) = match chat.peer? {
         Peer::User(_) if chats.is_secret(info.chat_id) => {
+            let secret = lang::t("secret chat");
             return Some(match seen {
-                Some(seen) => format!("secret chat · {seen}"),
-                None => "secret chat".into(),
+                Some(seen) => format!("{secret} · {seen}"),
+                None => secret.into(),
             });
         }
         Peer::User(_) => return seen,
-        _ if chat.is_channel => ("channel", "subscriber"),
-        _ if chats.is_forum(info.chat_id) => ("group with topics", "member"),
-        _ => ("group", "member"),
+        _ if chat.is_channel => (lang::t("channel"), "subscriber"),
+        _ if chats.is_forum(info.chat_id) => (lang::t("group with topics"), "member"),
+        _ => (lang::t("group"), "member"),
     };
     let members = info.about.as_ref().map_or(0, |a| a.member_count);
     Some(match members {
@@ -245,12 +270,12 @@ fn member_spans(
         Sender::User(id) => (chats.user_badge(id), chats.user_seen(id)),
         Sender::Chat(id) => (chats.badge(id), None),
     };
-    let mine = if me { " (me)" } else { "" };
+    let mine = if me { lang::t(" (me)") } else { "" };
     let role = match (member.role, member.title.is_empty()) {
         (Role::Member, _) => String::new(),
         (_, false) => truncate(&member.title, MAX_TITLE),
-        (Role::Owner, true) => "owner".into(),
-        (Role::Admin, true) => "admin".into(),
+        (Role::Owner, true) => lang::t("owner").into(),
+        (Role::Admin, true) => lang::t("admin").into(),
     };
     let (seen, online) = seen.map_or((String::new(), false), |s| {
         let (label, online) = seen_label(s, now);
@@ -291,21 +316,31 @@ fn member_spans(
     spans
 }
 
-/// "1 member", "1,234 members".
+/// "1 member", "1,234 members"; in Russian, "1 участник", "1 234 участника",
+/// for the words this popup counts.
 fn count(n: i32, one: &str) -> String {
-    match n {
-        1 => format!("1 {one}"),
-        n => format!("{} {one}s", thousands(n)),
+    let total = thousands(n);
+    let args: &[(&str, &dyn std::fmt::Display)] = &[("total", &total)];
+    match one {
+        "subscriber" => lang::n(n.into(), "{total} subscriber", "{total} subscribers", args),
+        "group" => lang::n(n.into(), "{total} group", "{total} groups", args),
+        _ => lang::n(n.into(), "{total} member", "{total} members", args),
     }
 }
 
-/// 1234567 as "1,234,567".
+/// 1234567 as "1,234,567"; in Russian, "1 234 567", with spaces that
+/// don't break; in Vietnamese, "1.234.567".
 fn thousands(n: i32) -> String {
+    let separator = match lang::current() {
+        lang::Lang::En => ',',
+        lang::Lang::Ru => '\u{a0}',
+        lang::Lang::Vi => '.',
+    };
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, digit) in digits.chars().enumerate() {
         if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
+            out.push(separator);
         }
         out.push(digit);
     }
@@ -485,5 +520,46 @@ mod tests {
         assert_eq!(count(1_234_567, "member"), "1,234,567 members");
         assert_eq!(thousands(999), "999");
         assert_eq!(thousands(1000), "1,000");
+    }
+
+    #[test]
+    fn russian_counts_take_the_form_for_their_number_and_spaces_between_thousands() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        assert_eq!(count(1, "member"), "1 участник");
+        assert_eq!(count(3, "group"), "3 группы");
+        assert_eq!(
+            count(1_234_567, "subscriber"),
+            "1\u{a0}234\u{a0}567 подписчиков"
+        );
+        assert_eq!(count(22, "subscriber"), "22 подписчика");
+        assert_eq!(count(11, "member"), "11 участников");
+    }
+
+    #[test]
+    fn in_vietnamese_labels_line_up_after_the_longest_and_thousands_take_dots() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        assert_eq!(count(1_234_567, "member"), "1.234.567 thành viên");
+        assert_eq!(count(2, "group"), "2 nhóm");
+
+        let mut chats = Chats::default();
+        let chat = chats.add_local(7, "Ann Lee", None);
+        (chat.is_private, chat.peer) = (true, Some(Peer::User(7)));
+        chats.set_username(Peer::User(7), Some(&usernames("ann")));
+        let mut info = ChatInfo::new(7);
+        info.set_about(About {
+            phone: "15550100".into(),
+            common_groups: 2,
+            ..About::default()
+        });
+        let rows = rows(&info, &chats, &HashMap::new());
+        let text = rows.join("\n");
+        for expected in [
+            "Tên người dùng @ann",
+            "Điện thoại     +15550100",
+            "Nhóm chung     2 nhóm",
+            "Esc đóng",
+        ] {
+            assert!(text.contains(expected), "{expected}: {rows:#?}");
+        }
     }
 }

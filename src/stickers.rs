@@ -5,6 +5,7 @@
 use tdlib_rs::enums::StickerFullType;
 use tdlib_rs::types;
 
+use crate::lang;
 use crate::messages::Preview;
 use crate::text;
 
@@ -112,8 +113,8 @@ impl StickerPanel {
         Self {
             chat_id,
             sections: vec![
-                section(Source::Recent, "Recent"),
-                section(Source::Favorites, "Favorites"),
+                section(Source::Recent, lang::t("Recent")),
+                section(Source::Favorites, lang::t("Favorites")),
             ],
             tab: 0,
             query: None,

@@ -22,6 +22,7 @@ use crate::chime::Sounds;
 use crate::complete::Completion;
 use crate::config;
 use crate::images::Images;
+use crate::lang;
 use crate::messages::{Editing, OpenChat, Replied, SendState, Sender};
 use crate::notify::Notifications;
 use crate::picker::{ChatPicker, Choice, Purpose};
@@ -116,8 +117,12 @@ fn activity(chat: &Chat, names: &messages::Names, topic: Option<&Topic>) -> Opti
     };
     let mut doings = chat.activity.iter().filter(|&&(_, _, at)| here(at));
     let &(_, doing, _) = doings.next()?;
+    let (does, they_do) = (
+        crate::chats::doing_words(doing, false),
+        crate::chats::doing_words(doing, true),
+    );
     if chat.is_private {
-        return Some(format!("{doing}…"));
+        return Some(format!("{does}…"));
     }
     let who: Vec<Sender> = chat
         .activity
@@ -126,9 +131,24 @@ fn activity(chat: &Chat, names: &messages::Names, topic: Option<&Topic>) -> Opti
         .map(|&(sender, _, _)| sender)
         .collect();
     Some(match who[..] {
-        [one] => format!("{} is {doing}…", names.get(one)),
-        [a, b] => format!("{} and {} are {doing}…", names.get(a), names.get(b)),
-        _ => format!("{} people are {doing}…", who.len()),
+        [one] => lang::f(
+            "{name} is {doing}…",
+            &[("name", &names.get(one)), ("doing", &does)],
+        ),
+        [a, b] => lang::f(
+            "{a} and {b} are {doing}…",
+            &[
+                ("a", &names.get(a)),
+                ("b", &names.get(b)),
+                ("doing", &they_do),
+            ],
+        ),
+        _ => lang::n(
+            who.len() as i64,
+            "{n} person is {doing}…",
+            "{n} people are {doing}…",
+            &[("doing", &they_do)],
+        ),
     })
 }
 
@@ -167,6 +187,17 @@ fn hint_spans(hints: &str, text: Style, colors: &Colors) -> Vec<Span<'static>> {
         .filter(|(_, part)| !part.is_empty())
         .map(|(i, part)| Span::styled(part.to_string(), if i % 2 == 1 { key } else { text }))
         .collect()
+}
+
+/// Columns key hints take once drawn, without their backticks and the
+/// space after them, which a popup's corner may cut: what a popup needs
+/// at least for them, besides its corners, as other languages run longer.
+fn hint_width(hints: &str) -> usize {
+    hints
+        .trim_end()
+        .split('`')
+        .map(UnicodeWidthStr::width)
+        .sum()
 }
 
 /// What a popup draws first: `Clear` over its area, and a blank in place
@@ -242,7 +273,7 @@ fn border(focused: bool, colors: &Colors) -> Style {
     })
 }
 
-fn draw_login(frame: &mut Frame, login: &Login, connection: Option<&str>, colors: &Colors) {
+fn draw_login(frame: &mut Frame, login: &Login, connection: Option<&'static str>, colors: &Colors) {
     if let LoginStep::OtherDevice { link } = &login.step
         && let Some(code) = qr::lines(link, colors)
     {
@@ -253,12 +284,13 @@ fn draw_login(frame: &mut Frame, login: &Login, connection: Option<&str>, colors
     let source_build = config::built_in_keys().is_none();
     let help_rows = match login.step {
         LoginStep::ApiId if source_build => 4,
-        LoginStep::BadProxy { .. } => 4,
+        // Other languages run longer, after a reason that can be long itself.
+        LoginStep::BadProxy { .. } => 4 + u16::from(lang::current() != lang::Lang::En),
         _ => 3,
     };
     let area = center(frame.area(), 64, 9 + help_rows);
     let block = bordered(colors)
-        .title(" Log in ")
+        .title(lang::t(" Log in "))
         .title_alignment(Alignment::Center)
         .border_style(Style::new().fg(colors.accent));
     let inner = block.inner(area);
@@ -273,65 +305,78 @@ fn draw_login(frame: &mut Frame, login: &Login, connection: Option<&str>, colors
     ])
     .areas(inner.inner(ratatui::layout::Margin::new(1, 0)));
 
-    let (title, text) = match &login.step {
-        LoginStep::Connecting => ("Connecting…".to_string(), String::new()),
+    let (title, text): (String, String) = match &login.step {
+        LoginStep::Connecting => (lang::t("Connecting…").into(), String::new()),
         LoginStep::LoggingOut => (
-            "Logging out…".to_string(),
-            "Then you can log in again, as yourself or someone else.".into(),
+            lang::t("Logging out…").into(),
+            lang::t("Then you can log in again, as yourself or someone else.").into(),
         ),
         LoginStep::ApiId if source_build => (
             "Telegram API ID".into(),
-            "Builds from source have no API key. Get yours once at my.telegram.org → \
-             API development tools (any app name), then paste api_id.\n\
-             Or skip it all: cargo binstall tuigram-cli"
-                .into(),
+            lang::t(
+                "Builds from source have no API key. Get yours once at my.telegram.org → \
+                 API development tools (any app name), then paste api_id.\n\
+                 Or skip it all: cargo binstall tuigram-cli",
+            )
+            .into(),
         ),
         LoginStep::ApiId => (
             "Telegram API ID".into(),
-            "Get your own API ID and hash once at my.telegram.org → API development \
-             tools (any app name), then paste api_id."
-                .into(),
+            lang::t(
+                "Get your own API ID and hash once at my.telegram.org → API development \
+                 tools (any app name), then paste api_id.",
+            )
+            .into(),
         ),
         LoginStep::ApiHash { .. } => (
             "Telegram API hash".into(),
-            "Now paste api_hash from the same page. Both stay on this computer.".into(),
+            lang::t("Now paste api_hash from the same page. Both stay on this computer.").into(),
         ),
         LoginStep::Phone => (
-            "Phone number".into(),
-            "Include the country code, e.g. +1 415 555 0123. Or press Tab to log in \
-             by scanning a QR code with Telegram on your phone."
-                .into(),
+            lang::t("Phone number").into(),
+            lang::t(
+                "Include the country code, e.g. +1 415 555 0123. Or press Tab to log in \
+                 by scanning a QR code with Telegram on your phone.",
+            )
+            .into(),
         ),
         LoginStep::Code { sent_via } => (
-            "Login code".into(),
-            format!("Telegram sent a code {sent_via}."),
+            lang::t("Login code").into(),
+            lang::f(
+                "Telegram sent a code {sent_via}.",
+                &[("sent_via", sent_via)],
+            ),
         ),
         LoginStep::Password { hint } if hint.is_empty() => (
-            "Two-step verification password".into(),
-            "Your account has a cloud password.".into(),
+            lang::t("Two-step verification password").into(),
+            lang::t("Your account has a cloud password.").into(),
         ),
         LoginStep::Password { hint } => (
-            "Two-step verification password".into(),
-            format!("Hint: {hint}"),
+            lang::t("Two-step verification password").into(),
+            format!("{} {hint}", lang::t("Hint:")),
         ),
         LoginStep::Email => (
-            "Email address".into(),
-            "Telegram needs an email address to send login codes to.".into(),
+            lang::t("Email address").into(),
+            lang::t("Telegram needs an email address to send login codes to.").into(),
         ),
         LoginStep::EmailCode => (
-            "Email code".into(),
-            "Enter the code Telegram sent to your email.".into(),
+            lang::t("Email code").into(),
+            lang::t("Enter the code Telegram sent to your email.").into(),
         ),
         LoginStep::OtherDevice { link } => (
-            "Confirm on another device".into(),
-            format!("Open this link on a logged-in device: {link}"),
-        ),
-        LoginStep::Unsupported(why) => ("Can't log in here".into(), (*why).into()),
-        LoginStep::BadProxy { from, why } => (
-            format!("Can't use {from}"),
+            lang::t("Confirm on another device").into(),
             format!(
+                "{} {link}",
+                lang::t("Open this link on a logged-in device:")
+            ),
+        ),
+        LoginStep::Unsupported(why) => (lang::t("Can't log in here").into(), (*why).into()),
+        LoginStep::BadProxy { from, why } => (
+            lang::f("Can't use {from}", &[("from", from)]),
+            lang::f(
                 "{why}. Fix it, then start tuigram again. Until then it doesn't connect, \
-                 rather than connect without the proxy."
+                 rather than connect without the proxy.",
+                &[("why", why)],
             ),
         ),
     };
@@ -353,28 +398,33 @@ fn draw_login(frame: &mut Frame, login: &Login, connection: Option<&str>, colors
     if let Some(message) = &login.error {
         frame.render_widget(Line::from(message.as_str()).fg(colors.error), error);
     } else if let Some(connection) = connection {
+        let words = lang::t(connection);
         // Before logging in, there's no `:proxy` yet.
         let line = match connection {
-            crate::app::CONNECTING => {
-                format!("{connection} Blocked here? See TG_PROXY in tuigram --help")
-            }
-            _ => connection.to_string(),
+            crate::app::CONNECTING => format!(
+                "{words} {}",
+                lang::t("Blocked here? See TG_PROXY in tuigram --help")
+            ),
+            _ => words.to_string(),
         };
         frame.render_widget(Line::from(line).fg(colors.warning), error);
     }
     let hint = match login.step {
-        _ if login.busy => "Sending…",
-        LoginStep::Phone => "`Enter` submit · `Tab` QR code · `Ctrl-c` quit",
-        LoginStep::OtherDevice { .. } => QR_KEYS,
-        _ if login.takes_input() => "`Enter` submit · `Ctrl-c` quit",
-        _ => "`Ctrl-c` quit",
+        _ if login.busy => lang::t("Sending…"),
+        LoginStep::Phone => lang::t("`Enter` submit · `Tab` QR code · `Ctrl-c` quit"),
+        LoginStep::OtherDevice { .. } => qr_keys(),
+        _ if login.takes_input() => lang::t("`Enter` submit · `Ctrl-c` quit"),
+        _ => lang::t("`Ctrl-c` quit"),
     };
     let muted = Style::new().fg(colors.muted);
     let hint = Line::from(hint_spans(hint, muted, colors)).right_aligned();
     frame.render_widget(hint, footer);
 }
 
-const QR_KEYS: &str = "`Esc` use phone number · `Ctrl-c` quit";
+/// The QR login's keys.
+fn qr_keys() -> &'static str {
+    lang::t("`Esc` use phone number · `Ctrl-c` quit")
+}
 
 /// A compact login box for the QR code, which is most of it: the code needs
 /// about 20 rows, and this fits it in an 80×24 terminal.
@@ -390,7 +440,7 @@ fn draw_qr_login(frame: &mut Frame, login: &Login, code: Vec<Line<'static>>, col
         center(screen, 64, 7)
     };
     let block = bordered(colors)
-        .title(" Scan the QR code ")
+        .title(lang::t(" Scan the QR code "))
         .title_alignment(Alignment::Center)
         .border_style(Style::new().fg(colors.accent));
     let inner = block.inner(area);
@@ -403,11 +453,16 @@ fn draw_qr_login(frame: &mut Frame, login: &Login, code: Vec<Line<'static>>, col
     ])
     .areas(inner.inner(ratatui::layout::Margin::new(1, 0)));
     let text = if fits {
-        "In Telegram on your phone: Settings → Devices → Link Desktop Device, then point \
-         the camera at this code."
-            .into()
+        lang::t(
+            "In Telegram on your phone: Settings → Devices → Link Desktop Device, then \
+             point the camera at this code.",
+        )
+        .into()
     } else {
-        format!("Make the terminal at least {width} columns by {height} rows to show the QR code.")
+        lang::f(
+            "Make the terminal at least {width} columns by {height} rows to show the QR code.",
+            &[("width", &width), ("height", &height)],
+        )
     };
     frame.render_widget(
         Paragraph::new(text)
@@ -422,7 +477,7 @@ fn draw_qr_login(frame: &mut Frame, login: &Login, code: Vec<Line<'static>>, col
     let footer_line = match &login.error {
         Some(message) => Line::from(message.as_str()).fg(colors.error),
         None => {
-            Line::from(hint_spans(QR_KEYS, Style::new().fg(colors.muted), colors)).right_aligned()
+            Line::from(hint_spans(qr_keys(), Style::new().fg(colors.muted), colors)).right_aligned()
         }
     };
     frame.render_widget(footer_line, footer);
@@ -621,8 +676,8 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         }
         None => frame.render_widget(
             Paragraph::new(match app.forum {
-                Some(_) => "Press Enter to open a topic",
-                None => "Press Enter to open a chat",
+                Some(_) => lang::t("Press Enter to open a topic"),
+                None => lang::t("Press Enter to open a chat"),
             })
             .fg(colors.muted)
             .centered()
@@ -826,8 +881,8 @@ fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors
     // Borders, the message and a gap, then the choices.
     let popup = center(area, width, rows + 4);
     let block = popup_block(
-        " Delete message ",
-        " `Enter` delete · `Esc` cancel ",
+        lang::t(" Delete message "),
+        lang::t(" `Enter` delete · `Esc` cancel "),
         colors,
     );
     let inner = block.inner(popup);
@@ -849,7 +904,8 @@ fn draw_delete(frame: &mut Frame, area: Rect, menu: &DeleteMenu, colors: &Colors
         message,
     );
     if menu.choices.is_empty() {
-        frame.render_widget(Line::from(" Checking…").fg(colors.muted), list);
+        let checking = lang::t(" Checking…");
+        frame.render_widget(Line::from(checking).fg(colors.muted), list);
         return;
     }
     let items: Vec<ListItem> = menu
@@ -901,7 +957,7 @@ fn draw_suggestions(frame: &mut Frame, composer: Rect, completion: &Completion, 
     let block = bordered(colors)
         .title_bottom(
             Line::from(hint_spans(
-                " `Tab` insert ",
+                lang::t(" `Tab` insert "),
                 Style::new().fg(colors.muted),
                 colors,
             ))
@@ -954,15 +1010,16 @@ fn draw_vote(frame: &mut Frame, area: Rect, menu: &VoteMenu, colors: &Colors) {
         .chain([menu.question.width() + 4])
         .max()
         .unwrap_or(0);
+    let keys = if menu.several {
+        lang::t(" `Space` tick · `Enter` vote · `Esc` close ")
+    } else {
+        lang::t(" `Enter` vote · `Esc` close ")
+    };
+    let longest = longest.max(hint_width(keys) + 2);
     let width = (longest.clamp(40, 60) as u16).min(area.width);
     // Borders, the question and a gap, then the answers.
     let popup = center(area, width, (rows + 4).min(area.height));
-    let keys = if menu.several {
-        " `Space` tick · `Enter` vote · `Esc` close "
-    } else {
-        " `Enter` vote · `Esc` close "
-    };
-    let block = popup_block(" Vote ", keys, colors);
+    let block = popup_block(lang::t(" Vote "), keys, colors);
     let inner = block.inner(popup);
     frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
@@ -1013,7 +1070,7 @@ fn draw_vote(frame: &mut Frame, area: Rect, menu: &VoteMenu, colors: &Colors) {
         };
         items.push(ListItem::new(Line::from(vec![
             bar,
-            Span::from("  Take back my vote").fg(colors.error),
+            Span::from(lang::t("  Take back my vote")).fg(colors.error),
         ])));
     }
     frame.render_stateful_widget(
@@ -1049,19 +1106,19 @@ fn draw_picker(
     let popup = center(area, PICKER_WIDTH.min(area.width), (visible + fixed) as u16);
     let (title, keys, placeholder) = match &picker.purpose {
         Purpose::Forward { .. } => (
-            " Forward to ",
-            " `Enter` forward · `Esc` cancel ",
-            "type to find a chat",
+            lang::t(" Forward to "),
+            lang::t(" `Enter` forward · `Esc` cancel "),
+            lang::t("type to find a chat"),
         ),
         Purpose::Open => (
-            " Find a chat or person ",
-            " `Enter` open · `Esc` cancel ",
-            "a name, @username or t.me link",
+            lang::t(" Find a chat or person "),
+            lang::t(" `Enter` open · `Esc` cancel "),
+            lang::t("a name, @username or t.me link"),
         ),
     };
     let mut title = vec![Span::from(title)];
     if picker.searching {
-        title.push(Span::from("· searching… ").fg(colors.muted));
+        title.push(Span::from(lang::t("· searching… ")).fg(colors.muted));
     }
     let block = popup_block(Line::from(title), keys, colors);
     let inner = block.inner(popup);
@@ -1095,9 +1152,9 @@ fn draw_picker(
 
     if choices.is_empty() {
         let empty = match () {
-            _ if picker.searching => " Searching Telegram…",
-            _ if picker.query.trim().is_empty() => " No chats yet",
-            _ => " Nothing found",
+            _ if picker.searching => lang::t(" Searching Telegram…"),
+            _ if picker.query.trim().is_empty() => lang::t(" No chats yet"),
+            _ => lang::t(" Nothing found"),
         };
         frame.render_widget(Line::from(empty).fg(colors.muted), list);
         return;
@@ -1122,13 +1179,16 @@ fn draw_picker(
                     let secret = chats.is_secret(*id);
                     let detail = match chats.username(*id) {
                         // Its title is the same as the other chat's.
-                        _ if secret => "secret chat".into(),
+                        _ if secret => lang::t("secret chat").into(),
                         Some(name) => format!("@{name}"),
-                        None if !chats.listed(*id) => "public".into(),
+                        None if !chats.listed(*id) => lang::t("public").into(),
                         None => String::new(),
                     };
                     (
-                        chats.title(*id).unwrap_or("Unknown").to_string(),
+                        chats
+                            .title(*id)
+                            .unwrap_or(lang::tc("thing", "Unknown"))
+                            .to_string(),
                         title_style(chats, *id, colors),
                         chats.badge(*id),
                         detail,
@@ -1140,16 +1200,16 @@ fn draw_picker(
                     None,
                     chats
                         .user_username(*id)
-                        .map_or("contact".into(), |name| format!("@{name}")),
+                        .map_or(lang::t("contact").into(), |name| format!("@{name}")),
                 ),
                 Choice::Username(name) => (
-                    format!("Open @{name}"),
+                    format!("{} @{name}", lang::t("Open")),
                     Style::new().fg(colors.accent),
                     None,
                     String::new(),
                 ),
                 Choice::Link(link) => (
-                    format!("Open {link}"),
+                    format!("{} {link}", lang::t("Open")),
                     Style::new().fg(colors.accent),
                     None,
                     String::new(),
@@ -1236,14 +1296,18 @@ fn draw_react(
         .min(usize::from(area.height).saturating_sub(fixed).max(1));
     let popup = center(area, REACT_WIDTH.min(area.width), (visible + fixed) as u16);
     let enter = match current {
-        Some(e) if yours.contains(&e) => "`Enter` take back",
-        _ => "`Enter` react",
+        Some(e) if yours.contains(&e) => lang::t("`Enter` take back"),
+        _ => lang::t("`Enter` react"),
     };
     let keys = match menu.query {
-        Some(_) => format!(" {enter} · `Esc` back "),
-        None => format!(" `/` search · {enter} · `Esc` close "),
+        Some(_) => format!(" {enter} · `Esc` {} ", lang::t("back")),
+        None => format!(
+            " `/` {} · {enter} · `Esc` {} ",
+            lang::t("search"),
+            lang::t("close")
+        ),
     };
-    let block = popup_block(" React ", &keys, colors);
+    let block = popup_block(lang::t(" React "), &keys, colors);
     let inner = block.inner(popup);
     frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
@@ -1260,7 +1324,7 @@ fn draw_react(
     if hint {
         let line = Line::from(vec![
             Span::from(" X").fg(colors.accent).bold(),
-            Span::from(" removes all yours, also in the chat").fg(colors.muted),
+            Span::from(lang::t(" removes all yours, also in the chat")).fg(colors.muted),
         ]);
         frame.render_widget(line, hint_row);
     }
@@ -1279,11 +1343,12 @@ fn draw_react(
     frame.render_widget(top_line, top);
 
     if menu.choices.is_none() {
-        frame.render_widget(Line::from(" Loading…").fg(colors.muted), grid);
+        frame.render_widget(Line::from(lang::t(" Loading…")).fg(colors.muted), grid);
         return;
     }
     let Some(current) = current else {
-        frame.render_widget(Line::from(" No emoji by that name").fg(colors.muted), grid);
+        let none = lang::t(" No emoji by that name");
+        frame.render_widget(Line::from(none).fg(colors.muted), grid);
         return;
     };
     // Each emoji takes four columns: itself and the cursor's brackets. One
@@ -1369,11 +1434,9 @@ fn draw_settings(
     colors: &Colors,
 ) {
     let area = frame.area();
-    let ru = settings.ru();
-    let t = |en: &'static str, ru_text: &'static str| crate::lang::pick(ru, en, ru_text);
     // Both tabs get the same size, so the tabs don't move when switching.
-    let width = (help::width(ru) as u16 + 2).min(area.width.saturating_sub(2));
-    let height = (help::height(ru) as u16 + 2).min(area.height.saturating_sub(2));
+    let width = (help::width() as u16 + 2).min(area.width.saturating_sub(2));
+    let height = (help::height() as u16 + 2).min(area.height.saturating_sub(2));
     let popup = center(area, width, height);
     let tab = |label: &'static str, active: bool| {
         if active {
@@ -1387,37 +1450,24 @@ fn draw_settings(
         }
     };
     let mut tabs = vec![Span::from(" ")];
-    tabs.extend(tab(
-        t(" Shortcuts ", " Клавиши "),
-        menu.tab == HelpTab::Shortcuts,
-    ));
+    tabs.extend(tab(lang::t(" Shortcuts "), menu.tab == HelpTab::Shortcuts));
     tabs.push(Span::from(" "));
-    tabs.extend(tab(
-        t(" Settings ", " Настройки "),
-        menu.tab == HelpTab::Settings,
-    ));
+    tabs.extend(tab(lang::t(" Settings "), menu.tab == HelpTab::Settings));
     tabs.push(Span::from(" "));
     let tabs = Line::from(tabs);
     let keys = match menu.tab {
-        HelpTab::Shortcuts => t(
-            " `j/k` scroll · `Tab` settings · `Esc` close ",
-            " `j/k` листать · `Tab` настройки · `Esc` закрыть ",
-        ),
-        HelpTab::Settings if menu.selected >= SettingsMenu::SOUNDS => t(
-            " `Enter` or `Space` use · `Tab` shortcuts · `Esc` close ",
-            " `Enter` или `Space` выбрать · `Tab` клавиши · `Esc` закрыть ",
-        ),
-        HelpTab::Settings => t(
-            " `Enter` or `Space` change · `Tab` shortcuts · `Esc` close ",
-            " `Enter` или `Space` изменить · `Tab` клавиши · `Esc` закрыть ",
-        ),
+        HelpTab::Shortcuts => lang::t(" `j/k` scroll · `Tab` settings · `Esc` close "),
+        HelpTab::Settings if menu.selected >= SettingsMenu::SOUNDS => {
+            lang::t(" `Enter` or `Space` use · `Tab` shortcuts · `Esc` close ")
+        }
+        HelpTab::Settings => lang::t(" `Enter` or `Space` change · `Tab` shortcuts · `Esc` close "),
     };
     let block = popup_block(tabs, keys, colors);
     let inner = block.inner(popup);
     frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
     if menu.tab == HelpTab::Shortcuts {
-        help::draw(frame, inner, &mut menu.scroll, ru, colors);
+        help::draw(frame, inner, &mut menu.scroll, colors);
         return;
     }
 
@@ -1449,157 +1499,120 @@ fn draw_settings(
         }
         lines.push(row(i, mark, Span::from(label.to_string())));
     };
-    lines.push(heading(t(" Interface", " Интерфейс")));
-    let lang = if settings.ru() {
-        " [Русский] "
-    } else {
-        " [English] "
-    };
-    add(
-        &mut lines,
-        SettingsMenu::LANGUAGE,
-        lang,
-        t("Language", "Язык"),
-    );
+    // Each language by its own name, so it's found whichever is set.
+    let dot = |on: bool| if on { " ● " } else { " ○ " };
+    lines.push(heading(lang::t(" Language")));
+    for (i, language) in lang::Lang::ALL.into_iter().enumerate() {
+        let mark = dot(settings.lang() == language);
+        add(
+            &mut lines,
+            SettingsMenu::LANGUAGE + i,
+            mark,
+            language.name(),
+        );
+    }
     lines.push(Line::default());
-    lines.push(heading(t(" Notifications", " Уведомления")));
+    lines.push(heading(lang::t(" Notifications")));
     add(
         &mut lines,
         SettingsMenu::NOTIFICATIONS,
         check(settings.notifications != Notifications::Off),
-        t(
-            "New messages, while tuigram is in the background",
-            "Новые сообщения, когда tuigram в фоне",
-        ),
+        lang::t("New messages, while tuigram is in the background"),
     );
     lines.push(Line::default());
-    lines.push(heading(t(" Chat list", " Список чатов")));
+    lines.push(heading(lang::t(" Chat list")));
     add(
         &mut lines,
         SettingsMenu::CHAT_GAPS,
         check(settings.chat_gaps),
-        t("A gap between chats", "Промежуток между чатами"),
+        lang::t("A gap between chats"),
     );
     add(
         &mut lines,
         SettingsMenu::LIST_RIGHT,
         check(settings.chat_list_side == Side::Right),
-        t("On the right side of the window", "Справа в окне"),
+        lang::t("On the right side of the window"),
     );
     lines.push(Line::default());
-    lines.push(heading(t(" Messages", " Сообщения")));
+    lines.push(heading(lang::t(" Messages")));
     add(
         &mut lines,
         SettingsMenu::BLOCK_GAPS,
         check(settings.block_gaps),
-        t(
-            "A gap between messages in a row from one person",
-            "Промежуток между подряд идущими сообщениями одного человека",
-        ),
+        lang::t("A gap between messages in a row from one person"),
     );
     let size = match settings.video_note_size {
-        VideoNoteSize::Small => t(" [small] ", " [маленький] "),
-        VideoNoteSize::Medium => t(" [medium] ", " [средний] "),
-        VideoNoteSize::Large => t(" [large] ", " [большой] "),
+        VideoNoteSize::Small => lang::t(" [small] "),
+        VideoNoteSize::Medium => lang::t(" [medium] "),
+        VideoNoteSize::Large => lang::t(" [large] "),
     };
     add(
         &mut lines,
         SettingsMenu::VIDEO_SIZE,
         size,
-        t(
-            "Video messages play on Space",
-            "Видеосообщения играют по Space",
-        ),
+        lang::t("Video messages play on Space"),
     );
     lines.push(Line::default());
-    lines.push(heading(t(" Look", " Вид")));
+    lines.push(heading(lang::t(" Look")));
     add(
         &mut lines,
         SettingsMenu::CORNERS,
         check(colors.rounded),
-        t(
-            "Round corners (turn off if they look broken)",
-            "Круглые углы (выключите, если выглядят сломанными)",
-        ),
+        lang::t("Round corners (turn off if they look broken)"),
     );
     add(
         &mut lines,
         SettingsMenu::PILLS,
         check(colors.pills),
-        t(
-            "Round pills (needs a Nerd Font)",
-            "Круглые «пилюли» (нужен Nerd Font)",
-        ),
+        lang::t("Round pills (needs a Nerd Font)"),
     );
     add(
         &mut lines,
         SettingsMenu::ANIMATIONS,
         check(settings.animations),
-        t(
-            "Animations (lights on focus, popups, toasts, new messages)",
-            "Анимации (подсветка фокуса, попапы, тосты, новые сообщения)",
-        ),
+        lang::t("Animations (lights on focus, popups, toasts, new messages)"),
     );
     lines.push(Line::default());
-    lines.push(heading(t(" Composer", " Поле ввода")));
+    lines.push(heading(lang::t(" Composer")));
     add(
         &mut lines,
         SettingsMenu::AFTER_SEND,
         check(settings.normal_after_send),
-        t(
-            "Back to Normal mode after sending a message",
-            "Назад в обычный режим после отправки сообщения",
-        ),
+        lang::t("Back to Normal mode after sending a message"),
     );
     add(
         &mut lines,
         SettingsMenu::WRAP_COMPOSER,
         check(settings.wrap_composer),
-        t(
-            "Wrap long lines onto the next row",
-            "Переносить длинные строки на следующую",
-        ),
+        lang::t("Wrap long lines onto the next row"),
     );
     lines.push(Line::default());
-    lines.push(heading(t(" Secret chats", " Секретные чаты")));
+    lines.push(heading(lang::t(" Secret chats")));
     add(
         &mut lines,
         SettingsMenu::SECRET_CHATS,
         check(settings.accept_secret_chats),
-        t(
-            "Take the ones others start here, not on your phone",
-            "Принимать начатые другими здесь, а не на телефоне",
-        ),
+        lang::t("Take the ones others start here, not on your phone"),
     );
     lines.push(Line::default());
-    lines.push(heading(t(
-        " Sound for new messages",
-        " Звук новых сообщений",
-    )));
+    lines.push(heading(lang::t(" Sound for new messages")));
     if over_ssh {
-        let why = t(
-            " Not played over SSH: it would play on the other computer",
-            " По SSH не играет: зазвучал бы на другом компьютере",
-        );
+        let why = lang::t(" Not played over SSH: it would play on the other computer");
         lines.push(Line::from(why).fg(colors.muted));
     }
     add(
         &mut lines,
         SettingsMenu::SOUND_FOCUSED,
         check(settings.sound_when_focused),
-        t(
-            "Also while tuigram's window is focused",
-            "Также когда окно tuigram в фокусе",
-        ),
+        lang::t("Also while tuigram's window is focused"),
     );
     // The dot marks the sound in use.
     let picked = settings.notification_sound.as_deref();
-    let dot = |on: bool| if on { " ● " } else { " ○ " };
     add(
         &mut lines,
         SettingsMenu::SOUNDS,
         dot(picked.is_none()),
-        t("None", "Нет"),
+        lang::t("None"),
     );
     for (i, sound) in sounds.list.iter().enumerate() {
         let mark = dot(picked == Some(sound.id.as_str()));
@@ -1607,18 +1620,13 @@ fn draw_settings(
     }
     if let Some(dir) = &sounds.dir {
         lines.push(Line::default());
-        lines.push(
-            Line::from(t(
-                " Your own sounds, WAV or Ogg Opus, go in",
-                " Свои звуки, WAV или Ogg Opus, кладутся в",
-            ))
-            .fg(colors.muted),
-        );
+        lines
+            .push(Line::from(lang::t(" Your own sounds, WAV or Ogg Opus, go in")).fg(colors.muted));
         lines.push(Line::from(format!(" {}", short_path(dir))).fg(colors.muted));
     }
     let sounds_end = lines.len() - 1;
     lines.push(Line::default());
-    lines.push(heading(t(" Theme", " Тема")));
+    lines.push(heading(lang::t(" Theme")));
     for (i, theme) in themes.list.iter().enumerate() {
         // The dot marks the theme in use.
         let mark = if theme.id == settings.theme {
@@ -1637,9 +1645,7 @@ fn draw_settings(
     }
     if let Some(dir) = &themes.dir {
         lines.push(Line::default());
-        lines.push(
-            Line::from(t(" Your own themes go in", " Свои темы кладутся в")).fg(colors.muted),
-        );
+        lines.push(Line::from(lang::t(" Your own themes go in")).fg(colors.muted));
         lines.push(Line::from(format!(" {}", short_path(dir))).fg(colors.muted));
     }
     // On the last sound or theme, the lines after it show too.
@@ -1704,9 +1710,9 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
     const LABEL: usize = 15;
     let title = format!(" {} ", confirm.title);
     let verdict = confirm.badge.map(|badge| match badge {
-        Badge::Scam => "Telegram marks it as a SCAM",
-        Badge::Fake => "Telegram marks it as FAKE: it poses as someone else",
-        Badge::Official => "Verified by Telegram ✓",
+        Badge::Scam => lang::t("Telegram marks it as a SCAM"),
+        Badge::Fake => lang::t("Telegram marks it as FAKE: it poses as someone else"),
+        Badge::Official => lang::t("Verified by Telegram ✓"),
     });
     let site_width = confirm
         .site
@@ -1719,10 +1725,15 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
         .chain(verdict.map(|v| v.width()))
         .max()
         .unwrap_or(0);
+    let keys = format!(
+        " `y` {} · `Esc` {} ",
+        confirm.action.verb(),
+        lang::t("cancel")
+    );
     let width = (longest.max(title.width()).max(site_width) as u16 + 4)
+        .max(hint_width(&keys) as u16 + 2)
         .min(area.width)
         .max(40.min(area.width));
-    let keys = format!(" `y` {} · `Esc` cancel ", confirm.action.verb());
     let border = match confirm.badge {
         Some(Badge::Scam | Badge::Fake) => colors.error,
         _ => colors.warning,
@@ -1799,9 +1810,15 @@ fn draw_buttons(frame: &mut Frame, area: Rect, menu: &ButtonMenu, colors: &Color
     let height = (menu.rows.len() as u16 + 5 + about_rows).min(area.height);
     let popup = center(area, width, height);
     let (title, keys) = if menu.reply {
-        (" Reply buttons ", " `Enter` send · `Esc` close ")
+        (
+            lang::t(" Reply buttons "),
+            lang::t(" `Enter` send · `Esc` close "),
+        )
     } else {
-        (" Buttons ", " `Enter` press · `Esc` close ")
+        (
+            lang::t(" Buttons "),
+            lang::t(" `Enter` press · `Esc` close "),
+        )
     };
     let block = popup_block(title, keys, colors);
     let inner = block.inner(popup);
@@ -1881,7 +1898,11 @@ fn draw_pin(frame: &mut Frame, area: Rect, menu: &PinMenu, colors: &Colors) {
     let width = ((menu.snippet.width() + 6).clamp(40, 60) as u16).min(area.width);
     // Borders, the message and a gap, then the choices.
     let popup = center(area, width, rows + 4);
-    let block = popup_block(" Pin message ", " `Enter` pin · `Esc` cancel ", colors);
+    let block = popup_block(
+        lang::t(" Pin message "),
+        lang::t(" `Enter` pin · `Esc` cancel "),
+        colors,
+    );
     let inner = block.inner(popup);
     frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
@@ -1901,7 +1922,8 @@ fn draw_pin(frame: &mut Frame, area: Rect, menu: &PinMenu, colors: &Colors) {
         message,
     );
     if menu.choices.is_empty() {
-        frame.render_widget(Line::from(" Checking…").fg(colors.muted), list);
+        let checking = lang::t(" Checking…");
+        frame.render_widget(Line::from(checking).fg(colors.muted), list);
         return;
     }
     let choice_width = (inner.width as usize).saturating_sub(3);
@@ -1939,26 +1961,29 @@ fn draw_timer(
     current: i32,
     colors: &Colors,
 ) {
-    const ABOUT: &str = " New messages disappear this long after they're seen.";
+    let about = lang::t(" New messages disappear this long after they're seen.");
     let rows = (menu.choices.len() as u16).min(area.height.saturating_sub(4).max(1));
-    let width = (ABOUT.width() as u16 + 2).min(area.width);
+    let width = (about.width() as u16 + 2).min(area.width);
     let popup = center(area, width, rows + 4);
-    // Which chat it changes, as the popup can be over another.
+    // Which chat it changes, as the popup can be over another. Room for
+    // the borders and the space after the name.
+    let what = lang::t(" Self-destruct timer · ");
     let title = format!(
-        " Self-destruct timer · {} ",
-        truncate(with, usize::from(width).saturating_sub(26))
+        "{what}{} ",
+        truncate(with, usize::from(width).saturating_sub(what.width() + 3))
     );
-    let block = popup_block(title, " `Enter` set · `Esc` cancel ", colors);
+    let keys = lang::t(" `Enter` set · `Esc` cancel ");
+    let block = popup_block(title, keys, colors);
     let inner = block.inner(popup);
     frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
-    let [about, _, list] = Layout::vertical([
+    let [about_row, _, list] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Fill(1),
     ])
     .areas(inner);
-    frame.render_widget(Line::from(ABOUT).fg(colors.subtle), about);
+    frame.render_widget(Line::from(about).fg(colors.subtle), about_row);
     let items: Vec<ListItem> = menu
         .choices
         .iter()
@@ -2005,25 +2030,34 @@ fn draw_key(frame: &mut Frame, area: Rect, key: &KeyView, colors: &Colors) {
         1 + picture_cols.max(hex_cols) + 1 + 2
     };
     let text_width = usize::from(width.saturating_sub(4)).max(1);
-    let about = format!(
-        "If {} sees the same picture in this chat on their device, nobody can read it but the two of you.",
-        key.with
+    let about = lang::f(
+        "If {name} sees the same picture in this chat on their device, nobody can read it \
+         but the two of you.",
+        &[("name", &key.with)],
     );
     let about = messages::wrap(&about, text_width);
     let art_rows = secret::KEY_SIDE as u16 + if side { 0 } else { 1 + hex.len() as u16 };
     let height = art_rows + about.len() as u16 + 3;
     // Part of the key can't be compared, and would pass for all of it.
     if width > area.width || height > area.height {
-        let text = " Make the window bigger to compare the key.";
+        let text = lang::t(" Make the window bigger to compare the key.");
         let popup = center(area, (text.width() as u16 + 3).min(area.width), 3);
-        let block = popup_block(" Encryption key ", " `Enter` close ", colors);
+        let block = popup_block(
+            lang::t(" Encryption key "),
+            lang::t(" `Enter` close "),
+            colors,
+        );
         frame.render_widget(Cover, popup);
         frame.render_widget(Paragraph::new(text).block(block), popup);
         return;
     }
     let popup = center(area, width, height);
-    let title = format!(" Encryption key · {} ", truncate(&key.with, text_width / 2));
-    let block = popup_block(title, " `Enter` close ", colors);
+    let title = format!(
+        " {} · {} ",
+        lang::t("Encryption key"),
+        truncate(&key.with, text_width / 2)
+    );
+    let block = popup_block(title, lang::t(" `Enter` close "), colors);
     let inner = block.inner(popup);
     frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);
@@ -2073,8 +2107,9 @@ fn draw_pinned(
     let width = 64.min(area.width);
     let rows = (open.pinned.len() as u16).min(area.height.saturating_sub(2));
     let popup = center(area, width, rows + 2);
-    let title = format!(" Pinned messages ({}) ", open.pinned.len());
-    let block = popup_block(title, " `Enter` go to · `P` unpin · `Esc` close ", colors);
+    let title = format!(" {} ({}) ", lang::t("Pinned messages"), open.pinned.len());
+    let keys = lang::t(" `Enter` go to · `P` unpin · `Esc` close ");
+    let block = popup_block(title, keys, colors);
     let inner = block.inner(popup);
     let row = menu.row(&open.pinned);
     frame.render_widget(Cover, popup);
@@ -2093,7 +2128,7 @@ fn draw_pinned(
             let who = truncate(&names.author(pinned.sender, pinned.outgoing), 16);
             let when = chrono::TimeZone::timestamp_opt(&chrono::Local, i64::from(pinned.date), 0)
                 .single()
-                .map_or(String::new(), |t| t.format("%-d %b").to_string());
+                .map_or(String::new(), |t| lang::day_month(&t));
             let head = format!("{who} · {when}  ");
             let room = (inner.width as usize).saturating_sub(1 + head.width());
             ListItem::new(Line::from(vec![
@@ -2116,7 +2151,6 @@ fn draw_media(frame: &mut Frame, area: Rect, app: &App, colors: &Colors) {
     let Some(menu) = &app.media_menu else {
         return;
     };
-    let ru = app.settings.ru();
     let names = messages::Names {
         users: &app.users,
         chats: &app.chats,
@@ -2132,11 +2166,7 @@ fn draw_media(frame: &mut Frame, area: Rect, app: &App, colors: &Colors) {
         format!("{}…", menu.rows.len())
     };
     let title = format!(" {} ({count}) ", menu.query);
-    let keys = crate::lang::pick(
-        ru,
-        " `Enter` go to · `O` show file · `Esc` close ",
-        " `Enter` перейти · `O` показать · `Esc` закрыть ",
-    );
+    let keys = lang::t(" `Enter` go to · `O` show file · `Esc` close ");
     let block = popup_block(title, keys, colors);
     let inner = block.inner(popup);
     frame.render_widget(Cover, popup);
@@ -2145,9 +2175,9 @@ fn draw_media(frame: &mut Frame, area: Rect, app: &App, colors: &Colors) {
         let text = if let Some(why) = &menu.error {
             format!(" {why} ")
         } else if menu.loading {
-            crate::lang::pick(ru, " Searching… ", " Ищу… ").into()
+            lang::t(" Searching… ").into()
         } else {
-            crate::lang::pick(ru, " Nothing found ", " Ничего не найдено ").into()
+            lang::t(" Nothing found ").into()
         };
         frame.render_widget(Paragraph::new(text).fg(colors.muted), inner);
         return;
@@ -2165,7 +2195,7 @@ fn draw_media(frame: &mut Frame, area: Rect, app: &App, colors: &Colors) {
             let who = truncate(&names.author(row.sender, row.outgoing), 16);
             let when = chrono::TimeZone::timestamp_opt(&chrono::Local, i64::from(row.date), 0)
                 .single()
-                .map_or(String::new(), |t| t.format("%-d %b").to_string());
+                .map_or(String::new(), |t| lang::day_month(&t));
             let head = format!("{who} · {when}  ");
             let room = (inner.width as usize).saturating_sub(3 + head.width());
             ListItem::new(Line::from(vec![
@@ -2224,23 +2254,24 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
         })
         .max()
         .unwrap_or(0);
-    // Room for borders, the bar and the "1 " shortcut, within the pane.
+    let (title, keys) = match menu.action {
+        MenuAction::Open => (
+            lang::t(" Open "),
+            lang::t(" `Enter` open · `1-9` pick · `Esc` close "),
+        ),
+        MenuAction::Copy => (
+            lang::t(" Copy "),
+            lang::t(" `Enter` copy · `1-9` pick · `Esc` close "),
+        ),
+    };
+    // Room for borders, the bar and the "1 " shortcut, within the pane, and
+    // for the keys.
     let width = (longest as u16 + 6)
+        .max(hint_width(keys) as u16 + 2)
         .min(area.width.saturating_sub(4))
         .max(36.min(area.width));
     let popup = center(area, width, menu.targets.len() as u16 + 2);
-    let block = match menu.action {
-        MenuAction::Open => popup_block(
-            " Open ",
-            " `Enter` open · `1-9` pick · `Esc` close ",
-            colors,
-        ),
-        MenuAction::Copy => popup_block(
-            " Copy ",
-            " `Enter` copy · `1-9` pick · `Esc` close ",
-            colors,
-        ),
-    };
+    let block = popup_block(title, keys, colors);
     let text_width = (block.inner(popup).width as usize).saturating_sub(3);
 
     let items: Vec<ListItem> = menu
@@ -2317,7 +2348,7 @@ fn draw_composer(
     if secret {
         let mut title = vec![Span::from(" ")];
         title.extend(lock_spans(colors));
-        title.push(Span::from("secret chat ").fg(colors.secret));
+        title.push(Span::from(lang::t("secret chat ")).fg(colors.secret));
         block = block.title(Line::from(title));
     }
     let mut text = block.inner(area);
@@ -2352,15 +2383,15 @@ fn draw_composer(
     }
     let caption = !attachments.is_empty();
     let placeholder = match (insert, &bar) {
-        (true, Some(ComposerBar::Edit(_))) => "Write the new text…",
-        (true, _) if caption => "Add a caption…",
+        (true, Some(ComposerBar::Edit(_))) => lang::t("Write the new text…"),
+        (true, _) if caption => lang::t("Add a caption…"),
         // Where it's seen, for those who don't read the status bar.
-        (true, Some(ComposerBar::Reply(_))) => "Write a reply… · `Tab` for stickers",
-        (true, None) => "Write a message… · `Tab` for stickers",
-        (false, Some(ComposerBar::Edit(_))) => "Press `i` to edit",
-        (false, _) if caption => "Press `i` to add a caption",
-        (false, Some(ComposerBar::Reply(_))) => "Press `i` to write your reply",
-        (false, None) => "Press `i` to write a message",
+        (true, Some(ComposerBar::Reply(_))) => lang::t("Write a reply… · `Tab` for stickers"),
+        (true, None) => lang::t("Write a message… · `Tab` for stickers"),
+        (false, Some(ComposerBar::Edit(_))) => lang::t("Press `i` to edit"),
+        (false, _) if caption => lang::t("Press `i` to add a caption"),
+        (false, Some(ComposerBar::Reply(_))) => lang::t("Press `i` to write your reply"),
+        (false, None) => lang::t("Press `i` to write a message"),
     };
     // Drawn over the empty text area rather than as its own placeholder,
     // which can't make the keys stand out. The cursor's look stays.
@@ -2489,9 +2520,9 @@ fn attachment_lines(
         .iter()
         .map(|a| {
             let kind = match a.sent_as(as_files) {
-                Kind::Photo { .. } => "Photo",
-                Kind::File if a.kind.is_photo() => "File, uncompressed",
-                Kind::File => "File",
+                Kind::Photo { .. } => lang::t("Photo"),
+                Kind::File if a.kind.is_photo() => lang::t("File, uncompressed"),
+                Kind::File => lang::t("File"),
             };
             line(
                 &a.name,
@@ -2505,7 +2536,10 @@ fn attachment_lines(
     if !rest.is_empty() {
         let size = rest.iter().map(|a| a.size).sum();
         let names: Vec<&str> = rest.iter().map(|a| a.name.as_str()).collect();
-        let more = format!("{} more: {}", rest.len(), names.join(", "));
+        let more = lang::f(
+            "{n} more: {names}",
+            &[("n", &rest.len()), ("names", &names.join(", "))],
+        );
         lines.push(line(&more, format!(" · {}", attach::size_label(size))));
     }
     lines
@@ -2539,7 +2573,7 @@ fn draw_bar(
     let width = (area.width as usize).saturating_sub(2);
     let (color, title, snippet) = match bar {
         ComposerBar::Reply(reply) => {
-            let label = "↩ Reply to ";
+            let label = lang::t("↩ Reply to ");
             let name = names.author(reply.sender, reply.outgoing);
             let name = truncate(&name, width.saturating_sub(label.width()));
             let title = vec![Span::from(label), Span::from(name).bold()];
@@ -2547,7 +2581,7 @@ fn draw_bar(
         }
         ComposerBar::Edit(editing) => (
             colors.edit,
-            vec![Span::from("✎ Edit message").bold()],
+            vec![Span::from(lang::t("✎ Edit message")).bold()],
             &editing.snippet,
         ),
     };
@@ -2571,34 +2605,36 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     };
     let (label, color, prefix, hints) = match prompt.kind {
         PromptKind::Chats => (
-            " SEARCH ",
+            lang::t(" SEARCH "),
             colors.search,
             " /",
-            "  `Enter` done · `Esc` cancel ",
+            lang::t("  `Enter` done · `Esc` cancel "),
         ),
         PromptKind::Messages => (
-            " SEARCH ",
+            lang::t(" SEARCH "),
             colors.search,
             " /",
-            "  `Tab` filters: from: has: before: after: · `Enter` search · `Esc` cancel ",
+            lang::t("  `Tab` filters: from: has: before: after: · `Enter` search · `Esc` cancel "),
         ),
         PromptKind::Command => (
-            " COMMAND ",
+            lang::t(" COMMAND "),
             colors.command,
             " :",
-            "  `Tab` complete · `Enter` run · `Esc` cancel ",
+            lang::t("  `Tab` complete · `Enter` run · `Esc` cancel "),
         ),
         PromptKind::Attach => (
-            " ATTACH ",
+            lang::t(" ATTACH "),
             colors.attach,
             " ",
-            "  `Tab` complete · `Enter` attach · `Esc` cancel ",
+            lang::t("  `Tab` complete · `Enter` attach · `Esc` cancel "),
         ),
         PromptKind::Proxy => (
-            " PROXY ",
+            lang::t(" PROXY "),
             colors.command,
             " ",
-            "  socks5://, http:// or t.me/proxy link · `Enter` use it, empty for none · `Esc` cancel ",
+            lang::t(
+                "  socks5://, http:// or t.me/proxy link · `Enter` use it, empty for none · `Esc` cancel ",
+            ),
         ),
     };
     let hints = Line::from(hint_spans(hints, Style::new().fg(colors.muted), colors));
@@ -2659,7 +2695,7 @@ fn draw_commands(
             }
         })
         .collect();
-    let title = " Commands · Tab completes ";
+    let title = lang::t(" Commands · Tab completes ");
     let longest = lines
         .iter()
         .map(Line::width)
@@ -2701,9 +2737,11 @@ fn draw_completions(frame: &mut Frame, area: Rect, names: &[String], colors: &Co
         })
         .collect();
     if names.len() > MAX_SHOWN {
-        lines.push(Line::from(format!(" … {} more", names.len() - MAX_SHOWN)).fg(colors.muted));
+        let more = names.len() - MAX_SHOWN;
+        let more = lang::f(" … {n} more", &[("n", &more)]);
+        lines.push(Line::from(more).fg(colors.muted));
     }
-    let title = " Matches · type more, then Tab ";
+    let title = lang::t(" Matches · type more, then Tab ");
     let longest = lines
         .iter()
         .map(Line::width)
@@ -2728,54 +2766,42 @@ fn draw_completions(frame: &mut Frame, area: Rect, names: &[String], colors: &Co
 }
 
 /// Ctrl-t's hint while photos are attached: what it switches them to.
-fn as_files_hint(open: &OpenChat, ru: bool) -> Option<&'static str> {
+fn as_files_hint(open: &OpenChat) -> Option<&'static str> {
     let photos = open.attachments.iter().any(|a| a.kind.is_photo());
     photos.then_some(match open.as_files {
-        true => crate::lang::pick(ru, "`Ctrl-t` send as photos", "`Ctrl-t` отправить как фото"),
-        false => crate::lang::pick(ru, "`Ctrl-t` send as files", "`Ctrl-t` отправить как файлы"),
+        true => lang::t("`Ctrl-t` send as photos"),
+        false => lang::t("`Ctrl-t` send as files"),
     })
 }
 
 /// Hints for keys that depend on the cursor: Enter on hidden spoilers, `gd`
 /// on a reply, and Ctrl-o / Ctrl-i after leaving a chat or a reply.
-fn jump_hints(open: &OpenChat, jumps: &Jumps, ru: bool) -> Vec<&'static str> {
+fn jump_hints(open: &OpenChat, jumps: &Jumps) -> Vec<&'static str> {
     let mut hints = Vec::new();
     let msg = open.cursor_id().and_then(|id| open.messages.get(&id));
     if msg.and_then(|m| m.hidden.as_ref()).is_some_and(|h| !h.open) {
-        hints.push(crate::lang::pick(
-            ru,
-            "`Enter` view it",
-            "`Enter` посмотреть",
-        ));
+        hints.push(lang::t("`Enter` view it"));
     } else if open.cursor_id().is_some_and(|id| open.hides_spoilers(id)) {
-        hints.push(crate::lang::pick(
-            ru,
-            "`Enter` show spoiler",
-            "`Enter` показать спойлер",
-        ));
+        hints.push(lang::t("`Enter` show spoiler"));
     } else if open
         .cursor_id()
         .and_then(|id| open.messages.get(&id))
         .is_some_and(|m| m.keyboard.is_some())
     {
-        hints.push("`Enter` buttons");
+        hints.push(lang::t("`Enter` buttons"));
     }
     let on_reply = open
         .cursor_id()
         .and_then(|id| open.messages.get(&id))
         .is_some_and(|m| m.reply_to.is_some());
     if on_reply {
-        hints.push(crate::lang::pick(
-            ru,
-            "`gd` go to replied",
-            "`gd` к отвеченному",
-        ));
+        hints.push(lang::t("`gd` go to replied"));
     }
     if jumps.can_go_back() {
-        hints.push(crate::lang::pick(ru, "`Ctrl-o` back", "`Ctrl-o` назад"));
+        hints.push(lang::t("`Ctrl-o` back"));
     }
     if jumps.can_go_forward() {
-        hints.push(crate::lang::pick(ru, "`Ctrl-i` forward", "`Ctrl-i` вперёд"));
+        hints.push(lang::t("`Ctrl-i` forward"));
     }
     hints
 }
@@ -2785,7 +2811,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         draw_prompt(frame, app, area, colors);
         return;
     }
-    let normal = Span::from(" NORMAL ").fg(colors.bg).bg(colors.primary);
+    let normal = Span::from(lang::t(" NORMAL "))
+        .fg(colors.bg)
+        .bg(colors.primary);
     let searching = app.open.as_ref().is_some_and(|o| o.search.is_some());
     let replying = app.open.as_ref().is_some_and(|o| o.reply.is_some());
     let editing = app.open.as_ref().is_some_and(|o| o.editing.is_some());
@@ -2796,133 +2824,92 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         .open
         .as_ref()
         .is_some_and(|o| !app.chats.joined(o.chat_id));
-    let insert = Span::from(" INSERT ").fg(colors.bg).bg(colors.insert);
-    let sticker = Span::from(" STICKERS ").fg(colors.bg).bg(colors.insert);
+    let insert = Span::from(lang::t(" INSERT "))
+        .fg(colors.bg)
+        .bg(colors.insert);
+    let sticker = Span::from(lang::t(" STICKERS "))
+        .fg(colors.bg)
+        .bg(colors.insert);
     let picking = app.focus == Focus::Input && app.stickers.is_some();
-    let ru = app.settings.ru();
-    let t = |en: &'static str, ru_text: &'static str| crate::lang::pick(ru, en, ru_text);
     let (mode, hints) = match app.focus {
         _ if app.resizing.is_some() => (
-            Span::from(" RESIZE ").fg(colors.bg).bg(colors.accent),
+            Span::from(lang::t(" RESIZE "))
+                .fg(colors.bg)
+                .bg(colors.accent),
             match app.settings.chat_list_side {
-                Side::Left => t(
+                Side::Left => lang::t(
                     "  `h` narrower · `l` wider · `=` as at first · `Enter` keep · `Esc` cancel",
-                    "  `h` уже · `l` шире · `=` как было · `Enter` оставить · `Esc` отмена",
                 ),
-                Side::Right => t(
+                Side::Right => lang::t(
                     "  `h` wider · `l` narrower · `=` as at first · `Enter` keep · `Esc` cancel",
-                    "  `h` шире · `l` уже · `=` как было · `Enter` оставить · `Esc` отмена",
                 ),
             },
         ),
         _ if app.confirm.is_some() => (
             normal,
             match app.confirm.as_ref().map(|c| &c.action) {
-                Some(Confirmed::Edit { .. }) => t(
-                    "  `y` edit · `n` or `Esc` cancel",
-                    "  `y` править · `n` или `Esc` отмена",
-                ),
-                Some(Confirmed::Join(_) | Confirmed::JoinLink { .. }) => t(
-                    "  `y` join · `n` or `Esc` cancel",
-                    "  `y` вступить · `n` или `Esc` отмена",
-                ),
-                Some(Confirmed::Leave(_)) => t(
-                    "  `y` leave · `n` or `Esc` cancel",
-                    "  `y` покинуть · `n` или `Esc` отмена",
-                ),
-                Some(Confirmed::Logout) => t(
-                    "  `y` log out · `n` or `Esc` cancel",
-                    "  `y` выйти из аккаунта · `n` или `Esc` отмена",
-                ),
-                Some(Confirmed::StartSecret { .. }) => t(
-                    "  `y` start it · `n` or `Esc` cancel",
-                    "  `y` начать · `n` или `Esc` отмена",
-                ),
-                Some(Confirmed::EndSecret { .. }) => t(
-                    "  `y` end it · `n` or `Esc` cancel",
-                    "  `y` завершить · `n` или `Esc` отмена",
-                ),
-                Some(Confirmed::UseProxy(_)) => t(
-                    "  `y` use it · `n` or `Esc` cancel",
-                    "  `y` использовать · `n` или `Esc` отмена",
-                ),
-                _ => t(
-                    "  `y` open · `n` or `Esc` cancel",
-                    "  `y` открыть · `n` или `Esc` отмена",
-                ),
+                Some(Confirmed::Edit { .. }) => lang::t("  `y` edit · `n` or `Esc` cancel"),
+                Some(
+                    Confirmed::Join { channel: true, .. }
+                    | Confirmed::JoinLink { channel: true, .. },
+                ) => lang::tc("channel", "  `y` join · `n` or `Esc` cancel"),
+                Some(Confirmed::Join { .. } | Confirmed::JoinLink { .. }) => {
+                    lang::t("  `y` join · `n` or `Esc` cancel")
+                }
+                Some(Confirmed::Leave(_)) => lang::t("  `y` leave · `n` or `Esc` cancel"),
+                Some(Confirmed::Logout) => lang::t("  `y` log out · `n` or `Esc` cancel"),
+                Some(Confirmed::StartSecret { .. }) => {
+                    lang::t("  `y` start it · `n` or `Esc` cancel")
+                }
+                Some(Confirmed::EndSecret { .. }) => lang::t("  `y` end it · `n` or `Esc` cancel"),
+                Some(Confirmed::UseProxy(_)) => lang::t("  `y` use it · `n` or `Esc` cancel"),
+                _ => lang::t("  `y` open · `n` or `Esc` cancel"),
             },
         ),
         _ if app.settings_menu.as_ref().map(|m| m.tab) == Some(HelpTab::Shortcuts) => (
             normal,
-            t(
-                "  `j/k` scroll · `Tab` settings · `Esc` close",
-                "  `j/k` листать · `Tab` настройки · `Esc` закрыть",
-            ),
+            lang::t("  `j/k` scroll · `Tab` settings · `Esc` close"),
         ),
         _ if app.settings_menu.is_some() => (
             normal,
-            t(
+            lang::t(
                 "  `j/k` move · `Enter` or `Space` change, saved at once · `Tab` shortcuts · `Esc` close",
-                "  `j/k` перемещение · `Enter` или `Space` изменить, сохраняется сразу · `Tab` клавиши · `Esc` закрыть",
             ),
         ),
         _ if app.delete_menu.is_some() => (
             normal,
-            t(
-                "  `j/k` choose · `Enter` delete · `Esc` cancel",
-                "  `j/k` выбор · `Enter` удалить · `Esc` отмена",
-            ),
+            lang::t("  `j/k` choose · `Enter` delete · `Esc` cancel"),
         ),
         _ if app.react_menu.as_ref().is_some_and(|m| m.query.is_some()) => (
             normal,
-            t(
+            lang::t(
                 "  type a name, like heart or +1 · `arrows` choose · `Enter` react · `Esc` back",
-                "  имя, например heart или +1 · `стрелки` выбор · `Enter` реакция · `Esc` назад",
             ),
         ),
         _ if app.react_menu.is_some() => (
             normal,
-            t(
+            lang::t(
                 "  `h/j/k/l` choose · `Enter` react, or take yours back · `X` take all yours back · `/` search · `Esc` close",
-                "  `h/j/k/l` выбор · `Enter` реакция или снять свою · `X` снять все свои · `/` поиск · `Esc` закрыть",
             ),
         ),
         _ if app.vote_menu.as_ref().is_some_and(|m| m.several) => (
             normal,
-            t(
-                "  `j/k` choose · `Space` tick · `Enter` vote for the ticked · `Esc` close",
-                "  `j/k` выбор · `Space` отметить · `Enter` голосовать за отмеченные · `Esc` закрыть",
-            ),
+            lang::t("  `j/k` choose · `Space` tick · `Enter` vote for the ticked · `Esc` close"),
         ),
         _ if app.vote_menu.is_some() => (
             normal,
-            t(
-                "  `j/k` choose · `Enter` vote · `Esc` close",
-                "  `j/k` выбор · `Enter` голосовать · `Esc` закрыть",
-            ),
+            lang::t("  `j/k` choose · `Enter` vote · `Esc` close"),
         ),
-        _ if app.notice.is_some() => (
-            normal,
-            t("  `Enter` or `Esc` close", "  `Enter` или `Esc` закрыть"),
-        ),
+        _ if app.notice.is_some() => (normal, lang::t("  `Enter` or `Esc` close")),
         _ if app.pin_menu.is_some() => (
             normal,
-            t(
-                "  `j/k` choose · `Enter` pin · `Esc` cancel",
-                "  `j/k` выбор · `Enter` закрепить · `Esc` отмена",
-            ),
+            lang::t("  `j/k` choose · `Enter` pin · `Esc` cancel"),
         ),
         _ if app.timer_menu.is_some() => (
             normal,
-            t(
-                "  `j/k` choose · `Enter` set the timer · `Esc` cancel",
-                "  `j/k` выбор · `Enter` задать таймер · `Esc` отмена",
-            ),
+            lang::t("  `j/k` choose · `Enter` set the timer · `Esc` cancel"),
         ),
-        _ if app.key_view.is_some() => (
-            normal,
-            t("  `Enter` or `Esc` close", "  `Enter` или `Esc` закрыть"),
-        ),
+        _ if app.key_view.is_some() => (normal, lang::t("  `Enter` or `Esc` close")),
         _ if app
             .chat_info
             .as_ref()
@@ -2930,224 +2917,187 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         {
             (
                 normal,
-                t(
-                    "  `j/k` move · `Enter` write to them · `g/G` first/last · `Esc` close",
-                    "  `j/k` перемещение · `Enter` написать · `g/G` первый/последний · `Esc` закрыть",
-                ),
+                lang::t("  `j/k` move · `Enter` write to them · `g/G` first/last · `Esc` close"),
             )
         }
-        _ if app.chat_info.is_some() => (normal, t("  `Esc` close", "  `Esc` закрыть")),
+        _ if app.chat_info.is_some() => (normal, lang::t("  `Esc` close")),
         _ if app.text_select.as_ref().is_some_and(TextSelect::selecting) => (
-            Span::from(" VISUAL ").fg(colors.bg).bg(colors.accent),
-            t(
+            Span::from(lang::t(" VISUAL "))
+                .fg(colors.bg)
+                .bg(colors.accent),
+            lang::t(
                 "  `y` copy · `h/j/k/l` `w/b/e` `0/$` `g/G` move the end · `v` or `Esc` stop selecting",
-                "  `y` копировать · `h/j/k/l` `w/b/e` `0/$` `g/G` конец выделения · `v` или `Esc` стоп",
             ),
         ),
         _ if app.text_select.is_some() => (
             normal,
-            t(
+            lang::t(
                 "  `v` start selecting · `h/j/k/l` move · `w/b/e` by word · `0/$` line start/end · `g/G` start/end · `Ctrl-d/u` half page · `Esc` close",
-                "  `v` выделять · `h/j/k/l` перемещение · `w/b/e` по словам · `0/$` начало/конец строки · `g/G` начало/конец · `Ctrl-d/u` полстраницы · `Esc` закрыть",
             ),
         ),
         _ if app.photo_view.is_some() => (
             normal,
-            t(
+            lang::t(
                 "  `h/l` older/newer photo · `j/k` zoom in/out · `o` open in its app · `y` copy · `Enter` or `Esc` close",
-                "  `h/l` старее/новее фото · `j/k` увеличить/уменьшить · `o` открыть в приложении · `y` копировать · `Enter` или `Esc` закрыть",
             ),
         ),
         _ if app.video_view.is_some() => (
             normal,
-            t(
+            lang::t(
                 "  `Space` pause · `j/k` zoom in/out · `o` open in its app · `Enter` or `Esc` close",
-                "  `Space` пауза · `j/k` увеличить/уменьшить · `o` открыть в приложении · `Enter` или `Esc` закрыть",
             ),
         ),
         _ if app.pinned_menu.is_some() => (
             normal,
-            t(
-                "  `j/k` choose · `Enter` go to it · `P` unpin it · `Esc` close",
-                "  `j/k` выбор · `Enter` перейти · `P` открепить · `Esc` закрыть",
-            ),
+            lang::t("  `j/k` choose · `Enter` go to it · `P` unpin it · `Esc` close"),
         ),
         _ if app.media_menu.is_some() => (
             normal,
-            t(
-                "  `j/k` choose · `Enter` go to it · `O` show the file · `Esc` close",
-                "  `j/k` выбор · `Enter` перейти · `O` показать файл · `Esc` закрыть",
-            ),
+            lang::t("  `j/k` choose · `Enter` go to it · `O` show the file · `Esc` close"),
         ),
         _ if app.button_menu.as_ref().is_some_and(|m| m.reply) => (
             normal,
-            t(
-                "  `h/j/k/l` choose · `Enter` send its words · `Esc` close",
-                "  `h/j/k/l` выбор · `Enter` отправить её текст · `Esc` закрыть",
-            ),
+            lang::t("  `h/j/k/l` choose · `Enter` send its words · `Esc` close"),
         ),
         _ if app.button_menu.is_some() => (
             normal,
-            t(
-                "  `h/j/k/l` choose · `Enter` press · `Esc` close",
-                "  `h/j/k/l` выбор · `Enter` нажать · `Esc` закрыть",
-            ),
+            lang::t("  `h/j/k/l` choose · `Enter` press · `Esc` close"),
         ),
         _ if app.picker.as_ref().is_some_and(ChatPicker::forwarding) => (
             normal,
-            t(
-                "  type a chat's name · `arrows` choose · `Enter` forward · `Esc` cancel",
-                "  имя чата · `стрелки` выбор · `Enter` переслать · `Esc` отмена",
-            ),
+            lang::t("  type a chat's name · `arrows` choose · `Enter` forward · `Esc` cancel"),
         ),
         _ if app.picker.is_some() => (
             normal,
-            t(
+            lang::t(
                 "  type a name, @username or t.me link · `arrows` choose · `Enter` open · `Esc` cancel",
-                "  имя, @username или ссылка t.me · `стрелки` выбор · `Enter` открыть · `Esc` отмена",
             ),
         ),
         Focus::Chats if !app.chats.filter().is_empty() => (
             normal,
-            t(
+            lang::t(
                 "  `j/k` move · `Enter` open · `Esc` clear search · `/` search again · `i` write · `q` quit",
-                "  `j/k` перемещение · `Enter` открыть · `Esc` сбросить поиск · `/` искать снова · `i` написать · `q` выход",
             ),
         ),
         Focus::Chats if !app.chats.tabs().is_empty() => (
             normal,
-            t(
+            lang::t(
                 "  `j/k` move · `Enter` open · `i` write · `Tab/Shift-Tab` folders · `/` search · `s` find anyone · `p` pin · `m` mute · `a` archive · `I` info · `Ctrl-o/i` back/forward · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
-                "  `j/k` перемещение · `Enter` открыть · `i` написать · `Tab/Shift-Tab` папки · `/` поиск · `s` найти любого · `p` закрепить · `m` звук · `a` архив · `I` инфо · `Ctrl-o/i` назад/вперёд · `H` выделить · `gg/G` вверх/вниз · `Ctrl-d/u` полстраницы · `Ctrl-r` ширина · `:` команды · `?` помощь · `q` выход",
             ),
         ),
         Focus::Chats => (
             normal,
-            t(
+            lang::t(
                 "  `j/k` move · `Enter` open · `i` write · `/` search · `s` find anyone · `p` pin · `m` mute · `a` archive · `I` info · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
-                "  `j/k` перемещение · `Enter` открыть · `i` написать · `/` поиск · `s` найти любого · `p` закрепить · `m` звук · `a` архив · `I` инфо · `H` выделить · `gg/G` вверх/вниз · `Ctrl-d/u` полстраницы · `Ctrl-r` ширина · `:` команды · `?` помощь · `q` выход",
             ),
         ),
         Focus::Topics => (
             normal,
-            t(
+            lang::t(
                 "  `j/k` move · `Enter` open · `i` write · `h` back · `s` find anyone · `I` info · `Ctrl-o/i` back/forward · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
-                "  `j/k` перемещение · `Enter` открыть · `i` написать · `h` назад · `s` найти любого · `I` инфо · `Ctrl-o/i` назад/вперёд · `gg/G` вверх/вниз · `Ctrl-d/u` полстраницы · `Ctrl-r` ширина · `:` команды · `?` помощь · `q` выход",
             ),
         ),
         Focus::Messages if searching => (
             normal,
-            t(
+            lang::t(
                 "  `n/N` older/newer match · `Esc` end search · `/` search again · `j/k` newer/older · `Enter` open/play media · `r` reply · `i` write · `h` back",
-                "  `n/N` старее/новее · `Esc` конец поиска · `/` искать снова · `j/k` новее/старее · `Enter` открыть/играть · `r` ответить · `i` написать · `h` назад",
             ),
         ),
         Focus::Messages if editing => (
             normal,
-            t(
+            lang::t(
                 "  `i` edit · `Esc` cancel edit · `e` edit selected instead · `j/k` newer/older · `h` back",
-                "  `i` править · `Esc` отмена правки · `e` править выбранное · `j/k` новее/старее · `h` назад",
             ),
         ),
         Focus::Messages if attaching => (
             normal,
-            t(
+            lang::t(
                 "  `i` add caption · `Esc` remove files · `a` attach more · `p` paste more · `r` reply · `j/k` newer/older · `h` back",
-                "  `i` подпись · `Esc` убрать файлы · `a` ещё файл · `p` вставить ещё · `r` ответить · `j/k` новее/старее · `h` назад",
             ),
         ),
         Focus::Messages if replying => (
             normal,
-            t(
+            lang::t(
                 "  `i` write reply · `Esc` cancel reply · `r` reply to selected instead · `j/k` newer/older · `Enter` open/play media · `h` back",
-                "  `i` написать ответ · `Esc` отмена ответа · `r` ответить выбранному · `j/k` новее/старее · `Enter` открыть/играть · `h` назад",
             ),
         ),
         Focus::Messages if joinable => (
             normal,
-            t(
+            lang::t(
                 "  you're not in this chat · `J` join · `j/k` newer/older · `Enter` open/play media · `s` find anyone · `h` back",
-                "  вы не в этом чате · `J` вступить · `j/k` новее/старее · `Enter` открыть/играть · `s` найти любого · `h` назад",
             ),
         ),
         Focus::Messages => (
             normal,
-            t(
+            lang::t(
                 "  `j/k` newer/older · `y` copy · `r` reply · `f` forward · `R` react · `X` unreact · `e` edit · `d` delete · `P` pin · `gp` pinned · `gu/gm/gM` unread/mention · `Enter` open/play media · `i` write · `a` attach · `p` paste · `/` search · `s` find anyone · `I` info · `gg/G` oldest/newest · `h` back · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
-                "  `j/k` новее/старее · `y` копировать · `r` ответить · `f` переслать · `R` реакция · `X` снять реакцию · `e` править · `d` удалить · `P` закрепить · `gp` закреплённые · `gu/gm/gM` непрочитанное/упоминание · `Enter` открыть/играть · `i` написать · `a` прикрепить · `p` вставить · `/` поиск · `s` найти любого · `I` инфо · `gg/G` старейшее/новейшее · `h` назад · `Ctrl-r` ширина · `:` команды · `?` помощь · `q` выход",
             ),
         ),
         _ if picking && app.stickers.as_ref().is_some_and(|p| p.query.is_some()) => (
             sticker,
-            t(
+            lang::t(
                 "  type an emoji or a word, like cat · `arrows` choose · `Enter` send · `Esc` back",
-                "  эмодзи или слово, например кот · `стрелки` выбор · `Enter` отправить · `Esc` назад",
             ),
         ),
         _ if picking => (
             sticker,
-            t(
+            lang::t(
                 "  `h/j/k/l` choose · `H/L` previous/next tab · `Enter` send · `/` search · `Tab` or `Esc` back to writing",
-                "  `h/j/k/l` выбор · `H/L` пред./след. вкладка · `Enter` отправить · `/` поиск · `Tab` или `Esc` обратно к тексту",
             ),
         ),
         Focus::Input if app.completion.as_ref().is_some_and(|c| !c.items.is_empty()) => (
             insert,
-            t(
+            lang::t(
                 "  `Tab` insert · `arrows` choose · keep typing to narrow it down · `Enter` send · `Esc` normal mode",
-                "  `Tab` вставить · `стрелки` выбор · продолжайте печатать для уточнения · `Enter` отправить · `Esc` обычный режим",
             ),
         ),
         Focus::Input if editing => (
             insert,
-            t(
+            lang::t(
                 "  `Enter` save · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` cancel edit",
-                "  `Enter` сохранить · `Alt-Enter` или `Ctrl-j` новая строка · `Esc` обычный режим · `Esc Esc` отмена правки",
             ),
         ),
         Focus::Input if dropped => (
             insert,
-            t(
+            lang::t(
                 "  `Enter` send · `Ctrl-z` paste as text instead · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` remove files",
-                "  `Enter` отправить · `Ctrl-z` вставить как текст · `Alt-Enter` или `Ctrl-j` новая строка · `Esc` обычный режим · `Esc Esc` убрать файлы",
             ),
         ),
         Focus::Input if attaching => (
             insert,
-            t(
+            lang::t(
                 "  `Enter` send · `Ctrl-v` paste more · `Alt-Enter` or `Ctrl-j` new line · `Esc` normal mode · `Esc Esc` remove files",
-                "  `Enter` отправить · `Ctrl-v` вставить ещё · `Alt-Enter` или `Ctrl-j` новая строка · `Esc` обычный режим · `Esc Esc` убрать файлы",
             ),
         ),
         Focus::Input if replying => (
             insert,
-            t(
+            lang::t(
                 "  `Enter` send reply · `Alt-Enter` or `Ctrl-j` new line · `Tab` stickers · `Esc` normal mode · `Esc Esc` cancel reply",
-                "  `Enter` отправить ответ · `Alt-Enter` или `Ctrl-j` новая строка · `Tab` стикеры · `Esc` обычный режим · `Esc Esc` отмена ответа",
             ),
         ),
         Focus::Input => (
             insert,
-            t(
+            lang::t(
                 "  `Enter` send · `Alt-Enter` or `Ctrl-j` new line · `Tab` stickers · `Ctrl-v` paste photo or file · `Esc` normal mode",
-                "  `Enter` отправить · `Alt-Enter` или `Ctrl-j` новая строка · `Tab` стикеры · `Ctrl-v` вставить фото или файл · `Esc` обычный режим",
             ),
         ),
     };
     // `l` goes back to a chat list on the right.
     let hints = match app.settings.chat_list_side {
         Side::Left => hints.to_string(),
-        Side::Right => hints
-            .replace("`h` back", "`l` back")
-            .replace("`h` назад", "`l` назад"),
+        // Hints say "back" in the same words as the `R` popup.
+        Side::Right => {
+            let back = lang::t("back");
+            hints.replace(&format!("`h` {back}"), &format!("`l` {back}"))
+        }
     };
     let popup = app.popup_open() || app.resizing.is_some();
     let mut context = match &app.open {
-        Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open, &app.jumps, ru),
+        Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open, &app.jumps),
         _ => Vec::new(),
     };
     if app.focus == Focus::Messages && !popup && app.unread_mentions() > 0 {
-        context.insert(0, crate::lang::pick(ru, "`gm` mention", "`gm` упоминание"));
+        context.insert(0, lang::t("`gm` mention"));
     }
     let retry = app.open.as_ref().is_some_and(|o| {
         o.cursor_id()
@@ -3155,15 +3105,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             .is_some_and(|m| m.state == SendState::Failed { can_retry: true })
     });
     if app.focus == Focus::Messages && !popup && retry {
-        context.insert(
-            0,
-            crate::lang::pick(ru, "`Enter` send again", "`Enter` отправить снова"),
-        );
+        context.insert(0, lang::t("`Enter` send again"));
     }
     if let Some(open) = &app.open
         && matches!(app.focus, Focus::Messages | Focus::Input)
         && !popup
-        && let Some(hint) = as_files_hint(open, ru)
+        && let Some(hint) = as_files_hint(open)
     {
         context.insert(0, hint);
     }
@@ -3171,7 +3118,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     // First, where it can't be cut off: nothing goes out or comes in
     // meanwhile.
     if let Some(connection) = app.connection {
-        spans.push(Span::from(format!("  {connection}")).fg(colors.warning));
+        spans.push(Span::from(format!("  {}", lang::t(connection))).fg(colors.warning));
     }
     let muted = Style::new().fg(colors.muted);
     if context.is_empty() {
@@ -3184,64 +3131,30 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
     }
     match app.resizing {
         Some(Resizing::List(_)) => {
-            let width = format!(
-                "  {} {}%",
-                crate::lang::pick(ru, "chat list", "список чатов"),
-                app.settings.list_width()
-            );
+            let width = format!("  {} {}%", lang::t("chat list"), app.settings.list_width());
             spans.push(Span::from(width).fg(colors.fg));
         }
         Some(Resizing::Topics(_)) => {
-            let width = match ru {
-                true => format!("  темы: {} колонок", app.settings.topics_pane_width()),
-                false => format!("  topics {} columns", app.settings.topics_pane_width()),
-            };
+            let n = app.settings.topics_pane_width();
+            let width = lang::n(n.into(), "  topics {n} column", "  topics {n} columns", &[]);
             spans.push(Span::from(width).fg(colors.fg));
         }
         None => {}
     }
     if app.quit_deadline.is_some() {
-        spans.push(
-            Span::from(crate::lang::pick(
-                ru,
-                "  Closing… (q again to force)",
-                "  Закрытие… (ещё `q` — принудительно)",
-            ))
-            .fg(colors.warning),
-        );
+        spans.push(Span::from(lang::t("  Closing… (q again to force)")).fg(colors.warning));
     } else if !app.opening.is_empty() {
-        spans.push(
-            Span::from(crate::lang::pick(
-                ru,
-                "  Downloading… opens when done",
-                "  Скачивание… откроется по готовности",
-            ))
-            .fg(colors.warning),
-        );
+        spans.push(Span::from(lang::t("  Downloading… opens when done")).fg(colors.warning));
     } else if !app.copying.is_empty() {
-        spans.push(
-            Span::from(crate::lang::pick(
-                ru,
-                "  Downloading… copies when done",
-                "  Скачивание… скопируется по готовности",
-            ))
-            .fg(colors.warning),
-        );
+        spans.push(Span::from(lang::t("  Downloading… copies when done")).fg(colors.warning));
     } else if app.pasting {
-        spans.push(
-            Span::from(crate::lang::pick(
-                ru,
-                "  Reading the clipboard…",
-                "  Чтение буфера обмена…",
-            ))
-            .fg(colors.warning),
-        );
+        spans.push(Span::from(lang::t("  Reading the clipboard…")).fg(colors.warning));
     } else if let Some(finding) = &app.finding {
         let what = truncate(&finding.request, 60);
         let looking = format!(
             "  {} {what}…{}",
-            crate::lang::pick(ru, "Looking for", "Поиск"),
-            crate::lang::pick(ru, " (Esc stops)", " (`Esc` стоп)")
+            lang::t("Looking for"),
+            lang::t(" (Esc stops)")
         );
         spans.push(Span::from(looking).fg(colors.warning));
     } else if let Some(message) = &app.status {
@@ -3462,7 +3375,7 @@ mod tests {
         assert!(has(&rows, "Switch tabs in this popup"), "the last shortcut");
         assert_eq!(
             menu.scroll,
-            help::height(false) - 16,
+            help::height() - 16,
             "the popup is 2 rows shorter than the screen, then borders"
         );
 
@@ -4073,18 +3986,18 @@ mod tests {
 
         let mut jumps = Jumps::default();
         assert_eq!(
-            jump_hints(&open, &jumps, false),
+            jump_hints(&open, &jumps),
             ["`gd` go to replied"],
             "newest is a reply"
         );
         open.selected = Some(1);
-        assert!(jump_hints(&open, &jumps, false).is_empty());
+        assert!(jump_hints(&open, &jumps).is_empty());
         jumps.leave(crate::app::Jump {
             chat_id: 1,
             topic: None,
             message_id: Some(2),
         });
-        assert_eq!(jump_hints(&open, &jumps, false), ["`Ctrl-o` back"]);
+        assert_eq!(jump_hints(&open, &jumps), ["`Ctrl-o` back"]);
     }
 
     #[test]
@@ -4406,6 +4319,7 @@ mod tests {
             crate::app::Confirmed::JoinLink {
                 link: "https://t.me/+x".into(),
                 request: "https://t.me/+x".into(),
+                channel: false,
             },
         );
         confirm.badge = Some(Badge::Scam);
@@ -4709,5 +4623,309 @@ mod tests {
         assert!(row(&rows, "A gap between chats").contains("[ ] A gap between chats"));
         assert!(row(&rows, "A gap between messages").contains("[ ] A gap between"));
         assert!(row(&rows, "Back to Normal").contains("▌ [✓] Back to Normal mode"));
+    }
+
+    #[test]
+    fn in_russian_the_login_screen_says_every_step_in_full() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let rows = draw_login_rows(LoginStep::Phone, 80, 24);
+        let text = rows.concat();
+        assert!(text.contains(" Вход "), "{rows:#?}");
+        assert!(text.contains("Номер телефона"));
+        assert!(
+            text.contains("телефоне."),
+            "help text isn't cut off: {rows:#?}"
+        );
+        assert!(text.contains("Enter отправить · Tab QR-код · Ctrl-c выход"));
+
+        let rows = draw_login_rows(LoginStep::ApiId, 80, 24);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("Или без всего этого: cargo binstall tuigram-cli")),
+            "the last line isn't cut off: {rows:#?}"
+        );
+
+        let bad = LoginStep::BadProxy {
+            from: "TG_PROXY",
+            why: "Unsupported proxy secret".into(),
+        };
+        let rows = draw_login_rows(bad, 80, 24);
+        let text = rows.concat();
+        assert!(text.contains("Не удаётся использовать TG_PROXY"));
+        assert!(
+            text.contains("прокси."),
+            "help text isn't cut off: {rows:#?}"
+        );
+
+        let link = LOGIN_LINK.to_string();
+        let step = LoginStep::OtherDevice { link: link.clone() };
+        let rows = draw_login_rows(step, 80, 24);
+        let text = rows.concat();
+        assert!(text.contains("Отсканируйте QR-код"));
+        assert!(text.contains("код."), "help text isn't cut off: {rows:#?}");
+        assert!(text.contains("Esc войти по номеру · Ctrl-c выход"));
+        let text = draw_login_rows(LoginStep::OtherDevice { link }, 80, 20).concat();
+        assert!(text.contains("64×24"), "{text}");
+    }
+
+    #[test]
+    fn in_russian_popups_are_wide_enough_for_their_keys() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let colors = Colors::default();
+        let render = |width, draw: &dyn Fn(&mut Frame)| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
+            terminal.draw(|f| draw(f)).unwrap();
+            buffer_rows(terminal.backend().buffer())
+        };
+        let has = |rows: &[String], needle: &str| rows.iter().any(|r| r.contains(needle));
+
+        let menu = DeleteMenu {
+            message_id: 5,
+            snippet: "до встречи".into(),
+            choices: Vec::new(),
+            selected: 0,
+        };
+        let rows = render(60, &|f| draw_delete(f, f.area(), &menu, &colors));
+        assert!(has(&rows, " Удалить сообщение "));
+        assert!(has(&rows, "Проверка…"), "until TDLib answers");
+        assert!(has(&rows, "Enter удалить · Esc отмена"));
+
+        let menu = PickMenu {
+            action: MenuAction::Copy,
+            targets: vec![Target::Link("https://x.dev".into())],
+            selected: 0,
+        };
+        let rows = render(70, &|f| draw_menu(f, f.area(), &menu, &colors));
+        assert!(has(&rows, " Скопировать "));
+        assert!(
+            has(&rows, "Enter скопировать · 1-9 выбор · Esc закрыть"),
+            "the keys aren't cut off: {rows:#?}"
+        );
+
+        let menu = VoteMenu {
+            message_id: 5,
+            question: "Куда?".into(),
+            answers: vec!["Сюда".into(), "Туда".into()],
+            ticked: vec![false, false],
+            several: true,
+            can_retract: true,
+            selected: 0,
+        };
+        let rows = render(70, &|f| draw_vote(f, f.area(), &menu, &colors));
+        assert!(has(&rows, " Голосование "));
+        assert!(has(&rows, "Отменить голос"));
+        assert!(
+            has(&rows, "Space отметить · Enter голосовать · Esc закрыть"),
+            "the keys aren't cut off: {rows:#?}"
+        );
+
+        let confirm = Confirm::new(
+            "Выйти из аккаунта?",
+            vec!["Затем можно войти снова.".into()],
+            Confirmed::Logout,
+        );
+        let rows = render(70, &|f| draw_confirm(f, f.area(), &confirm, &colors));
+        assert!(
+            has(&rows, " y выйти из аккаунта · Esc отмена "),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn in_russian_who_is_typing_agrees_with_how_many_are() {
+        use tdlib_rs::enums::{ChatAction, MessageSender};
+        use tdlib_rs::types::MessageSenderUser;
+
+        crate::lang::set(crate::lang::Lang::Ru);
+        let mut chats = crate::chats::Chats::default();
+        chats.add_local(1, "Leo", None).is_private = true;
+        chats.add_local(-100, "Rustaceans", None);
+        let user = |user_id| MessageSender::User(MessageSenderUser { user_id });
+        chats.set_action(1, None, &user(7), &ChatAction::RecordingVoiceNote);
+        chats.set_action(-100, None, &user(7), &ChatAction::Typing);
+        let users = std::collections::HashMap::from([
+            (7, "Leo".to_string()),
+            (8, "Maya".to_string()),
+            (9, "Sam".to_string()),
+        ]);
+        let doing = |chats: &crate::chats::Chats, id| {
+            let names = messages::Names {
+                users: &users,
+                chats,
+            };
+            activity(chats.get(id).unwrap(), &names, None)
+        };
+        assert_eq!(doing(&chats, 1).as_deref(), Some("записывает голосовое…"));
+        assert_eq!(doing(&chats, -100).as_deref(), Some("Leo печатает…"));
+
+        chats.set_action(-100, None, &user(8), &ChatAction::Typing);
+        assert_eq!(doing(&chats, -100).as_deref(), Some("Leo и Maya печатают…"));
+        chats.set_action(-100, None, &user(9), &ChatAction::Typing);
+        assert_eq!(doing(&chats, -100).as_deref(), Some("3 человека печатают…"));
+    }
+
+    #[test]
+    fn in_vietnamese_the_login_screen_says_every_step_in_full() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let rows = draw_login_rows(LoginStep::Phone, 80, 24);
+        let text = rows.concat();
+        assert!(text.contains(" Đăng nhập "), "{rows:#?}");
+        assert!(text.contains("Số điện thoại"));
+        assert!(
+            text.contains("thoại."),
+            "help text isn't cut off: {rows:#?}"
+        );
+        assert!(text.contains("Enter gửi · Tab mã QR · Ctrl-c thoát"));
+
+        let rows = draw_login_rows(LoginStep::ApiId, 80, 24);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("Hoặc bỏ qua tất cả: cargo binstall tuigram-cli")),
+            "the last line isn't cut off: {rows:#?}"
+        );
+
+        let bad = LoginStep::BadProxy {
+            from: "TG_PROXY",
+            why: "Unsupported proxy secret".into(),
+        };
+        let rows = draw_login_rows(bad, 80, 24);
+        let text = rows.concat();
+        assert!(text.contains("Không thể dùng TG_PROXY"));
+        assert!(
+            text.contains("proxy."),
+            "help text isn't cut off: {rows:#?}"
+        );
+
+        let link = LOGIN_LINK.to_string();
+        let step = LoginStep::OtherDevice { link: link.clone() };
+        let rows = draw_login_rows(step, 80, 24);
+        let text = rows.concat();
+        assert!(text.contains("Quét mã QR"));
+        assert!(text.contains("này."), "help text isn't cut off: {rows:#?}");
+        assert!(text.contains("Esc dùng số điện thoại · Ctrl-c thoát"));
+        let rows = draw_login_rows(LoginStep::OtherDevice { link }, 80, 20);
+        let text = rows.concat();
+        assert!(text.contains("64 cột × 24"), "{rows:#?}");
+        assert!(text.contains("QR."), "help text isn't cut off: {rows:#?}");
+    }
+
+    #[test]
+    fn in_vietnamese_popups_are_wide_enough_for_their_keys() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let colors = Colors::default();
+        let render = |width, draw: &dyn Fn(&mut Frame)| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            terminal.draw(|f| draw(f)).unwrap();
+            buffer_rows(terminal.backend().buffer())
+        };
+        let has = |rows: &[String], needle: &str| rows.iter().any(|r| r.contains(needle));
+
+        let menu = DeleteMenu {
+            message_id: 5,
+            snippet: "hẹn gặp lại".into(),
+            choices: Vec::new(),
+            selected: 0,
+        };
+        let rows = render(60, &|f| draw_delete(f, f.area(), &menu, &colors));
+        assert!(has(&rows, " Xóa tin nhắn "));
+        assert!(has(&rows, "Đang kiểm tra…"), "until TDLib answers");
+        assert!(has(&rows, "Enter xóa · Esc hủy"));
+
+        let menu = PickMenu {
+            action: MenuAction::Copy,
+            targets: vec![Target::Link("https://x.dev".into())],
+            selected: 0,
+        };
+        let rows = render(70, &|f| draw_menu(f, f.area(), &menu, &colors));
+        assert!(has(&rows, " Sao chép "));
+        assert!(
+            has(&rows, "Enter sao chép · 1-9 chọn · Esc đóng"),
+            "the keys aren't cut off: {rows:#?}"
+        );
+
+        let menu = VoteMenu {
+            message_id: 5,
+            question: "Đi đâu?".into(),
+            answers: vec!["Đây".into(), "Kia".into()],
+            ticked: vec![false, false],
+            several: true,
+            can_retract: true,
+            selected: 0,
+        };
+        let rows = render(70, &|f| draw_vote(f, f.area(), &menu, &colors));
+        assert!(has(&rows, " Bỏ phiếu "));
+        assert!(has(&rows, "Rút lại phiếu bầu"));
+        assert!(
+            has(&rows, "Space đánh dấu · Enter bỏ phiếu · Esc đóng"),
+            "the keys aren't cut off: {rows:#?}"
+        );
+
+        // The `R` popup has a width of its own.
+        let mut menu = ReactMenu::new(5, "hẹn gặp lại".into());
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal
+            .draw(|f| draw_react(f, f.area(), &mut menu, &["❤"], &colors))
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+        assert!(has(&rows, " Thả cảm xúc "));
+        assert!(
+            has(&rows, " X gỡ hết cảm xúc, cả trong trò chuyện"),
+            "{rows:#?}"
+        );
+        assert!(
+            has(&rows, "/ tìm · Enter thả cảm xúc · Esc đóng"),
+            "the keys aren't cut off: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn in_vietnamese_who_is_typing_is_said_in_its_own_order() {
+        use tdlib_rs::enums::{ChatAction, MessageSender};
+        use tdlib_rs::types::MessageSenderUser;
+
+        crate::lang::set(crate::lang::Lang::Vi);
+        let mut chats = crate::chats::Chats::default();
+        chats.add_local(-100, "Rustaceans", None);
+        let user = |user_id| MessageSender::User(MessageSenderUser { user_id });
+        chats.set_action(-100, None, &user(7), &ChatAction::Typing);
+        let users = std::collections::HashMap::from([
+            (7, "Leo".to_string()),
+            (8, "Maya".to_string()),
+            (9, "Sam".to_string()),
+        ]);
+        let doing = |chats: &crate::chats::Chats| {
+            let names = messages::Names {
+                users: &users,
+                chats,
+            };
+            activity(chats.get(-100).unwrap(), &names, None).unwrap()
+        };
+        // The words for what they do come from the chat list's own table.
+        let typing = crate::chats::doing_words("typing", true);
+        assert_eq!(doing(&chats), format!("Leo {typing}…"));
+        chats.set_action(-100, None, &user(8), &ChatAction::Typing);
+        assert_eq!(doing(&chats), format!("Leo và Maya {typing}…"));
+        chats.set_action(-100, None, &user(9), &ChatAction::Typing);
+        assert_eq!(doing(&chats), format!("3 người {typing}…"));
+    }
+
+    #[test]
+    fn in_vietnamese_the_status_bar_names_the_mode_and_back_follows_the_list() {
+        let dir = std::env::temp_dir().join("tuigram-test-vietnamese-status");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tg = crate::tg::Tg::detached(tokio::sync::mpsc::unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, no_images(), &dir);
+        crate::lang::set(crate::lang::Lang::Vi);
+        app.focus = Focus::Topics;
+        app.settings.chat_list_side = Side::Right;
+        let colors = Colors::default();
+        let mut terminal = Terminal::new(TestBackend::new(200, 1)).unwrap();
+        terminal
+            .draw(|f| draw_status(f, &app, f.area(), &colors))
+            .unwrap();
+        let row = buffer_rows(terminal.backend().buffer()).concat();
+        assert!(row.starts_with(" THƯỜNG "), "{row}");
+        assert!(row.contains("l quay lại"), "{row}");
+        assert!(!row.contains("h quay lại"), "{row}");
     }
 }

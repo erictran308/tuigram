@@ -7,6 +7,7 @@ use std::ops::Range;
 use chrono::{Local, NaiveDate, TimeZone};
 use tdlib_rs::enums::SearchMessagesFilter;
 
+use crate::lang;
 use crate::messages::{Msg, Sender};
 use crate::tg::Found;
 
@@ -102,7 +103,7 @@ pub fn parse(typed: &str) -> Result<Query, String> {
         };
         let value = &token[key.len()..];
         if seen.contains(&key) {
-            return Err(format!("Only one {key} at a time"));
+            return Err(lang::f("Only one {key} at a time", &[("key", &key)]));
         }
         seen.push(key);
         match key {
@@ -114,9 +115,9 @@ pub fn parse(typed: &str) -> Result<Query, String> {
                 let kind = Has::ALL
                     .into_iter()
                     .find(|(name, _)| value.eq_ignore_ascii_case(name))
-                    .ok_or(
+                    .ok_or(lang::t(
                         "has: takes photo, video, media, file, link, voice, note, gif or audio",
-                    )?;
+                    ))?;
                 query.has = Some(kind.1);
             }
             "before:" => query.before = Some(day_start(value)?),
@@ -125,19 +126,19 @@ pub fn parse(typed: &str) -> Result<Query, String> {
     }
     query.words = words.join(" ");
     if query.words.is_empty() && query.from.is_none() && query.has.is_none() {
-        return Err("Add words, from: or has: to search for".into());
+        return Err(lang::t("Add words, from: or has: to search for").into());
     }
     if let (Some(before), Some(after)) = (query.before, query.after)
         && after >= before
     {
-        return Err("after: has to be a day before before:".into());
+        return Err(lang::t("after: has to be a day before before:").into());
     }
     Ok(query)
 }
 
 fn who(value: &str) -> Result<Who, String> {
     match value {
-        "" | "@" => Err("from: takes me, @username or a name, like from:@alice".into()),
+        "" | "@" => Err(lang::t("from: takes me, @username or a name, like from:@alice").into()),
         _ if value.eq_ignore_ascii_case("me") => Ok(Who::Me),
         _ => Ok(match value.strip_prefix('@') {
             Some(name) => Who::Username(name.to_string()),
@@ -148,7 +149,12 @@ fn who(value: &str) -> Result<Who, String> {
 
 /// The start of a day typed like 2025-10-01, in local time, as a unix time.
 fn day_start(value: &str) -> Result<i32, String> {
-    let wrong = || format!("Dates are like 2025-10-01, not \"{value}\"");
+    let wrong = || {
+        lang::f(
+            "Dates are like 2025-10-01, not \"{value}\"",
+            &[("value", &value)],
+        )
+    };
     let day = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| wrong())?;
     let start = Local
         .from_local_datetime(&day.and_hms_opt(0, 0, 0).ok_or_else(wrong)?)
@@ -293,9 +299,9 @@ impl MessageSearch {
         match self.current {
             Some(i) => {
                 let total = (self.total.max(0) as usize).max(self.results.len());
-                format!("{} of {total}", i + 1)
+                format!("{} {} {total}", i + 1, lang::t("of"))
             }
-            None => "searching…".into(),
+            None => lang::t("searching…").into(),
         }
     }
 }
@@ -323,13 +329,13 @@ impl MediaRow {
 
     fn of_msg(id: i64, msg: &Msg) -> Self {
         let label = if msg.video.is_some() {
-            "Video message".into()
+            lang::t("Video message").into()
         } else if msg.voice.is_some() {
-            "Voice message".into()
+            lang::t("Voice message").into()
         } else if let Some(file) = &msg.file {
             file.label.clone()
         } else if msg.photo.is_some() {
-            "Photo".into()
+            lang::t("Photo").into()
         } else {
             msg.snippet()
         };
@@ -566,6 +572,53 @@ mod tests {
             "Add words, from: or has: to search for"
         );
         assert!(why("hi after:2025-10-01 before:2025-10-01").starts_with("after: has to be"));
+    }
+
+    #[test]
+    fn in_russian_a_filter_that_cant_be_read_says_why_in_russian() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let why = |typed| parse(typed).unwrap_err();
+        assert_eq!(
+            why("has:photo has:video"),
+            "has: можно указать только один раз"
+        );
+        assert_eq!(
+            why("hi before:10/01/2025"),
+            "Даты пишутся как 2025-10-01, а не «10/01/2025»"
+        );
+        let mut search = MessageSearch::new("hi".into(), parse("hi").unwrap());
+        assert_eq!(search.position(), "ищу…");
+        search.add(Found {
+            ids: vec![9, 7],
+            messages: Vec::new(),
+            total: 2,
+            next_from: 0,
+            next_offset: String::new(),
+        });
+        search.current = Some(0);
+        assert_eq!(search.position(), "1 из 2");
+    }
+
+    #[test]
+    fn in_vietnamese_a_filter_that_cant_be_read_says_why_in_vietnamese() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let why = |typed| parse(typed).unwrap_err();
+        assert_eq!(why("has:photo has:video"), "Chỉ được dùng has: một lần");
+        assert_eq!(
+            why("hi before:10/01/2025"),
+            "Ngày phải viết như 2025-10-01, không phải \"10/01/2025\""
+        );
+        let mut search = MessageSearch::new("hi".into(), parse("hi").unwrap());
+        assert_eq!(search.position(), "đang tìm…");
+        search.add(Found {
+            ids: vec![9, 7],
+            messages: Vec::new(),
+            total: 2,
+            next_from: 0,
+            next_offset: String::new(),
+        });
+        search.current = Some(0);
+        assert_eq!(search.position(), "1 / 2");
     }
 
     #[test]

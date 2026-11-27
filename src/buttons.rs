@@ -5,6 +5,7 @@
 use tdlib_rs::enums::{InlineKeyboardButtonType, KeyboardButtonType, ReplyMarkup};
 use tokio::time::Instant;
 
+use crate::lang;
 use crate::messages::{Link, MediaFile, link_host, one_line, web_url};
 use crate::text;
 
@@ -47,18 +48,22 @@ impl Button {
     /// words are cut to fit, and a reply button sends all of its own.
     pub fn describe(&self) -> String {
         match &self.press {
-            Press::Callback(_) => {
-                format!("Presses \"{}\": the bot decides what happens", self.label)
-            }
+            Press::Callback(_) => lang::f(
+                "Presses \"{label}\": the bot decides what happens",
+                &[("label", &self.label)],
+            ),
             Press::Open(link) => {
                 let host = link_host(&link.url).unwrap_or_else(|| link.url.clone());
-                format!("Opens {} in your browser, asking first", one_line(&host))
+                lang::f(
+                    "Opens {host} in your browser, asking first",
+                    &[("host", &one_line(&host))],
+                )
             }
-            Press::Telegram(url) => format!("Opens {url} in tuigram"),
-            Press::User(_) => format!("Opens your chat with {}", self.label),
-            Press::Copy(text) => format!("Copies: {text}"),
-            Press::Send(text) => format!("Sends as you: {text}"),
-            Press::File(file) => format!("Opens {}", file.label),
+            Press::Telegram(url) => lang::f("Opens {url} in tuigram", &[("url", url)]),
+            Press::User(_) => lang::f("Opens your chat with {name}", &[("name", &self.label)]),
+            Press::Copy(text) => format!("{}: {text}", lang::t("Copies")),
+            Press::Send(text) => format!("{}: {text}", lang::t("Sends as you")),
+            Press::File(file) => format!("{} {}", lang::t("Opens"), file.label),
             Press::Unsupported(why) => (*why).to_string(),
         }
     }
@@ -74,7 +79,9 @@ pub struct Keyboard {
 }
 
 /// What a button that tuigram can't press says instead.
-const ELSEWHERE: &str = "Only Telegram's own apps can do this";
+fn elsewhere() -> &'static str {
+    lang::t("Only Telegram's own apps can do this")
+}
 
 impl Keyboard {
     /// The buttons TDLib sent with a message, if any. Their words are the
@@ -113,13 +120,13 @@ fn inline_button(label: &str, kind: &InlineKeyboardButtonType) -> Button {
         T::LoginUrl(u) => link(label, &u.url),
         T::User(u) => Press::User(u.user_id),
         T::CopyText(c) => Press::Copy(one_line(&c.text)),
-        T::WebApp(_) => Press::Unsupported("Web apps only open in Telegram's own apps"),
-        T::CallbackGame => Press::Unsupported("Games only run in Telegram's own apps"),
-        T::Buy => Press::Unsupported("Payments only work in Telegram's own apps"),
-        T::CallbackWithPassword(_) => {
-            Press::Unsupported("This button asks for your password: use Telegram's own apps")
-        }
-        T::SwitchInline(_) => Press::Unsupported(ELSEWHERE),
+        T::WebApp(_) => Press::Unsupported(lang::t("Web apps only open in Telegram's own apps")),
+        T::CallbackGame => Press::Unsupported(lang::t("Games only run in Telegram's own apps")),
+        T::Buy => Press::Unsupported(lang::t("Payments only work in Telegram's own apps")),
+        T::CallbackWithPassword(_) => Press::Unsupported(lang::t(
+            "This button asks for your password: use Telegram's own apps",
+        )),
+        T::SwitchInline(_) => Press::Unsupported(elsewhere()),
     };
     Button {
         label: label.to_string(),
@@ -130,7 +137,7 @@ fn inline_button(label: &str, kind: &InlineKeyboardButtonType) -> Button {
 fn reply_button(label: String, kind: &KeyboardButtonType) -> Button {
     let press = match kind {
         KeyboardButtonType::Text => Press::Send(label.clone()),
-        _ => Press::Unsupported(ELSEWHERE),
+        _ => Press::Unsupported(elsewhere()),
     };
     Button { label, press }
 }
@@ -149,7 +156,7 @@ fn link(label: &str, url: &str) -> Press {
             url,
             disguise: Some(label.to_string()),
         }),
-        None => Press::Unsupported("This button's link isn't a web address"),
+        None => Press::Unsupported(lang::t("This button's link isn't a web address")),
     }
 }
 
@@ -180,14 +187,14 @@ impl ButtonMenu {
         let mut rows = keyboard.rows.clone();
         rows.extend(file.map(|f| {
             vec![Button {
-                label: format!("Open {}", f.label),
+                label: format!("{} {}", lang::t("Open"), f.label),
                 press: Press::File(f.clone()),
             }]
         }));
         rows.extend(links.iter().map(|l| {
             let host = link_host(&l.url).unwrap_or_else(|| l.url.clone());
             vec![Button {
-                label: format!("Open link: {}", one_line(&host)),
+                label: format!("{}: {}", lang::t("Open link"), one_line(&host)),
                 press: Press::Open(l.clone()),
             }]
         }));
@@ -402,5 +409,53 @@ mod tests {
             "cleaned"
         );
         assert!(matches!(link("Chat", "tg://x y"), Press::Unsupported(_)));
+    }
+
+    #[test]
+    fn in_russian_it_says_what_enter_does_in_russian() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let reply = Button {
+            label: "Да".into(),
+            press: Press::Send("Да, и всё, что дальше".into()),
+        };
+        assert_eq!(
+            reply.describe(),
+            "Отправляет от вашего имени: Да, и всё, что дальше"
+        );
+        let keyboard = keyboard(vec![
+            vec![url("Docs", "https://example.com/docs")],
+            vec![inline("Play", InlineKeyboardButtonType::CallbackGame)],
+        ]);
+        assert_eq!(
+            keyboard.rows[0][0].describe(),
+            "Открывает example.com в браузере, сначала спросив"
+        );
+        assert_eq!(
+            keyboard.rows[1][0].describe(),
+            "Игры работают только в приложениях Telegram"
+        );
+        let link = Link::from("https://example.com/a");
+        let menu = ButtonMenu::new(9, "Выбор".into(), &keyboard, None, &[link]);
+        assert_eq!(menu.rows[2][0].label, "Открыть ссылку: example.com");
+    }
+
+    #[test]
+    fn in_vietnamese_it_says_what_enter_does_in_vietnamese() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let keyboard = keyboard(vec![
+            vec![url("Docs", "https://example.com/docs")],
+            vec![callback("Có", "y")],
+        ]);
+        assert_eq!(
+            keyboard.rows[0][0].describe(),
+            "Mở example.com trong trình duyệt, có hỏi trước"
+        );
+        assert_eq!(
+            keyboard.rows[1][0].describe(),
+            "Nhấn \"Có\": bot quyết định điều gì xảy ra"
+        );
+        let link = Link::from("https://example.com/a");
+        let menu = ButtonMenu::new(9, "Chọn".into(), &keyboard, None, &[link]);
+        assert_eq!(menu.rows[2][0].label, "Mở liên kết: example.com");
     }
 }
