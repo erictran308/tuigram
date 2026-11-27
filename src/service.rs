@@ -4,6 +4,7 @@
 
 use tdlib_rs::enums::MessageContent;
 
+use crate::lang;
 use crate::messages::{Sender, duration};
 use crate::text;
 
@@ -12,16 +13,56 @@ use crate::text;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Service {
     /// The sender did it; the words go after their name: "pinned a message".
-    Did(String),
+    Did(Deed),
     /// The same, naming what someone called something: "created the topic",
     /// then the topic's name, in quotes.
-    Quoting(String, String),
+    Quoting(Deed, String),
     /// The sender added these people. Themselves alone: they joined.
     Added(Vec<i64>),
     /// The sender removed this person. Themselves: they left.
     Removed(i64),
     /// Words of their own, after nobody's name.
     Note(String),
+}
+
+/// What someone did, in the words that go after their name. Russian says
+/// it one way after a name, «закрепил(а)», and another after «Вы»
+/// (`lang::tc("you", …)`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Deed {
+    them: String,
+    you: String,
+}
+
+impl Deed {
+    /// `them` after a name, `you` after "you".
+    fn said(them: &str, you: &str) -> Self {
+        Self {
+            them: them.into(),
+            you: you.into(),
+        }
+    }
+
+    /// The same with `{hole}` filled in both by `value`, which isn't read
+    /// for more, as `lang::f` fills it.
+    fn filled(them: &str, you: &str, hole: &str, value: &str) -> Self {
+        let fill = |text| lang::fill(text, &[(hole, &value)]);
+        Self::said(&fill(them), &fill(you))
+    }
+
+    fn after(&self, you: bool) -> &str {
+        if you { &self.you } else { &self.them }
+    }
+}
+
+/// The same words after anyone's name.
+impl From<&str> for Deed {
+    fn from(words: &str) -> Self {
+        Self {
+            them: words.into(),
+            you: words.into(),
+        }
+    }
 }
 
 /// Names a service message lists before saying how many more there are.
@@ -45,7 +86,7 @@ impl Part {
     pub fn text(&self) -> &str {
         match self {
             Part::Words(text) | Part::Name(text) | Part::Quote(text) => text,
-            Part::You => "You",
+            Part::You => lang::t("You"),
         }
     }
 }
@@ -59,55 +100,153 @@ impl Service {
     /// The service message `content` is, if it's one tuigram knows.
     pub fn of(content: &MessageContent) -> Option<Self> {
         use MessageContent as C;
-        let did = |words: &str| Some(Service::Did(words.into()));
+        let did = |them: &str, you: &str| Some(Service::Did(Deed::said(them, you)));
         // Names and titles are other people's words.
-        let quoting = |words: &str, title: &str| {
+        let quoting = |deed: Deed, title: &str| {
             let title = text::clean(title).replace(['\n', '\t'], " ");
-            let title = format!("\"{}\"", text::first_chars(&title, 128));
-            Some(Service::Quoting(words.into(), title))
+            let title = text::first_chars(&title, 128);
+            let title = lang::f("\"{title}\"", &[("title", &title)]);
+            Some(Service::Quoting(deed, title))
         };
         match content {
             C::MessageChatAddMembers(m) => Some(Service::Added(m.member_user_ids.clone())),
             C::MessageChatDeleteMember(m) => Some(Service::Removed(m.user_id)),
-            C::MessageChatJoinByLink => did("joined via an invite link"),
-            C::MessageChatJoinByRequest => did("joined, approved by an admin"),
-            C::MessageBasicGroupChatCreate(m) => quoting("created the group", &m.title),
-            C::MessageSupergroupChatCreate(m) => quoting("created", &m.title),
-            C::MessageChatChangeTitle(m) => quoting("changed the name to", &m.title),
-            C::MessageChatChangePhoto(_) => did("changed the photo"),
-            C::MessageChatDeletePhoto => did("removed the photo"),
-            C::MessageChatUpgradeTo(_) | C::MessageChatUpgradeFrom(_) => {
-                did("upgraded the group to a supergroup")
-            }
-            C::MessagePinMessage(_) => did("pinned a message"),
-            C::MessageScreenshotTaken => did("took a screenshot"),
+            C::MessageChatJoinByLink => did(
+                lang::t("joined via an invite link"),
+                lang::tc("you", "joined via an invite link"),
+            ),
+            C::MessageChatJoinByRequest => did(
+                lang::t("joined, approved by an admin"),
+                lang::tc("you", "joined, approved by an admin"),
+            ),
+            C::MessageBasicGroupChatCreate(m) => quoting(
+                Deed::said(
+                    lang::t("created the group"),
+                    lang::tc("you", "created the group"),
+                ),
+                &m.title,
+            ),
+            C::MessageSupergroupChatCreate(m) => quoting(
+                Deed::said(lang::t("created"), lang::tc("you", "created")),
+                &m.title,
+            ),
+            C::MessageChatChangeTitle(m) => quoting(
+                Deed::said(
+                    lang::t("changed the name to"),
+                    lang::tc("you", "changed the name to"),
+                ),
+                &m.title,
+            ),
+            C::MessageChatChangePhoto(_) => did(
+                lang::t("changed the photo"),
+                lang::tc("you", "changed the photo"),
+            ),
+            C::MessageChatDeletePhoto => did(
+                lang::t("removed the photo"),
+                lang::tc("you", "removed the photo"),
+            ),
+            C::MessageChatUpgradeTo(_) | C::MessageChatUpgradeFrom(_) => did(
+                lang::t("upgraded the group to a supergroup"),
+                lang::tc("you", "upgraded the group to a supergroup"),
+            ),
+            C::MessagePinMessage(_) => did(
+                lang::t("pinned a message"),
+                lang::tc("you", "pinned a message"),
+            ),
+            C::MessageScreenshotTaken => did(
+                lang::t("took a screenshot"),
+                lang::tc("you", "took a screenshot"),
+            ),
             C::MessageChatSetMessageAutoDeleteTime(m) => match m.message_auto_delete_time {
-                0 => did("turned the timer off"),
-                secs => did(&format!(
-                    "set messages to disappear after {}",
-                    crate::secret::timer_words(secs)
-                )),
+                0 => did(
+                    lang::t("turned the timer off"),
+                    lang::tc("you", "turned the timer off"),
+                ),
+                secs => Some(Service::Did(Deed::filled(
+                    lang::t("set messages to disappear after {time}"),
+                    lang::tc("you", "set messages to disappear after {time}"),
+                    "time",
+                    &crate::secret::timer_words(secs),
+                ))),
             },
-            C::MessageVideoChatScheduled(_) => did("scheduled a video chat"),
-            C::MessageVideoChatStarted(_) => did("started a video chat"),
-            C::MessageVideoChatEnded(m) => {
-                did(&format!("ended the video chat ({})", duration(m.duration)))
-            }
-            C::MessageInviteVideoChatParticipants(_) => did("invited people to the video chat"),
-            C::MessageChatSetTheme(_) => did("changed the chat theme"),
-            C::MessageChatSetBackground(_) => did("changed the chat background"),
+            C::MessageVideoChatScheduled(_) => did(
+                lang::t("scheduled a video chat"),
+                lang::tc("you", "scheduled a video chat"),
+            ),
+            C::MessageVideoChatStarted(_) => did(
+                lang::t("started a video chat"),
+                lang::tc("you", "started a video chat"),
+            ),
+            C::MessageVideoChatEnded(m) => Some(Service::Did(Deed::filled(
+                lang::t("ended the video chat ({length})"),
+                lang::tc("you", "ended the video chat ({length})"),
+                "length",
+                &duration(m.duration),
+            ))),
+            C::MessageInviteVideoChatParticipants(_) => did(
+                lang::t("invited people to the video chat"),
+                lang::tc("you", "invited people to the video chat"),
+            ),
+            C::MessageChatSetTheme(_) => did(
+                lang::t("changed the chat theme"),
+                lang::tc("you", "changed the chat theme"),
+            ),
+            C::MessageChatSetBackground(_) => did(
+                lang::t("changed the chat background"),
+                lang::tc("you", "changed the chat background"),
+            ),
             C::MessageChatBoost(m) if m.boost_count > 1 => {
-                did(&format!("boosted the group {} times", m.boost_count))
+                let times = lang::n(m.boost_count.into(), "{n} time", "{n} times", &[]);
+                Some(Service::Did(Deed::filled(
+                    lang::t("boosted the group {times}"),
+                    lang::tc("you", "boosted the group {times}"),
+                    "times",
+                    &times,
+                )))
             }
-            C::MessageChatBoost(_) => did("boosted the group"),
-            C::MessageForumTopicCreated(m) => quoting("created the topic", &m.name),
-            C::MessageForumTopicEdited(_) => did("edited a topic"),
-            C::MessageForumTopicIsClosedToggled(m) if m.is_closed => did("closed a topic"),
-            C::MessageForumTopicIsClosedToggled(_) => did("reopened a topic"),
-            C::MessageForumTopicIsHiddenToggled(m) if m.is_hidden => did("hid the General topic"),
-            C::MessageForumTopicIsHiddenToggled(_) => did("showed the General topic"),
-            C::MessageGameScore(m) => did(&format!("scored {} in a game", m.score)),
-            C::MessageContactRegistered => did("joined Telegram"),
+            C::MessageChatBoost(_) => did(
+                lang::t("boosted the group"),
+                lang::tc("you", "boosted the group"),
+            ),
+            C::MessageForumTopicCreated(m) => quoting(
+                Deed::said(
+                    lang::t("created the topic"),
+                    lang::tc("you", "created the topic"),
+                ),
+                &m.name,
+            ),
+            C::MessageForumTopicEdited(_) => {
+                did(lang::t("edited a topic"), lang::tc("you", "edited a topic"))
+            }
+            C::MessageForumTopicIsClosedToggled(m) if m.is_closed => {
+                did(lang::t("closed a topic"), lang::tc("you", "closed a topic"))
+            }
+            C::MessageForumTopicIsClosedToggled(_) => did(
+                lang::t("reopened a topic"),
+                lang::tc("you", "reopened a topic"),
+            ),
+            C::MessageForumTopicIsHiddenToggled(m) if m.is_hidden => did(
+                lang::t("hid the General topic"),
+                lang::tc("you", "hid the General topic"),
+            ),
+            C::MessageForumTopicIsHiddenToggled(_) => did(
+                lang::t("showed the General topic"),
+                lang::tc("you", "showed the General topic"),
+            ),
+            C::MessageGameScore(m) => {
+                // The count's words name what's counted where a language does.
+                let points = lang::n(m.score.into(), "{n} in a game", "{n} in a game", &[]);
+                Some(Service::Did(Deed::filled(
+                    lang::t("scored {points}"),
+                    lang::tc("you", "scored {points}"),
+                    "points",
+                    &points,
+                )))
+            }
+            C::MessageContactRegistered => did(
+                lang::t("joined Telegram"),
+                lang::tc("you", "joined Telegram"),
+            ),
             C::MessageCustomServiceAction(m) => {
                 let words = text::clean(&m.text).replace(['\n', '\t'], " ");
                 Some(Service::Note(text::first_chars(&words, 300).to_string()))
@@ -119,13 +258,21 @@ impl Service {
     /// What happened, without names, for the chat list: "Joined the group".
     pub fn label(&self, sender: Sender) -> String {
         let words = match self {
-            Service::Added(ids) if is_only(ids, sender) => "joined the group".to_string(),
-            Service::Added(ids) if ids.len() == 1 => "added a member".to_string(),
-            Service::Added(ids) => format!("added {} members", ids.len()),
-            Service::Removed(id) if is_only(&[*id], sender) => "left the group".to_string(),
-            Service::Removed(_) => "removed a member".to_string(),
-            Service::Did(words) | Service::Note(words) => words.clone(),
-            Service::Quoting(words, title) => format!("{words} {title}"),
+            Service::Added(ids) if is_only(ids, sender) => lang::t("joined the group").to_string(),
+            Service::Added(ids) if ids.len() == 1 => lang::t("added a member").to_string(),
+            Service::Added(ids) => lang::n(
+                ids.len() as i64,
+                "added {n} member",
+                "added {n} members",
+                &[],
+            ),
+            Service::Removed(id) if is_only(&[*id], sender) => {
+                lang::t("left the group").to_string()
+            }
+            Service::Removed(_) => lang::t("removed a member").into(),
+            Service::Did(deed) => deed.them.clone(),
+            Service::Note(words) => words.clone(),
+            Service::Quoting(deed, title) => format!("{} {title}", deed.them),
         };
         let mut chars = words.chars();
         chars.next().map_or(String::new(), |first| {
@@ -137,22 +284,39 @@ impl Service {
     /// is the sender (a name, or you), and `name` names the people it
     /// mentions.
     pub fn sentence(&self, sender: Sender, actor: Part, name: impl Fn(i64) -> String) -> Vec<Part> {
+        let you = actor == Part::You;
         let words = |text: &str| Part::Words(text.into());
+        // Russian's verb is another after «Вы» than after a name.
+        let verb = |them: &str, yours: &str| words(if you { yours } else { them });
         match self {
-            Service::Added(ids) if is_only(ids, sender) => vec![actor, words(" joined the group")],
+            Service::Added(ids) if is_only(ids, sender) => vec![
+                actor,
+                verb(
+                    lang::t(" joined the group"),
+                    lang::tc("you", " joined the group"),
+                ),
+            ],
             Service::Added(ids) => {
-                let mut parts = vec![actor, words(" added ")];
+                let mut parts = vec![actor, verb(lang::t(" added "), lang::tc("you", " added "))];
                 parts.extend(names(ids, name));
                 parts
             }
-            Service::Removed(id) if is_only(&[*id], sender) => {
-                vec![actor, words(" left the group")]
-            }
-            Service::Removed(id) => vec![actor, words(" removed "), Part::Name(name(*id))],
-            Service::Did(did) => vec![actor, words(&format!(" {did}"))],
+            Service::Removed(id) if is_only(&[*id], sender) => vec![
+                actor,
+                verb(
+                    lang::t(" left the group"),
+                    lang::tc("you", " left the group"),
+                ),
+            ],
+            Service::Removed(id) => vec![
+                actor,
+                verb(lang::t(" removed "), lang::tc("you", " removed ")),
+                Part::Name(name(*id)),
+            ],
+            Service::Did(did) => vec![actor, words(&format!(" {}", did.after(you)))],
             Service::Quoting(did, title) => vec![
                 actor,
-                words(&format!(" {did} ")),
+                words(&format!(" {} ", did.after(you))),
                 Part::Quote(title.clone()),
             ],
             Service::Note(note) => vec![words(note)],
@@ -173,20 +337,20 @@ fn names(ids: &[i64], name: impl Fn(i64) -> String) -> Vec<Part> {
         .map(|&id| Part::Name(name(id)))
         .collect();
     let more = ids.len().saturating_sub(MAX_NAMES);
-    let others = match more {
-        0 => None,
-        1 => Some("1 other".to_string()),
-        n => Some(format!("{n} others")),
-    };
+    let others = (more > 0).then(|| lang::n(more as i64, "{n} other", "{n} others", &[]));
     let count = shown.len() + usize::from(others.is_some());
     if count == 0 {
-        return vec![Part::Words("nobody".into())];
+        return vec![Part::Words(lang::t("nobody").into())];
     }
     let mut parts = Vec::new();
     let items = shown.into_iter().chain(others.map(Part::Words)).enumerate();
     for (i, item) in items {
         if i > 0 {
-            let joint = if i + 1 == count { " and " } else { ", " };
+            let joint = if i + 1 == count {
+                lang::t(" and ")
+            } else {
+                ", "
+            };
             parts.push(Part::Words(joint.into()));
         }
         parts.push(item);
@@ -282,6 +446,85 @@ mod tests {
                 .sentence(Sender::User(2), Part::Name("Bob".into()), name);
         assert_eq!(parts.last(), Some(&Part::Quote("\"Thu 8 Oct\"".into())));
         assert_eq!(text(&parts), "Bob created the topic \"Thu 8 Oct\"");
+    }
+
+    #[test]
+    fn in_russian_the_verb_says_whether_you_did_it() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        assert_eq!(sentence(added(&[2, 3]), 1), "Alice добавил(а) Bob и Carol");
+        assert_eq!(
+            sentence(added(&[2, 3, 4, 5]), 1),
+            "Alice добавил(а) Bob, Carol, Dan и ещё 1"
+        );
+        let pinned = MessageContent::MessagePinMessage(types::MessagePinMessage { message_id: 1 });
+        let service = Service::of(&pinned).unwrap();
+        let parts = service.sentence(Sender::User(1), Part::You, name);
+        assert_eq!(
+            parts,
+            [Part::You, Part::Words(" закрепили сообщение".into())]
+        );
+        assert_eq!(text(&parts), "Вы закрепили сообщение");
+        assert_eq!(sentence(pinned, 1), "Alice закрепил(а) сообщение");
+        assert_eq!(service.label(Sender::User(1)), "Закрепил(а) сообщение");
+        let title = MessageContent::MessageChatChangeTitle(types::MessageChatChangeTitle {
+            title: "Trip plans".into(),
+        });
+        let parts =
+            Service::of(&title)
+                .unwrap()
+                .sentence(Sender::User(2), Part::Name("Bob".into()), name);
+        assert_eq!(parts.last(), Some(&Part::Quote("«Trip plans»".into())));
+        assert_eq!(text(&parts), "Bob изменил(а) название на «Trip plans»");
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_russian_counts_keep_the_verb_for_who_did_it() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let boost =
+            |boost_count| MessageContent::MessageChatBoost(types::MessageChatBoost { boost_count });
+        assert_eq!(sentence(boost(2), 1), "Alice забустил(а) группу 2 раза");
+        let you = |content| {
+            let service = Service::of(&content).unwrap();
+            text(&service.sentence(Sender::User(1), Part::You, name))
+        };
+        assert_eq!(you(boost(5)), "Вы забустили группу 5 раз");
+        let score = MessageContent::MessageGameScore(types::MessageGameScore {
+            score: 21,
+            ..Default::default()
+        });
+        assert_eq!(sentence(score.clone(), 1), "Alice набрал(а) 21 очко в игре");
+        assert_eq!(you(score), "Вы набрали 21 очко в игре");
+        let label = Service::of(&added(&[2, 3])).unwrap().label(Sender::User(1));
+        assert_eq!(label, "Добавил(а) участников: 2");
+        crate::lang::set(crate::lang::Lang::En);
+        assert_eq!(sentence(boost(2), 1), "Alice boosted the group 2 times");
+    }
+
+    #[test]
+    fn in_vietnamese_the_verb_is_the_same_whoever_did_it() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        assert_eq!(sentence(added(&[2, 3]), 1), "Alice đã thêm Bob và Carol");
+        assert_eq!(
+            sentence(added(&[2, 3, 4, 5, 1]), 1),
+            "Alice đã thêm Bob, Carol, Dan và 2 người khác"
+        );
+        let pinned = MessageContent::MessagePinMessage(types::MessagePinMessage { message_id: 1 });
+        let service = Service::of(&pinned).unwrap();
+        let parts = service.sentence(Sender::User(1), Part::You, name);
+        assert_eq!(text(&parts), "Bạn đã ghim một tin nhắn");
+        assert_eq!(sentence(pinned, 1), "Alice đã ghim một tin nhắn");
+        assert_eq!(service.label(Sender::User(1)), "Đã ghim một tin nhắn");
+        let title = MessageContent::MessageChatChangeTitle(types::MessageChatChangeTitle {
+            title: "Trip plans".into(),
+        });
+        let parts =
+            Service::of(&title)
+                .unwrap()
+                .sentence(Sender::User(2), Part::Name("Bob".into()), name);
+        assert_eq!(parts.last(), Some(&Part::Quote("\"Trip plans\"".into())));
+        assert_eq!(text(&parts), "Bob đã đổi tên thành \"Trip plans\"");
+        crate::lang::set(crate::lang::Lang::En);
     }
 
     #[test]

@@ -16,7 +16,9 @@ use anyhow::Result;
 use image::imageops::FilterType;
 use image::{DynamicImage, RgbaImage};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
+use ratatui::widgets::Widget;
 use ratatui_image::picker::cap_parser::Parser;
 use ratatui_image::picker::{Capability, Picker, ProtocolType};
 use ratatui_image::protocol::kitty::Kitty;
@@ -25,6 +27,7 @@ use ratatui_image::{FontSize, Resize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chats::ChatPhoto;
+use crate::lang;
 use crate::messages::Preview;
 use crate::term::{self, Terminal};
 use crate::tg::Tg;
@@ -47,6 +50,8 @@ pub struct Key {
     pub thumbnail: bool,
     /// A chat photo for the chat list, cut to a circle.
     pub avatar: bool,
+    /// A video message's still, cut to a circle like the video playing it.
+    pub round: bool,
 }
 
 /// Caps for decoding images from other people. Telegram's photos are at most
@@ -248,7 +253,7 @@ fn kitty_id_base() -> u32 {
 
 /// What kitty's protocol draws in every cell of an image, after the code
 /// that sends the image in the first cell of its first drawing.
-const PLACEHOLDER: char = '\u{10EEEE}';
+pub(crate) const PLACEHOLDER: char = '\u{10EEEE}';
 
 /// The code that sends a kitty image, taken out of `cell`, the first an
 /// image was drawn in, if it holds one: its placeholder stays.
@@ -288,7 +293,7 @@ pub fn panic_is_contained() -> bool {
 pub fn contained<T>(decode: impl FnOnce() -> Result<T>) -> Result<T> {
     DECODING.with(|d| d.set(true));
     let result = catch_unwind(AssertUnwindSafe(decode))
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("the image couldn't be decoded")));
+        .unwrap_or_else(|_| Err(anyhow::anyhow!(lang::t("the image couldn't be decoded"))));
     DECODING.with(|d| d.set(false));
     result
 }
@@ -433,7 +438,7 @@ pub struct Images {
     /// as a file comes without it.
     pixels: HashMap<i32, (u32, u32)>,
     /// Photos the last frame showed, with their size.
-    wanted: Vec<(Preview, u16, u16)>,
+    wanted: Vec<(Preview, u16, u16, bool)>,
     /// Chat photos the last frame showed, with their size.
     wanted_avatars: Vec<(ChatPhoto, u16, u16)>,
     /// The number the last image built for kitty's protocol was given.
@@ -442,9 +447,15 @@ pub struct Images {
     dropped: Dropped,
     /// See [`KITTY_BUDGET`]; smaller in tests.
     kitty_budget: usize,
-    /// The codes sending the kitty images this frame drew for the first
-    /// time: see [`Images::take_transmit`].
+    /// The codes of kitty images a frame drew before they were sent ahead
+    /// of it: see [`Images::take_transmit`]. None should be, since every
+    /// image is queued in [`Images::untransmitted`] as it's encoded.
     transmits: Vec<String>,
+    /// Kitty images encoded since the terminal was sent them: kitty draws
+    /// a placeholder naming an image it doesn't have yet blank, and
+    /// doesn't revisit the cell when the image arrives after the frame,
+    /// so they're sent before that frame (see [`Images::prime_transmits`]).
+    untransmitted: Vec<Key>,
 }
 
 impl Images {
@@ -470,6 +481,7 @@ impl Images {
             dropped: Dropped::default(),
             kitty_budget: KITTY_BUDGET,
             transmits: Vec::new(),
+            untransmitted: Vec::new(),
         }
     }
 
@@ -492,6 +504,17 @@ impl Images {
     /// Pixel size of one terminal cell, for sizing photos by aspect ratio.
     pub fn font_size(&self) -> FontSize {
         self.picker.font_size()
+    }
+
+    /// The terminal speaks kitty's graphics protocol, which video messages
+    /// play through.
+    pub fn kitty(&self) -> bool {
+        self.picker.protocol_type() == ProtocolType::Kitty
+    }
+
+    /// Escapes need tmux's passthrough wrapping.
+    pub fn tmux(&self) -> bool {
+        self.picker.tmux_detected()
     }
 
     /// The terminal's window measures its cells `now` (see
@@ -531,13 +554,21 @@ impl Images {
     }
 
     /// The best image ready to draw: the photo, else its blurry thumbnail.
-    pub fn get(&mut self, photo: &Preview, cols: u16, rows: u16) -> Option<&SlicedProtocol> {
+    /// `round` cuts it to a circle: a video message's still.
+    pub fn get(
+        &mut self,
+        photo: &Preview,
+        cols: u16,
+        rows: u16,
+        round: bool,
+    ) -> Option<&SlicedProtocol> {
         let key = |thumbnail| Key {
             file_id: photo.file_id,
             cols,
             rows,
             thumbnail,
             avatar: false,
+            round,
         };
         let key = [key(false), key(true)]
             .into_iter()
@@ -557,6 +588,7 @@ impl Images {
             rows,
             thumbnail: false,
             avatar: false,
+            round: false,
         };
         let frame = self.frame;
         let (encoded, used) = self.ready.get_mut(&key)?;
@@ -574,9 +606,10 @@ impl Images {
         matches!(self.files.get(&photo.file_id), Some(FileState::Failed))
     }
 
-    /// Called while drawing, for each photo on screen.
-    pub fn want(&mut self, photo: &Preview, cols: u16, rows: u16) {
-        self.wanted.push((photo.clone(), cols, rows));
+    /// Called while drawing, for each photo on screen. `round` cuts it to a
+    /// circle: a video message's still.
+    pub fn want(&mut self, photo: &Preview, cols: u16, rows: u16, round: bool) {
+        self.wanted.push((photo.clone(), cols, rows, round));
     }
 
     /// TDLib keeps its database and downloads in `dirs`.
@@ -600,6 +633,7 @@ impl Images {
             rows,
             thumbnail,
             avatar: true,
+            round: false,
         };
         // See paints_over: a popup may be over the list.
         if covered && self.paints_over() {
@@ -623,24 +657,35 @@ impl Images {
     pub fn fetch(&mut self, tg: &Tg) {
         self.frame += 1;
         self.fetch_avatars(tg);
-        for (photo, cols, rows) in std::mem::take(&mut self.wanted) {
+        let font = self.picker.font_size();
+        for (photo, cols, rows, round) in std::mem::take(&mut self.wanted) {
             let full = Key {
                 file_id: photo.file_id,
                 cols,
                 rows,
                 thumbnail: false,
                 avatar: false,
+                round,
             };
             if self.ready.contains_key(&full) {
                 continue;
             }
+            // A round one is cut on a canvas of its cells in pixels, as the
+            // chat list's avatars are.
+            let (width, height) = (
+                u32::from(cols) * u32::from(font.width),
+                u32::from(rows) * u32::from(font.height),
+            );
             match self.files.get(&photo.file_id) {
                 Some(FileState::Ready(path)) => {
                     let path = path.clone();
                     let (sticker, tdlib_dirs) = (photo.sticker, Arc::clone(&self.tdlib_dirs));
-                    self.build(full, move || match sticker {
-                        true => Ok(open_sticker(&path)?),
-                        false => Ok(open_photo(&path, &tdlib_dirs)?),
+                    self.build(full, move || match (sticker, round) {
+                        (true, _) => Ok(open_sticker(&path)?),
+                        (false, true) => {
+                            Ok(circle(&open_photo(&path, &tdlib_dirs)?, width, height).into())
+                        }
+                        (false, false) => Ok(open_photo(&path, &tdlib_dirs)?),
                     });
                 }
                 Some(FileState::Downloading | FileState::Failed) => {}
@@ -654,7 +699,10 @@ impl Images {
                     thumbnail: true,
                     ..full
                 };
-                self.build(key, move || Ok(decode_bytes(&data)?));
+                self.build(key, move || match round {
+                    true => Ok(circle(&decode_bytes(&data)?, width, height).into()),
+                    false => Ok(decode_bytes(&data)?),
+                });
             }
         }
     }
@@ -668,6 +716,7 @@ impl Images {
                 rows,
                 thumbnail: false,
                 avatar: true,
+                round: false,
             };
             if self.avatars.contains_key(&full) {
                 continue;
@@ -777,6 +826,9 @@ impl Images {
         {
             self.ready.remove(&oldest);
         }
+        if image.kitty.is_some() {
+            self.untransmitted.push(key);
+        }
         self.ready.insert(key, (image, self.frame));
     }
 
@@ -804,6 +856,9 @@ impl Images {
                 .map(|(&k, _)| k)
         {
             self.avatars.remove(&oldest);
+        }
+        if image.kitty.is_some() {
+            self.untransmitted.push(key);
         }
         let avatar = Avatar {
             image,
@@ -837,15 +892,60 @@ impl Images {
         }
     }
 
+    /// Sends the images encoded for kitty's protocol since the last frame,
+    /// before the frame that would draw their placeholders: kitty draws a
+    /// placeholder naming an image it doesn't have yet blank and doesn't
+    /// revisit the cell when the image arrives after it, so a photo that
+    /// finished decoding with the viewer open stayed "Loading…" until a
+    /// resize redrew every cell.
+    pub fn prime_transmits(&mut self, terminal: &mut Terminal) {
+        let codes = self.pending_transmits();
+        if !codes.is_empty() {
+            let _ = term::send(terminal, codes);
+        }
+    }
+
+    /// The codes sending the [`Images::untransmitted`] images, rendering
+    /// each off-screen so its transmit code is made, which its first cell
+    /// then holds; the placeholders a frame draws later name an image the
+    /// terminal already has.
+    fn pending_transmits(&mut self) -> Vec<String> {
+        let mut codes = Vec::new();
+        for key in std::mem::take(&mut self.untransmitted) {
+            let image = if key.avatar {
+                self.avatars.get(&key).map(|a| &a.image.image)
+            } else {
+                self.ready.get(&key).map(|(e, _)| &e.image)
+            };
+            let Some(image) = image else {
+                continue;
+            };
+            let area = Rect::new(0, 0, key.cols.max(1), key.rows.max(1));
+            let mut buf = Buffer::empty(area);
+            SlicedImage::new(image, SignedPosition::from((0, 0))).render(area, &mut buf);
+            'cells: for y in 0..area.height {
+                for x in 0..area.width {
+                    if let Some(code) = transmit_in(&mut buf[(x, y)]) {
+                        codes.push(code);
+                        break 'cells;
+                    }
+                }
+            }
+        }
+        codes
+    }
+
     /// Draws the image `pick` gives (from [`get`](Self::get),
     /// [`sharp`](Self::sharp) or [`avatar`](Self::avatar)) at `at` in `area`,
     /// if it's ready; false if not. Every image is drawn through here: with
     /// kitty's protocol, its first drawing carries the image itself in the
     /// first cell it covers, where anything drawn over that cell later in
     /// the frame (a popup, the date at the top, a toast) would lose it for
-    /// good, and with it the image. So it's taken out of the cell, leaving
-    /// the placeholder, and sent after the frame
-    /// ([`send_pictures`](Self::send_pictures)).
+    /// good, and with it the image. Each is sent ahead of the frame that
+    /// first draws it ([`prime_transmits`](Self::prime_transmits)), so a
+    /// frame draws placeholders only; one that still carries its code has
+    /// it taken out of the cell, leaving the placeholder, and sent after
+    /// the frame ([`send_pictures`](Self::send_pictures)).
     pub fn draw(
         &mut self,
         frame: &mut Frame,
@@ -885,9 +985,10 @@ impl Images {
         }
     }
 
-    /// Sends the images the frame just drawn drew for the first time (see
-    /// [`draw`](Self::draw)), once it's on the terminal: its placeholders
-    /// show each as soon as it's there.
+    /// Sends the images the frame just drawn still carried the codes of
+    /// (see [`draw`](Self::draw)), once it's on the terminal. Too late for
+    /// kitty, which leaves a placeholder blank if it came before its image:
+    /// the backstop to [`prime_transmits`](Self::prime_transmits).
     pub fn send_pictures(&mut self, terminal: &mut Terminal) {
         if !self.transmits.is_empty() {
             let _ = term::send(terminal, std::mem::take(&mut self.transmits));
@@ -1035,6 +1136,7 @@ mod tests {
             rows: 50,
             thumbnail: false,
             avatar: false,
+            round: false,
         };
         for file_id in 0..10 {
             images.insert_ready(at(file_id, 4), image::RgbImage::new(4, 4).into());
@@ -1053,6 +1155,7 @@ mod tests {
             rows: 2,
             thumbnail: false,
             avatar: false,
+            round: false,
         }
     }
 
@@ -1089,7 +1192,7 @@ mod tests {
         go.send(()).unwrap();
         images.on_built(rx.recv().await.unwrap());
         assert!(
-            images.get(&preview(7), 4, 2).is_none(),
+            images.get(&preview(7), 4, 2, false).is_none(),
             "not the new session's"
         );
         assert!(!images.is_broken(&preview(7)));
@@ -1143,15 +1246,18 @@ mod tests {
             (start.width * 2, start.height * 2)
         );
         assert!(!images.draws_photos(), "the protocol stays");
-        assert!(images.get(&preview(1), 4, 2).is_none(), "made again");
+        assert!(images.get(&preview(1), 4, 2, false).is_none(), "made again");
         go.send(()).unwrap();
         images.on_built(rx.recv().await.unwrap());
-        assert!(images.get(&preview(7), 4, 2).is_none(), "dropped");
+        assert!(images.get(&preview(7), 4, 2, false).is_none(), "dropped");
         assert!(!images.is_broken(&preview(7)));
         assert!(!images.measured(measure(20, 40)), "only once");
         images.build(key(7), || Ok(DynamicImage::new_rgba8(8, 8)));
         images.on_built(rx.recv().await.unwrap());
-        assert!(images.get(&preview(7), 4, 2).is_some(), "the new size");
+        assert!(
+            images.get(&preview(7), 4, 2, false).is_some(),
+            "the new size"
+        );
     }
 
     #[tokio::test]
@@ -1221,12 +1327,18 @@ mod tests {
         images.insert_ready(key(0), DynamicImage::new_rgba8(8, 8));
         for id in 1..MAX_READY as i32 + 10 {
             images.frame += 1;
-            assert!(images.get(&preview(0), 4, 2).is_some(), "still drawn");
+            assert!(
+                images.get(&preview(0), 4, 2, false).is_some(),
+                "still drawn"
+            );
             images.insert_ready(key(id), DynamicImage::new_rgba8(8, 8));
         }
         assert_eq!(images.ready.len(), MAX_READY);
-        assert!(images.get(&preview(0), 4, 2).is_some());
-        assert!(images.get(&preview(1), 4, 2).is_none(), "the oldest went");
+        assert!(images.get(&preview(0), 4, 2, false).is_some());
+        assert!(
+            images.get(&preview(1), 4, 2, false).is_none(),
+            "the oldest went"
+        );
     }
 
     #[tokio::test]
@@ -1239,11 +1351,11 @@ mod tests {
         let mut images = Images::new(Picker::halfblocks(), tx);
         let photo = preview(-1);
         images.local_file(-1, path.to_str().unwrap());
-        images.want(&photo, 4, 2);
+        images.want(&photo, 4, 2, false);
         // A detached client makes no requests, so a download would never end.
         images.fetch(&Tg::detached(tokio::sync::mpsc::unbounded_channel().0));
         images.on_built(rx.recv().await.unwrap());
-        assert!(images.get(&photo, 4, 2).is_some());
+        assert!(images.get(&photo, 4, 2, false).is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1264,10 +1376,13 @@ mod tests {
             "as said, until decoded"
         );
         images.on_downloaded(3, Some(path.to_str().unwrap().into()));
-        images.want(&photo, 4, 2);
+        images.want(&photo, 4, 2, false);
         images.fetch(&Tg::detached(tokio::sync::mpsc::unbounded_channel().0));
         images.on_built(rx.recv().await.unwrap());
-        assert!(images.get(&photo, 4, 2).is_some(), "read by its contents");
+        assert!(
+            images.get(&photo, 4, 2, false).is_some(),
+            "read by its contents"
+        );
         assert_eq!(size(images.measured_photo(&photo)), (80, 60));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1300,7 +1415,7 @@ mod tests {
         let mut images = kitty();
         images.insert_ready(key(7), photo());
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
-        let image = images.get(&preview(7), 4, 2).unwrap();
+        let image = images.get(&preview(7), 4, 2, false).unwrap();
         SlicedImage::new(image, SignedPosition::from((0, 0))).render(buf.area, &mut buf);
         assert!(buf[(0, 0)].symbol().contains("i=1,a=T"), "sent as 1");
         assert_eq!(images.deletions(), None, "nothing dropped yet");
@@ -1308,6 +1423,44 @@ mod tests {
         images.clear();
         assert_eq!(images.deletions(), Some(delete(1)));
         assert_eq!(images.deletions(), None, "told once");
+    }
+
+    #[test]
+    fn a_kitty_image_is_sent_before_the_frame_drawing_its_placeholders() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+        use ratatui_image::sliced::{SignedPosition, SlicedImage};
+
+        let mut images = kitty();
+        images.insert_ready(key(7), photo());
+        let codes = images.pending_transmits();
+        assert_eq!(codes.len(), 1, "made once, off-screen");
+        assert!(codes[0].contains("i=1,a=T"), "{codes:?}");
+        assert!(images.pending_transmits().is_empty(), "sent once");
+
+        // The frame then draws placeholders only, naming an image the
+        // terminal already has.
+        let image = images.get(&preview(7), 4, 2, false).unwrap();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
+        SlicedImage::new(image, SignedPosition::from((0, 0))).render(buf.area, &mut buf);
+        assert!(!buf[(0, 0)].symbol().starts_with('\x1b'), "no code left");
+        assert!(buf[(0, 0)].symbol().contains(PLACEHOLDER));
+
+        // A chat photo for the list too.
+        let avatar = Key {
+            avatar: true,
+            ..key(9)
+        };
+        images.insert_ready(avatar, photo());
+        let codes = images.pending_transmits();
+        assert_eq!(codes.len(), 1, "{codes:?}");
+        assert!(codes[0].contains("i=2,a=T"), "{codes:?}");
+
+        // One dropped before it could be sent is skipped.
+        images.insert_ready(key(8), photo());
+        images.clear();
+        assert!(images.pending_transmits().is_empty());
     }
 
     #[test]
@@ -1339,7 +1492,7 @@ mod tests {
         images.insert_ready(key(2), photo());
         // A frame draws the second, then a third comes.
         images.frame = 3;
-        assert!(images.get(&preview(2), 4, 2).is_some());
+        assert!(images.get(&preview(2), 4, 2, false).is_some());
         images.frame = 4;
         images.insert_ready(key(3), photo());
         assert!(!images.ready.contains_key(&key(1)), "drawn longest ago");
@@ -1347,8 +1500,8 @@ mod tests {
         assert_eq!(images.deletions(), Some(delete(1)));
 
         // Every one kept is on screen: the quota gives way.
-        assert!(images.get(&preview(2), 4, 2).is_some());
-        assert!(images.get(&preview(3), 4, 2).is_some());
+        assert!(images.get(&preview(2), 4, 2, false).is_some());
+        assert!(images.get(&preview(3), 4, 2, false).is_some());
         images.frame = 5;
         images.insert_ready(key(4), photo());
         assert_eq!(images.ready.len(), 3);
@@ -1392,7 +1545,7 @@ mod tests {
         let mut draw = |images: &mut Images| {
             terminal
                 .draw(|frame| {
-                    assert!(images.draw(frame, area, at, |i| i.get(&preview(7), 4, 2)));
+                    assert!(images.draw(frame, area, at, |i| i.get(&preview(7), 4, 2, false)));
                     // A popup over its first cell.
                     frame.render_widget(Paragraph::new("popup"), Rect::new(0, 1, 6, 1));
                 })
@@ -1423,7 +1576,7 @@ mod tests {
         let (area, at) = (Rect::new(7, 1, 4, 4), SignedPosition::from((0, -1)));
         terminal
             .draw(|frame| {
-                assert!(images.draw(frame, area, at, |i| i.get(&preview(7), 4, 2)));
+                assert!(images.draw(frame, area, at, |i| i.get(&preview(7), 4, 2, false)));
             })
             .unwrap();
         assert_eq!(images.sending(), 1);
@@ -1462,7 +1615,7 @@ mod tests {
         let mut images = Images::new(Picker::halfblocks(), tx);
         images.tdlib_keeps_files_in(tdlib_dirs.into());
         images.on_downloaded(3, Some(path.to_str().unwrap().into()));
-        images.want(&preview(3), 4, 2);
+        images.want(&preview(3), 4, 2, false);
         images.fetch(&Tg::detached(tokio::sync::mpsc::unbounded_channel().0));
         images.on_built(rx.recv().await.unwrap());
         images.sharp(&preview(3), 4, 2).is_some()

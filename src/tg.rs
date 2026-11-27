@@ -22,6 +22,7 @@ use crate::chats::{Badge, List, Peer};
 use crate::config::{ApiKeys, Config};
 use crate::draft;
 use crate::info::{self, About, Member};
+use crate::lang;
 use crate::messages::Sender;
 use crate::reactions::{self, Available, ReactionKind};
 use crate::search::{Has, Query, Who};
@@ -54,12 +55,13 @@ pub enum TgEvent {
         page: Page,
         messages: Option<Vec<types::Message>>,
     },
-    /// A page of message search results. `None` if the request failed.
+    /// A page of message search results. `Err` is why the request failed.
     Found {
         chat_id: i64,
         topic: Option<i32>,
         query: String,
-        found: Option<Found>,
+        /// Boxed: a page is big, and every event is as big as the biggest.
+        found: Result<Box<Found>, String>,
     },
     /// The message that `message_id` replies to; `None` if TDLib couldn't find it.
     Replied {
@@ -308,6 +310,9 @@ impl Mentions {
 /// Messages matching a search, newest first.
 pub struct Found {
     pub ids: Vec<i64>,
+    /// The messages themselves, for the media browser's rows; only those
+    /// whose ids are in `ids`.
+    pub messages: Vec<types::Message>,
     /// TDLib's estimate of how many match in all; -1 if unknown.
     pub total: i32,
     /// Pass as `from` to get the next page; 0 when there are no more.
@@ -337,6 +342,10 @@ const NOTIFICATION_GROUPS: i64 = 5;
 const PINNED_PAGE: i32 = 100;
 /// Pages of pinned messages asked for at most.
 const PINNED_PAGES: usize = 5;
+
+/// Pages of a search scanned at most while matching the sender here,
+/// which Telegram's server won't do together with a media filter.
+const LOCAL_SENDER_PAGES: usize = 10;
 
 /// Stickers a search in the sticker panel asks for.
 const STICKER_SEARCH_LIMIT: i32 = 100;
@@ -900,18 +909,11 @@ impl Tg {
                 true => secret_search_page(chat_id, &ask, offset, limit, client_id).await,
                 false => search_page(chat_id, topic, &ask, from, limit, client_id).await,
             };
-            let found = match found {
-                Ok(found) => Some(found),
-                Err(why) => {
-                    let _ = tx.send(TgEvent::Error(why));
-                    None
-                }
-            };
             let _ = tx.send(TgEvent::Found {
                 chat_id,
                 topic,
                 query,
-                found,
+                found: found.map(Box::new),
             });
         });
     }
@@ -1539,8 +1541,9 @@ impl Tg {
         });
     }
 
-    /// Searches your contacts, and Telegram's public chats, for the `s`
-    /// picker. TDLib sends the users and chats it finds as updates first.
+    /// Searches your contacts, your chats on Telegram's servers, and
+    /// Telegram's public chats, for the `s` picker. TDLib sends the users
+    /// and chats it finds as updates first.
     pub fn find_chats(&self, query: String) {
         let tx = self.tx.clone();
         let client_id = self.client_id;
@@ -1552,12 +1555,29 @@ impl Tg {
                     Ok(enums::Users::Users(u)) => u.user_ids,
                     Err(_) => Vec::new(),
                 };
-            // Too short a query, or one searched too often, is an error;
-            // either way nothing was found.
-            let chat_ids = match functions::search_public_chats(query.clone(), client_id).await {
+            // Chats of yours the local cache doesn't know yet: people you
+            // wrote to before, groups you're in.
+            let mut chat_ids = match functions::search_chats_on_server(
+                query.clone(),
+                CONTACT_SEARCH_LIMIT,
+                client_id,
+            )
+            .await
+            {
                 Ok(enums::Chats::Chats(c)) => c.chat_ids,
                 Err(_) => Vec::new(),
             };
+            // Too short a query, or one searched too often, is an error;
+            // either way nothing was found.
+            let public = match functions::search_public_chats(query.clone(), client_id).await {
+                Ok(enums::Chats::Chats(c)) => c.chat_ids,
+                Err(_) => Vec::new(),
+            };
+            for id in public {
+                if !chat_ids.contains(&id) {
+                    chat_ids.push(id);
+                }
+            }
             let _ = tx.send(TgEvent::ChatsFound {
                 query,
                 chat_ids,
@@ -1606,7 +1626,7 @@ impl Tg {
                             .await
                             .map_err(|e| Missed::Said(e.message))?;
                     if info.chat_id == 0 {
-                        return Err(Missed::Said("That message can't be found".into()));
+                        return Err(Missed::Said(lang::t("That message can't be found").into()));
                     }
                     // In a forum, a link can lead to a topic, or a message
                     // in one.
@@ -1909,15 +1929,12 @@ impl Tg {
                 }
             };
             if let Err(e) = set.await {
-                let what = if accept {
-                    "take"
+                let why = if accept {
+                    lang::t("Couldn't take the secret chats others start")
                 } else {
-                    "leave to your phone"
+                    lang::t("Couldn't leave to your phone the secret chats others start")
                 };
-                let why = format!(
-                    "Couldn't {what} the secret chats others start: {}",
-                    e.message
-                );
+                let why = format!("{why}: {}", e.message);
                 let _ = tx.send(TgEvent::Error(why));
             }
         });
@@ -2252,7 +2269,7 @@ async fn search_page(
     limit: i32,
     client_id: i32,
 ) -> Result<Found, String> {
-    let sender = match &ask.from {
+    let mut sender = match &ask.from {
         Some(Who::Sender(Sender::User(user_id))) => Some(user_sender(*user_id)),
         Some(Who::Sender(Sender::Chat(chat_id))) => Some(chat_sender(*chat_id)),
         // A private chat's id is the person's; groups and channels have
@@ -2263,6 +2280,13 @@ async fn search_page(
         },
         // The app makes these a sender first.
         Some(Who::Me | Who::Name(_)) | None => None,
+    };
+    // Telegram's server won't search by a sender and what's in the
+    // messages at once ("INPUT_FILTER_INVALID"), so with both the sender
+    // is matched here, after a search by the filter alone.
+    let local_sender = match ask.has.is_some() {
+        true => sender.take(),
+        false => None,
     };
     let mut offset = 0;
     if from == 0
@@ -2275,6 +2299,7 @@ async fn search_page(
             Err(e) if e.code == 404 => {
                 return Ok(Found {
                     ids: Vec::new(),
+                    messages: Vec::new(),
                     total: 0,
                     next_from: 0,
                     next_offset: String::new(),
@@ -2283,27 +2308,65 @@ async fn search_page(
             Err(e) => return Err(e.message),
         }
     }
-    let enums::FoundChatMessages::FoundChatMessages(found) = functions::search_chat_messages(
-        chat_id,
-        forum_topic(topic),
-        ask.words.clone(),
-        sender,
-        from,
-        offset,
-        limit,
-        ask.has.map(Has::tdlib),
-        client_id,
-    )
-    .await
-    .map_err(|e| e.message)?;
     let mut page = Found {
         ids: Vec::new(),
-        total: found.total_count,
-        next_from: found.next_from_message_id,
+        messages: Vec::new(),
+        total: -1,
+        next_from: 0,
         next_offset: String::new(),
     };
-    page.keep_dates(ask, &found.messages);
+    // Pages of the unfiltered search until enough of them survive the
+    // sender matched here; without one, the single page the caller wants.
+    for _ in 0..LOCAL_SENDER_PAGES {
+        let enums::FoundChatMessages::FoundChatMessages(found) = functions::search_chat_messages(
+            chat_id,
+            forum_topic(topic),
+            ask.words.clone(),
+            sender.clone(),
+            from,
+            offset,
+            limit,
+            ask.has.map(Has::tdlib),
+            client_id,
+        )
+        .await
+        .map_err(|e| e.message)?;
+        page.total = found.total_count;
+        page.next_from = found.next_from_message_id;
+        from = found.next_from_message_id;
+        offset = 0;
+        let messages: Vec<types::Message> = match &local_sender {
+            Some(want) => found
+                .messages
+                .into_iter()
+                .filter(|m| sender_matches(&m.sender_id, want))
+                .collect(),
+            None => found.messages,
+        };
+        page.keep_dates(ask, messages);
+        if local_sender.is_none() || page.messages.len() >= limit as usize || page.next_from == 0 {
+            break;
+        }
+    }
+    if local_sender.is_some() {
+        // TDLib's count is every sender's.
+        page.total = -1;
+    }
     Ok(page)
+}
+
+/// True when `got` is `want`: the local half of a search by a sender and
+/// what's in the messages, which Telegram's server won't do.
+fn sender_matches(got: &enums::MessageSender, want: &enums::MessageSender) -> bool {
+    match (got, want) {
+        (enums::MessageSender::User(got), enums::MessageSender::User(want)) => {
+            got.user_id == want.user_id
+        }
+        (enums::MessageSender::Chat(got), enums::MessageSender::Chat(want)) => {
+            got.chat_id == want.chat_id
+        }
+        _ => false,
+    }
 }
 
 /// A page of words found in a secret chat, which TDLib searches its own
@@ -2328,18 +2391,19 @@ async fn secret_search_page(
     .map_err(|e| e.message)?;
     let mut page = Found {
         ids: Vec::new(),
+        messages: Vec::new(),
         total: found.total_count,
         next_from: 0,
         next_offset: found.next_offset,
     };
-    page.keep_dates(ask, &found.messages);
+    page.keep_dates(ask, found.messages);
     Ok(page)
 }
 
 impl Found {
     /// Keeps the messages of a page, newest first, sent between the days
     /// `ask` gives; one from before `after:` ends the search.
-    fn keep_dates(&mut self, ask: &Query, messages: &[types::Message]) {
+    fn keep_dates(&mut self, ask: &Query, messages: Vec<types::Message>) {
         for m in messages {
             if ask.after.is_some_and(|after| m.date < after) {
                 self.next_from = 0;
@@ -2348,6 +2412,7 @@ impl Found {
             }
             if ask.before.is_none_or(|before| m.date < before) {
                 self.ids.push(m.id);
+                self.messages.push(m);
             }
         }
         // TDLib counts every date.
@@ -2385,7 +2450,8 @@ async fn public_chat(username: &str, client_id: i32) -> Result<i64, String> {
     match functions::search_public_chat(username.to_string(), client_id).await {
         Ok(enums::Chat::Chat(chat)) => Ok(chat.id),
         Err(e) if e.code == 400 => Err(format!(
-            "Nobody on Telegram is called @{}",
+            "{} @{}",
+            lang::t("Nobody on Telegram is called"),
             crate::text::clean(username)
         )),
         Err(e) => Err(e.message),
@@ -2557,6 +2623,17 @@ mod tests {
         assert_eq!(wishes.next(second), None);
         let third = wishes.ask(Some(socks(1081)));
         assert_eq!(wishes.next(second), Some((third, Some(socks(1081)))));
+    }
+
+    #[test]
+    fn a_sender_is_matched_by_kind_and_id() {
+        let user = user_sender(42);
+        assert!(sender_matches(&user_sender(42), &user));
+        assert!(!sender_matches(&user_sender(43), &user));
+        assert!(!sender_matches(&chat_sender(-100), &user));
+        assert!(sender_matches(&chat_sender(-100), &chat_sender(-100)));
+        assert!(!sender_matches(&chat_sender(-101), &chat_sender(-100)));
+        assert!(!sender_matches(&user, &chat_sender(-100)));
     }
 
     fn entities(text: &types::FormattedText) -> Vec<(i32, i32, String)> {

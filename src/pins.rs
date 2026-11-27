@@ -2,6 +2,7 @@
 //! bar over the chat shows the newest pinned one, and `gp` lists them all to
 //! go to.
 
+use crate::lang;
 use crate::messages::{Msg, Sender};
 
 /// A pinned message, as the bar and the `gp` list show it.
@@ -44,12 +45,12 @@ impl PinChoice {
     /// What the popup says; `with` is whom a one-on-one chat is with.
     pub fn label(self, with: &str, channel: bool) -> String {
         match self {
-            PinChoice::Pin => "Pin".into(),
-            PinChoice::ForBoth => format!("Pin for me and {with}"),
-            PinChoice::ForMe => "Pin just for me".into(),
-            PinChoice::Notify if channel => "Pin and notify subscribers".into(),
-            PinChoice::Notify => "Pin and notify members".into(),
-            PinChoice::Quietly => "Pin without notifying".into(),
+            PinChoice::Pin => lang::t("Pin").into(),
+            PinChoice::ForBoth => lang::f("Pin for me and {name}", &[("name", &with)]),
+            PinChoice::ForMe => lang::t("Pin just for me").into(),
+            PinChoice::Notify if channel => lang::t("Pin and notify subscribers").into(),
+            PinChoice::Notify => lang::t("Pin and notify members").into(),
+            PinChoice::Quietly => lang::t("Pin without notifying").into(),
         }
     }
 

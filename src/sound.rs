@@ -65,6 +65,18 @@ impl Sink for Silent {
     }
 }
 
+/// Why the device can't play, in words the status bar shows before the
+/// system's own.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn cant_use() -> &'static str {
+    crate::lang::t("the sound device can't be used")
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn stopped() -> &'static str {
+    crate::lang::t("the sound device stopped")
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod device {
     use std::collections::VecDeque;
@@ -74,7 +86,7 @@ mod device {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
-    use super::Sink;
+    use super::{Sink, cant_use, stopped};
     use crate::voice::RATE;
 
     /// Samples queued ahead of what's heard: enough that a busy moment
@@ -107,13 +119,17 @@ mod device {
         queue.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn didnt_start() -> &'static str {
+        crate::lang::t("the sound device didn't start")
+    }
+
     pub fn open() -> Result<Box<dyn Sink>> {
         let device = cpal::default_host()
             .default_output_device()
-            .context("no speakers or headphones found")?;
+            .context(crate::lang::t("no speakers or headphones found"))?;
         let supported = device
             .default_output_config()
-            .map_err(|e| anyhow!("the sound device can't be used: {e}"))?;
+            .map_err(|e| anyhow!("{}: {e}", cant_use()))?;
         let format = supported.sample_format();
         let config: StreamConfig = supported.into();
         let queue = Arc::new(Mutex::new(Queue::default()));
@@ -122,11 +138,14 @@ mod device {
             SampleFormat::I16 => stream::<i16>(&device, config, &queue)?,
             SampleFormat::U16 => stream::<u16>(&device, config, &queue)?,
             SampleFormat::I32 => stream::<i32>(&device, config, &queue)?,
-            other => bail!("the sound device takes {other} samples, which tuigram can't make"),
+            other => bail!(crate::lang::f(
+                "the sound device takes {format} samples, which tuigram can't make",
+                &[("format", &other)],
+            )),
         };
         stream
             .play()
-            .map_err(|e| anyhow!("the sound device didn't start: {e}"))?;
+            .map_err(|e| anyhow!("{}: {e}", didnt_start()))?;
         Ok(Box::new(Device {
             _stream: stream,
             queue,
@@ -164,13 +183,13 @@ mod device {
                 move |e| lock(&failed).failed = Some(e.to_string()),
                 None,
             )
-            .map_err(|e| anyhow!("the sound device can't be used: {e}"))
+            .map_err(|e| anyhow!("{}: {e}", cant_use()))
     }
 
     impl Device {
         fn check(&self) -> Result<()> {
             match &lock(&self.queue).failed {
-                Some(e) => bail!("the sound device stopped: {e}"),
+                Some(e) => bail!("{}: {e}", stopped()),
                 None => Ok(()),
             }
         }
@@ -306,7 +325,7 @@ mod device {
 
     use anyhow::{Result, bail};
 
-    use super::Sink;
+    use super::{Sink, cant_use, stopped};
     use crate::voice::RATE;
 
     /// ALSA's `snd_pcm_t`, only ever behind a pointer.
@@ -365,7 +384,9 @@ mod device {
         static ALSA: OnceLock<Option<Alsa>> = OnceLock::new();
         match ALSA.get_or_init(load) {
             Some(alsa) => Ok(alsa),
-            None => bail!("there's no sound here (ALSA's libasound.so.2 isn't installed)"),
+            None => bail!(crate::lang::t(
+                "there's no sound here (ALSA's libasound.so.2 isn't installed)"
+            )),
         }
     }
 
@@ -459,7 +480,11 @@ mod device {
         // SAFETY: `pcm` is written by ALSA; "default" is NUL-terminated.
         let e = unsafe { (alsa.open)(&mut pcm, c"default".as_ptr(), PLAYBACK, 0) };
         if e < 0 {
-            bail!("the sound device can't be opened: {}", message(alsa, e));
+            bail!(
+                "{}: {}",
+                crate::lang::t("the sound device can't be opened"),
+                message(alsa, e)
+            );
         }
         let device = Device {
             alsa,
@@ -473,7 +498,7 @@ mod device {
         // SAFETY: `pcm` is open.
         let e = unsafe { (alsa.set_params)(pcm, S16, RW_INTERLEAVED, 1, RATE, 1, LATENCY) };
         if e < 0 {
-            bail!("the sound device can't be used: {}", message(alsa, e));
+            bail!("{}: {}", cant_use(), message(alsa, e));
         }
         Ok(Box::new(device))
     }
@@ -482,7 +507,7 @@ mod device {
         // SAFETY: snd_strerror returns a static string for any code.
         let text = unsafe { (alsa.strerror)(e) };
         if text.is_null() {
-            return format!("error {e}");
+            return format!("{} {e}", crate::lang::t("error"));
         }
         // SAFETY: not null, and NUL-terminated.
         unsafe { CStr::from_ptr(text) }
@@ -517,7 +542,7 @@ mod device {
                     // SAFETY: `pcm` is open.
                     let e = unsafe { (self.alsa.recover)(self.pcm, n as c_int, 1) };
                     if e < 0 {
-                        bail!("the sound device stopped: {}", message(self.alsa, e));
+                        bail!("{}: {}", stopped(), message(self.alsa, e));
                     }
                     continue;
                 }
@@ -567,7 +592,8 @@ mod device {
             let e = unsafe { (self.alsa.prepare)(self.pcm) };
             if e < 0 {
                 bail!(
-                    "the sound device didn't start again: {}",
+                    "{}: {}",
+                    crate::lang::t("the sound device didn't start again"),
                     message(self.alsa, e)
                 );
             }
@@ -606,6 +632,8 @@ mod device {
     use super::Sink;
 
     pub fn open() -> Result<Box<dyn Sink>> {
-        bail!("tuigram can't play sound on this system yet")
+        bail!(crate::lang::t(
+            "tuigram can't play sound on this system yet"
+        ))
     }
 }

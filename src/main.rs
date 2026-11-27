@@ -10,10 +10,13 @@ mod demo;
 mod draft;
 mod images;
 mod info;
+mod lang;
 mod messages;
 mod motion;
+mod mouse;
 mod notify;
 mod opus;
+mod pepper;
 mod picker;
 mod pins;
 mod poll;
@@ -33,6 +36,7 @@ mod theme;
 mod tmux;
 mod topics;
 mod ui;
+mod video;
 mod viewer;
 mod voice;
 
@@ -40,8 +44,9 @@ use std::io::{Write, stdout};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use ratatui_image::picker::Picker;
@@ -80,7 +85,10 @@ async fn main() -> Result<()> {
     // (caught there), ends the app: the terminal is put back, then
     // the message is printed without control characters, since it can quote
     // text from a message. Carrying on after a background thread died would
-    // leave the screen restored under a running app.
+    // leave the screen restored under a running app. Everything here may
+    // fail with the terminal already gone: it's ignored, a panic inside the
+    // hook would abort (ratatui's `restore()` prints on failure, and that
+    // print panics on a closed stderr).
     std::panic::set_hook(Box::new(|info| {
         if images::panic_is_contained() {
             return;
@@ -89,12 +97,17 @@ async fn main() -> Result<()> {
             stdout(),
             PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
-            DisableFocusChange
+            DisableFocusChange,
+            DisableMouseCapture
         );
         notify::send(notify::RESTORE_TITLE);
-        ratatui::restore();
+        let _ = ratatui::try_restore();
         tmux::restore();
-        eprintln!("tuigram crashed: {}", text::clean(&info.to_string()));
+        let _ = writeln!(
+            std::io::stderr(),
+            "tuigram crashed: {}",
+            text::clean(&info.to_string())
+        );
         tg::offline_now();
         std::process::exit(101);
     }));
@@ -108,6 +121,9 @@ async fn main() -> Result<()> {
     // Read receipts wait while the terminal window is in the background, on
     // terminals that report focus changes.
     execute!(stdout(), EnableFocusChange)?;
+    // Clicks and the wheel work the panes; selecting text with the mouse
+    // still works, over Shift, as in every terminal app that reads the mouse.
+    execute!(stdout(), EnableMouseCapture)?;
     // Terminals with the kitty keyboard protocol (kitty, Ghostty, WezTerm…)
     // can then report Shift-Enter separately from Enter.
     let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -127,6 +143,7 @@ async fn main() -> Result<()> {
     let clipboard = clipboard::Clipboard::new(clipboard_tx, outbox, tdlib_dirs);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::unbounded_channel();
     let player = voice::Player::new(voice_tx, voice::Output::Speakers);
+    let (video_tx, video_rx) = tokio::sync::mpsc::unbounded_channel();
     let app = app::App::new(
         tg,
         images,
@@ -135,17 +152,33 @@ async fn main() -> Result<()> {
         settings,
         settings_path,
         env_keys,
+        video_tx,
     );
     let result = app
-        .run(&mut terminal, rx, image_rx, clipboard_rx, voice_rx)
+        .run(
+            &mut terminal,
+            rx,
+            image_rx,
+            clipboard_rx,
+            voice_rx,
+            video_rx,
+        )
         .await;
 
     if enhanced {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(stdout(), DisableBracketedPaste, DisableFocusChange);
+    let _ = execute!(
+        stdout(),
+        DisableBracketedPaste,
+        DisableFocusChange,
+        DisableMouseCapture
+    );
     notify::send(notify::RESTORE_TITLE);
-    ratatui::restore();
+    // The terminal may be gone already (its window closed with tuigram in
+    // it): restoring then fails, and ratatui's `restore()` would panic
+    // printing that.
+    let _ = ratatui::try_restore();
     tmux::restore();
     result
 }

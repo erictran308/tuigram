@@ -3,6 +3,7 @@
 //! `h` / `l` go to the photo before or after it, and `j` / `k` zoom in and
 //! out, never past the size that fills the window, so all of it shows.
 
+use crate::lang;
 use crate::messages::{MediaFile, Msg, Preview};
 
 /// The sizes `j` and `k` go through, as shares of the size that fills the
@@ -89,8 +90,8 @@ impl PhotoView {
 pub fn cant_copy(msg: &Msg) -> Option<&'static str> {
     match (msg.saveable, msg.destruct) {
         (true, _) => None,
-        (false, Some(_)) => Some("Self-destructing media can't be copied"),
-        (false, None) => Some("This chat doesn't allow copying its messages"),
+        (false, Some(_)) => Some(lang::t("Self-destructing media can't be copied")),
+        (false, None) => Some(lang::t("This chat doesn't allow copying its messages")),
     }
 }
 
@@ -115,6 +116,7 @@ mod tests {
                 id: 1,
                 label: "Photo".into(),
                 photo: true,
+                downloaded: false,
             },
             cant_copy: None,
             zoom: None,

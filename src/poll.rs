@@ -4,6 +4,7 @@
 use tdlib_rs::enums::PollType;
 use tdlib_rs::types;
 
+use crate::lang;
 use crate::messages::without_spoilers;
 use crate::text;
 
@@ -70,10 +71,12 @@ impl Poll {
 
     /// Why Enter can't vote in it, if it can't.
     pub fn cant_vote(&self) -> Option<&'static str> {
-        if self.closed {
-            Some("This poll is closed")
+        if self.closed && self.quiz {
+            Some(lang::tc("quiz", "This poll is closed"))
+        } else if self.closed {
+            Some(lang::t("This poll is closed"))
         } else if self.quiz && self.voted() {
-            Some("You answered this quiz")
+            Some(lang::t("You answered this quiz"))
         } else {
             None
         }
@@ -84,22 +87,23 @@ impl Poll {
     /// closed, as Telegram shows them.
     pub fn text(&self) -> String {
         let kind = match (self.anonymous, self.quiz) {
-            (true, true) => "Anonymous quiz",
-            (true, false) => "Anonymous poll",
-            (false, true) => "Quiz",
-            (false, false) => "Poll",
+            (true, true) => lang::t("Anonymous quiz"),
+            (true, false) => lang::t("Anonymous poll"),
+            (false, true) => lang::t("Quiz"),
+            (false, false) => lang::t("Poll"),
         };
-        let votes = match self.voters {
-            1 => "1 vote".to_string(),
-            n => format!("{n} votes"),
-        };
+        let votes = lang::n(self.voters.into(), "{n} vote", "{n} votes", &[]);
         let mut about = vec![kind.to_string()];
         if self.several {
-            about.push("pick several".into());
+            about.push(lang::t("pick several").into());
         }
         about.push(votes);
         if self.closed {
-            about.push("closed".into());
+            let closed = match self.quiz {
+                true => lang::tc("quiz", "closed"),
+                false => lang::t("closed"),
+            };
+            about.push(closed.into());
         }
         let mut lines = vec![format!("📊 {}", self.question), about.join(" · ")];
         let results = self.voted() || self.closed;
@@ -247,6 +251,43 @@ mod tests {
         assert_eq!(quiz.cant_vote(), Some("You answered this quiz"));
         assert_eq!(poll(None, true).cant_vote(), Some("This poll is closed"));
         assert_eq!(poll(Some(0), false).cant_vote(), None, "a vote can change");
+    }
+
+    #[test]
+    fn in_russian_a_poll_counts_its_votes_in_russian() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        assert_eq!(
+            poll(None, false).text(),
+            "📊 Lunch?\nАнонимный опрос · 8 голосов\n○ Pizza\n○ Sushi"
+        );
+        let mut one = poll(None, true);
+        one.voters = 21;
+        one.several = true;
+        assert!(
+            one.text()
+                .contains("Анонимный опрос · несколько ответов · 21 голос · завершён"),
+            "{}",
+            one.text()
+        );
+        one.voters = 3;
+        assert!(one.text().contains("3 голоса"));
+        assert_eq!(one.cant_vote(), Some("Этот опрос завершён"));
+    }
+
+    #[test]
+    fn in_vietnamese_a_count_of_votes_has_one_form() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let mut one = poll(None, true);
+        one.voters = 21;
+        one.several = true;
+        assert!(
+            one.text()
+                .contains("Bình chọn ẩn danh · chọn nhiều · 21 phiếu · đã kết thúc"),
+            "{}",
+            one.text()
+        );
+        one.quiz = true;
+        assert_eq!(one.cant_vote(), Some("Câu đố này đã kết thúc"));
     }
 
     #[test]

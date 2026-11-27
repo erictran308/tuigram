@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use tdlib_rs::types::VoiceNote;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::lang;
 use crate::opus::OpusDecoder;
 use crate::sound::{self, Sink};
 
@@ -36,6 +37,16 @@ const STALLED: Duration = Duration::from_secs(3);
 
 /// How often the screen follows the message playing.
 const TICK: Duration = Duration::from_millis(200);
+
+/// Why playing failed when no thread could be started for it.
+fn no_thread() -> &'static str {
+    lang::t("there's no thread to play it on")
+}
+
+/// Why a file that stops partway can't be played.
+fn cut_short() -> &'static str {
+    lang::t("it's cut short")
+}
 
 /// A voice message, as its bubble shows it.
 #[derive(Clone, Debug, PartialEq)]
@@ -295,7 +306,7 @@ impl Player {
         match spawned {
             Ok(thread) => self.ringing = Some(Ringing { shared, thread }),
             Err(_) => {
-                let happened = Happened::Failed("there's no thread to play it on".into());
+                let happened = Happened::Failed(no_thread().into());
                 let _ = self.tx.send(VoiceEvent {
                     ticket: RING,
                     happened,
@@ -360,11 +371,11 @@ impl Player {
                 send(match result {
                     Ok(Ok(())) => Happened::Ended,
                     Ok(Err(e)) => Happened::Failed(format!("{e:#}")),
-                    Err(_) => Happened::Failed("it couldn't be decoded".into()),
+                    Err(_) => Happened::Failed(lang::t("it couldn't be decoded").into()),
                 });
             });
         if spawned.is_err() {
-            let happened = Happened::Failed("there's no thread to play it on".into());
+            let happened = Happened::Failed(no_thread().into());
             let _ = failed.send(VoiceEvent { ticket, happened });
         }
     }
@@ -450,9 +461,9 @@ impl Drop for Player {
 /// Plays the file at `path` until it ends or `shared` says stop. `started`
 /// is called once sound is on its way.
 fn play(path: &Path, shared: &Shared, output: Output, started: &mut dyn FnMut()) -> Result<()> {
-    let file = File::open(path).context("the file can't be read")?;
+    let file = File::open(path).context(lang::t("the file can't be read"))?;
     if file.metadata().map_or(true, |m| m.len() > MAX_FILE) {
-        bail!("it's too long");
+        bail!(lang::t("it's too long"));
     }
     let mut sound = OggOpus::new(BufReader::new(file))?;
     let mut sink = sink_for(output)?;
@@ -548,7 +559,7 @@ impl Heard {
     /// Fails once nothing more has been heard for a while.
     fn check(&self) -> Result<()> {
         if self.since.elapsed() > STALLED {
-            bail!("the sound device stopped playing");
+            bail!(lang::t("the sound device stopped playing"));
         }
         Ok(())
     }
@@ -649,7 +660,7 @@ impl<R: Read> OggPackets<R> {
             self.at += len;
             if keep {
                 if self.packet.len() + len > MAX_PACKET {
-                    bail!("part of it is too big");
+                    bail!(lang::t("part of it is too big"));
                 }
                 self.packet.extend_from_slice(data);
             }
@@ -669,25 +680,24 @@ impl<R: Read> OggPackets<R> {
     fn read_page(&mut self) -> Result<bool> {
         loop {
             let mut header = [0; 27];
-            let got = read_up_to(&mut self.reader, &mut header).context("it can't be read")?;
+            let got =
+                read_up_to(&mut self.reader, &mut header).context(lang::t("it can't be read"))?;
             if got == 0 {
                 return Ok(false);
             }
             if &header[..4] != b"OggS" || header[4] != 0 {
-                bail!("it isn't an Ogg file");
+                bail!(lang::t("it isn't an Ogg file"));
             }
             if got < header.len() {
-                bail!("it's cut short");
+                bail!(cut_short());
             }
             let mut lacing = vec![0; usize::from(header[26])];
-            self.reader
-                .read_exact(&mut lacing)
-                .context("it's cut short")?;
+            self.reader.read_exact(&mut lacing).context(cut_short())?;
             let len = lacing.iter().map(|&l| usize::from(l)).sum();
             self.page.resize(len, 0);
             self.reader
                 .read_exact(&mut self.page)
-                .context("it's cut short")?;
+                .context(cut_short())?;
             let serial = u32::from_le_bytes([header[14], header[15], header[16], header[17]]);
             if *self.serial.get_or_insert(serial) != serial {
                 continue;
@@ -737,18 +747,18 @@ pub struct OggOpus<R: Read> {
 impl<R: Read> OggOpus<R> {
     pub fn new(reader: R) -> Result<Self> {
         let mut packets = OggPackets::new(reader);
-        let head = packets.next(true)?.context("it's empty")?;
+        let head = packets.next(true)?.context(lang::t("it's empty"))?;
         let h = &head.data;
         if h.len() < 19 || !h.starts_with(b"OpusHead") {
-            bail!("it isn't Opus");
+            bail!(lang::t("it isn't Opus"));
         }
         // Versions 0.x; a new major version may be laid out otherwise.
         if h[8] >> 4 != 0 {
-            bail!("it's a newer kind of Opus file");
+            bail!(lang::t("it's a newer kind of Opus file"));
         }
         // Family 0 is mono or stereo; others have more channels.
         if h[18] != 0 || !(1..=2).contains(&h[9]) {
-            bail!("it has more than two channels");
+            bail!(lang::t("it has more than two channels"));
         }
         let gain = f32::from(i16::from_le_bytes([h[16], h[17]])) / 256.0;
         let skip = usize::from(u16::from_le_bytes([h[10], h[11]]));
@@ -774,7 +784,7 @@ impl<R: Read> OggOpus<R> {
         let n = self
             .decoder
             .decode(&packet.data, &mut self.buffer)
-            .context("part of it is broken")?;
+            .context(lang::t("part of it is broken"))?;
         let n = n.min(self.buffer.len());
         let end = match packet.end {
             Some(granule) => granule.saturating_sub(self.decoded).min(n as u64) as usize,

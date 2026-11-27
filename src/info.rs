@@ -3,6 +3,7 @@
 use tdlib_rs::enums::{ChatMemberStatus, MessageSender};
 use tdlib_rs::types;
 
+use crate::lang;
 use crate::messages::{Sender, one_line};
 use crate::text;
 
@@ -75,9 +76,13 @@ impl About {
         full: Option<&types::SupergroupFullInfo>,
     ) -> Self {
         let roster = match full {
-            None => Roster::Hidden("Couldn't get its members"),
-            Some(f) if f.has_hidden_members => Roster::Hidden("Its admins hid who's in it"),
-            Some(f) if !f.can_get_members => Roster::Hidden("Only its admins can see who's in it"),
+            None => Roster::Hidden(lang::t("Couldn't get its members")),
+            Some(f) if f.has_hidden_members => {
+                Roster::Hidden(lang::t("Its admins hid who's in it"))
+            }
+            Some(f) if !f.can_get_members => {
+                Roster::Hidden(lang::t("Only its admins can see who's in it"))
+            }
             Some(_) => Roster::Paged {
                 supergroup_id: group.id,
             },

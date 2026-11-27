@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use futures::StreamExt;
 use ratatui::style::Style;
 use ratatui_textarea::{DataCursor, TextArea};
@@ -13,7 +16,7 @@ use tdlib_rs::enums::{
     MessageTopic, NotificationType, OptionValue, ProxyType, Update, UserType,
 };
 use tdlib_rs::types::{Message, Proxy, UpdateNotificationGroup};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{Instant, sleep_until};
 
 use crate::attach::{self, Attachment, Dropped};
@@ -26,6 +29,7 @@ use crate::config::{self, ApiKeys};
 use crate::draft::{self, Draft};
 use crate::images::{self, ImageEvent, Images};
 use crate::info::ChatInfo;
+use crate::lang;
 use crate::messages::{
     Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState, Sender, link_host, one_line,
     web_url,
@@ -37,10 +41,10 @@ use crate::pins::{PinMenu, Pinned, PinnedMenu, Place};
 use crate::poll::{Vote, VoteMenu};
 use crate::proxy;
 use crate::reactions::{self, ReactMenu, ReactionKind};
-use crate::search::{self, MessageSearch, Who};
+use crate::search::{self, MediaMenu, MessageSearch, Who};
 use crate::secret::{KeyView, Secret, SecretState, TimerMenu};
 use crate::select::{self, TextSelect};
-use crate::settings::{self, Settings, Side};
+use crate::settings::{self, Settings, Side, VideoNoteSize};
 use crate::stickers::{self, Source, StickerPanel};
 use crate::term::Terminal;
 use crate::text;
@@ -48,6 +52,7 @@ use crate::tg::{Deletable, EditText, Found, Invite, Mentions, Missed, Page, Tagg
 use crate::theme::{Colors, Corners, Themes};
 use crate::topics::{self, Forum};
 use crate::ui;
+use crate::video::{Inline, VideoEvent, VideoView};
 use crate::viewer::{self, PhotoView};
 use crate::voice::{Happened, Player, VoiceEvent};
 
@@ -57,6 +62,9 @@ const CHAT_PAGE: i32 = 50;
 const HISTORY_PAGE: i32 = 50;
 /// Search results requested per `searchChatMessages` call.
 const SEARCH_PAGE: i32 = 50;
+/// The most the media browser pages in: a chat's whole history of files
+/// can be tens of thousands, and past this a `before:` search narrows it.
+const MEDIA_ROWS_MAX: usize = 500;
 /// Keep requesting history until at least this many messages are loaded.
 /// TDLib often answers the first request with only what it has cached.
 const MIN_LOADED: usize = 30;
@@ -186,6 +194,11 @@ pub enum Target {
         message_id: i64,
         file: MediaFile,
     },
+    /// Message `message_id`'s video message, which plays in the terminal.
+    Video {
+        message_id: i64,
+        file: MediaFile,
+    },
     Link(Link),
     /// The whole text or caption; only copied.
     Text(String),
@@ -194,11 +207,12 @@ pub enum Target {
 impl Target {
     pub fn label(&self) -> &str {
         match self {
-            Target::File(file) | Target::Voice { file, .. } | Target::Photo { file, .. } => {
-                &file.label
-            }
+            Target::File(file)
+            | Target::Voice { file, .. }
+            | Target::Photo { file, .. }
+            | Target::Video { file, .. } => &file.label,
             Target::Link(link) => &link.url,
-            Target::Text(_) => "Whole message",
+            Target::Text(_) => lang::t("Whole message"),
         }
     }
 }
@@ -246,7 +260,7 @@ impl Site {
     /// The site a link goes to.
     pub fn link(host: String) -> Self {
         Self {
-            label: "It goes to:",
+            label: lang::t("It goes to:"),
             host,
         }
     }
@@ -254,7 +268,7 @@ impl Site {
     /// A proxy's server, `host:port`.
     pub fn server(address: String) -> Self {
         Self {
-            label: "Server:",
+            label: lang::t("Server:"),
             host: address,
         }
     }
@@ -271,11 +285,15 @@ pub enum Confirmed {
         text: String,
     },
     /// Join this public group or channel, to write in it.
-    Join(i64),
+    Join {
+        chat_id: i64,
+        channel: bool,
+    },
     /// Join the chat this invite link leads to, then open it.
     JoinLink {
         link: String,
         request: String,
+        channel: bool,
     },
     /// Leave this group or channel.
     Leave(i64),
@@ -301,15 +319,19 @@ impl Confirmed {
     /// What `y` does, for the key hints.
     pub fn verb(&self) -> &'static str {
         match self {
-            Confirmed::OpenFile(_) | Confirmed::OpenLink(_) => "open",
-            Confirmed::Edit { .. } => "edit",
-            Confirmed::Join(_) | Confirmed::JoinLink { .. } => "join",
-            Confirmed::Leave(_) => "leave",
-            Confirmed::Logout => "log out",
-            Confirmed::StartSecret { .. } => "start it",
-            Confirmed::EndSecret { .. } => "end it",
-            Confirmed::UseProxy(_) => "use it",
-            Confirmed::NoProxy => "connect directly",
+            Confirmed::OpenFile(_) | Confirmed::OpenLink(_) => lang::t("open"),
+            Confirmed::Edit { .. } => lang::t("edit"),
+            // Joining a channel is subscribing to it, in Russian too.
+            Confirmed::Join { channel: true, .. } | Confirmed::JoinLink { channel: true, .. } => {
+                lang::tc("channel", "join")
+            }
+            Confirmed::Join { .. } | Confirmed::JoinLink { .. } => lang::t("join"),
+            Confirmed::Leave(_) => lang::t("leave"),
+            Confirmed::Logout => lang::t("log out"),
+            Confirmed::StartSecret { .. } => lang::t("start it"),
+            Confirmed::EndSecret { .. } => lang::t("end it"),
+            Confirmed::UseProxy(_) => lang::t("use it"),
+            Confirmed::NoProxy => lang::t("connect directly"),
         }
     }
 }
@@ -334,7 +356,7 @@ fn opens_once(msg: &crate::messages::Msg) -> bool {
 /// The file Enter may open from `msg`. Media seen only while open (a voice
 /// message whose timer starts once it's played) isn't handed to another
 /// app, which would keep it; a voice message tuigram plays itself is fine.
-fn openable_file(msg: &crate::messages::Msg) -> Option<&MediaFile> {
+pub(crate) fn openable_file(msg: &crate::messages::Msg) -> Option<&MediaFile> {
     msg.file
         .as_ref()
         .filter(|_| !opens_once(msg) || msg.voice.is_some())
@@ -350,6 +372,11 @@ fn file_target(id: i64, msg: &crate::messages::Msg, file: MediaFile) -> Target {
         }
     } else if msg.photo.as_ref().is_some_and(|p| p.file_id == file.id) {
         Target::Photo {
+            message_id: id,
+            file,
+        }
+    } else if msg.video.as_ref().is_some_and(|v| v.file_id == file.id) {
+        Target::Video {
             message_id: id,
             file,
         }
@@ -408,8 +435,8 @@ pub enum DeleteChoice {
 impl DeleteChoice {
     pub fn label(self) -> &'static str {
         match self {
-            DeleteChoice::Everyone => "Delete for everyone",
-            DeleteChoice::OnlyMe => "Delete for me",
+            DeleteChoice::Everyone => lang::t("Delete for everyone"),
+            DeleteChoice::OnlyMe => lang::t("Delete for me"),
         }
     }
 }
@@ -472,19 +499,25 @@ pub struct SettingsMenu {
     /// How notifications went out when the popup opened, so turning them
     /// off and on again keeps the way, e.g. "bell".
     pub saved_notifications: Notifications,
+    /// Where its tabs and rows were drawn last frame, for the mouse.
+    pub drawn: crate::mouse::Popup,
 }
 
 impl SettingsMenu {
-    /// The notifications row, the first one.
-    pub const NOTIFICATIONS: usize = 0;
+    /// The first of the interface language rows, one per [`crate::lang::Lang::ALL`].
+    pub const LANGUAGE: usize = 0;
+    /// The notifications row.
+    pub const NOTIFICATIONS: usize = Self::LANGUAGE + crate::lang::Lang::ALL.len();
     /// The "gap between chats" row.
     pub const CHAT_GAPS: usize = Self::NOTIFICATIONS + 1;
     /// The "chat list on the right" row.
     pub const LIST_RIGHT: usize = Self::CHAT_GAPS + 1;
     /// The "gap between messages" row.
     pub const BLOCK_GAPS: usize = Self::LIST_RIGHT + 1;
+    /// The "video message size on Space" row.
+    pub const VIDEO_SIZE: usize = Self::BLOCK_GAPS + 1;
     /// The "round corners" row.
-    pub const CORNERS: usize = Self::BLOCK_GAPS + 1;
+    pub const CORNERS: usize = Self::VIDEO_SIZE + 1;
     /// The "round pills, with a Nerd Font" row.
     pub const PILLS: usize = Self::CORNERS + 1;
     /// The "animations" row.
@@ -515,6 +548,7 @@ impl SettingsMenu {
             selected: 0,
             settings_scroll: 0,
             saved_notifications: settings.notifications,
+            drawn: crate::mouse::Popup::default(),
         }
     }
 }
@@ -706,13 +740,17 @@ impl Command {
 
     pub fn about(self) -> &'static str {
         match self {
-            Command::Info => "Show what this chat is, and who's in it (also I)",
-            Command::Key => "Show a secret chat's key, to compare with the other person's",
-            Command::Leave => "Leave this group or channel, or end a secret chat (asks first)",
-            Command::Logout => "Log out of Telegram on this computer (asks first)",
-            Command::Proxy => "Connect through a proxy where Telegram is blocked, or directly",
-            Command::Secret => "Start a secret chat with this person (asks first)",
-            Command::Timer => "Set how long messages in a secret chat last once seen",
+            Command::Info => lang::t("Show what this chat is, and who's in it (also I)"),
+            Command::Key => lang::t("Show a secret chat's key, to compare with the other person's"),
+            Command::Leave => {
+                lang::t("Leave this group or channel, or end a secret chat (asks first)")
+            }
+            Command::Logout => lang::t("Log out of Telegram on this computer (asks first)"),
+            Command::Proxy => {
+                lang::t("Connect through a proxy where Telegram is blocked, or directly")
+            }
+            Command::Secret => lang::t("Start a secret chat with this person (asks first)"),
+            Command::Timer => lang::t("Set how long messages in a secret chat last once seen"),
         }
     }
 
@@ -721,14 +759,13 @@ impl Command {
     }
 }
 
-/// Ctrl-r's resize mode: the pane whose edge `h` and `l` move, with its
-/// width before, which Esc puts back.
+/// Ctrl-r's resize mode: the pane whose edge `h` and `l` move.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resizing {
     /// The chat list, in percent of the window.
-    List(u16),
+    List,
     /// A forum's topics pane, in columns.
-    Topics(u16),
+    Topics,
 }
 
 /// Where keys go. `Input` is Insert mode; the others are Normal mode.
@@ -761,6 +798,8 @@ pub struct App {
     pub player: Player,
     /// Files being downloaded to open in their default app when done.
     pub opening: HashSet<i32>,
+    /// Files being downloaded to show in the file manager when done.
+    pub revealing: HashSet<i32>,
     clipboard: Clipboard,
     /// Files being downloaded to copy when done, by file id.
     pub copying: HashMap<i32, MediaFile>,
@@ -781,12 +820,23 @@ pub struct App {
     pub pin_menu: Option<PinMenu>,
     /// `gp`: the chat's pinned messages, to go to.
     pub pinned_menu: Option<PinnedMenu>,
+    /// The media browser a `/` search with `has:` opens.
+    pub media_menu: Option<MediaMenu>,
     /// `:timer`: how long messages in a secret chat last.
     pub timer_menu: Option<TimerMenu>,
     /// `:key`: a secret chat's key, to compare.
     pub key_view: Option<KeyView>,
     /// Enter on a photo: it, as big as the window allows.
     pub photo_view: Option<PhotoView>,
+    /// Enter on a video message: it plays in the terminal.
+    pub video_view: Option<VideoView>,
+    /// Space on a video message: it plays where its thumbnail is.
+    pub inline_video: Option<Inline>,
+    /// Where the panes and their rows are, for the mouse: the ui fills it
+    /// every frame.
+    pub mouse: crate::mouse::Map,
+    /// The decoder thread's word reaches the app through here.
+    video_tx: UnboundedSender<VideoEvent>,
     /// `I`: what a chat is, and who's in it.
     pub chat_info: Option<ChatInfo>,
     /// `v`: a message's text, to select part of it and copy that.
@@ -820,6 +870,9 @@ pub struct App {
     rang_at: Option<Instant>,
     /// tuigram runs over SSH, so its sound would play on the other computer.
     pub over_ssh: bool,
+    /// Pepper's player, where video messages play through it (see
+    /// [`crate::pepper`]): never over SSH, nor in tests.
+    pub pepper: Option<PathBuf>,
     /// The colors of the theme in use.
     pub colors: Colors,
     /// Corners are drawn round (`Settings.corners`, `Auto` decided).
@@ -851,7 +904,8 @@ pub struct App {
     /// Last error, shown in the status bar until the next key press.
     pub status: Option<String>,
     /// What TDLib's connection to Telegram is doing, while it isn't
-    /// working, e.g. "Connecting…"; shown in the status bar.
+    /// working, e.g. "Connecting…", in English: put in the language set
+    /// where it's shown, so a switch says it in the new one.
     pub connection: Option<&'static str>,
     /// Proxy changes TDLib hasn't answered yet, by their number.
     proxy_changes: BTreeMap<u64, ProxyChange>,
@@ -908,6 +962,7 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tg: Tg,
         images: Images,
@@ -916,7 +971,10 @@ impl App {
         settings: Settings,
         settings_path: PathBuf,
         env_keys: Option<ApiKeys>,
+        video_tx: UnboundedSender<VideoEvent>,
     ) -> Self {
+        let over_ssh = chime::over_ssh(|name| std::env::var(name).ok());
+        crate::lang::set(settings.lang());
         let mut chats = Chats::default();
         chats.set_highlighted(&settings.highlighted_chats);
         let notify_with = settings
@@ -936,6 +994,7 @@ impl App {
             images,
             player,
             opening: HashSet::new(),
+            revealing: HashSet::new(),
             clipboard,
             copying: HashMap::new(),
             pasting: false,
@@ -948,9 +1007,14 @@ impl App {
             notice: None,
             pin_menu: None,
             pinned_menu: None,
+            media_menu: None,
             timer_menu: None,
             key_view: None,
             photo_view: None,
+            video_view: None,
+            inline_video: None,
+            mouse: crate::mouse::Map::default(),
+            video_tx,
             chat_info: None,
             text_select: None,
             picker: None,
@@ -965,7 +1029,10 @@ impl App {
             sound: None,
             sound_stamp: None,
             rang_at: None,
-            over_ssh: chime::over_ssh(|name| std::env::var(name).ok()),
+            over_ssh,
+            pepper: (!cfg!(test) && !over_ssh)
+                .then(crate::pepper::player)
+                .flatten(),
             settings_path,
             colors: Colors::default(),
             rounded,
@@ -983,7 +1050,7 @@ impl App {
             // Only development builds read `.env`; someone expecting it to
             // pick a separate session should know this one didn't.
             status: config::dotenv_ignored()
-                .then(|| "./.env is ignored: only development builds read it".into()),
+                .then(|| lang::t("./.env is ignored: only development builds read it").into()),
             connection: None,
             pending_g: false,
             quit_deadline: None,
@@ -1020,7 +1087,7 @@ impl App {
             Ok(colors) => self.colors = colors,
             Err(e) => {
                 self.colors = Colors::default();
-                self.status = Some(format!("Theme not used: {e}"));
+                self.status = Some(format!("{}{e}", lang::t("Theme not used: ")));
             }
         }
     }
@@ -1041,7 +1108,7 @@ impl App {
         (self.sound, self.sound_stamp) = (None, None);
         match self.sounds.samples(id) {
             Ok(samples) => (self.sound, self.sound_stamp) = (Some(samples), stamp),
-            Err(e) => self.status = Some(format!("Sound not used: {e}")),
+            Err(e) => self.status = Some(format!("{}{e}", lang::t("Sound not used: "))),
         }
     }
 
@@ -1052,8 +1119,10 @@ impl App {
         mut image_events: UnboundedReceiver<ImageEvent>,
         mut clipboard: UnboundedReceiver<ClipboardEvent>,
         mut voice_events: UnboundedReceiver<VoiceEvent>,
+        mut video_events: UnboundedReceiver<VideoEvent>,
     ) -> Result<()> {
-        let mut keys = EventStream::new();
+        let mut keys =
+            EventStream::new().filter(|event| futures::future::ready(!mouse_moved(event)));
         let mut signals = quit_signals();
         // What broke the terminal, if it went away: the app then closes as
         // `q` closes it, without drawing, and returns this.
@@ -1116,6 +1185,14 @@ impl App {
             // like it, not once writing to the terminal failed.
             if failed.is_none() {
                 self.images.send_deletions(terminal);
+                // Images encoded since the last frame reach the terminal
+                // ahead of the frame drawing their placeholders.
+                self.images.prime_transmits(terminal);
+            }
+            // The inline player's `seen` says its bubble was drawn: reset
+            // before the frame, checked after it.
+            if let Some(inline) = self.inline_video.as_mut() {
+                inline.seen = false;
             }
             if failed.is_none()
                 && let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut self))
@@ -1126,6 +1203,36 @@ impl App {
             // After it: the images it drew for the first time.
             if failed.is_none() {
                 self.images.send_pictures(terminal);
+            }
+            // And the video frame waiting, over the overlay's blank cells.
+            if failed.is_none()
+                && let Some(view) = self.video_view.as_mut()
+            {
+                if let Some(why) = view.error.take() {
+                    self.status = Some(format!(
+                        "{}{why}",
+                        lang::t("Can't play this video message: ")
+                    ));
+                    self.video_view = None;
+                } else {
+                    view.send_frame(terminal);
+                }
+            }
+            // The inline player's newest frame goes to the terminal; one
+            // whose bubble wasn't drawn this frame is stopped. One still
+            // waiting for its download has nothing drawn to see: it stays.
+            if failed.is_none() && self.inline_video.is_some() {
+                let (seen, started) = self
+                    .inline_video
+                    .as_ref()
+                    .map_or((false, false), |i| (i.seen, i.started()));
+                if seen {
+                    if let Some(inline) = self.inline_video.as_mut() {
+                        inline.send_frame(terminal);
+                    }
+                } else if started {
+                    self.inline_video = None;
+                }
             }
             // Start downloads/encodes for photos the frame showed but didn't have.
             self.images.fetch(&self.tg);
@@ -1186,6 +1293,7 @@ impl App {
                 Some(event) = image_events.recv() => self.images.on_built(event),
                 Some(event) = clipboard.recv() => self.on_clipboard(event),
                 Some(event) = voice_events.recv() => self.on_voice(event),
+                Some(event) = video_events.recv() => self.on_video(event),
                 Some(event) = keys.next(), if failed.is_none() => match event {
                     Ok(event) => self.on_terminal_event(event),
                     Err(e) => {
@@ -1222,7 +1330,10 @@ impl App {
     }
 
     fn on_terminal_event(&mut self, event: Event) {
-        if matches!(event, Event::Key(_) | Event::Paste(_) | Event::FocusGained) {
+        if matches!(
+            event,
+            Event::Key(_) | Event::Paste(_) | Event::FocusGained | Event::Mouse(_)
+        ) {
             self.last_input = Instant::now();
             self.last_input_wall = SystemTime::now();
         }
@@ -1237,6 +1348,7 @@ impl App {
         }
         match event {
             Event::Key(key) => self.on_key(key),
+            Event::Mouse(mouse) => self.on_mouse(mouse),
             Event::FocusGained => {
                 self.terminal_focused = true;
                 self.focus_reported = true;
@@ -1278,7 +1390,7 @@ impl App {
             // Files attached and Insert mode under a popup would go out with
             // the next Enter or two, meant for the popup.
             Event::Paste(_) if self.over_panes() => {
-                self.status = Some("Close what's open to paste".into());
+                self.status = Some(lang::t("Close what's open to paste").into());
             }
             Event::Paste(text) if matches!(self.focus, Focus::Input | Focus::Messages) => {
                 self.on_paste(text)
@@ -1442,7 +1554,19 @@ impl App {
                 if self.opening.remove(&file_id) {
                     match &path {
                         Some(path) => self.open_downloaded(path.clone()),
-                        None => self.status = Some("Download failed".into()),
+                        None => self.status = Some(lang::t("Download failed").into()),
+                    }
+                }
+                if self.revealing.remove(&file_id) {
+                    match &path {
+                        // Marked as from the internet first: from the file
+                        // manager it can be opened as Enter would.
+                        Some(path) => {
+                            mark_downloaded(path);
+                            reveal_in_file_manager(path);
+                            self.status = Some(lang::t("Shown in the file manager").into());
+                        }
+                        None => self.status = Some(lang::t("Download failed").into()),
                     }
                 }
                 if let Some(file) = self.copying.remove(&file_id) {
@@ -1453,7 +1577,7 @@ impl App {
                             mark_downloaded(path);
                             self.copy_downloaded(file, path)
                         }
-                        None => self.status = Some("Download failed".into()),
+                        None => self.status = Some(lang::t("Download failed").into()),
                     }
                 }
                 if self.player.waits_for(file_id) {
@@ -1462,12 +1586,56 @@ impl App {
                         // and one that plays once would be gone unheard.
                         Some(_) if !self.present() => {
                             self.player.stop();
-                            self.status = Some("Voice message downloaded: Enter plays it".into());
+                            self.status =
+                                Some(lang::t("Voice message downloaded: Enter plays it").into());
                         }
                         Some(path) => self.player.start(PathBuf::from(path)),
                         None => {
                             self.player.stop();
-                            self.status = Some("Download failed".into());
+                            self.status = Some(lang::t("Download failed").into());
+                        }
+                    }
+                }
+                // Not to an empty room either: playing a video message tells
+                // its sender, once a frame of it shows (`App::on_video`).
+                let present = self.present();
+                if let Some(view) = self.video_view.as_mut()
+                    && view.waits_for(file_id)
+                {
+                    match &path {
+                        Some(_) if !present => {
+                            self.status =
+                                Some(lang::t("Video message downloaded: Enter plays it").into());
+                            self.video_view = None;
+                        }
+                        Some(path) => view.downloaded(PathBuf::from(path)),
+                        None => {
+                            self.status = Some(lang::t("Download failed").into());
+                            self.video_view = None;
+                        }
+                    }
+                }
+                if let Some(inline) = self.inline_video.as_mut()
+                    && inline.waits_for(file_id)
+                {
+                    match &path {
+                        Some(_) if !present => {
+                            self.status =
+                                Some(lang::t("Video message downloaded: Space plays it").into());
+                            self.inline_video = None;
+                        }
+                        Some(path) => {
+                            if let Err(why) = inline.downloaded(PathBuf::from(path)) {
+                                self.status = Some(format!(
+                                    "{}{why}",
+                                    lang::t("Can't play this video message: ")
+                                ));
+                                self.inline_video = None;
+                            }
+                        }
+                        None => {
+                            self.status = Some(lang::t("Download failed").into());
+                            self.inline_video = None;
                         }
                     }
                 }
@@ -1527,7 +1695,10 @@ impl App {
                 // on it.
                 if self.busy() {
                     if found.is_ok() {
-                        self.status = Some(format!("Found {request}: press s to open it"));
+                        self.status = Some(lang::f(
+                            "Found {request}: press s to open it",
+                            &[("request", &request)],
+                        ));
                     }
                     return;
                 }
@@ -1551,29 +1722,36 @@ impl App {
                     // A link in a message goes to the browser, as before.
                     (Err(Missed::Elsewhere), Some(link)) => self.open_link_outside(link),
                     (Err(Missed::Elsewhere), None) => {
-                        self.status = Some("tuigram can't open this kind of link".into());
+                        self.status = Some(lang::t("tuigram can't open this kind of link").into());
                     }
                 }
             }
             TgEvent::Forwarded { chat_id } => {
                 let title = self.chats.title(chat_id).unwrap_or_default().to_string();
                 // Forwards into a forum go to its General topic.
+                // General is the topic's name as Telegram gives it.
+                let to = lang::t("to");
                 let to = match self.chats.is_forum(chat_id) {
-                    true => format!("to {title} › General"),
-                    false => format!("to {title}"),
+                    true => format!("{to} {title} › General"),
+                    false => format!("{to} {title}"),
                 };
-                self.show_toast("Forwarded", &to);
+                self.show_toast(lang::t("Forwarded"), &to);
             }
             TgEvent::Joined { chat_id } => {
                 let title = self.chats.title(chat_id).unwrap_or_default().to_string();
-                self.show_toast("Joined", &title);
+                let joined = match self.chats.get(chat_id).is_some_and(|c| c.is_channel) {
+                    true => lang::tc("channel", "Joined"),
+                    false => lang::t("Joined"),
+                };
+                self.show_toast(joined, &title);
             }
             TgEvent::Left { chat_id } => {
                 let title = self.chats.title(chat_id).unwrap_or_default().to_string();
                 if self.chats.is_secret(chat_id) {
-                    self.show_toast("Ended the secret chat", &format!("with {title}"));
+                    let with = format!("{} {title}", lang::t("with"));
+                    self.show_toast(lang::t("Ended the secret chat"), &with);
                 } else {
-                    self.show_toast("Left", &title);
+                    self.show_toast(lang::t("Left"), &title);
                 }
             }
             TgEvent::BotAnswer {
@@ -1654,7 +1832,7 @@ impl App {
             && open.unread_after.is_none()
             && !messages.iter().any(|m| m.id == target)
         {
-            self.status = Some("That message isn't in this topic".into());
+            self.status = Some(lang::t("That message isn't in this topic").into());
             return;
         }
         open.add_page(
@@ -1676,7 +1854,21 @@ impl App {
         }
     }
 
-    fn on_found(&mut self, place: (i64, Option<i32>), query: &str, found: Option<Found>) {
+    fn on_found(
+        &mut self,
+        place: (i64, Option<i32>),
+        query: &str,
+        found: Result<Box<Found>, String>,
+    ) {
+        // A page the media browser asked for goes to it.
+        if self
+            .media_menu
+            .as_ref()
+            .is_some_and(|m| m.loading && m.query == query)
+        {
+            self.on_media_found(place, found);
+            return;
+        }
         // Ignore results for a search that was replaced or ended meanwhile.
         let Some(open) = self.open.as_mut().filter(|o| o.place() == place) else {
             return;
@@ -1691,15 +1883,72 @@ impl App {
         search.loading = false;
         let wanted = search.wanted.take();
         match found {
-            Some(found) => {
-                search.add(found);
+            Ok(found) => {
+                search.add(*found);
                 if let Some(index) = wanted {
                     self.go_to_match(index);
                 }
             }
             // The error is in the status bar. Without a match, end the search.
-            None if search.results.is_empty() => open.search = None,
-            None => {}
+            Err(why) => {
+                self.status = Some(why);
+                if open.search.as_ref().is_some_and(|s| s.results.is_empty()) {
+                    open.search = None;
+                }
+            }
+        }
+    }
+
+    /// A page of the media browser's search: the rows are listed, and the
+    /// next page is asked for until there are no more (or MEDIA_ROWS_MAX).
+    fn on_media_found(&mut self, place: (i64, Option<i32>), found: Result<Box<Found>, String>) {
+        let Some(open) = self.open.as_ref().filter(|o| o.place() == place) else {
+            // The chat the search was in is gone: the list means nothing.
+            self.media_menu = None;
+            return;
+        };
+        let (chat_id, topic) = (open.chat_id, open.topic);
+        let secret = self.chats.is_secret(chat_id);
+        let next = {
+            let Some(menu) = self.media_menu.as_mut() else {
+                return;
+            };
+            menu.loading = false;
+            match found {
+                Ok(found) => {
+                    menu.add(*found);
+                    if !menu.done && menu.rows.len() < MEDIA_ROWS_MAX {
+                        menu.loading = true;
+                        Some((
+                            menu.query.clone(),
+                            menu.ask.clone(),
+                            menu.next_from,
+                            menu.next_offset.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                // The window stays, saying why: an error only in the status
+                // bar, with the window closing at once, was too easy to miss.
+                Err(why) => {
+                    menu.error = Some(why.clone());
+                    self.status = Some(why);
+                    None
+                }
+            }
+        };
+        if let Some((query, ask, from, offset)) = next {
+            self.tg.search_messages(
+                chat_id,
+                topic,
+                secret,
+                query,
+                ask,
+                from,
+                offset,
+                SEARCH_PAGE,
+            );
         }
     }
 
@@ -1899,7 +2148,11 @@ impl App {
                 }
             }
             Update::MessageSendFailed(u) => {
-                self.status = Some(format!("Message not sent: {}", u.error.message));
+                self.status = Some(format!(
+                    "{}{}",
+                    lang::t("Message not sent: "),
+                    u.error.message
+                ));
                 if let Some(open) = self
                     .open
                     .as_mut()
@@ -1925,6 +2178,20 @@ impl App {
                     {
                         self.photo_view = None;
                     }
+                    if self
+                        .video_view
+                        .as_ref()
+                        .is_some_and(|v| v.lost(u.chat_id, u.message_id, msg))
+                    {
+                        self.video_view = None;
+                    }
+                    if self
+                        .inline_video
+                        .as_ref()
+                        .is_some_and(|v| v.lost(u.chat_id, u.message_id, msg))
+                    {
+                        self.inline_video = None;
+                    }
                     // Edited: what's selected may not be in it any more.
                     if self.text_select.as_ref().is_some_and(|s| {
                         s.chat_id == u.chat_id
@@ -1932,7 +2199,8 @@ impl App {
                             && msg.is_none_or(|m| m.source_text != s.source)
                     }) {
                         self.text_select = None;
-                        self.status = Some("The message was edited: v selects again".into());
+                        self.status =
+                            Some(lang::t("The message was edited: v selects again").into());
                     }
                 }
             }
@@ -1984,6 +2252,20 @@ impl App {
                     .is_some_and(|v| u.message_ids.iter().any(|&id| v.lost(u.chat_id, id, None)))
                 {
                     self.photo_view = None;
+                }
+                if self
+                    .video_view
+                    .as_ref()
+                    .is_some_and(|v| u.message_ids.iter().any(|&id| v.lost(u.chat_id, id, None)))
+                {
+                    self.video_view = None;
+                }
+                if self
+                    .inline_video
+                    .as_ref()
+                    .is_some_and(|v| u.message_ids.iter().any(|&id| v.lost(u.chat_id, id, None)))
+                {
+                    self.inline_video = None;
                 }
                 if self.text_select.as_ref().is_some_and(|s| {
                     s.chat_id == u.chat_id && u.message_ids.contains(&s.message_id)
@@ -2058,12 +2340,12 @@ impl App {
             AuthorizationState::WaitOtherDeviceConfirmation(s) => {
                 LoginStep::OtherDevice { link: s.link }
             }
-            AuthorizationState::WaitRegistration(_) => LoginStep::Unsupported(
+            AuthorizationState::WaitRegistration(_) => LoginStep::Unsupported(lang::t(
                 "This number has no Telegram account. Sign up in the official app first.",
-            ),
-            AuthorizationState::WaitPremiumPurchase(_) => LoginStep::Unsupported(
+            )),
+            AuthorizationState::WaitPremiumPurchase(_) => LoginStep::Unsupported(lang::t(
                 "Telegram requires a Premium purchase to log in with this number. Use the official app.",
-            ),
+            )),
             AuthorizationState::Ready => {
                 self.screen = Screen::Main;
                 self.wanted_lists.insert(List::Main);
@@ -2119,6 +2401,26 @@ impl App {
             return;
         }
         self.status = None;
+        // Cyrillic keycaps read as their QWERTY twins outside typing, so
+        // moves and commands work in whichever layout is on. Typing —
+        // Insert mode, prompts, the picker, the login — gets the letters
+        // as they are.
+        let typing = matches!(self.screen, Screen::Login(_))
+            || self.prompt.is_some()
+            || self.picker.is_some()
+            || self.focus == Focus::Input;
+        let key = match (typing, key.code) {
+            (false, KeyCode::Char(c)) => {
+                // A terminal may report a shifted letter as the small one
+                // with a Shift modifier: it's the capital it types.
+                let c = match key.modifiers.contains(KeyModifiers::SHIFT) {
+                    true => c.to_uppercase().next().unwrap_or(c),
+                    false => c,
+                };
+                KeyEvent::new(KeyCode::Char(qwerty(c)), key.modifiers)
+            }
+            _ => key,
+        };
         match self.screen {
             Screen::Login(_) => self.on_login_key(key),
             Screen::Main if self.confirm.is_some() => self.on_confirm_key(key),
@@ -2135,12 +2437,14 @@ impl App {
                 }
             }
             Screen::Main if self.photo_view.is_some() => self.on_viewer_key(key),
+            Screen::Main if self.video_view.is_some() => self.on_video_key(key),
             Screen::Main if self.settings_menu.is_some() => self.on_settings_key(key, ctrl),
             Screen::Main if self.delete_menu.is_some() => self.on_delete_key(key),
             Screen::Main if self.react_menu.is_some() => self.on_react_key(key, ctrl),
             Screen::Main if self.vote_menu.is_some() => self.on_vote_key(key),
             Screen::Main if self.button_menu.is_some() => self.on_button_key(key),
             Screen::Main if self.pin_menu.is_some() => self.on_pin_key(key),
+            Screen::Main if self.media_menu.is_some() => self.on_media_key(key, ctrl),
             Screen::Main if self.pinned_menu.is_some() => self.on_pinned_key(key),
             Screen::Main if self.timer_menu.is_some() => self.on_timer_key(key),
             Screen::Main if self.chat_info.is_some() => self.on_info_key(key, ctrl),
@@ -2203,19 +2507,21 @@ impl App {
             LoginStep::ApiId => {
                 match config::parse_api_id(&value) {
                     Some(id) => self.screen = login_screen(LoginStep::ApiHash { id }),
-                    None => login.error = Some("The API ID is a number, like 1234567".into()),
+                    None => {
+                        login.error = Some(lang::t("The API ID is a number, like 1234567").into())
+                    }
                 }
                 return;
             }
             LoginStep::ApiHash { id } => {
                 if !config::is_api_hash(&value) {
-                    login.error = Some("The API hash is 32 letters and digits".into());
+                    login.error = Some(lang::t("The API hash is 32 letters and digits").into());
                     return;
                 }
                 let keys = ApiKeys { id, hash: value };
                 self.settings.api_keys = Some(keys.clone());
                 if let Err(e) = self.settings.save(&self.settings_path) {
-                    login.error = Some(format!("Couldn't save them: {e:#}"));
+                    login.error = Some(format!("{}{e:#}", lang::t("Couldn't save them: ")));
                     return;
                 }
                 if self.keys_source.is_some() {
@@ -2270,16 +2576,21 @@ impl App {
     /// it asks for another key, which a new client then starts with.
     fn reject_api_keys(&mut self) {
         let message = match self.keys_source {
-            Some(KeySource::Env) => "Telegram rejected TG_API_ID / TG_API_HASH.".to_string(),
+            Some(KeySource::Env) => {
+                lang::t("Telegram rejected TG_API_ID / TG_API_HASH.").to_string()
+            }
             Some(KeySource::BuiltIn) => {
                 self.built_in_rejected = true;
-                "Telegram rejected tuigram's built-in key. Use your own.".into()
+                lang::t("Telegram rejected tuigram's built-in key. Use your own.").into()
             }
             Some(KeySource::Saved) | None => {
                 self.settings.api_keys = None;
                 match self.settings.save(&self.settings_path) {
-                    Ok(()) => "Telegram rejected that API ID and hash.".into(),
-                    Err(e) => format!("Telegram rejected the API key; can't forget it: {e:#}"),
+                    Ok(()) => lang::t("Telegram rejected that API ID and hash.").into(),
+                    Err(e) => format!(
+                        "{}{e:#}",
+                        lang::t("Telegram rejected the API key; can't forget it: ")
+                    ),
                 }
             }
         };
@@ -2294,6 +2605,145 @@ impl App {
                 login.error = Some(message);
             }
             Screen::Main => self.status = Some(message),
+        }
+    }
+
+    /// The mouse: the wheel scrolls the pane under it, a click focuses it —
+    /// a chat or topic opens, a message becomes the cursor (and opens on a
+    /// second click, as in Telegram's apps), the composer takes the keys.
+    /// Popups and viewers keep their keys: clicks then do nothing, but in
+    /// the `?` popup, which takes them ([`App::on_settings_mouse`]).
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        if matches!(self.screen, Screen::Main) && self.settings_on_top() {
+            self.on_settings_mouse(mouse);
+            return;
+        }
+        if !matches!(self.screen, Screen::Main)
+            || self.over_panes()
+            || self.photo_view.is_some()
+            || self.video_view.is_some()
+        {
+            return;
+        }
+        let (x, y) = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.mouse_scroll(x, y, 1),
+            MouseEventKind::ScrollUp => self.mouse_scroll(x, y, -1),
+            MouseEventKind::Down(MouseButton::Left) => self.mouse_click(x, y),
+            _ => {}
+        }
+    }
+
+    /// The `?` popup has the keys: nothing `on_key` hands them to first is up.
+    fn settings_on_top(&self) -> bool {
+        self.settings_menu.is_some()
+            && self.confirm.is_none()
+            && self.notice.is_none()
+            && self.key_view.is_none()
+            && self.photo_view.is_none()
+            && self.video_view.is_none()
+    }
+
+    /// The mouse in the `?` popup: the wheel over it moves as `j` and `k`
+    /// do, a click on a tab switches to it, and one on a setting puts the
+    /// cursor there. Only a click on the setting already under the cursor
+    /// changes it, as Enter does, so a stray click changes nothing.
+    fn on_settings_mouse(&mut self, mouse: MouseEvent) {
+        let Some(menu) = self.settings_menu.as_ref() else {
+            return;
+        };
+        let (x, y) = (mouse.column, mouse.row);
+        let drawn = &menu.drawn;
+        let wheel = |code| drawn.contains(x, y).then_some(code);
+        let code = match mouse.kind {
+            MouseEventKind::ScrollDown => wheel(KeyCode::Char('j')),
+            MouseEventKind::ScrollUp => wheel(KeyCode::Char('k')),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let tab = drawn.tab_at(x, y);
+                let on_settings = menu.tab == HelpTab::Settings;
+                let row = drawn.setting_at(x, y).filter(|_| on_settings);
+                let selected = menu.selected;
+                match (tab, row) {
+                    (Some(tab), _) => {
+                        if let Some(menu) = self.settings_menu.as_mut() {
+                            menu.tab = [HelpTab::Shortcuts, HelpTab::Settings][tab];
+                        }
+                    }
+                    (None, Some(row)) if row == selected => self.change_setting(),
+                    (None, Some(row)) => {
+                        if let Some(menu) = self.settings_menu.as_mut() {
+                            menu.selected = row;
+                        }
+                    }
+                    (None, None) => {}
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(code) = code {
+            self.on_settings_key(KeyEvent::new(code, KeyModifiers::NONE), false);
+        }
+    }
+
+    /// The wheel over a pane moves its cursor, as `j` and `k` do.
+    fn mouse_scroll(&mut self, x: u16, y: u16, delta: isize) {
+        match self.mouse.pane_at(x, y) {
+            Some(crate::mouse::Pane::Chats) => self.move_chat_cursor(delta),
+            Some(crate::mouse::Pane::Topics) => self.move_topic_cursor(delta),
+            Some(crate::mouse::Pane::Messages) => self.move_message_cursor(delta),
+            None => {}
+        }
+    }
+
+    fn mouse_click(&mut self, x: u16, y: u16) {
+        if let Some(chat_id) = self.mouse.chat_at(x, y) {
+            self.focus = Focus::Chats;
+            self.selected = Some(chat_id);
+            if self.open.as_ref().is_none_or(|o| o.chat_id != chat_id) {
+                self.open_chat(chat_id);
+            }
+            return;
+        }
+        if let Some(topic_id) = self.mouse.topic_at(x, y) {
+            self.focus = Focus::Topics;
+            if let Some(forum) = self.forum.as_mut() {
+                forum.selected = Some(topic_id);
+            }
+            if self.open.as_ref().and_then(|o| o.topic) != Some(topic_id) {
+                self.open_selected_topic();
+            }
+            return;
+        }
+        if let Some(message_id) = self.mouse.message_at(x, y) {
+            let was_focused = self.focus == Focus::Messages;
+            let was_selected = self.open.as_ref().and_then(|o| o.selected);
+            if self.focus == Focus::Input {
+                self.leave_insert();
+            }
+            self.focus = Focus::Messages;
+            if let Some(open) = self.open.as_mut() {
+                open.selected = Some(message_id);
+            }
+            // A click on the message already under the cursor opens it, as
+            // Enter would: photos, videos, files. A video message plays as
+            // Space plays it, at the size the settings pick.
+            if was_focused && was_selected == Some(message_id) {
+                let is_note = self
+                    .open
+                    .as_ref()
+                    .and_then(|o| o.messages.get(&message_id))
+                    .is_some_and(|m| m.video.is_some());
+                if is_note {
+                    self.toggle_inline_video();
+                } else {
+                    self.open_selected_message();
+                }
+            }
+            return;
+        }
+        if self.mouse.over_composer(x, y) && self.open.is_some() {
+            self.start_writing();
         }
     }
 
@@ -2330,10 +2780,10 @@ impl App {
             // Before `r`, which replies.
             // In a forum's topics, the topics pane; else the chat list.
             (Focus::Topics, KeyCode::Char('r')) if ctrl && self.forum.is_some() => {
-                self.resizing = Some(Resizing::Topics(self.settings.topics_width));
+                self.resizing = Some(Resizing::Topics);
             }
             (_, KeyCode::Char('r')) if ctrl => {
-                self.resizing = Some(Resizing::List(self.settings.chat_list_width));
+                self.resizing = Some(Resizing::List);
             }
             (_, KeyCode::Char('g')) => self.pending_g = true,
             // From the chats or a forum's topics: opens the one under the
@@ -2416,6 +2866,7 @@ impl App {
             (Focus::Messages, KeyCode::Char('r')) => self.reply_to_selected(),
             (Focus::Messages, KeyCode::Char('e')) => self.edit_selected(),
             (Focus::Messages, KeyCode::Char('y')) => self.copy_selected(),
+            (Focus::Messages, KeyCode::Char('O')) => self.reveal_selected_file(),
             (Focus::Messages, KeyCode::Char('v')) if !ctrl => self.open_text_select(),
             (Focus::Messages, KeyCode::Char('a')) => self.open_prompt(PromptKind::Attach),
             (Focus::Messages, KeyCode::Char('p')) if pending_g => self.open_pinned_menu(),
@@ -2430,6 +2881,8 @@ impl App {
             (Focus::Messages, KeyCode::Char('d')) => self.open_delete_menu(),
             (Focus::Messages, KeyCode::Char('R')) => self.open_react_menu(),
             (Focus::Messages, KeyCode::Char('X')) => self.remove_reactions(),
+            (Focus::Messages, KeyCode::Char('J')) => self.join_open_chat(),
+            (Focus::Messages, KeyCode::Char('Q')) => self.close_open_chat(),
             (Focus::Messages, KeyCode::Char('f')) => self.forward_selected(),
             (Focus::Chats, KeyCode::Enter) => self.open_selected_chat(),
             (Focus::Chats, KeyCode::Char(c)) if c == to_chat => self.open_selected_chat(),
@@ -2450,8 +2903,11 @@ impl App {
                 self.start_writing();
             }
             (Focus::Topics, KeyCode::Esc) => self.focus = Focus::Chats,
+            (Focus::Topics, KeyCode::Char('Q')) => self.close_open_chat(),
             (Focus::Topics, KeyCode::Char(c)) if c == to_list => self.focus = Focus::Chats,
             (Focus::Messages, KeyCode::Enter) => self.open_selected_message(),
+            (Focus::Messages, KeyCode::Char(' ')) => self.toggle_inline_video(),
+            (Focus::Messages, KeyCode::Char('z')) => self.zoom_inline_video(),
             (Focus::Messages, KeyCode::Esc) => self.focus = self.left_of_messages(),
             (Focus::Messages, KeyCode::Char(c)) if c == to_list => {
                 self.focus = self.left_of_messages();
@@ -2600,21 +3056,30 @@ impl App {
     }
 
     /// Whom Tab offers after `from:` in a search: you, then the @usernames
-    /// of the people whose messages are loaded, newest first.
+    /// of the people whose messages are loaded, newest first, then of the
+    /// chats in the list, so any of them is a few Tabs away.
     fn search_people(&self) -> Vec<String> {
         let mut people = vec!["me".to_string()];
-        let Some(open) = &self.open else {
-            return people;
-        };
-        for msg in open.messages.values().rev() {
-            if let Sender::User(id) = msg.sender
-                && !self.chats.is_saved(id)
-                && let Some(name) = self.chats.user_username(id)
-            {
-                let name = format!("@{name}");
-                if !people.contains(&name) {
-                    people.push(name);
+        if let Some(open) = &self.open {
+            for msg in open.messages.values().rev() {
+                if let Sender::User(id) = msg.sender
+                    && !self.chats.is_saved(id)
+                    && let Some(name) = self.chats.user_username(id)
+                {
+                    let name = format!("@{name}");
+                    if !people.contains(&name) {
+                        people.push(name);
+                    }
                 }
+            }
+        }
+        for &id in self.chats.ids() {
+            let Some(name) = self.chats.username(id) else {
+                continue;
+            };
+            let name = format!("@{name}");
+            if !people.contains(&name) {
+                people.push(name);
             }
         }
         people
@@ -2625,7 +3090,10 @@ impl App {
     fn resolve_sender(&self, mut ask: search::Query) -> Result<search::Query, String> {
         let sender = match &ask.from {
             Some(Who::Me) => {
-                let me = self.chats.my_id().ok_or("Your account isn't known yet")?;
+                let me = self
+                    .chats
+                    .my_id()
+                    .ok_or(lang::t("Your account isn't known yet"))?;
                 Sender::User(me)
             }
             Some(Who::Username(name)) => match self.chats.user_by_username(name) {
@@ -2656,15 +3124,17 @@ impl App {
                 match (exact.as_slice(), matching.as_slice()) {
                     ([id], _) | ([], [(id, _)]) => Sender::User(*id),
                     ([], []) => {
-                        return Err(format!(
-                            "Nobody called {name} wrote in the messages loaded: try from:@username"
+                        return Err(lang::f(
+                            "Nobody called {name} wrote in the messages loaded: try from:@username",
+                            &[("name", &name)],
                         ));
                     }
                     _ => {
                         let names: Vec<&str> = matching.iter().map(|&(_, n)| n).take(3).collect();
-                        return Err(format!(
-                            "{name} could be {}: use from:@username",
-                            names.join(", ")
+                        let names = names.join(", ");
+                        return Err(lang::f(
+                            "{name} could be {names}: use from:@username",
+                            &[("name", &name), ("names", &names)],
                         ));
                     }
                 }
@@ -2749,27 +3219,54 @@ impl App {
             self.focus = Focus::Input;
             return;
         }
-        let title = self.chats.title(open.chat_id).unwrap_or("this chat");
+        self.confirm_join(open.chat_id);
+    }
+
+    /// Asks to join the public group or channel `chat_id`, which joining
+    /// a channel is subscribing to.
+    fn confirm_join(&mut self, chat_id: i64) {
+        let title = self.chats.title(chat_id);
         // Only a channel's admins write in it; joining one is following it.
-        let channel = self.chats.get(open.chat_id).is_some_and(|c| c.is_channel);
+        let channel = self.chats.get(chat_id).is_some_and(|c| c.is_channel);
         let (ask, why) = if channel {
             (
-                "Join this channel?",
-                "Join it to have it in your chat list.",
+                lang::t("Join this channel?"),
+                lang::t("Join it to have it in your chat list."),
             )
         } else {
             (
-                "Join to write here?",
-                "Join it to write, and to have it in your chat list.",
+                lang::t("Join to write here?"),
+                lang::t("Join it to write, and to have it in your chat list."),
             )
         };
-        let mut confirm = Confirm::new(
-            ask,
-            vec![format!("You're not in {title}."), why.into()],
-            Confirmed::Join(open.chat_id),
-        );
-        confirm.badge = self.chats.badge(open.chat_id);
+        // Russian says it otherwise for a channel.
+        let (not_in, this) = match channel {
+            true => (
+                lang::tc("channel", "You're not in {title}."),
+                lang::tc("channel", "this chat"),
+            ),
+            false => (
+                lang::t("You're not in {title}."),
+                lang::tc("group", "this chat"),
+            ),
+        };
+        let not_in = lang::fill(not_in, &[("title", &title.unwrap_or(this))]);
+        let action = Confirmed::Join { chat_id, channel };
+        let mut confirm = Confirm::new(ask, vec![not_in, why.into()], action);
+        confirm.badge = self.chats.badge(chat_id);
         self.confirm = Some(confirm);
+    }
+
+    /// `J`: join the open public group or channel, as Telegram's Join
+    /// button does.
+    fn join_open_chat(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        if self.chats.joined(open.chat_id) {
+            return;
+        }
+        self.confirm_join(open.chat_id);
     }
 
     /// Why nothing can be sent in a secret chat now: it waits for the
@@ -2779,7 +3276,7 @@ impl App {
         let name = self
             .users
             .get(&secret.user_id)
-            .map_or("them", String::as_str);
+            .map_or(lang::t("them"), String::as_str);
         secret.cant_send(name)
     }
 
@@ -2937,9 +3434,9 @@ impl App {
             return;
         }
         if let Some(changed) = open.attachments.iter().find(|a| a.swapped()) {
-            self.status = Some(format!(
-                "{} changed since it was attached. Drop the files (Esc in Normal mode) and attach it again",
-                changed.name
+            self.status = Some(lang::f(
+                "{name} changed since it was attached. Drop the files (Esc in Normal mode) and attach it again",
+                &[("name", &changed.name)],
             ));
             return;
         }
@@ -3049,7 +3546,7 @@ impl App {
                     return;
                 }
                 if submit {
-                    self.status = Some(format!("No chats match \"{query}\""));
+                    self.status = Some(lang::f("No chats match \"{query}\"", &[("query", &query)]));
                 }
                 self.chats.set_filter(&prompt.previous_filter);
                 self.selected = prompt.previous_selected;
@@ -3065,11 +3562,18 @@ impl App {
                 let ask = search::parse(&query)
                     .and_then(|ask| match ask.from {
                         // TDLib can't tell in a secret chat.
-                        Some(_) if secret => Err("from: doesn't work in secret chats".into()),
+                        Some(_) if secret => {
+                            Err(lang::t("from: doesn't work in secret chats").into())
+                        }
                         _ => Ok(ask),
                     })
                     .and_then(|ask| self.resolve_sender(ask));
                 match ask {
+                    Ok(ask) if ask.has.is_some() => {
+                        // A media filter opens the browser: every match in
+                        // one list, as Telegram's "shared media" shows it.
+                        self.open_media_menu(query, ask);
+                    }
                     Ok(ask) => {
                         if let Some(open) = self.open.as_mut() {
                             open.search = Some(MessageSearch::new(query, ask));
@@ -3100,7 +3604,7 @@ impl App {
                 Some(Command::Proxy) => self.open_proxy_prompt(),
                 Some(Command::Secret) => self.ask_secret_chat(),
                 Some(Command::Timer) => self.open_timer_menu(),
-                None => self.status = Some(format!("Not a command: {query}")),
+                None => self.status = Some(format!("{}{query}", lang::t("Not a command: "))),
             },
         }
     }
@@ -3236,8 +3740,8 @@ impl App {
     /// In a forum, only the topic open is being read: `topic` is the one
     /// the message is in.
     fn sees(&self, chat_id: i64, topic: Option<i32>) -> bool {
-        // The photo viewer hides every chat.
-        if self.photo_view.is_some() {
+        // The photo viewer and the video player hide every chat.
+        if self.photo_view.is_some() || self.video_view.is_some() {
             return false;
         }
         if self.focus_reported {
@@ -3276,9 +3780,13 @@ impl App {
             .iter()
             .any(|n| matches!(n.r#type, NotificationType::NewSecretChat));
         if taken && !self.settings.accept_secret_chats {
-            let who = self.chats.title(update.chat_id).unwrap_or("Someone");
-            self.status = Some(format!(
-                "{who} started a secret chat, which this computer took anyway: :leave ends it"
+            let who = self
+                .chats
+                .title(update.chat_id)
+                .unwrap_or(lang::t("Someone"));
+            self.status = Some(lang::f(
+                "{who} started a secret chat, which this computer took anyway: :leave ends it",
+                &[("who", &who)],
             ));
         }
         let chat_id = update.chat_id;
@@ -3316,8 +3824,8 @@ impl App {
                     let note = Note {
                         id: notification.id,
                         chat_id,
-                        chat: "Secret chat".into(),
-                        text: "Someone started a secret chat with you".into(),
+                        chat: lang::t("Secret chat").into(),
+                        text: lang::t("Someone started a secret chat with you").into(),
                         silent: notification.is_silent || no_sound,
                     };
                     self.notifier.add(note, Instant::now());
@@ -3331,8 +3839,8 @@ impl App {
                 let note = Note {
                     id: notification.id,
                     chat_id,
-                    chat: "Secret chat".into(),
-                    text: "New message".into(),
+                    chat: lang::t("Secret chat").into(),
+                    text: lang::t("New message").into(),
                     silent: notification.is_silent || no_sound,
                 };
                 self.notifier.add(note, Instant::now());
@@ -3341,7 +3849,7 @@ impl App {
             let text = if new.show_preview {
                 self.notification_text(&new.message)
             } else {
-                "New message".into()
+                lang::t("New message").into()
             };
             let note = Note {
                 id: notification.id,
@@ -3368,11 +3876,15 @@ impl App {
                 self.users
                     .get(&id)
                     .cloned()
-                    .unwrap_or_else(|| "Someone".into())
+                    .unwrap_or_else(|| lang::t("Someone").into())
             };
             let actor = match sender {
                 Sender::User(id) => name(id),
-                Sender::Chat(id) => self.chats.title(id).unwrap_or("Someone").to_string(),
+                Sender::Chat(id) => self
+                    .chats
+                    .title(id)
+                    .unwrap_or(lang::t("Someone"))
+                    .to_string(),
             };
             let parts = service.sentence(sender, crate::service::Part::Name(actor), name);
             return crate::service::text(&parts);
@@ -3442,35 +3954,41 @@ impl App {
             _ => self.open.as_ref().map(|o| o.chat_id),
         };
         let Some((chat_id, chat)) = chat_id.and_then(|id| Some((id, self.chats.get(id)?))) else {
-            self.status = Some("Open the group or channel to leave first".into());
+            self.status = Some(lang::t("Open the group or channel to leave first").into());
             return;
         };
         if let Some(secret_id) = chat.secret_id {
             let title = self.chats.title(chat_id).unwrap_or_default();
             self.confirm = Some(Confirm::new(
-                "End this secret chat?",
+                lang::t("End this secret chat?"),
                 vec![
-                    format!("With {title}."),
-                    "Nothing more can be sent in it, by either of you,".into(),
-                    "and its messages are deleted from this computer.".into(),
+                    format!("{} {title}.", lang::t("With")),
+                    lang::t("Nothing more can be sent in it, by either of you,").into(),
+                    lang::t("and its messages are deleted from this computer.").into(),
                 ],
                 Confirmed::EndSecret { chat_id, secret_id },
             ));
             return;
         }
         if chat.is_private {
-            self.status = Some("A chat with one person can't be left".into());
+            self.status = Some(lang::t("A chat with one person can't be left").into());
             return;
         }
         if !self.chats.joined(chat_id) {
-            self.status = Some("You're not in this chat".into());
+            self.status = Some(lang::t("You're not in this chat").into());
             return;
         }
         let title = self.chats.title(chat_id).unwrap_or_default();
         let (ask, why) = if chat.is_channel {
-            ("Leave this channel?", "Its posts stop coming to you.")
+            (
+                lang::t("Leave this channel?"),
+                lang::t("Its posts stop coming to you."),
+            )
         } else {
-            ("Leave this group?", "Its messages stop coming to you.")
+            (
+                lang::t("Leave this group?"),
+                lang::t("Its messages stop coming to you."),
+            )
         };
         let mut confirm = Confirm::new(
             ask,
@@ -3494,25 +4012,30 @@ impl App {
     /// chat the command is about is with.
     fn ask_secret_chat(&mut self) {
         let Some(user_id) = self.command_chat().and_then(|id| self.chats.person(id)) else {
-            self.status = Some("Open a chat with someone to start a secret chat with them".into());
+            self.status =
+                Some(lang::t("Open a chat with someone to start a secret chat with them").into());
             return;
         };
         if self.chats.is_bot(user_id) {
-            self.status = Some("Bots can't be in secret chats".into());
+            self.status = Some(lang::t("Bots can't be in secret chats").into());
             return;
         }
         let with = self
             .users
             .get(&user_id)
             .cloned()
-            .unwrap_or_else(|| "them".into());
+            .unwrap_or_else(|| lang::t("them").into());
+        let lines = vec![
+            lang::f(
+                "With {with}. It's end-to-end encrypted, and kept only",
+                &[("with", &with)],
+            ),
+            lang::t("on this computer and on the device of theirs that").into(),
+            lang::t("accepts it: your other devices won't have it.").into(),
+        ];
         self.confirm = Some(Confirm::new(
-            "Start a secret chat?",
-            vec![
-                format!("With {with}. It's end-to-end encrypted, and kept only"),
-                "on this computer and on the device of theirs that".into(),
-                "accepts it: your other devices won't have it.".into(),
-            ],
+            lang::t("Start a secret chat?"),
+            lines,
             Confirmed::StartSecret { user_id, with },
         ));
         let badge = self.command_chat().and_then(|id| self.chats.badge(id));
@@ -3531,7 +4054,7 @@ impl App {
             .filter(|&id| self.chats.is_secret(id))
             .and_then(|id| Some((id, self.chats.secret(id)?.clone())));
         if found.is_none() {
-            self.status = Some("Open a secret chat first (:secret starts one)".into());
+            self.status = Some(lang::t("Open a secret chat first (:secret starts one)").into());
         }
         found
     }
@@ -3585,13 +4108,18 @@ impl App {
         let Some((chat_id, secret)) = self.open_secret_chat() else {
             return;
         };
-        let with = self.chats.title(chat_id).unwrap_or("them").to_string();
+        let with = self
+            .chats
+            .title(chat_id)
+            .unwrap_or(lang::t("them"))
+            .to_string();
         if crate::secret::key_picture(&secret.key_hash).is_none() {
             self.status = Some(match secret.state {
-                SecretState::Pending => {
-                    format!("The key is made once {with} accepts the secret chat")
-                }
-                _ => "Telegram gave no key to compare for this chat".into(),
+                SecretState::Pending => lang::f(
+                    "The key is made once {with} accepts the secret chat",
+                    &[("with", &with)],
+                ),
+                _ => lang::t("Telegram gave no key to compare for this chat").into(),
             });
             return;
         }
@@ -3606,14 +4134,14 @@ impl App {
     /// code, and maybe the password.
     fn ask_to_log_out(&mut self) {
         let mut lines: Vec<String> = vec![
-            "This ends the session on Telegram and deletes what".into(),
-            "tuigram keeps on this computer. Logging in again".into(),
-            "takes a code, and your password if you have one.".into(),
+            lang::t("This ends the session on Telegram and deletes what").into(),
+            lang::t("tuigram keeps on this computer. Logging in again").into(),
+            lang::t("takes a code, and your password if you have one.").into(),
         ];
         if self.chats.has_secret_chats() {
-            lines.push("Your secret chats go too: they're kept only here.".into());
+            lines.push(lang::t("Your secret chats go too: they're kept only here.").into());
         }
-        self.confirm = Some(Confirm::new("Log out?", lines, Confirmed::Logout));
+        self.confirm = Some(Confirm::new(lang::t("Log out?"), lines, Confirmed::Logout));
     }
 
     /// `:logout`, once asked: ends the session on Telegram's side and
@@ -3631,7 +4159,7 @@ impl App {
         // Highlights are chat ids of the old account.
         self.settings.highlighted_chats.clear();
         if let Err(e) = self.settings.save(&self.settings_path) {
-            self.status = Some(format!("Couldn't save settings: {e:#}"));
+            self.status = Some(format!("{}{e:#}", lang::t("Couldn't save settings: ")));
         }
         self.chats = Chats::default();
         self.users.clear();
@@ -3642,7 +4170,9 @@ impl App {
         self.composer = new_composer();
         self.images.forget_files();
         self.player.stop();
+        self.inline_video = None;
         self.opening.clear();
+        self.revealing.clear();
         self.copying.clear();
         self.close_popups();
         self.finding = None;
@@ -3676,7 +4206,7 @@ impl App {
         };
         match current.checked_add_signed(step) {
             Some(index) => self.go_to_match(index),
-            None => self.status = Some("No newer matches".into()),
+            None => self.status = Some(lang::t("No newer matches").into()),
         }
     }
 
@@ -3711,10 +4241,13 @@ impl App {
                 );
             }
         } else if search.results.is_empty() {
-            self.status = Some(format!("No messages match \"{}\"", search.query));
+            self.status = Some(lang::f(
+                "No messages match \"{query}\"",
+                &[("query", &search.query)],
+            ));
             open.search = None;
         } else {
-            self.status = Some("No older matches".into());
+            self.status = Some(lang::t("No older matches").into());
         }
     }
 
@@ -3819,8 +4352,8 @@ impl App {
                     None => self.jump_to_newest(),
                 }
             }
-            None if back => self.status = Some("Nothing to go back to".into()),
-            None => self.status = Some("Nothing to go forward to".into()),
+            None if back => self.status = Some(lang::t("Nothing to go back to").into()),
+            None => self.status = Some(lang::t("Nothing to go forward to").into()),
         }
     }
 
@@ -4048,9 +4581,11 @@ impl App {
         self.button_menu = None;
         self.pin_menu = None;
         self.pinned_menu = None;
+        self.media_menu = None;
         self.timer_menu = None;
         self.key_view = None;
         self.photo_view = None;
+        self.video_view = None;
         self.chat_info = None;
         self.text_select = None;
     }
@@ -4065,6 +4600,16 @@ impl App {
         }
     }
 
+    /// `Q`: closes the open chat, leaving only the chat list on screen.
+    fn close_open_chat(&mut self) {
+        if self.open.is_none() && self.forum.is_none() {
+            return;
+        }
+        self.close_chat_popups();
+        self.leave_chat();
+        self.focus = Focus::Chats;
+    }
+
     /// Before the messages shown give way to others: you stop typing in
     /// them, and a voice message in them stops playing.
     fn leave_messages(&mut self) {
@@ -4074,6 +4619,8 @@ impl App {
         self.pasting = false;
         // A voice message plays in its own chat, where it shows playing.
         self.player.stop();
+        // So does a video message playing in its bubble.
+        self.inline_video = None;
         if self.open.is_some() {
             self.images.clear();
         }
@@ -4176,8 +4723,10 @@ impl App {
             return;
         };
         match msg.state {
-            SendState::Pending => self.status = Some("Wait until it's sent".into()),
-            SendState::Failed { .. } => self.status = Some("This message wasn't sent".into()),
+            SendState::Pending => self.status = Some(lang::t("Wait until it's sent").into()),
+            SendState::Failed { .. } => {
+                self.status = Some(lang::t("This message wasn't sent").into())
+            }
             SendState::Sent if msg.pinned => self.tg.unpin_message(open.chat_id, id),
             SendState::Sent => {
                 let chat = self.chats.get(open.chat_id);
@@ -4187,7 +4736,11 @@ impl App {
                     Some(c) if c.is_channel => Place::Channel,
                     _ => Place::Group,
                 };
-                let with = self.chats.title(open.chat_id).unwrap_or("them").to_string();
+                let with = self
+                    .chats
+                    .title(open.chat_id)
+                    .unwrap_or(lang::t("them"))
+                    .to_string();
                 self.pin_menu = Some(PinMenu::new(id, msg.snippet(), place, with));
                 self.tg.check_pinnable(open.chat_id, id);
             }
@@ -4211,7 +4764,7 @@ impl App {
             None => self.pin_menu = None,
             Some(false) => {
                 self.pin_menu = None;
-                self.status = Some("You can't pin messages here".into());
+                self.status = Some(lang::t("You can't pin messages here").into());
             }
             // A second answer (P pressed again) keeps the cursor.
             Some(true) if menu.choices.is_empty() => menu.allow(),
@@ -4262,7 +4815,73 @@ impl App {
         };
         self.pinned_menu = PinnedMenu::new(&open.pinned);
         if self.pinned_menu.is_none() {
-            self.status = Some("No pinned messages in this chat".into());
+            self.status = Some(lang::t("No pinned messages in this chat").into());
+        }
+    }
+
+    /// A `/` search with `has:` opens the media browser: every
+    /// match of the search in the open chat, in one list. Pages are asked
+    /// for until Telegram says there are no more (or MEDIA_ROWS_MAX).
+    fn open_media_menu(&mut self, query: String, ask: search::Query) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let mut menu = MediaMenu::new(query, ask);
+        menu.loading = true;
+        let secret = self.chats.is_secret(open.chat_id);
+        self.tg.search_messages(
+            open.chat_id,
+            open.topic,
+            secret,
+            menu.query.clone(),
+            menu.ask.clone(),
+            0,
+            String::new(),
+            SEARCH_PAGE,
+        );
+        self.media_menu = Some(menu);
+    }
+
+    /// The media browser takes all keys while it's up: Enter goes to the
+    /// message under the cursor, where its file opens as any message's.
+    fn on_media_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let Some(menu) = self.media_menu.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => menu.move_by(1),
+            KeyCode::Char('k') | KeyCode::Up => menu.move_by(-1),
+            KeyCode::Char('d') if ctrl => menu.move_by(20),
+            KeyCode::Char('u') if ctrl => menu.move_by(-20),
+            KeyCode::Char('g') => menu.jump(false),
+            KeyCode::Char('G') => menu.jump(true),
+            KeyCode::Enter | KeyCode::Char('l') => {
+                let id = menu.current().map(|r| r.id);
+                self.media_menu = None;
+                if let Some(id) = id {
+                    // Ctrl-o comes back.
+                    if let Some(here) = self.here() {
+                        self.jumps.leave(here);
+                    }
+                    self.jump_to_message(id);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'h') => self.media_menu = None,
+            // As `O` on its message: downloaded first if need be, then
+            // shown in the file manager.
+            KeyCode::Char('O') => {
+                let file_id = menu.current().and_then(|r| r.file_id);
+                match file_id {
+                    Some(id) if self.revealing.insert(id) => {
+                        self.tg.download(id);
+                        self.status =
+                            Some(lang::t("Downloading to show in the file manager…").into());
+                    }
+                    Some(_) => {}
+                    None => self.status = Some(lang::t("No file in this message").into()),
+                }
+            }
+            _ => {}
         }
     }
 
@@ -4348,7 +4967,7 @@ impl App {
             match (msg.state, poll.cant_vote()) {
                 (SendState::Sent, None) => self.vote_menu = Some(VoteMenu::new(id, poll)),
                 (SendState::Sent, Some(why)) => self.status = Some(why.into()),
-                _ => self.status = Some("Wait until it's sent".into()),
+                _ => self.status = Some(lang::t("Wait until it's sent").into()),
             }
             return;
         }
@@ -4372,7 +4991,7 @@ impl App {
                         &captioned.links,
                     ));
                 }
-                _ => self.status = Some("Wait until it's sent".into()),
+                _ => self.status = Some(lang::t("Wait until it's sent").into()),
             }
             return;
         }
@@ -4393,11 +5012,12 @@ impl App {
         match targets.len() {
             0 if opens_once(msg) => {
                 self.status = Some(format!(
-                    "tuigram can't show this only while it's open: {}",
-                    crate::messages::ON_PHONE
+                    "{}: {}",
+                    lang::t("tuigram can't show this only while it's open"),
+                    crate::messages::on_phone()
                 ));
             }
-            0 => self.status = Some("Nothing to open in this message".into()),
+            0 => self.status = Some(lang::t("Nothing to open in this message").into()),
             1 => self.open_target(targets.remove(0)),
             _ => {
                 self.menu = Some(PickMenu {
@@ -4426,7 +5046,8 @@ impl App {
         };
         let (chat_id, ids) = (open.chat_id, open.retry_ids(*id));
         if !can_retry {
-            self.status = Some("Telegram won't take this message again: `d` deletes it".into());
+            self.status =
+                Some(lang::t("Telegram won't take this message again: `d` deletes it").into());
         } else if let Some(why) = self.cant_send(chat_id) {
             self.status = Some(why);
         } else {
@@ -4450,7 +5071,7 @@ impl App {
             return;
         };
         if matches!(msg.state, SendState::Failed { .. }) {
-            self.status = Some("Can't reply to a message that wasn't sent".into());
+            self.status = Some(lang::t("Can't reply to a message that wasn't sent").into());
             return;
         }
         open.reply = Some(Replied::new(id, msg));
@@ -4496,7 +5117,8 @@ impl App {
         // Nor under a popup or a prompt, which would keep the keys while the
         // composer took the edit, or lose a `Confirm` already up.
         if self.over_panes() {
-            self.status = Some("The edit came while something else was open: e edits again".into());
+            self.status =
+                Some(lang::t("The edit came while something else was open: e edits again").into());
             return;
         }
         // Without it as Markdown, it's edited as plain text, which loses
@@ -4508,13 +5130,13 @@ impl App {
         // On an error, TDLib's message is already in the status bar.
         match editable {
             None => {}
-            Some(false) => self.status = Some("You can't edit this message".into()),
+            Some(false) => self.status = Some(lang::t("You can't edit this message").into()),
             Some(true) if loses => {
                 self.confirm = Some(Confirm::new(
-                    "Edit and lose some formatting?",
+                    lang::t("Edit and lose some formatting?"),
                     vec![
-                        "Some of its formatting can't be written in Markdown".into(),
-                        "(underline, custom emoji…), so an edit would lose it.".into(),
+                        lang::t("Some of its formatting can't be written in Markdown").into(),
+                        lang::t("(underline, custom emoji…), so an edit would lose it.").into(),
                     ],
                     Confirmed::Edit {
                         id: message_id,
@@ -4576,7 +5198,7 @@ impl App {
         let text = self.composer.lines().join("\n");
         let text = text.trim();
         if text.is_empty() && editing.editable == Editable::Text {
-            self.status = Some("A message can't be empty (d deletes it)".into());
+            self.status = Some(lang::t("A message can't be empty (d deletes it)").into());
             return;
         }
         if text != editing.original.trim() {
@@ -4634,7 +5256,7 @@ impl App {
         menu.set_allowed(deletable);
         if menu.choices.is_empty() {
             self.delete_menu = None;
-            self.status = Some("You can't delete this message".into());
+            self.status = Some(lang::t("You can't delete this message").into());
         }
     }
 
@@ -4686,8 +5308,10 @@ impl App {
             return;
         };
         match msg.state {
-            SendState::Pending => self.status = Some("Wait until it's sent".into()),
-            SendState::Failed { .. } => self.status = Some("This message wasn't sent".into()),
+            SendState::Pending => self.status = Some(lang::t("Wait until it's sent").into()),
+            SendState::Failed { .. } => {
+                self.status = Some(lang::t("This message wasn't sent").into())
+            }
             SendState::Sent => {
                 self.react_menu = Some(ReactMenu::new(message_id, msg.snippet()));
                 self.tg.available_reactions(open.chat_id, message_id);
@@ -4717,7 +5341,9 @@ impl App {
         };
         if available.emoji.is_empty() {
             self.react_menu = None;
-            let reason = available.reason.unwrap_or("Reactions are off in this chat");
+            let reason = available
+                .reason
+                .unwrap_or(lang::t("Reactions are off in this chat"));
             self.status = Some(reason.into());
             return;
         }
@@ -4883,7 +5509,7 @@ impl App {
         };
         match button.press {
             Press::Callback(data) => {
-                self.show_toast("Pressed", &button.label);
+                self.show_toast(lang::t("Pressed"), &button.label);
                 let topic = self.open.as_ref().and_then(|o| o.topic);
                 self.tg
                     .press_button(chat_id, topic, message_id, data, button.label);
@@ -4899,7 +5525,9 @@ impl App {
                     .map(|msg| file_target(message_id, msg, file));
                 match target {
                     Some(target) => self.open_target(target),
-                    None => self.status = Some("That message isn't loaded any more".into()),
+                    None => {
+                        self.status = Some(lang::t("That message isn't loaded any more").into())
+                    }
                 }
             }
             Press::Telegram(url) => {
@@ -4961,7 +5589,7 @@ impl App {
                 url,
                 disguise: Some(label),
             }),
-            None => self.status = Some("The bot's link isn't a web address".into()),
+            None => self.status = Some(lang::t("The bot's link isn't a web address").into()),
         }
     }
 
@@ -4972,7 +5600,7 @@ impl App {
             return;
         };
         if self.chats.is_secret(open.chat_id) {
-            self.status = Some("Messages in secret chats can't be forwarded".into());
+            self.status = Some(lang::t("Messages in secret chats can't be forwarded").into());
             return;
         }
         let Some((&id, msg)) = open
@@ -4982,8 +5610,10 @@ impl App {
             return;
         };
         match msg.state {
-            SendState::Pending => self.status = Some("Wait until it's sent".into()),
-            SendState::Failed { .. } => self.status = Some("This message wasn't sent".into()),
+            SendState::Pending => self.status = Some(lang::t("Wait until it's sent").into()),
+            SendState::Failed { .. } => {
+                self.status = Some(lang::t("This message wasn't sent").into())
+            }
             SendState::Sent => {
                 self.picker = Some(ChatPicker::new(Purpose::Forward {
                     from: open.chat_id,
@@ -5056,7 +5686,7 @@ impl App {
                     .users
                     .get(&user_id)
                     .cloned()
-                    .unwrap_or_else(|| "your contact".into());
+                    .unwrap_or_else(|| lang::t("your contact").into());
                 self.finding = Some(Finding::new(&name));
                 self.tg.find_private_chat(user_id, name);
             }
@@ -5075,20 +5705,44 @@ impl App {
     /// Asks before joining the chat an invite link leads to, saying what it
     /// is and what Telegram thinks of it.
     fn confirm_invite(&mut self, link: String, request: String, invite: Invite) {
-        let kind = if invite.channel { "channel" } else { "group" };
-        let mut lines = vec![
-            invite.title,
-            format!("A {kind} with {} members.", invite.members),
-        ];
-        if invite.by_request {
-            lines.push("An admin has to let you in.".into());
-        }
-        let title = if invite.by_request {
-            format!("Ask to join this {kind}?")
-        } else {
-            format!("Join this {kind}?")
+        let n = invite.members;
+        let (about, title) = match invite.channel {
+            true => (
+                lang::n(
+                    n.into(),
+                    "A channel with {n} member.",
+                    "A channel with {n} members.",
+                    &[],
+                ),
+                match invite.by_request {
+                    true => lang::t("Ask to join this channel?"),
+                    false => lang::t("Join this channel?"),
+                },
+            ),
+            false => (
+                lang::n(
+                    n.into(),
+                    "A group with {n} member.",
+                    "A group with {n} members.",
+                    &[],
+                ),
+                match invite.by_request {
+                    true => lang::t("Ask to join this group?"),
+                    false => lang::t("Join this group?"),
+                },
+            ),
         };
-        let mut confirm = Confirm::new(title, lines, Confirmed::JoinLink { link, request });
+        let mut lines = vec![invite.title, about];
+        if invite.by_request {
+            lines.push(lang::t("An admin has to let you in.").into());
+        }
+        let channel = invite.channel;
+        let action = Confirmed::JoinLink {
+            link,
+            request,
+            channel,
+        };
+        let mut confirm = Confirm::new(title, lines, action);
         confirm.badge = invite.badge;
         self.confirm = Some(confirm);
     }
@@ -5101,7 +5755,7 @@ impl App {
         };
         let yours = open.your_reactions();
         if yours.is_empty() {
-            self.status = Some("You haven't reacted to this message".into());
+            self.status = Some(lang::t("You haven't reacted to this message").into());
             return;
         }
         for (message_id, kind) in yours {
@@ -5110,10 +5764,10 @@ impl App {
     }
 
     /// Resize mode takes the keys: `h` and `l` move the line between the
-    /// chat list and the chat as you press them, `=` puts it back where it
-    /// starts out, Enter keeps it and Esc puts back where it was.
+    /// panes as you press them and `=` puts it back where it starts out, each
+    /// saved at once; Enter, Esc or Ctrl-r leave.
     fn on_resize_key(&mut self, key: KeyEvent, ctrl: bool) {
-        let Some(before) = self.resizing else {
+        let Some(pane) = self.resizing else {
             return;
         };
         // `h` and `l` move the line between the panes that way: the chat
@@ -5122,44 +5776,30 @@ impl App {
             Side::Left => -1,
             Side::Right => 1,
         };
+        let widths = |s: &Settings| (s.chat_list_width, s.topics_width);
+        let before = widths(&self.settings);
         let settings = &mut self.settings;
-        match (before, key.code) {
-            (Resizing::List(_), KeyCode::Char('h') | KeyCode::Left) => settings.resize_list(left),
-            (Resizing::List(_), KeyCode::Char('l') | KeyCode::Right) => settings.resize_list(-left),
-            (Resizing::Topics(_), KeyCode::Char('h') | KeyCode::Left) => {
-                settings.resize_topics(left)
-            }
-            (Resizing::Topics(_), KeyCode::Char('l') | KeyCode::Right) => {
+        match (pane, key.code) {
+            (Resizing::List, KeyCode::Char('h') | KeyCode::Left) => settings.resize_list(left),
+            (Resizing::List, KeyCode::Char('l') | KeyCode::Right) => settings.resize_list(-left),
+            (Resizing::Topics, KeyCode::Char('h') | KeyCode::Left) => settings.resize_topics(left),
+            (Resizing::Topics, KeyCode::Char('l') | KeyCode::Right) => {
                 settings.resize_topics(-left)
             }
-            (Resizing::List(_), KeyCode::Char('=')) => {
+            (Resizing::List, KeyCode::Char('=')) => {
                 settings.chat_list_width = settings::DEFAULT_LIST_WIDTH;
             }
-            (Resizing::Topics(_), KeyCode::Char('=')) => {
+            (Resizing::Topics, KeyCode::Char('=')) => {
                 settings.topics_width = settings::DEFAULT_TOPICS_WIDTH;
             }
-            (_, KeyCode::Esc) => {
-                match before {
-                    Resizing::List(width) => settings.chat_list_width = width,
-                    Resizing::Topics(width) => settings.topics_width = width,
-                }
-                self.resizing = None;
-            }
-            (_, KeyCode::Enter) => self.end_resize(),
-            (_, KeyCode::Char('r')) if ctrl => self.end_resize(),
+            (_, KeyCode::Enter | KeyCode::Esc) => self.resizing = None,
+            (_, KeyCode::Char('r')) if ctrl => self.resizing = None,
             _ => {}
         }
-    }
-
-    /// Leaves resize mode with the panes as they are, saved for next time.
-    fn end_resize(&mut self) {
-        let changed = match self.resizing.take() {
-            Some(Resizing::List(width)) => width != self.settings.chat_list_width,
-            Some(Resizing::Topics(width)) => width != self.settings.topics_width,
-            None => false,
-        };
-        if changed && let Err(e) = self.settings.save(&self.settings_path) {
-            self.status = Some(format!("Couldn't save settings: {e:#}"));
+        if widths(&self.settings) != before
+            && let Err(e) = self.settings.save(&self.settings_path)
+        {
+            self.status = Some(format!("{}{e:#}", lang::t("Couldn't save settings: ")));
         }
     }
 
@@ -5170,7 +5810,7 @@ impl App {
             return;
         };
         if open.editing.is_some() {
-            self.status = Some("An edit can't change a message into a sticker".into());
+            self.status = Some(lang::t("An edit can't change a message into a sticker").into());
             return;
         }
         self.stickers = Some(StickerPanel::new(open.chat_id));
@@ -5323,7 +5963,7 @@ impl App {
                 .map(|_| self.chats.read_inbox(open.chat_id)),
         };
         let Some(read) = open.unread_line.or(unread_now) else {
-            self.status = Some("No unread messages".into());
+            self.status = Some(lang::t("No unread messages").into());
             return;
         };
         // Just opened, and already on its way there.
@@ -5369,7 +6009,7 @@ impl App {
             (true, false) => Mentions::Before(from),
             // On the newest, following new ones: none can be newer.
             (false, _) if open.selected.is_none() && open.at_newest => {
-                self.status = Some("No newer mentions".into());
+                self.status = Some(lang::t("No newer mentions").into());
                 return;
             }
             (false, _) => Mentions::After(from),
@@ -5415,15 +6055,13 @@ impl App {
             return;
         }
         let Some(to) = ask.pick(&ids) else {
-            self.status = Some(
-                match ask {
-                    Mentions::Unread => "No unread mentions",
-                    Mentions::Before(0) => "Nobody mentioned you here",
-                    Mentions::Before(_) => "No older mentions",
-                    Mentions::After(_) => "No newer mentions",
-                }
-                .into(),
-            );
+            let said = match ask {
+                Mentions::Unread => lang::t("No unread mentions"),
+                Mentions::Before(0) => lang::t("Nobody mentioned you here"),
+                Mentions::Before(_) => lang::t("No older mentions"),
+                Mentions::After(_) => lang::t("No newer mentions"),
+            };
+            self.status = Some(said.into());
             return;
         };
         if let Some(here) = self.here() {
@@ -5436,7 +6074,7 @@ impl App {
     /// and who's in it.
     fn open_chat_info(&mut self) {
         let Some(chat_id) = self.info_chat() else {
-            self.status = Some("No chat selected".into());
+            self.status = Some(lang::t("No chat selected").into());
             return;
         };
         let Some(peer) = self.chats.get(chat_id).and_then(|c| c.peer) else {
@@ -5504,7 +6142,7 @@ impl App {
                     .users
                     .get(&user_id)
                     .cloned()
-                    .unwrap_or_else(|| "them".into());
+                    .unwrap_or_else(|| lang::t("them").into());
                 self.finding = Some(Finding::new(&name));
                 self.tg.find_private_chat(user_id, name);
             }
@@ -5517,6 +6155,7 @@ impl App {
         match target {
             Target::Voice { message_id, file } => self.play_voice(message_id, file.id),
             Target::Photo { message_id, file } => self.view_photo(message_id, file),
+            Target::Video { message_id, file } => self.view_video(message_id, file),
             Target::File(file) => {
                 // TDLib answers at once if the file is already downloaded.
                 if self.opening.insert(file.id) {
@@ -5555,7 +6194,7 @@ impl App {
             }
         };
         let Some(view) = view else {
-            self.status = Some("This photo can't be shown here".into());
+            self.status = Some(lang::t("This photo can't be shown here").into());
             return;
         };
         // The cursor stays on it rather than following new messages: what
@@ -5590,7 +6229,8 @@ impl App {
             // What Telegram says can't be saved isn't handed to an app that
             // can save it: it's shown here instead.
             KeyCode::Char('o') if view.cant_copy.is_some() => {
-                self.status = Some("This photo can't be saved, so it opens only here".into());
+                self.status =
+                    Some(lang::t("This photo can't be saved, so it opens only here").into());
             }
             KeyCode::Char('o') => {
                 let file = view.file.clone();
@@ -5632,15 +6272,303 @@ impl App {
         }
         match (newer, open.all_loaded, open.at_newest) {
             (false, false, _) => {
-                self.status = Some("Loading older messages…".into());
+                self.status = Some(lang::t("Loading older messages…").into());
                 self.load_older_messages();
             }
             (true, _, false) => {
-                self.status = Some("Loading newer messages…".into());
+                self.status = Some(lang::t("Loading newer messages…").into());
                 self.load_newer_messages();
             }
-            (false, true, _) => self.status = Some("No older photos in this chat".into()),
-            (true, _, true) => self.status = Some("No newer photos in this chat".into()),
+            (false, true, _) => self.status = Some(lang::t("No older photos in this chat").into()),
+            (true, _, true) => self.status = Some(lang::t("No newer photos in this chat").into()),
+        }
+    }
+
+    /// Plays message `message_id`'s video message in the terminal; one
+    /// that's no longer loaded, or where the terminal can't show it, opens
+    /// in its app.
+    fn view_video(&mut self, message_id: i64, file: MediaFile) {
+        if self.pepper.is_none() && !self.images.kitty() {
+            self.status = Some(
+                lang::t("Video messages play in the terminal only with kitty's protocol").into(),
+            );
+            self.open_target(Target::File(file));
+            return;
+        }
+        // kitty reads each frame from a file on its own computer.
+        if self.over_ssh {
+            self.status =
+                Some(lang::t("Video messages play in the terminal only on this computer").into());
+            self.open_target(Target::File(file));
+            return;
+        }
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let chat_id = open.chat_id;
+        let view = match open.messages.get(&message_id) {
+            Some(msg) => VideoView::of(
+                chat_id,
+                message_id,
+                msg,
+                self.video_tx.clone(),
+                self.images.tmux(),
+                self.pepper.clone(),
+                &self.colors,
+            ),
+            None => {
+                self.open_target(Target::File(file));
+                return;
+            }
+        };
+        let Some(mut view) = view else {
+            self.status = Some(lang::t("This video message can't be played here").into());
+            return;
+        };
+        if view.note.size > crate::video::MAX_FILE {
+            self.status = Some(lang::t("Can't play this video message: it's too big").into());
+            return;
+        }
+        // One playing inline grows to the whole window where it is; another
+        // message's just stops.
+        if let Some(inline) = self.inline_video.take()
+            && inline.is_on(chat_id, message_id)
+        {
+            view.resume_at(inline.position());
+        }
+        if open.selected.is_none() {
+            open.selected = Some(message_id);
+        }
+        view.tell = open.tells(message_id);
+        self.tg.download(view.note.file_id);
+        self.video_view = Some(view);
+    }
+
+    /// Space on a video message: it plays where its thumbnail is, or pauses
+    /// if it's the one playing. The size comes from the settings: the
+    /// bubble's, twice that, or the whole window, as Enter does. One
+    /// without a thumbnail's cells to play in opens on the whole window
+    /// too.
+    fn toggle_inline_video(&mut self) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let Some(message_id) = open.cursor_id() else {
+            return;
+        };
+        let chat_id = open.chat_id;
+        if self
+            .inline_video
+            .as_mut()
+            .is_some_and(|i| i.is_on(chat_id, message_id))
+        {
+            if let Some(inline) = self.inline_video.as_mut() {
+                inline.toggle();
+            }
+            return;
+        }
+        let Some(msg) = open.messages.get(&message_id) else {
+            return;
+        };
+        if msg.video.is_none() {
+            return;
+        }
+        // Not what's seen only while open, which isn't handed to ffmpeg and mpv.
+        let Some(file) = openable_file(msg).cloned() else {
+            return;
+        };
+        let tell = open.tells(message_id);
+        // The "large" size, and notes with no cells to play in, take the
+        // whole window, as Enter does.
+        if self.settings.video_note_size == VideoNoteSize::Large || msg.preview.is_none() {
+            self.view_video(message_id, file);
+            return;
+        }
+        if self.pepper.is_none() && !self.images.kitty() {
+            self.status = Some(
+                lang::t("This terminal can't play video messages in the chat; Enter plays one on the whole window")
+                .into(),
+            );
+            return;
+        }
+        if self.over_ssh {
+            self.status =
+                Some(lang::t("Video messages play in the terminal only on this computer").into());
+            return;
+        }
+        let Some(mut inline) = Inline::of(
+            chat_id,
+            message_id,
+            msg,
+            self.video_tx.clone(),
+            self.images.tmux(),
+            self.pepper.clone(),
+            &self.colors,
+        ) else {
+            return;
+        };
+        if inline.note.size > crate::video::MAX_FILE {
+            self.status = Some(lang::t("Can't play this video message: it's too big").into());
+            return;
+        }
+        // The "medium" size starts twice the thumbnail's cells each way.
+        if self.settings.video_note_size == VideoNoteSize::Medium {
+            inline.toggle_zoom();
+        }
+        inline.tell = tell;
+        let file_id = inline.note.file_id;
+        self.inline_video = None; // another message's, playing, stops
+        self.tg.download(file_id);
+        self.status = Some(lang::t("Downloading the video message…").into());
+        self.inline_video = Some(inline);
+    }
+
+    /// z on a video message: it plays inline at twice the cells each way,
+    /// pushing the messages around it apart; z again, back to the
+    /// thumbnail's size. Works while it downloads and after it played out,
+    /// not only mid-playback. Not playing yet: starts it, zoomed.
+    fn zoom_inline_video(&mut self) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let Some(message_id) = open.cursor_id() else {
+            return;
+        };
+        let chat_id = open.chat_id;
+        if let Some(inline) = self
+            .inline_video
+            .as_mut()
+            .filter(|i| i.is_on(chat_id, message_id))
+        {
+            inline.toggle_zoom();
+            return;
+        }
+        if !open
+            .messages
+            .get(&message_id)
+            .is_some_and(|m| m.video.is_some())
+        {
+            return;
+        }
+        self.toggle_inline_video();
+        // The "large" size opened the whole-window player instead; a "medium"
+        // start is zoomed already.
+        if let Some(inline) = self
+            .inline_video
+            .as_mut()
+            .filter(|i| i.is_on(chat_id, message_id) && !i.medium())
+        {
+            inline.toggle_zoom();
+        }
+    }
+
+    /// The video player takes all keys while it's up.
+    fn on_video_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.video_view.as_mut() else {
+            return;
+        };
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('j' | '+' | '=') => view.zoom_in(),
+            KeyCode::Char('k' | '-') => view.zoom_out(),
+            KeyCode::Char(' ') => view.toggle(),
+            // What Telegram says can't be saved isn't handed to an app that
+            // can save it.
+            KeyCode::Char('o') if view.cant_copy.is_some() => {
+                self.status = Some(
+                    lang::t("This video message can't be saved, so it plays only here").into(),
+                );
+            }
+            KeyCode::Char('o') => {
+                let file = view.file.clone();
+                self.video_view = None;
+                self.open_target(Target::File(file));
+            }
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => self.video_view = None,
+            _ => {}
+        }
+    }
+
+    /// Word from the video decoder: a frame, the end (each plays once), or
+    /// why it can't play — then the player closes. The tag says whose word
+    /// it is. The first frame shown while someone's there tells the sender.
+    fn on_video(&mut self, event: VideoEvent) {
+        let present = self.present();
+        if event.tag == crate::video::TAG_INLINE {
+            let Some(inline) = self.inline_video.as_mut() else {
+                return;
+            };
+            match inline.on_event(event) {
+                Err(why) => {
+                    self.status = Some(format!(
+                        "{}{why}",
+                        lang::t("Can't play this video message: ")
+                    ));
+                    self.inline_video = None;
+                }
+                Ok(()) if present && inline.tell_now() => {
+                    let (chat_id, id) = (inline.chat_id, inline.message_id);
+                    self.played_video(chat_id, id);
+                }
+                Ok(()) => {}
+            }
+            return;
+        }
+        let Some(view) = self.video_view.as_mut() else {
+            return;
+        };
+        if let Err(why) = view.on_event(event) {
+            self.status = Some(format!(
+                "{}{why}",
+                lang::t("Can't play this video message: ")
+            ));
+            self.video_view = None;
+            return;
+        }
+        let tell = (present && view.tell_now()).then_some((view.chat_id, view.message_id));
+        // Played out: it plays once, then the chat is back.
+        if view.finished() {
+            self.video_view = None;
+        }
+        if let Some((chat_id, id)) = tell {
+            self.played_video(chat_id, id);
+        }
+    }
+
+    /// Video message `message_id` of chat `chat_id` shows playing to
+    /// someone: its sender sees it was, as in Telegram's apps.
+    fn played_video(&mut self, chat_id: i64, message_id: i64) {
+        self.tg.open_content(chat_id, message_id);
+        if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == chat_id) {
+            open.set_opened(message_id);
+        }
+    }
+
+    /// `O` on a message: its file shows in the file manager, picked where
+    /// the manager takes the hint. Downloads it first if it isn't here yet.
+    fn reveal_selected_file(&mut self) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let msg = open.cursor_id().and_then(|id| open.messages.get(&id));
+        let Some((msg, file)) = msg.and_then(|m| Some((m, openable_file(m)?.clone()))) else {
+            self.status = Some(lang::t("No file in this message").into());
+            return;
+        };
+        // Shown, it can be copied out of the file manager.
+        if let Some(why) = crate::viewer::cant_copy(msg) {
+            self.status = Some(why.into());
+            return;
+        }
+        // TDLib answers at once if the file is already downloaded.
+        if self.revealing.insert(file.id) {
+            self.tg.download(file.id);
+            self.status = Some(lang::t("Downloading to show in the file manager…").into());
         }
     }
 
@@ -5661,7 +6589,7 @@ impl App {
             .and_then(|m| m.voice.as_ref())
             .map_or(0, |v| v.size);
         if size > crate::voice::MAX_FILE {
-            self.status = Some("Can't play this voice message: it's too long".into());
+            self.status = Some(lang::t("Can't play this voice message: it's too long").into());
             return;
         }
         // Decided now, while it's surely loaded: it may not be once it plays.
@@ -5683,14 +6611,13 @@ impl App {
                 // host can pass for a familiar one.
                 let site = link_host(&url).map(|host| match host.is_ascii() {
                     true => host,
-                    false => format!("{host} (has non-Latin letters)"),
+                    false => format!("{host} {}", lang::t("(has non-Latin letters)")),
                 });
+                // Each label is as wide as the site's, so what follows lines up.
+                let (said, address) = (lang::t("The text says: "), lang::t("Full address:  "));
                 let mut confirm = Confirm::new(
-                    "Open this link?",
-                    vec![
-                        format!("The text says: {shown}"),
-                        format!("Full address:  {url}"),
-                    ],
+                    lang::t("Open this link?"),
+                    vec![format!("{said}{shown}"), format!("{address}{url}")],
                     Confirmed::OpenLink(url),
                 );
                 confirm.site = site.map(Site::link);
@@ -5718,16 +6645,17 @@ impl App {
         // A slow download can finish while you're busy with something else:
         // a warning popping up then would take keys meant for that.
         if self.busy() {
-            self.status = Some(format!(
-                "{name} downloaded: press Enter on it again to open it"
+            self.status = Some(lang::f(
+                "{name} downloaded: press Enter on it again to open it",
+                &[("name", &name)],
             ));
             return;
         }
         self.confirm = Some(Confirm::new(
-            format!("Open {name}?"),
+            format!("{} {name}?", lang::t("Open")),
             vec![
-                "Files like this can run programs on your computer.".into(),
-                "Only open it if you trust whoever sent it.".into(),
+                lang::t("Files like this can run programs on your computer.").into(),
+                lang::t("Only open it if you trust whoever sent it.").into(),
             ],
             Confirmed::OpenFile(path),
         ));
@@ -5765,16 +6693,18 @@ impl App {
             || self.button_menu.is_some()
             || self.pin_menu.is_some()
             || self.pinned_menu.is_some()
+            || self.media_menu.is_some()
             || self.timer_menu.is_some()
             || self.key_view.is_some()
             || self.photo_view.is_some()
+            || self.video_view.is_some()
             || self.chat_info.is_some()
             || self.text_select.is_some()
     }
 
     fn open_externally(&mut self, target: &str) {
         if let Err(e) = open_externally(target) {
-            self.status = Some(format!("Couldn't open it: {e}"));
+            self.status = Some(format!("{}{e}", lang::t("Couldn't open it: ")));
         }
     }
 
@@ -5794,11 +6724,11 @@ impl App {
                             self.open_externally(&target)
                         }
                         Confirmed::Edit { id, text } => self.start_edit(id, text),
-                        Confirmed::Join(chat_id) => self.tg.join_chat(chat_id),
+                        Confirmed::Join { chat_id, .. } => self.tg.join_chat(chat_id),
                         Confirmed::Leave(chat_id) => self.tg.leave_chat(chat_id),
                         Confirmed::Logout => self.log_out(),
                         Confirmed::StartSecret { user_id, with } => {
-                            let request = format!("a secret chat with {with}");
+                            let request = format!("{} {with}", lang::t("a secret chat with"));
                             self.finding = Some(Finding::new(&request));
                             self.tg.start_secret_chat(user_id, request);
                         }
@@ -5811,7 +6741,7 @@ impl App {
                             self.forget_draft(chat_id);
                             self.tg.end_secret_chat(chat_id, secret_id, open)
                         }
-                        Confirmed::JoinLink { link, request } => {
+                        Confirmed::JoinLink { link, request, .. } => {
                             self.finding = Some(Finding::new(&request));
                             self.tg.join_by_link(link, request);
                         }
@@ -5855,7 +6785,7 @@ impl App {
                 .map(Target::File),
         );
         match targets.len() {
-            0 => self.status = Some("Nothing to copy in this message".into()),
+            0 => self.status = Some(lang::t("Nothing to copy in this message").into()),
             1 => self.copy_target(targets.remove(0)),
             _ => {
                 self.menu = Some(PickMenu {
@@ -5882,7 +6812,7 @@ impl App {
             return;
         }
         if msg.source_text.is_empty() {
-            self.status = Some("No text to select in this message".into());
+            self.status = Some(lang::t("No text to select in this message").into());
             return;
         }
         let select = TextSelect::new(open.chat_id, id, msg.source_text.clone());
@@ -5911,7 +6841,9 @@ impl App {
                     self.text_select = None;
                     self.copy_target(Target::Text(text));
                 }
-                None => self.status = Some("Nothing selected: v starts a selection".into()),
+                None => {
+                    self.status = Some(lang::t("Nothing selected: v starts a selection").into())
+                }
             },
             _ => {}
         }
@@ -5923,12 +6855,13 @@ impl App {
         let text = match target {
             Target::Text(text) => text,
             Target::Link(link) => link.url,
-            Target::File(file) | Target::Photo { file, .. } => {
+            Target::File(file) | Target::Photo { file, .. } | Target::Video { file, .. } => {
                 // Only text gets through the terminal to the user's own
                 // computer.
                 if self.clipboard.remote {
-                    self.status =
-                        Some("Over SSH, only text reaches your computer's clipboard".into());
+                    self.status = Some(
+                        lang::t("Over SSH, only text reaches your computer's clipboard").into(),
+                    );
                     return;
                 }
                 let id = file.id;
@@ -5941,9 +6874,11 @@ impl App {
             Target::Voice { .. } => return,
         };
         match self.clipboard.copy_text(&text) {
-            Ok(Copied::System) => self.show_toast("Copied", &text),
-            Ok(Copied::Terminal) => self.show_toast("Sent to the terminal's clipboard", &text),
-            Err(e) => self.status = Some(format!("Couldn't copy: {e}")),
+            Ok(Copied::System) => self.show_toast(lang::t("Copied"), &text),
+            Ok(Copied::Terminal) => {
+                self.show_toast(lang::t("Sent to the terminal's clipboard"), &text)
+            }
+            Err(e) => self.status = Some(format!("{}{e}", lang::t("Couldn't copy: "))),
         }
     }
 
@@ -5955,15 +6890,18 @@ impl App {
             return;
         }
         match self.clipboard.copy_file(Path::new(path)) {
-            Ok(()) => self.show_toast("Copied", &file.label),
-            Err(e) => self.status = Some(format!("Couldn't copy: {e}")),
+            Ok(()) => self.show_toast(lang::t("Copied"), &file.label),
+            Err(e) => self.status = Some(format!("{}{e}", lang::t("Couldn't copy: "))),
         }
     }
 
     /// Word from the voice message playing.
     fn on_voice(&mut self, event: VoiceEvent) {
         if let Some(why) = event.ring_failed() {
-            self.status = Some(format!("Can't play the sound for new messages: {why}"));
+            self.status = Some(format!(
+                "{}{why}",
+                lang::t("Can't play the sound for new messages: ")
+            ));
             return;
         }
         let Some(news) = self.player.on_event(event) else {
@@ -5983,7 +6921,10 @@ impl App {
             }
             Happened::Started | Happened::Ended => {}
             Happened::Failed(why) => {
-                self.status = Some(format!("Can't play this voice message: {why}"));
+                self.status = Some(format!(
+                    "{}{why}",
+                    lang::t("Can't play this voice message: ")
+                ));
             }
         }
     }
@@ -6002,7 +6943,7 @@ impl App {
         match &self.open {
             None => false,
             Some(open) if open.editing.is_some() => {
-                self.status = Some("Files can't be added to an edit".into());
+                self.status = Some(lang::t("Files can't be added to an edit").into());
                 false
             }
             Some(_) => true,
@@ -6084,8 +7025,8 @@ impl App {
         // terminal's own paste brings the user's, as a bracketed paste.
         if self.clipboard.remote {
             self.status = Some(
-                "Over SSH, paste with your terminal's own paste key: the clipboard here is the other computer's"
-                    .into(),
+                lang::t("Over SSH, paste with your terminal's own paste key: the clipboard here is the other computer's")
+                .into(),
             );
             return;
         }
@@ -6102,13 +7043,15 @@ impl App {
         // Nor into Insert mode once the keys went to the chats or topics,
         // where an Enter meant to open one would send it.
         if !matches!(self.focus, Focus::Messages | Focus::Input) {
-            self.status = Some("The paste came after you left the messages: p pastes again".into());
+            self.status =
+                Some(lang::t("The paste came after you left the messages: p pastes again").into());
             return;
         }
         // Nor under a popup or a prompt, out of sight or taking the Enter.
         if self.over_panes() {
-            self.status =
-                Some("The paste came while something else was open: p pastes again".into());
+            self.status = Some(
+                lang::t("The paste came while something else was open: p pastes again").into(),
+            );
             return;
         }
         match pasted.content {
@@ -6118,7 +7061,8 @@ impl App {
                 let (paths, relative): (Vec<_>, Vec<_>) =
                     paths.into_iter().partition(|p| p.is_absolute());
                 if !relative.is_empty() {
-                    self.status = Some("Copied files without a full path were left out".into());
+                    self.status =
+                        Some(lang::t("Copied files without a full path were left out").into());
                 }
                 self.attach(paths, None);
             }
@@ -6127,7 +7071,7 @@ impl App {
                 if self.attach(vec![path], None) == 1
                     && let Some(last) = self.open.as_mut().and_then(|o| o.attachments.last_mut())
                 {
-                    last.name = "Pasted image".into();
+                    last.name = lang::t("Pasted image").into();
                 }
             }
             Ok(Paste::Text(text)) => {
@@ -6147,7 +7091,8 @@ impl App {
         if open.attachments.iter().any(|a| a.kind.is_photo()) {
             open.as_files = !open.as_files;
         } else if !open.attachments.is_empty() {
-            self.status = Some("These go as files already: only photos can go either way".into());
+            self.status =
+                Some(lang::t("These go as files already: only photos can go either way").into());
         }
     }
 
@@ -6166,8 +7111,8 @@ impl App {
             .image
             .and_then(|image| self.clipboard.copy_image(image).map_err(|e| e.to_string()));
         match result {
-            Ok(()) => self.show_toast("Copied", &decoded.label),
-            Err(e) => self.status = Some(format!("Couldn't copy: {e}")),
+            Ok(()) => self.show_toast(lang::t("Copied"), &decoded.label),
+            Err(e) => self.status = Some(format!("{}{e}", lang::t("Couldn't copy: "))),
         }
     }
 
@@ -6291,7 +7236,7 @@ impl App {
                         settings.theme = theme.id.clone();
                     }
                     Err(e) => {
-                        self.status = Some(format!("Theme not used: {e}"));
+                        self.status = Some(format!("{}{e}", lang::t("Theme not used: ")));
                         return;
                     }
                 }
@@ -6310,8 +7255,8 @@ impl App {
                         // Played, to hear what it's like.
                         if self.over_ssh {
                             self.status = Some(
-                                "Over SSH, tuigram plays no sound: it would play on the other computer"
-                                    .into(),
+                                lang::t("Over SSH, tuigram plays no sound: it would play on the other computer")
+                                .into(),
                             );
                         } else {
                             self.player.ring(Arc::clone(&samples));
@@ -6321,11 +7266,23 @@ impl App {
                         settings.notification_sound = Some(sound.id.clone());
                     }
                     Err(e) => {
-                        self.status = Some(format!("Sound not used: {e}"));
+                        self.status = Some(format!("{}{e}", lang::t("Sound not used: ")));
                         return;
                     }
                 },
             },
+            i if i < SettingsMenu::NOTIFICATIONS => {
+                let lang = crate::lang::Lang::ALL[i - SettingsMenu::LANGUAGE];
+                settings.language = lang.code().into();
+                crate::lang::set(lang);
+                // Their names and errors are worded as they're read.
+                if let Some(dir) = self.themes.dir.clone() {
+                    self.themes = Themes::load(&dir);
+                }
+                if let Some(dir) = self.sounds.dir.clone() {
+                    self.sounds = Sounds::load(&dir);
+                }
+            }
             SettingsMenu::NOTIFICATIONS => {
                 // Back on, they go out the way they did before, e.g. "bell".
                 let on = match menu.saved_notifications {
@@ -6346,6 +7303,9 @@ impl App {
                 };
             }
             SettingsMenu::BLOCK_GAPS => settings.block_gaps = !settings.block_gaps,
+            SettingsMenu::VIDEO_SIZE => {
+                settings.video_note_size = settings.video_note_size.next();
+            }
             SettingsMenu::CORNERS => {
                 // Picked for good either way: a terminal the guess got
                 // wrong stays as the user set it.
@@ -6375,7 +7335,7 @@ impl App {
             _ => return,
         }
         if let Err(e) = self.settings.save(&self.settings_path) {
-            self.status = Some(format!("Settings not saved: {e:#}"));
+            self.status = Some(format!("{}{e:#}", lang::t("Settings not saved: ")));
         }
     }
 
@@ -6480,7 +7440,7 @@ impl App {
     /// previous folder, round the end, with the cursor on its first chat.
     fn switch_list(&mut self, step: isize) {
         if self.chats.tabs().is_empty() {
-            self.status = Some("No folders yet: Telegram's apps can make them".into());
+            self.status = Some(lang::t("No folders yet: Telegram's apps can make them").into());
             return;
         }
         let list = self.chats.next_list(step);
@@ -6533,7 +7493,7 @@ impl App {
         if self.tg.env_proxy().is_some() {
             "TG_PROXY"
         } else {
-            "the proxy in settings.toml"
+            lang::t("the proxy in settings.toml")
         }
     }
 
@@ -6542,7 +7502,7 @@ impl App {
     fn proxy_setting(&self) -> Result<Option<Proxy>, (&'static str, String)> {
         let (link, from) = match (self.tg.env_proxy(), &self.settings.proxy) {
             (Some(link), _) => (link, "TG_PROXY"),
-            (None, Some(link)) => (link.as_str(), "the proxy in settings.toml"),
+            (None, Some(link)) => (link.as_str(), lang::t("the proxy in settings.toml")),
             (None, None) => return Ok(None),
         };
         proxy::parse(link).map(Some).map_err(|why| (from, why))
@@ -6553,7 +7513,7 @@ impl App {
     /// show it to whoever is looking.
     fn open_proxy_prompt(&mut self) {
         if self.tg.env_proxy().is_some() {
-            self.status = Some("TG_PROXY sets the proxy: change it there".into());
+            self.status = Some(lang::t("TG_PROXY sets the proxy: change it there").into());
             return;
         }
         self.open_prompt(PromptKind::Proxy);
@@ -6581,9 +7541,9 @@ impl App {
         }
         // Changed, it doesn't take the old password along, to another server.
         if link.contains(proxy::MASK) {
-            self.status = Some(format!(
-                "The link still has {} for the hidden password or secret: write it out",
-                proxy::MASK
+            self.status = Some(lang::f(
+                "The link still has {mask} for the hidden password or secret: write it out",
+                &[("mask", &proxy::MASK)],
             ));
             return;
         }
@@ -6592,18 +7552,20 @@ impl App {
             return;
         }
         let Some(saved) = self.settings.proxy.as_deref() else {
-            self.status = Some("No proxy: tuigram connects to Telegram directly".into());
+            self.status = Some(lang::t("No proxy: tuigram connects to Telegram directly").into());
             return;
         };
         let what = proxy::parse(saved)
             .map(|proxy| proxy::describe(&proxy))
-            .unwrap_or_else(|_| "the proxy".into());
+            .unwrap_or_else(|_| lang::t("the proxy").into());
         self.confirm = Some(Confirm::new(
-            "Connect directly?",
+            lang::t("Connect directly?"),
             vec![
-                format!("tuigram would stop using {what}."),
-                "Telegram would see your IP address, and your network that you use Telegram."
-                    .into(),
+                lang::f("tuigram would stop using {what}.", &[("what", &what)]),
+                lang::t(
+                    "Telegram would see your IP address, and your network that you use Telegram.",
+                )
+                .into(),
             ],
             Confirmed::NoProxy,
         ));
@@ -6613,27 +7575,34 @@ impl App {
     /// connecting through it.
     fn ask_to_use_proxy(&mut self, link: &str) {
         if self.tg.env_proxy().is_some() {
-            self.status = Some("TG_PROXY sets the proxy: change it there".into());
+            self.status = Some(lang::t("TG_PROXY sets the proxy: change it there").into());
             return;
         }
         match proxy::parse(link) {
             Ok(proxy) => {
+                // The label is as wide as the server's, so what follows lines up.
                 let mut lines = vec![
-                    format!("Proxy:         {}", proxy::kind(&proxy)),
-                    "tuigram would connect to Telegram through it. It sees your IP address \
-                     and when you use Telegram, not your messages."
-                        .into(),
+                    format!("{}{}", lang::t("Proxy:         "), proxy::kind(&proxy)),
+                    lang::t(
+                        "tuigram would connect to Telegram through it. It sees your IP address \
+                         and when you use Telegram, not your messages.",
+                    )
+                    .into(),
                 ];
                 if matches!(proxy.r#type, ProxyType::Mtproto(_)) {
                     lines.push(
-                        "It can also put a channel it promotes in your chat list, marked \
-                         \"proxy sponsor\"."
-                            .into(),
+                        lang::t(
+                            "It can also put a channel it promotes in your chat list, marked \
+                             \"proxy sponsor\".",
+                        )
+                        .into(),
                     );
                 }
-                lines.push("`:proxy` changes it, or goes back to connecting directly.".into());
+                lines.push(
+                    lang::t("`:proxy` changes it, or goes back to connecting directly.").into(),
+                );
                 let mut confirm = Confirm::new(
-                    "Use this proxy?",
+                    lang::t("Use this proxy?"),
                     lines,
                     Confirmed::UseProxy(link.to_string()),
                 );
@@ -6661,8 +7630,8 @@ impl App {
             }
         };
         self.status = Some(match &proxy {
-            Some(proxy) => format!("Switching to {}…", proxy::describe(proxy)),
-            None => "Switching to connecting directly…".into(),
+            Some(proxy) => format!("{} {}…", lang::t("Switching to"), proxy::describe(proxy)),
+            None => lang::t("Switching to connecting directly…").into(),
         });
         let number = self.tg.use_proxy(proxy);
         let link = (!link.is_empty()).then(|| link.to_string());
@@ -6693,15 +7662,23 @@ impl App {
                 self.settings.proxy = link;
                 self.status = None;
                 if let Err(e) = self.settings.save(&self.settings_path) {
-                    self.status = Some(format!("Proxy not saved for next time: {e:#}"));
+                    self.status = Some(format!(
+                        "{}{e:#}",
+                        lang::t("Proxy not saved for next time: ")
+                    ));
                 }
                 match &proxy {
-                    Some(proxy) => self.show_toast("Connecting through", &proxy::describe(proxy)),
-                    None => self.show_toast("No proxy", "Connecting to Telegram directly"),
+                    Some(proxy) => {
+                        self.show_toast(lang::t("Connecting through"), &proxy::describe(proxy))
+                    }
+                    None => self.show_toast(
+                        lang::t("No proxy"),
+                        lang::t("Connecting to Telegram directly"),
+                    ),
                 }
             }
             (ProxyChange::Set(_), Err(why)) => {
-                self.status = Some(format!("The proxy wasn't changed: {why}"));
+                self.status = Some(format!("{}{why}", lang::t("The proxy wasn't changed: ")));
             }
         }
     }
@@ -6734,9 +7711,9 @@ impl App {
         self.tg.archive(chat_id, !archived);
         let title = self.chats.title(chat_id).unwrap_or_default().to_string();
         let done = if archived {
-            "Moved out of the archive"
+            lang::t("Moved out of the archive")
         } else {
-            "Archived"
+            lang::t("Archived")
         };
         self.show_toast(done, &title);
     }
@@ -6748,7 +7725,7 @@ impl App {
         };
         self.settings.highlighted_chats = self.chats.toggle_highlight(chat_id);
         if let Err(e) = self.settings.save(&self.settings_path) {
-            self.status = Some(format!("Highlight not saved: {e:#}"));
+            self.status = Some(format!("{}{e:#}", lang::t("Highlight not saved: ")));
         }
     }
 
@@ -6810,6 +7787,124 @@ fn open_externally(target: &str) -> std::io::Result<()> {
     }
 }
 
+/// Mouse motion isn't anyone doing anything: it neither wakes the loop to
+/// redraw nor counts as someone being there (see [`App::present`]).
+fn mouse_moved(event: &std::io::Result<Event>) -> bool {
+    matches!(
+        event,
+        Ok(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved | MouseEventKind::Drag(_),
+            ..
+        }))
+    )
+}
+
+/// The QWERTY key a Cyrillic keycap sits on: `н` is `y`, `р` is `h`, so
+/// commands work without switching layouts. Anything else is left alone.
+fn qwerty(c: char) -> char {
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    let mapped = match lower {
+        'й' => 'q',
+        'ц' => 'w',
+        'у' => 'e',
+        'к' => 'r',
+        'е' => 't',
+        'н' => 'y',
+        'г' => 'u',
+        'ш' => 'i',
+        'щ' => 'o',
+        'з' => 'p',
+        'х' => '[',
+        'ъ' => ']',
+        'ё' => '`',
+        'ф' => 'a',
+        'ы' => 's',
+        'в' => 'd',
+        'а' => 'f',
+        'п' => 'g',
+        'р' => 'h',
+        'о' => 'j',
+        'л' => 'k',
+        'д' => 'l',
+        'ж' => ';',
+        'э' => '\'',
+        'я' => 'z',
+        'ч' => 'x',
+        'с' => 'c',
+        'м' => 'v',
+        'и' => 'b',
+        'т' => 'n',
+        'ь' => 'm',
+        'б' => ',',
+        'ю' => '.',
+        _ => return c,
+    };
+    if c.is_uppercase() {
+        mapped.to_ascii_uppercase()
+    } else {
+        mapped
+    }
+}
+
+/// Shows `path` in the file manager rather than opening it: the file
+/// itself picked where the manager answers org.freedesktop.FileManager1
+/// (Nautilus, Dolphin, Nemo…), its folder opened where none does. A
+/// manager the bus has to start answers the call that woke it with a mere
+/// "started", losing what it was told to show: so it's started first,
+/// then told, in a thread that can wait for it to wake.
+fn reveal_in_file_manager(path: &str) {
+    let path = path.to_string();
+    std::thread::spawn(move || {
+        let uri = format!("file://{}", percent_encode(&path));
+        let run = |args: &[String]| {
+            std::process::Command::new("dbus-send")
+                .arg("--session")
+                .arg("--print-reply")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+        };
+        let started = run(&[
+            "--dest=org.freedesktop.DBus".into(),
+            "/org/freedesktop/DBus".into(),
+            "org.freedesktop.DBus.StartServiceByName".into(),
+            "string:org.freedesktop.FileManager1".into(),
+            "uint32:0".into(),
+        ]);
+        let shown = matches!(started, Ok(s) if s.success())
+            && matches!(
+                run(&[
+                    "--dest=org.freedesktop.FileManager1".into(),
+                    "/org/freedesktop/FileManager1".into(),
+                    "org.freedesktop.FileManager1.ShowItems".into(),
+                    format!("array:string:{uri}"),
+                    "string:".into(),
+                ]),
+                Ok(s) if s.success()
+            );
+        if !shown && let Some(dir) = Path::new(&path).parent() {
+            let _ = open::that_detached(dir);
+        }
+    });
+}
+
+/// The path part of a `file://` URI: bytes outside a small safe set as
+/// %XX, since the file manager's DBus door takes a URI, not a path.
+fn percent_encode(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(char::from(b));
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Marks a downloaded file as coming from the internet, as browsers do, so
 /// the system's own checks apply when it's opened: Gatekeeper on macOS,
 /// SmartScreen and Office's Protected View on Windows. Best effort.
@@ -6845,18 +7940,18 @@ fn mark_downloaded(path: &str) {
 
 /// Trying to reach Telegram, directly: where it's blocked, that's all
 /// that ever happens.
-pub const CONNECTING: &str = "Connecting…";
+pub const CONNECTING: &str = lang::key("Connecting…");
 
-/// What the connection to Telegram is doing, in words, while it isn't
-/// working.
+/// What the connection to Telegram is doing, in English words, while it
+/// isn't working.
 fn connection_words(state: &ConnectionState) -> Option<&'static str> {
-    match state {
-        ConnectionState::WaitingForNetwork => Some("Waiting for network…"),
-        ConnectionState::ConnectingToProxy => Some("Connecting to the proxy…"),
-        ConnectionState::Connecting => Some(CONNECTING),
-        ConnectionState::Updating => Some("Updating…"),
-        ConnectionState::Ready => None,
-    }
+    Some(match state {
+        ConnectionState::WaitingForNetwork => lang::key("Waiting for network…"),
+        ConnectionState::ConnectingToProxy => lang::key("Connecting to the proxy…"),
+        ConnectionState::Connecting => CONNECTING,
+        ConnectionState::Updating => lang::key("Updating…"),
+        ConnectionState::Ready => return None,
+    })
 }
 
 /// A one-line prompt input holding `text`, with the cursor at its end.
@@ -6878,18 +7973,21 @@ pub fn new_composer() -> TextArea<'static> {
     composer
 }
 
+/// Where the code went, to end "Telegram sent a code …".
 fn code_destination(kind: &AuthenticationCodeType) -> &'static str {
     match kind {
-        AuthenticationCodeType::TelegramMessage(_) => "to your Telegram app on another device",
+        AuthenticationCodeType::TelegramMessage(_) => {
+            lang::t("to your Telegram app on another device")
+        }
         AuthenticationCodeType::Sms(_)
         | AuthenticationCodeType::SmsWord(_)
-        | AuthenticationCodeType::SmsPhrase(_) => "by SMS",
-        AuthenticationCodeType::Call(_) => "by phone call",
+        | AuthenticationCodeType::SmsPhrase(_) => lang::t("by SMS"),
+        AuthenticationCodeType::Call(_) => lang::t("by phone call"),
         AuthenticationCodeType::MissedCall(_) | AuthenticationCodeType::FlashCall(_) => {
-            "as a missed call: enter the last digits of the calling number"
+            lang::t("as a missed call: enter the last digits of the calling number")
         }
-        AuthenticationCodeType::Fragment(_) => "to fragment.com",
-        _ => "to one of your devices",
+        AuthenticationCodeType::Fragment(_) => lang::t("to fragment.com"),
+        _ => lang::t("to one of your devices"),
     }
 }
 
@@ -6944,6 +8042,14 @@ mod tests {
         // tells Telegram something when it changes.
         let selected = |app: &App| app.settings_menu.as_ref().unwrap().selected;
         app.settings_menu.as_mut().unwrap().selected = SettingsMenu::BLOCK_GAPS;
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_eq!(selected(&app), SettingsMenu::VIDEO_SIZE);
+        // The video message size cycles: small, medium, large, small again.
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(
+            saved().video_note_size,
+            crate::settings::VideoNoteSize::Medium
+        );
         press(&mut app, KeyCode::Char('j'), none);
         assert_eq!(selected(&app), SettingsMenu::CORNERS);
         let rounded = app.rounded;
@@ -7184,6 +8290,168 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The screen at `width` columns, one char per cell, so a column is an
+    /// index into its row.
+    fn grid(app: &mut App, width: u16) -> Vec<Vec<char>> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The cell `text` starts at, on the first of `rows` that has it.
+    fn cell_of(grid: &[Vec<char>], rows: std::ops::Range<u16>, text: &str) -> (u16, u16) {
+        let want: Vec<char> = text.chars().collect();
+        rows.clone()
+            .find_map(|y| {
+                let row = &grid[usize::from(y)];
+                let x = row.windows(want.len()).position(|w| w == want.as_slice())?;
+                Some((x as u16, y))
+            })
+            .unwrap_or_else(|| panic!("{text} isn't on rows {rows:?}"))
+    }
+
+    fn mouse_at(kind: MouseEventKind, (x, y): (u16, u16)) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn the_settings_popup_takes_the_mouse() {
+        let dir = std::env::temp_dir().join(format!("tuigram-mouse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        let click = |at| mouse_at(MouseEventKind::Down(MouseButton::Left), at);
+        let menu = |app: &App| {
+            let menu = app.settings_menu.as_ref().unwrap();
+            (menu.tab, menu.selected)
+        };
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        let screen = grid(&mut app, 120);
+        let top = app.settings_menu.as_ref().unwrap().drawn.area.y;
+        let settings_tab = cell_of(&screen, top..top + 1, "Settings");
+        app.on_mouse(click(settings_tab));
+        assert_eq!(menu(&app).0, HelpTab::Settings, "its tab");
+
+        // A click puts the cursor on a setting; only one on the setting
+        // under the cursor changes it.
+        let gaps = app.settings.chat_gaps;
+        let screen = grid(&mut app, 120);
+        let row = cell_of(&screen, 0..20, "A gap between chats");
+        app.on_mouse(click(row));
+        assert_eq!(menu(&app).1, SettingsMenu::CHAT_GAPS);
+        assert_eq!(app.settings.chat_gaps, gaps, "not yet");
+        grid(&mut app, 120);
+        app.on_mouse(click(row));
+        assert_eq!(app.settings.chat_gaps, !gaps);
+        let saved = Settings::load(&settings::path(&dir)).unwrap();
+        assert_eq!(saved.chat_gaps, !gaps, "saved at once");
+
+        // The wheel over it moves as j and k do; elsewhere it does nothing.
+        app.on_mouse(mouse_at(MouseEventKind::ScrollDown, row));
+        assert_eq!(menu(&app).1, SettingsMenu::LIST_RIGHT);
+        app.on_mouse(mouse_at(MouseEventKind::ScrollUp, (0, 0)));
+        assert_eq!(menu(&app).1, SettingsMenu::LIST_RIGHT);
+
+        // Nothing while a popup over it has the keys.
+        app.confirm = Some(Confirm::new("Log out?", Vec::new(), Confirmed::Logout));
+        app.on_mouse(mouse_at(MouseEventKind::ScrollDown, row));
+        app.on_mouse(click(settings_tab));
+        assert_eq!(menu(&app).1, SettingsMenu::LIST_RIGHT);
+        app.confirm = None;
+
+        let screen = grid(&mut app, 120);
+        let shortcuts_tab = cell_of(&screen, top..top + 1, "Shortcuts");
+        app.on_mouse(click(shortcuts_tab));
+        assert_eq!(menu(&app).0, HelpTab::Shortcuts);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_long_setting_wraps_and_a_click_on_any_of_its_rows_picks_it() {
+        let dir = std::env::temp_dir().join(format!("tuigram-wrap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        lang::set(lang::Lang::Vi);
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        // Right under the secret chats' row, which then shows too.
+        app.settings_menu.as_mut().unwrap().selected = SettingsMenu::SOUND_FOCUSED;
+        let screen = grid(&mut app, 80);
+        // Its whole sentence, to its last word, inside the popup.
+        let first = cell_of(&screen, 0..20, "Nhận các cuộc");
+        let last = cell_of(&screen, 0..20, "thoại");
+        assert!(last.1 > first.1, "on rows of its own");
+        let popup = app.settings_menu.as_ref().unwrap().drawn.area;
+        assert!(last.0 + 5 < popup.right(), "inside the popup");
+        app.on_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), last));
+        let selected = app.settings_menu.as_ref().unwrap().selected;
+        assert_eq!(selected, SettingsMenu::SECRET_CHATS);
+        assert!(
+            !app.settings.accept_secret_chats,
+            "a first click only picks it"
+        );
+        lang::set(lang::Lang::En);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_language_picked_in_the_settings_speaks_at_once_and_is_saved() {
+        let dir = std::env::temp_dir().join(format!("tuigram-language-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        let none = KeyModifiers::NONE;
+        press(&mut app, KeyCode::Char('?'), none);
+        press(&mut app, KeyCode::Tab, none);
+        // A row for each language, by its own name, the one in use dotted.
+        let rows = screen_of(&mut app, 140).join("\n");
+        for row in [" ● English", " ○ Русский", " ○ Tiếng Việt"] {
+            assert!(rows.contains(row), "{row}: {rows}");
+        }
+        app.settings_menu.as_mut().unwrap().selected = SettingsMenu::LANGUAGE + 2;
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(lang::current(), lang::Lang::Vi, "at once");
+        let saved = Settings::load(&settings::path(&dir)).unwrap();
+        assert_eq!(saved.language, "vi");
+        let rows = screen_of(&mut app, 140).join("\n");
+        assert!(rows.contains(" ● Tiếng Việt"), "{rows}");
+        assert!(rows.contains(lang::t(" Notifications").trim()), "{rows}");
+        lang::set(lang::Lang::En);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_connection_is_said_in_the_language_picked_since() {
+        let mut app = test_app("connection-words");
+        app.on_update(Update::ConnectionState(
+            tdlib_rs::types::UpdateConnectionState {
+                state: ConnectionState::Connecting,
+            },
+        ));
+        assert!(screen(&mut app)[19].contains("Connecting…"));
+        lang::set(lang::Lang::Vi);
+        let row = screen(&mut app)[19].clone();
+        assert!(row.contains(lang::t("Connecting…")), "{row}");
+        assert!(!row.contains("Connecting…"), "{row}");
+        lang::set(lang::Lang::En);
+    }
+
     #[test]
     fn a_sound_picked_in_the_settings_plays_and_is_saved() {
         let dir = std::env::temp_dir().join(format!("tuigram-sound-{}", std::process::id()));
@@ -7359,7 +8627,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_r_resizes_the_panes_and_enter_keeps_it_for_next_time() {
+    fn ctrl_r_resizes_the_panes_and_each_press_is_kept_for_next_time() {
         let dir = std::env::temp_dir().join(format!("tuigram-resize-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
@@ -7387,17 +8655,24 @@ mod tests {
             status.contains(" RESIZE ") && status.contains("chat list 45%"),
             "{status}"
         );
+        let saved = || {
+            Settings::load(&settings::path(&dir))
+                .unwrap()
+                .chat_list_width
+        };
+        assert_eq!(saved(), 45, "saved as it's pressed, no Enter needed");
 
         press(&mut app, KeyCode::Enter, none);
         assert!(app.resizing.is_none());
-        let saved = Settings::load(&settings::path(&dir)).unwrap();
-        assert_eq!(saved.chat_list_width, 45);
 
         press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('h'), none);
         assert_eq!(edge(&screen(&mut app)), 39);
+        assert_eq!(saved(), 40);
         press(&mut app, KeyCode::Esc, none);
-        assert_eq!(edge(&screen(&mut app)), 44, "Esc puts it back");
+        assert!(app.resizing.is_none());
+        assert_eq!(edge(&screen(&mut app)), 39, "Esc leaves it as it is");
+        assert_eq!(saved(), 40);
         assert!(app.focus == Focus::Messages, "and stays in the chat");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -7754,28 +9029,33 @@ mod tests {
         let list = app.settings.chat_list_width;
 
         press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
-        assert_eq!(app.resizing, Some(Resizing::Topics(30)));
+        assert_eq!(app.resizing, Some(Resizing::Topics));
         press(&mut app, KeyCode::Char('l'), none);
         press(&mut app, KeyCode::Char('l'), none);
         let rows = screen_of(&mut app, 140);
         assert_eq!(edge(&rows), start + 4, "two columns a press");
         assert!(rows.last().unwrap().contains("topics 34 columns"));
         assert_eq!(app.settings.chat_list_width, list, "the chat list stays");
+        let saved = |app: &App| Settings::load(&app.settings_path).unwrap().topics_width;
+        assert_eq!(saved(&app), 34, "kept for next time as it's pressed");
         press(&mut app, KeyCode::Esc, none);
-        assert_eq!(edge(&screen_of(&mut app, 140)), start, "Esc puts it back");
+        assert_eq!(
+            edge(&screen_of(&mut app, 140)),
+            start + 4,
+            "Esc leaves it as it is"
+        );
 
         press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('h'), none);
         press(&mut app, KeyCode::Enter, none);
         assert!(app.resizing.is_none());
-        assert_eq!(app.settings.topics_width, 28);
-        let saved = Settings::load(&app.settings_path).unwrap();
-        assert_eq!(saved.topics_width, 28, "kept for next time");
+        assert_eq!(app.settings.topics_width, 32);
+        assert_eq!(saved(&app), 32);
 
         // Elsewhere, Ctrl-r still resizes the chat list.
         app.focus = Focus::Messages;
         press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
-        assert!(matches!(app.resizing, Some(Resizing::List(_))));
+        assert!(matches!(app.resizing, Some(Resizing::List)));
     }
 
     #[test]
@@ -7935,6 +9215,78 @@ mod tests {
         press(&mut app, KeyCode::Enter, none);
         assert_eq!(app.status.as_deref(), Some("Only one has: at a time"));
         assert!(app.open.as_ref().unwrap().search.is_none(), "nothing asked");
+    }
+
+    #[test]
+    fn from_tab_offers_the_usernames_of_chats_in_the_list() {
+        let mut app = test_app("from-tab-chats");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        let (_, other) = two_chats(&app);
+        app.chats.add_local(other, "Hiking", None).peer = Some(Peer::Supergroup(9));
+        app.chats.set_username(
+            Peer::Supergroup(9),
+            Some(&tdlib_rs::types::Usernames {
+                active_usernames: vec!["hikingclub".into()],
+                ..Default::default()
+            }),
+        );
+        press(&mut app, KeyCode::Char('/'), none);
+        for c in "from:@h".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(app.prompt.as_ref().unwrap().query(), "from:@hikingclub");
+    }
+
+    #[test]
+    fn a_search_with_a_media_filter_opens_the_media_browser() {
+        let mut app = test_app("media-browser");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        press(&mut app, KeyCode::Char('/'), none);
+        for c in "has:file".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Enter, none);
+        let menu = app.media_menu.as_ref().expect("the browser opened");
+        assert_eq!(menu.query, "has:file");
+        assert!(menu.loading, "the first page was asked for");
+        assert!(app.open.as_ref().unwrap().search.is_none(), "no n/N search");
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.media_menu.is_none());
+
+        // A text-only search stays the n/N kind.
+        press(&mut app, KeyCode::Char('/'), none);
+        for c in "hello".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.media_menu.is_none());
+        assert!(app.open.as_ref().unwrap().search.is_some());
+    }
+
+    #[test]
+    fn a_failed_media_search_says_so_in_its_window() {
+        let mut app = test_app("media-error");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        press(&mut app, KeyCode::Char('/'), none);
+        for c in "has:file".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.media_menu.is_some());
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        app.on_tg(TgEvent::Found {
+            chat_id,
+            topic: None,
+            query: "has:file".into(),
+            found: Err("Nobody on Telegram is called @x".into()),
+        });
+        assert!(app.media_menu.is_some(), "the window stays");
+        let text = screen(&mut app).join("\n");
+        assert!(text.contains("Nobody on Telegram"), "says why: {text}");
     }
 
     #[test]
@@ -9007,12 +10359,87 @@ mod tests {
         press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
         assert!(app.focus == Focus::Messages, "not writing yet");
         let confirm = app.confirm.as_ref().expect("asks");
-        assert!(matches!(confirm.action, Confirmed::Join(id) if id == chat_id));
+        assert!(matches!(confirm.action, Confirmed::Join { chat_id: id, .. } if id == chat_id));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
         app.chats.set_member(77, true);
         press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
         assert!(app.focus == Focus::Input, "once you're in");
+    }
+
+    #[test]
+    fn j_joins_the_public_chat_you_are_viewing() {
+        let mut app = test_app("jjoin");
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        app.chats.add_local(chat_id, "Weekend Hike", None).peer = Some(Peer::Supergroup(77));
+        app.chats.set_member(77, false);
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('J'), KeyModifiers::NONE);
+        let confirm = app.confirm.as_ref().expect("asks");
+        assert!(matches!(confirm.action, Confirmed::Join { chat_id: id, .. } if id == chat_id));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        app.chats.set_member(77, true);
+        press(&mut app, KeyCode::Char('J'), KeyModifiers::NONE);
+        assert!(app.confirm.is_none(), "already in");
+    }
+
+    #[test]
+    fn q_closes_the_chat_leaving_the_list() {
+        let mut app = test_app("qclose");
+        assert!(app.open.is_some());
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('Q'), KeyModifiers::NONE);
+        assert!(app.open.is_none(), "nothing open on the right");
+        assert!(app.focus == Focus::Chats);
+        press(&mut app, KeyCode::Char('Q'), KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn a_shifted_letter_reported_as_shift_and_the_small_one_is_the_capital() {
+        // Some terminals report Shift-q as `q` with a Shift modifier: the
+        // capital it types is meant.
+        let mut app = test_app("shiftletter");
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::SHIFT);
+        assert!(app.open.is_none(), "closed as Q closes");
+        assert!(app.quit_deadline.is_none(), "not quit as q quits");
+
+        // `й` sits on `q`: Shift-й is Q too, whichever layout is on.
+        let mut app = test_app("shiftcyr");
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('й'), KeyModifiers::SHIFT);
+        assert!(app.open.is_none(), "closed as Q closes");
+        assert!(app.quit_deadline.is_none());
+    }
+
+    #[test]
+    fn o_in_the_media_browser_shows_the_file_in_its_manager() {
+        let mut app = test_app("mediao");
+        let mut menu = crate::search::MediaMenu::new(
+            "has:file".into(),
+            crate::search::parse("has:file").unwrap(),
+        );
+        menu.rows = vec![crate::search::MediaRow {
+            id: 1,
+            label: "file".into(),
+            sender: crate::messages::Sender::User(1),
+            outgoing: false,
+            date: 0,
+            file_id: Some(42),
+            downloaded: true,
+        }];
+        app.media_menu = Some(menu);
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('O'), KeyModifiers::NONE);
+        assert!(app.media_menu.is_some(), "the list stays");
+        assert!(app.revealing.contains(&42), "downloading to show");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Downloading to show in the file manager…")
+        );
+        let text = screen(&mut app).join("\n");
+        assert!(text.contains("✓ file"), "on disk is marked: {text}");
     }
 
     #[test]
@@ -9267,6 +10694,232 @@ mod tests {
         );
     }
 
+    /// Makes the cursor's message someone else's video message, file 50, in
+    /// a terminal speaking kitty's protocol, where they play.
+    fn video_message(app: &mut App) -> (i64, i64) {
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        app.images = Images::new(picker, unbounded_channel().0);
+        app.over_ssh = false;
+        let id = plain_message(app);
+        let open = app.open.as_mut().unwrap();
+        let msg = open.messages.get_mut(&id).unwrap();
+        msg.outgoing = false;
+        msg.links.clear();
+        msg.unplayed = true;
+        msg.preview = Some(crate::messages::Preview {
+            file_id: 51,
+            width: 240,
+            height: 240,
+            thumbnail: None,
+            sticker: false,
+        });
+        msg.file = Some(MediaFile {
+            id: 50,
+            label: "Video message".into(),
+            photo: false,
+            downloaded: false,
+        });
+        msg.video = Some(crate::video::Note {
+            file_id: 50,
+            size: 1000,
+            duration: 5,
+            length: 240,
+        });
+        (open.chat_id, id)
+    }
+
+    #[test]
+    fn space_plays_a_video_message_but_not_one_seen_only_while_open() {
+        let mut app = test_app("video-once");
+        app.focus = Focus::Messages;
+        let (_, id) = video_message(&mut app);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.inline_video.is_some(), "downloading to play");
+        app.inline_video = None;
+
+        // Its timer starts once it's opened: ffmpeg and mpv don't get it.
+        let open = app.open.as_mut().unwrap();
+        open.messages.get_mut(&id).unwrap().destruct = Some(crate::secret::Destruct {
+            after: 10,
+            on_open: true,
+            ends: None,
+        });
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.inline_video.is_none());
+        assert!(app.video_view.is_none());
+    }
+
+    #[test]
+    fn a_video_message_downloaded_while_nobody_is_there_waits_and_tells_nobody() {
+        let mut app = test_app("video-away");
+        app.focus = Focus::Messages;
+        let (_, id) = video_message(&mut app);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(
+            app.inline_video.as_ref().unwrap().tell,
+            "someone else's, unplayed"
+        );
+        app.terminal_focused = false;
+        app.on_tg(TgEvent::Downloaded {
+            file_id: 50,
+            path: Some("/nowhere/file_50.mp4".into()),
+        });
+        assert!(app.inline_video.is_none(), "not played to an empty room");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Video message downloaded: Space plays it")
+        );
+        assert!(
+            app.open.as_ref().unwrap().messages[&id].unplayed,
+            "nobody told"
+        );
+
+        // Your own tells nobody however it plays.
+        app.terminal_focused = true;
+        let open = app.open.as_mut().unwrap();
+        open.messages.get_mut(&id).unwrap().outgoing = true;
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(!app.inline_video.as_ref().unwrap().tell);
+    }
+
+    #[test]
+    fn what_telegram_says_cant_be_saved_isnt_handed_on_from_a_video_message() {
+        let mut app = test_app("video-save");
+        app.focus = Focus::Messages;
+        let (chat_id, id) = video_message(&mut app);
+        let open = app.open.as_mut().unwrap();
+        let msg = open.messages.get_mut(&id).unwrap();
+        msg.saveable = false;
+        app.video_view = VideoView::of(
+            chat_id,
+            id,
+            msg,
+            app.video_tx.clone(),
+            false,
+            None,
+            &app.colors,
+        );
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+        assert!(app.video_view.is_some(), "it stays");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("This video message can't be saved, so it plays only here")
+        );
+        assert!(app.opening.is_empty());
+
+        // Nor does O show it in the file manager.
+        app.video_view = None;
+        press(&mut app, KeyCode::Char('O'), KeyModifiers::NONE);
+        assert!(app.revealing.is_empty());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("This chat doesn't allow copying its messages")
+        );
+    }
+
+    #[test]
+    fn a_video_message_stops_on_leaving_its_chat_or_logging_out() {
+        let mut app = test_app("video-leave");
+        app.focus = Focus::Messages;
+        let (chat_id, id) = video_message(&mut app);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.inline_video.is_some());
+        let msg = &app.open.as_ref().unwrap().messages[&id];
+        app.video_view = VideoView::of(
+            chat_id,
+            id,
+            msg,
+            app.video_tx.clone(),
+            false,
+            None,
+            &app.colors,
+        );
+        let (_, other) = two_chats(&app);
+        app.open_chat(other);
+        assert!(app.inline_video.is_none(), "its chat was left");
+        assert!(app.video_view.is_none());
+
+        let mut app = test_app("video-logout");
+        let (chat_id, id) = video_message(&mut app);
+        let msg = &app.open.as_ref().unwrap().messages[&id];
+        app.video_view = VideoView::of(
+            chat_id,
+            id,
+            msg,
+            app.video_tx.clone(),
+            false,
+            None,
+            &app.colors,
+        );
+        app.forget_session();
+        assert!(app.video_view.is_none(), "the session ended");
+    }
+
+    #[test]
+    fn the_media_browser_holds_back_read_receipts_and_pastes_as_popups_do() {
+        let mut app = test_app("media-popup");
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "has:file".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.media_menu.is_some());
+        assert!(app.popup_open());
+        app.on_terminal_event(Event::Paste("hello".into()));
+        assert!(app.focus != Focus::Input, "no Insert mode under it");
+    }
+
+    #[test]
+    fn mouse_motion_is_nobody_doing_anything() {
+        let mouse = |kind| {
+            Ok(Event::Mouse(MouseEvent {
+                kind,
+                column: 3,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            }))
+        };
+        assert!(mouse_moved(&mouse(MouseEventKind::Moved)));
+        assert!(mouse_moved(&mouse(MouseEventKind::Drag(MouseButton::Left))));
+        assert!(!mouse_moved(&mouse(MouseEventKind::Down(
+            MouseButton::Left
+        ))));
+        assert!(!mouse_moved(&mouse(MouseEventKind::ScrollUp)));
+        assert!(!mouse_moved(&Ok(Event::FocusGained)));
+    }
+
+    #[test]
+    fn commands_work_in_the_cyrillic_layout_too() {
+        assert_eq!(qwerty('н'), 'y');
+        assert_eq!(qwerty('Н'), 'Y');
+        assert_eq!(qwerty('р'), 'h');
+        assert_eq!(qwerty('ю'), '.');
+        assert_eq!(qwerty('a'), 'a');
+        assert_eq!(qwerty('/'), '/');
+
+        // `н` sits on `y`: it copies as y does, no layout switch needed.
+        let mut app = test_app("layout");
+        app.focus = Focus::Messages;
+        plain_message(&mut app);
+        press(&mut app, KeyCode::Char('н'), KeyModifiers::NONE);
+        assert!(app.toast.is_some(), "copied as y copies");
+
+        // Typing is untouched: Insert mode takes the letters as they are.
+        app.focus = Focus::Input;
+        press(&mut app, KeyCode::Char('ы'), KeyModifiers::NONE);
+        assert_eq!(app.composer.lines().join("\n"), "ы");
+    }
+
+    #[test]
+    fn a_file_uri_encodes_what_breaks_one() {
+        assert_eq!(
+            percent_encode("/tmp/a b/файл.pdf"),
+            "/tmp/a%20b/%D1%84%D0%B0%D0%B9%D0%BB.pdf"
+        );
+    }
+
     #[test]
     fn y_copies_nothing_telegram_says_cant_be_saved() {
         let mut app = test_app("secret-copy");
@@ -9470,6 +11123,7 @@ mod tests {
             id: 30,
             label: "Voice message".into(),
             photo: false,
+            downloaded: false,
         });
         msg.links.clear();
         msg.source_text.clear();
@@ -9503,6 +11157,7 @@ mod tests {
             id: 30,
             label: "Voice message".into(),
             photo: false,
+            downloaded: false,
         });
         msg.voice = Some(crate::voice::Voice {
             file_id: 30,
@@ -9542,6 +11197,7 @@ mod tests {
             id: file_id + 1,
             label: "Photo".into(),
             photo: true,
+            downloaded: false,
         });
     }
 
@@ -9808,7 +11464,7 @@ mod tests {
     #[test]
     fn logging_out_leaves_no_popup_or_resize_mode_behind() {
         let mut app = test_app("forget-popups");
-        app.resizing = Some(Resizing::List(30));
+        app.resizing = Some(Resizing::List);
         app.confirm = Some(Confirm::new("Log out?", Vec::new(), Confirmed::Logout));
         app.react_menu = Some(ReactMenu::new(1, "hi".into()));
         app.forget_session();
@@ -9841,6 +11497,7 @@ mod tests {
             id: 7,
             label: "notes.pdf".into(),
             photo: false,
+            downloaded: false,
         }));
         assert_eq!(
             app.status.as_deref(),
@@ -10442,5 +12099,341 @@ mod tests {
         crate::demo::show_forum(&mut app);
         app.focus = Focus::Topics;
         assert_eq!(app.info_chat(), app.forum.as_ref().map(|f| f.chat_id));
+    }
+
+    /// The demo app, speaking Russian: `App::new` speaks the settings'
+    /// language, the demo's English.
+    fn russian_app(tag: &str) -> App {
+        let mut app = test_app(tag);
+        app.settings.language = "ru".into();
+        crate::lang::set(crate::lang::Lang::Ru);
+        app
+    }
+
+    #[test]
+    fn in_russian_the_status_bar_says_what_went_wrong_in_russian() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let mut app = russian_app("ru-status");
+        command(&mut app, "nope");
+        assert_eq!(app.status.as_deref(), Some("Нет такой команды: nope"));
+        // After the key hints, which are long.
+        let rows = screen_of(&mut app, 600);
+        assert!(
+            rows[19].contains("Нет такой команды: nope"),
+            "{:?}",
+            rows[19]
+        );
+
+        app.on_update(Update::ConnectionState(
+            tdlib_rs::types::UpdateConnectionState {
+                state: ConnectionState::WaitingForNetwork,
+            },
+        ));
+        let rows = screen(&mut app);
+        assert!(
+            rows[19].starts_with(" ОБЫЧНЫЙ   Ожидание сети…"),
+            "{:?}",
+            rows[19]
+        );
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_russian_a_toast_says_what_was_done() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let mut app = russian_app("ru-toast");
+        app.focus = Focus::Chats;
+        app.chats.refresh();
+        app.selected = app.chats.ids().first().copied();
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.title.as_str()),
+            Some("Перенесено в архив")
+        );
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_russian_a_disguised_link_asks_with_the_site_on_its_own_line_and_lined_up() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let mut app = russian_app("ru-link");
+        app.open_link_outside(Link {
+            url: "https://shop.example/pay".into(),
+            disguise: Some("Мой банк".into()),
+        });
+        let confirm = app.confirm.as_ref().expect("asks first");
+        assert_eq!(confirm.title, "Открыть ссылку?");
+        assert_eq!(confirm.action.verb(), "открыть");
+        let rows = screen(&mut app);
+        // The column what follows `label` starts in.
+        let at = |label: &str| {
+            let row = rows.iter().find(|r| r.contains(label)).expect(label);
+            let (before, after) = row.split_once(label).unwrap();
+            let gap = after.chars().take_while(|&c| c == ' ').count();
+            before.chars().count() + label.chars().count() + gap
+        };
+        // The text, the site and the address start in one column, in the
+        // order the English has them.
+        let column = at("В тексте:");
+        assert_eq!(at("Ведёт на:"), column);
+        assert_eq!(at("Полный адрес:"), column);
+        let text = rows.iter().position(|r| r.contains("Мой банк")).unwrap();
+        assert!(rows[text + 1].contains("shop.example"), "{rows:#?}");
+        assert!(
+            rows[text + 2].contains("https://shop.example/pay"),
+            "{rows:#?}"
+        );
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_russian_logging_out_asks_in_russian_line_by_line() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let mut app = russian_app("ru-logout");
+        command(&mut app, "logout");
+        let confirm = app.confirm.as_ref().expect("asks");
+        assert_eq!(confirm.title, "Выйти из аккаунта?");
+        // Three lines as in English, and the demo's secret chats a fourth.
+        assert_eq!(confirm.lines.len(), 4);
+        let rows = screen(&mut app).join("\n");
+        assert!(rows.contains(" Выйти из аккаунта? "), "{rows}");
+        assert!(rows.contains("Сеанс в Telegram завершится"), "{rows}");
+        assert!(rows.contains("понадобятся код и пароль"), "{rows}");
+        assert!(rows.contains("Секретные чаты тоже пропадут"), "{rows}");
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_russian_an_invite_counts_its_members_as_russian_does() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let mut app = russian_app("ru-invite");
+        let invite = |members, channel, by_request| Invite {
+            title: "Hikers".into(),
+            members,
+            channel,
+            badge: None,
+            by_request,
+        };
+        app.confirm_invite(
+            "https://t.me/+x".into(),
+            "x".into(),
+            invite(21, true, false),
+        );
+        let confirm = app.confirm.take().unwrap();
+        assert_eq!(confirm.title, "Подписаться на канал?");
+        assert_eq!(confirm.lines, ["Hikers", "Канал, 21 подписчик."]);
+        assert_eq!(confirm.action.verb(), "подписаться", "as the title asks");
+
+        app.confirm_invite("https://t.me/+x".into(), "x".into(), invite(3, false, true));
+        let confirm = app.confirm.take().unwrap();
+        assert_eq!(confirm.title, "Подать заявку на вступление в группу?");
+        assert_eq!(confirm.action.verb(), "вступить");
+        assert_eq!(
+            confirm.lines,
+            [
+                "Hikers",
+                "Группа, 3 участника.",
+                "Заявку должен одобрить администратор."
+            ]
+        );
+
+        // English is as it was.
+        crate::lang::set(crate::lang::Lang::En);
+        app.confirm_invite("https://t.me/+x".into(), "x".into(), invite(3, false, true));
+        let confirm = app.confirm.take().unwrap();
+        assert_eq!(confirm.title, "Ask to join this group?");
+        assert_eq!(
+            confirm.lines,
+            [
+                "Hikers",
+                "A group with 3 members.",
+                "An admin has to let you in."
+            ]
+        );
+    }
+
+    #[test]
+    fn joining_says_you_are_not_in_the_chat_as_each_language_does() {
+        let mut app = test_app("join-words");
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        app.chats.add_local(chat_id, "Hikers", None);
+        let not_in = |app: &mut App, chat_id| {
+            app.confirm_join(chat_id);
+            app.confirm.take().unwrap().lines[0].clone()
+        };
+        assert_eq!(not_in(&mut app, chat_id), "You're not in Hikers.");
+        crate::lang::set(crate::lang::Lang::Ru);
+        assert_eq!(not_in(&mut app, chat_id), "Вы не участник: Hikers.");
+        // A chat not known has no title.
+        assert_eq!(not_in(&mut app, 424242), "Вы не участник: эта группа.");
+        crate::lang::set(crate::lang::Lang::Vi);
+        assert_eq!(not_in(&mut app, chat_id), "Bạn chưa tham gia Hikers.");
+        assert_eq!(not_in(&mut app, 424242), "Bạn chưa tham gia nhóm này.");
+
+        app.chats.add_local(chat_id, "Hikers", None).is_channel = true;
+        crate::lang::set(crate::lang::Lang::Ru);
+        assert_eq!(not_in(&mut app, chat_id), "Вы не подписчик: Hikers.");
+        crate::lang::set(crate::lang::Lang::En);
+        assert_eq!(not_in(&mut app, chat_id), "You're not in Hikers.");
+        assert_eq!(not_in(&mut app, 424242), "You're not in this chat.");
+    }
+
+    #[test]
+    fn starting_a_secret_chat_asks_in_three_lines_in_each_language() {
+        let mut app = test_app("secret-start-words");
+        let lines = |app: &mut App| {
+            chat_with_chardy(app, None);
+            command(app, "secret");
+            app.confirm.take().expect("asks").lines
+        };
+        assert_eq!(
+            lines(&mut app),
+            [
+                "With Chardy. It's end-to-end encrypted, and kept only",
+                "on this computer and on the device of theirs that",
+                "accepts it: your other devices won't have it.",
+            ]
+        );
+        crate::lang::set(crate::lang::Lang::Ru);
+        assert_eq!(
+            lines(&mut app),
+            [
+                "Собеседник: Chardy. Чат защищён сквозным шифрованием и хранится",
+                "только на этом компьютере и на том устройстве собеседника,",
+                "которое его примет: на других ваших устройствах его не будет.",
+            ]
+        );
+        crate::lang::set(crate::lang::Lang::Vi);
+        assert_eq!(
+            lines(&mut app),
+            [
+                "Với Chardy. Được mã hóa đầu cuối và chỉ được lưu",
+                "trên máy tính này và trên thiết bị mà người kia",
+                "dùng để chấp nhận: các thiết bị khác của bạn sẽ không có.",
+            ]
+        );
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    /// The demo app, speaking Vietnamese.
+    fn vietnamese_app(tag: &str) -> App {
+        let mut app = test_app(tag);
+        app.settings.language = "vi".into();
+        crate::lang::set(crate::lang::Lang::Vi);
+        app
+    }
+
+    /// The column what follows `label` starts in, on the first row with it.
+    fn column_after(rows: &[String], label: &str) -> usize {
+        let row = rows.iter().find(|r| r.contains(label)).expect(label);
+        let (before, after) = row.split_once(label).unwrap();
+        let gap = after.chars().take_while(|&c| c == ' ').count();
+        before.chars().count() + label.chars().count() + gap
+    }
+
+    #[test]
+    fn in_vietnamese_the_status_bar_says_what_went_wrong_in_vietnamese() {
+        let mut app = vietnamese_app("vi-status");
+        command(&mut app, "nope");
+        assert_eq!(app.status.as_deref(), Some("Không có lệnh: nope"));
+
+        app.on_update(Update::ConnectionState(
+            tdlib_rs::types::UpdateConnectionState {
+                state: ConnectionState::WaitingForNetwork,
+            },
+        ));
+        let rows = screen(&mut app);
+        assert!(rows[19].contains("Đang chờ mạng…"), "{:?}", rows[19]);
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_vietnamese_a_disguised_link_and_a_proxy_ask_with_their_labels_lined_up() {
+        let mut app = vietnamese_app("vi-link");
+        app.open_link_outside(Link {
+            url: "https://shop.example/pay".into(),
+            disguise: Some("Ngân hàng của tôi".into()),
+        });
+        let confirm = app.confirm.as_ref().expect("asks first");
+        assert_eq!(confirm.title, "Mở liên kết này?");
+        assert_eq!(confirm.action.verb(), "mở");
+        let rows = screen(&mut app);
+        // The text, the site and the address start in one column, in the
+        // order the English has them.
+        let column = column_after(&rows, "Văn bản ghi:");
+        assert_eq!(column_after(&rows, "Dẫn đến:"), column);
+        assert_eq!(column_after(&rows, "Địa chỉ thật:"), column);
+        let text = rows
+            .iter()
+            .position(|r| r.contains("Ngân hàng của tôi"))
+            .unwrap();
+        assert!(rows[text + 1].contains("shop.example"), "{rows:#?}");
+        assert!(
+            rows[text + 2].contains("https://shop.example/pay"),
+            "{rows:#?}"
+        );
+        app.confirm = None;
+
+        app.ask_to_use_proxy("socks5://10.0.0.1:1080");
+        let confirm = app.confirm.as_ref().expect("asks first");
+        assert_eq!(confirm.title, "Dùng proxy này?");
+        let rows = screen(&mut app);
+        assert_eq!(
+            column_after(&rows, "Proxy:"),
+            column_after(&rows, "Máy chủ:")
+        );
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_vietnamese_logging_out_asks_line_by_line() {
+        let mut app = vietnamese_app("vi-logout");
+        command(&mut app, "logout");
+        let confirm = app.confirm.as_ref().expect("asks");
+        assert_eq!(confirm.title, "Đăng xuất?");
+        // Three lines as in English, and the demo's secret chats a fourth.
+        assert_eq!(confirm.lines.len(), 4);
+        let rows = screen(&mut app).join("\n");
+        assert!(rows.contains(" Đăng xuất? "), "{rows}");
+        assert!(rows.contains("Phiên trên Telegram sẽ kết thúc"), "{rows}");
+        assert!(rows.contains("cần mã, và mật khẩu"), "{rows}");
+        assert!(
+            rows.contains("Các cuộc trò chuyện bí mật cũng mất"),
+            "{rows}"
+        );
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_vietnamese_an_invite_says_what_it_is_whatever_the_count() {
+        let mut app = vietnamese_app("vi-invite");
+        let invite = |members, channel, by_request| Invite {
+            title: "Hikers".into(),
+            members,
+            channel,
+            badge: None,
+            by_request,
+        };
+        app.confirm_invite(
+            "https://t.me/+x".into(),
+            "x".into(),
+            invite(21, true, false),
+        );
+        let confirm = app.confirm.take().unwrap();
+        assert_eq!(confirm.title, "Tham gia kênh này?");
+        assert_eq!(confirm.lines, ["Hikers", "Kênh có 21 người đăng ký."]);
+
+        app.confirm_invite("https://t.me/+x".into(), "x".into(), invite(1, false, true));
+        let confirm = app.confirm.take().unwrap();
+        assert_eq!(confirm.title, "Gửi yêu cầu tham gia nhóm này?");
+        assert_eq!(
+            confirm.lines,
+            [
+                "Hikers",
+                "Nhóm có 1 thành viên.",
+                "Quản trị viên phải duyệt cho bạn vào."
+            ]
+        );
+        crate::lang::set(crate::lang::Lang::En);
     }
 }

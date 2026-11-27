@@ -7,327 +7,477 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
+use crate::lang;
 use crate::theme::Colors;
 
-/// Every keyboard shortcut, grouped by where it works. Keep this in step
-/// with the key handling in `app.rs` (and the status bar hints).
+/// Every keyboard shortcut, grouped by where it works, in English: titles,
+/// descriptions and keys written in words are put in the language set where
+/// they're drawn. Keep this in step with the key handling in `app.rs` (and
+/// the status bar hints).
 const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     (
-        "Everywhere",
+        lang::key("Everywhere"),
         &[
-            ("?", "This help, and settings"),
+            ("?", lang::key("This help, and settings")),
             (
                 ":",
-                "Type a command: info, secret, key, timer, leave, proxy or logout",
+                lang::key("Type a command: info, secret, key, timer, leave, proxy or logout"),
             ),
-            ("s", "Find a chat or person: a name, @username or t.me link"),
+            (
+                "s",
+                lang::key("Find a chat or person: a name, @username or t.me link"),
+            ),
             (
                 "I",
-                "What the chat is, and who's in it: Enter on someone writes to them",
+                lang::key("What the chat is, and who's in it: Enter on someone writes to them"),
             ),
-            ("H", "Highlight or unhighlight the selected chat"),
+            ("H", lang::key("Highlight or unhighlight the selected chat")),
             (
                 "Ctrl-o / Ctrl-i",
-                "Back to the chat or reply you left / forward again",
+                lang::key("Back to the chat or reply you left / forward again"),
             ),
             (
                 "Ctrl-r",
-                "Resize the panes: h / l, = as at first, Enter keeps, Esc cancels",
+                lang::key(
+                    "Resize the panes: h / l, = as at first, saved at once; Esc or Enter is done",
+                ),
             ),
-            ("q", "Quit (press again to stop waiting)"),
-            ("Ctrl-c", "Quit, except while writing"),
+            ("q", lang::key("Quit (press again to stop waiting)")),
+            ("Ctrl-c", lang::key("Quit, except while writing")),
+            (
+                "",
+                lang::key(
+                    "Keys work in the Cyrillic layout too: н is y, р is h; typing takes letters as they are",
+                ),
+            ),
         ],
     ),
     (
-        "Chat list",
+        lang::key("Chat list"),
         &[
-            ("j / k", "Move down / up"),
-            ("gg / G", "First / last chat"),
-            ("Ctrl-d / Ctrl-u", "Half a page down / up"),
+            ("j / k", lang::key("Move down / up")),
+            ("gg / G", lang::key("First / last chat")),
+            ("Ctrl-d / Ctrl-u", lang::key("Half a page down / up")),
             (
                 "Enter / l",
-                "Open the chat, at its first unread message (Enter / h with the list on the right)",
+                lang::key(
+                    "Open the chat, at its first unread message (Enter / h with the list on the right)",
+                ),
             ),
-            ("i", "Open the chat and write"),
-            ("gm", "Open the chat at a message that mentions you"),
+            ("i", lang::key("Open the chat and write")),
+            (
+                "gm",
+                lang::key("Open the chat at a message that mentions you"),
+            ),
             (
                 "Tab / Shift-Tab",
-                "Next / previous folder, then the archive",
+                lang::key("Next / previous folder, then the archive"),
             ),
-            ("/", "Filter chats by name"),
-            ("p", "Pin or unpin the chat (on all your devices)"),
-            ("m", "Mute or unmute the chat"),
-            ("a", "Archive the chat, or move it out of the archive"),
-            ("Esc", "Clear the filter"),
+            ("/", lang::key("Filter chats by name")),
+            (
+                "p",
+                lang::key("Pin or unpin the chat (on all your devices)"),
+            ),
+            ("m", lang::key("Mute or unmute the chat")),
+            (
+                "a",
+                lang::key("Archive the chat, or move it out of the archive"),
+            ),
+            ("Esc", lang::key("Clear the filter")),
         ],
     ),
     (
-        "Forum topics",
+        lang::key("Forum topics"),
         &[
-            ("j / k", "Move down / up"),
-            ("gg / G", "First / last topic"),
+            ("j / k", lang::key("Move down / up")),
+            ("gg / G", lang::key("First / last topic")),
             (
                 "Enter / l",
-                "Open the topic's messages (Enter / h with the list on the right)",
+                lang::key("Open the topic's messages (Enter / h with the list on the right)"),
             ),
-            ("i", "Open the topic and write"),
-            ("Ctrl-r", "Resize the topics pane: h / l, = as at first"),
+            ("i", lang::key("Open the topic and write")),
+            (
+                "Ctrl-r",
+                lang::key("Resize the topics pane: h / l, = as at first"),
+            ),
             (
                 "h / Esc",
-                "Back to the chat list (l with the list on the right)",
+                lang::key("Back to the chat list (l with the list on the right)"),
             ),
         ],
     ),
     (
-        "Messages",
+        lang::key("Messages"),
         &[
-            ("j / k", "Newer / older message"),
-            ("gg / G", "Oldest / newest message"),
-            ("Ctrl-d / Ctrl-u", "Half a page newer / older"),
+            ("j / k", lang::key("Newer / older message")),
+            ("gg / G", lang::key("Oldest / newest message")),
+            ("Ctrl-d / Ctrl-u", lang::key("Half a page newer / older")),
             (
                 "Enter",
-                "Send a message that wasn't sent again, show spoilers, view a photo shown only while open, play or pause a voice message, vote in a poll, list a bot's buttons, show the photo, or open the file or link",
+                lang::key(
+                    "Send a message that wasn't sent again, show spoilers, view a photo shown only while open, play or pause a voice message, vote in a poll, list a bot's buttons, show the photo, or open the file or link",
+                ),
             ),
-            ("y", "Copy the text, a link, or the photo or file"),
-            ("v", "Show the text to select part of it and copy that"),
-            ("r", "Reply"),
-            ("f", "Forward to another chat (an album goes whole)"),
-            ("e", "Edit your message"),
+            (
+                "y",
+                lang::key("Copy the text, a link, or the photo or file"),
+            ),
+            ("O", lang::key("Show the file in the file manager")),
+            (
+                "v",
+                lang::key("Show the text to select part of it and copy that"),
+            ),
+            ("r", lang::key("Reply")),
+            (
+                "f",
+                lang::key("Forward to another chat (an album goes whole)"),
+            ),
+            ("e", lang::key("Edit your message")),
             (
                 "R",
-                "React, or take your reaction back (/ finds an emoji by name)",
+                lang::key("React, or take your reaction back (/ finds an emoji by name)"),
             ),
-            ("X", "Take back all your reactions"),
-            ("d", "Delete"),
-            ("P", "Pin the message (asks how), or unpin it"),
-            ("gp", "Pinned messages: Enter goes to one, P unpins it"),
-            ("gd", "Go to the message a reply answers"),
+            ("X", lang::key("Take back all your reactions")),
+            (
+                "J",
+                lang::key("Join the public group or channel you're viewing"),
+            ),
+            ("d", lang::key("Delete")),
+            ("P", lang::key("Pin the message (asks how), or unpin it")),
+            (
+                "gp",
+                lang::key("Pinned messages: Enter goes to one, P unpins it"),
+            ),
+            ("gd", lang::key("Go to the message a reply answers")),
             (
                 "gu",
-                "Go to the first unread message, under the \"Unread messages\" line",
+                lang::key("Go to the first unread message, under the \"Unread messages\" line"),
             ),
             (
                 "gm / gM",
-                "Go to the oldest unread message that mentions you or answers yours (@ in the chat list), and seeing it reads it; once you've seen them all, to the one before / after the cursor",
+                lang::key(
+                    "Go to the oldest unread message that mentions you or answers yours (@ in the chat list), and seeing it reads it; once you've seen them all, to the one before / after the cursor",
+                ),
             ),
             (
                 "Tab",
-                "Forward again, as Ctrl-i (most terminals send Ctrl-i as Tab)",
+                lang::key("Forward again, as Ctrl-i (most terminals send Ctrl-i as Tab)"),
             ),
-            ("i", "Write a message"),
-            ("a", "Attach a file by its path (Tab completes it)"),
-            ("p", "Paste a photo, files or text from the clipboard"),
-            ("/", "Search the whole chat"),
+            ("i", lang::key("Write a message")),
+            (
+                "a",
+                lang::key("Attach a file by its path (Tab completes it)"),
+            ),
+            (
+                "p",
+                lang::key("Paste a photo, files or text from the clipboard"),
+            ),
+            (
+                "/",
+                lang::key(
+                    "Search the whole chat; a has: search lists every match in a media browser",
+                ),
+            ),
             (
                 "from: has:",
-                "In a search: from:@alice, from:me or from:a name; has:photo (video, media, file, link, voice, gif, audio)",
+                lang::key(
+                    "In a search: from:@alice, from:me, from:this or from:a name; has:photo (video, media, file, link, voice, note, gif, audio)",
+                ),
             ),
             (
                 "before: after:",
-                "In a search: before:2025-10-01, after:2025-09-01 (that day counts)",
+                lang::key("In a search: before:2025-10-01, after:2025-09-01 (that day counts)"),
             ),
-            ("n / N", "Next older / newer match"),
+            ("n / N", lang::key("Next older / newer match")),
+            ("Q", lang::key("Close the chat, leaving only the chat list")),
             (
                 "Esc",
-                "End the search, cancel the edit, remove the files, cancel the reply, or go back",
+                lang::key(
+                    "End the search, cancel the edit, remove the files, cancel the reply, or go back",
+                ),
             ),
             (
                 "h",
-                "Back to the chat list, or a forum's topics (l with the list on the right)",
+                lang::key(
+                    "Back to the chat list, or a forum's topics (l with the list on the right)",
+                ),
             ),
         ],
     ),
     (
-        "Writing",
+        lang::key("Writing"),
         &[
-            ("Enter", "Send, or save the edit"),
-            ("Alt-Enter / Ctrl-j", "New line"),
-            ("Ctrl-u", "Delete back to the start of the line"),
+            ("Enter", lang::key("Send, or save the edit")),
+            ("Alt-Enter / Ctrl-j", lang::key("New line")),
+            ("Ctrl-u", lang::key("Delete back to the start of the line")),
             (
-                "**bold**",
-                "Formatting: __italic__ ~~strike~~ ||spoiler|| `code` ```block``` [text](url)",
+                lang::key("**bold**"),
+                lang::key(
+                    "Formatting: __italic__ ~~strike~~ ||spoiler|| `code` ```block``` [text](url)",
+                ),
             ),
             (
-                "@name / :smile",
-                "Suggests people in the group, or emoji; Tab puts one in",
+                lang::key("@name / :smile"),
+                lang::key("Suggests people in the group, or emoji; Tab puts one in"),
             ),
-            ("/command", "Starting a message: the bots' commands"),
-            ("Ctrl-v", "Paste a photo, files or text from the clipboard"),
             (
-                "Drop a file",
-                "Attach it; the text you write is its caption",
+                lang::key("/command"),
+                lang::key("Starting a message: the bots' commands"),
+            ),
+            (
+                "Ctrl-v",
+                lang::key("Paste a photo, files or text from the clipboard"),
+            ),
+            (
+                lang::key("Drop a file"),
+                lang::key("Attach it; the text you write is its caption"),
             ),
             (
                 "Ctrl-z",
-                "Turn files just pasted back into their path as text",
+                lang::key("Turn files just pasted back into their path as text"),
             ),
             (
                 "Ctrl-t",
-                "Send attached photos as files, uncompressed, or back",
+                lang::key("Send attached photos as files, uncompressed, or back"),
             ),
-            ("Tab", "Stickers"),
+            ("Tab", lang::key("Stickers")),
             (
                 "Esc / Ctrl-c",
-                "Back to Normal mode; what's written stays as the chat's draft, on your other devices too",
+                lang::key(
+                    "Back to Normal mode; what's written stays as the chat's draft, on your other devices too",
+                ),
             ),
         ],
     ),
     (
-        "Selecting text (v)",
+        lang::key("Selecting text (v)"),
         &[
-            ("h / j / k / l", "Move a character, or a row on screen"),
-            ("w / b / e", "Next word / word before / end of the word"),
-            ("0 / $", "Start / end of the line"),
-            ("g / G", "Start / end of the text"),
-            ("Ctrl-d / Ctrl-u", "Half a page down / up"),
+            (
+                "h / j / k / l",
+                lang::key("Move a character, or a row on screen"),
+            ),
+            (
+                "w / b / e",
+                lang::key("Next word / word before / end of the word"),
+            ),
+            ("0 / $", lang::key("Start / end of the line")),
+            ("g / G", lang::key("Start / end of the text")),
+            ("Ctrl-d / Ctrl-u", lang::key("Half a page down / up")),
             (
                 "v",
-                "Start selecting where the cursor is, or stop; it takes in both ends, as in vim",
+                lang::key(
+                    "Start selecting where the cursor is, or stop; it takes in both ends, as in vim",
+                ),
             ),
-            ("y", "Copy what's selected and close"),
-            ("Esc", "Stop selecting, then close"),
+            ("y", lang::key("Copy what's selected and close")),
+            ("Esc", lang::key("Stop selecting, then close")),
         ],
     ),
     (
-        "Stickers",
+        lang::key("Stickers"),
         &[
-            ("h / j / k / l", "Move"),
-            ("H / L", "Previous / next tab: Recent, Favorites, your sets"),
-            ("Enter", "Send the sticker, or the reply"),
-            ("/", "Find stickers by emoji or word"),
-            ("Tab / Esc", "Back to writing"),
-        ],
-    ),
-    (
-        "Photo viewer",
-        &[
-            ("h / l", "The photo before / after it in the chat"),
+            ("h / j / k / l", lang::key("Move")),
             (
-                "j / k",
-                "Zoom in / out (also + / -), up to filling the window",
+                "H / L",
+                lang::key("Previous / next tab: Recent, Favorites, your sets"),
             ),
-            ("o", "Open the photo in your computer's viewer"),
-            ("y", "Copy the photo"),
-            ("Enter / Esc / q", "Close"),
-        ],
-    ),
-    (
-        "Bot buttons",
-        &[
-            ("h / j / k / l", "Move, as the buttons are laid out"),
-            ("Tab / Shift-Tab", "Next / previous button"),
             (
                 "Enter",
-                "Press it: the bot answers, a link opens (asking first), a reply button sends its words",
+                lang::key("Send the sticker (as the reply, if you're replying)"),
             ),
-            ("Esc / q", "Close"),
+            ("/", lang::key("Find stickers by emoji or word")),
+            ("Tab / Esc", lang::key("Back to writing")),
         ],
     ),
     (
-        "Secret chats",
+        lang::key("Photo viewer"),
+        &[
+            (
+                "h / l",
+                lang::key("The photo before / after it in the chat"),
+            ),
+            (
+                "j / k",
+                lang::key("Zoom in / out (also + / -), up to filling the window"),
+            ),
+            ("o", lang::key("Open the photo in your computer's viewer")),
+            ("y", lang::key("Copy the photo")),
+            ("Enter / Esc / q", lang::key("Close")),
+        ],
+    ),
+    (
+        lang::key("Video player"),
+        &[
+            (
+                "Space",
+                lang::key("Play (once) or pause, right in the message (size in Settings)"),
+            ),
+            ("z", lang::key("Twice as big in the chat, or back")),
+            ("j / k", lang::key("Zoom in / out, on the whole window")),
+            ("o", lang::key("Open the video in your computer's player")),
+            ("Enter", lang::key("Fill the window; it closes once played")),
+            ("Esc / q", lang::key("Close")),
+        ],
+    ),
+    (
+        lang::key("Bot buttons"),
+        &[
+            (
+                "h / j / k / l",
+                lang::key("Move, as the buttons are laid out"),
+            ),
+            ("Tab / Shift-Tab", lang::key("Next / previous button")),
+            (
+                "Enter",
+                lang::key(
+                    "Press it: the bot answers, a link opens (asking first), a reply button sends its words",
+                ),
+            ),
+            ("Esc / q", lang::key("Close")),
+        ],
+    ),
+    (
+        lang::key("Secret chats"),
         &[
             (
                 ":secret",
-                "Start one with the person in this chat (asks first); it's kept on this computer only",
+                lang::key(
+                    "Start one with the person in this chat (asks first); it's kept on this computer only",
+                ),
             ),
             (
                 ":key",
-                "Its key as a picture, to compare with the other person's",
+                lang::key("Its key as a picture, to compare with the other person's"),
             ),
-            (":timer", "How long new messages last once they're seen"),
+            (
+                ":timer",
+                lang::key("How long new messages last once they're seen"),
+            ),
             (
                 ":leave",
-                "End it for both of you, and delete it here (asks first)",
+                lang::key("End it for both of you, and delete it here (asks first)"),
             ),
             (
                 "Enter",
-                "On a 🔥 photo: view it; it's covered again when you move on",
+                lang::key("On a 🔥 photo: view it; it's covered again when you move on"),
             ),
         ],
     ),
     (
-        "Search and command prompts",
+        lang::key("Search and command prompts"),
         &[
-            ("Enter", "Search, keep the chat filter, or run the command"),
+            (
+                "Enter",
+                lang::key("Search, keep the chat filter, or run the command"),
+            ),
             (
                 "Tab / Shift-Tab",
-                "Complete a command or a search filter (again for the next one), or the path of a file to attach",
+                lang::key(
+                    "Complete a command or a search filter (again for the next one), or the path of a file to attach",
+                ),
             ),
-            ("Esc / Ctrl-c", "Cancel"),
+            ("Esc / Ctrl-c", lang::key("Cancel")),
         ],
     ),
     (
-        "Forward and find popups",
+        lang::key("Forward and find popups"),
         &[
-            ("Type", "Search chats by name, or @username"),
-            ("Up / Down", "Move (also Ctrl-p / Ctrl-n, Tab)"),
-            ("Enter", "Forward there, or open it"),
-            ("Esc", "Cancel"),
+            (
+                lang::key("Type"),
+                lang::key("Search chats by name, or @username"),
+            ),
+            ("Up / Down", lang::key("Move (also Ctrl-p / Ctrl-n, Tab)")),
+            ("Enter", lang::key("Forward there, or open it")),
+            ("Esc", lang::key("Cancel")),
         ],
     ),
     (
-        "Menus and popups",
+        lang::key("Menus and popups"),
         &[
-            ("j / k", "Move"),
-            ("Enter", "Choose"),
-            ("1-9", "Choose by number"),
+            ("j / k", lang::key("Move")),
+            ("Enter", lang::key("Choose")),
+            ("1-9", lang::key("Choose by number")),
             (
                 "Space",
-                "Tick a setting, or use a sound or a theme (Enter too); saved at once",
+                lang::key("Tick a setting, or use a sound or a theme (Enter too); saved at once"),
             ),
-            ("Esc / q", "Close"),
-            ("Tab / h / l", "Switch tabs in this popup"),
+            ("Esc / q", lang::key("Close")),
+            ("Tab / h / l", lang::key("Switch tabs in this popup")),
             (
                 "y / n",
-                "Go ahead or not, when asked about a file, a link or joining",
+                lang::key("Go ahead or not, when asked about a file, a link or joining"),
             ),
         ],
     ),
 ];
+
+/// A key as the language set writes it: only keys written in words, such as
+/// "Drop a file", have other words; the rest are looked up and stay as they are.
+fn key_text(key: &'static str) -> &'static str {
+    lang::t(key)
+}
 
 /// The longest key, which sets where the descriptions start.
 fn key_width() -> usize {
     SHORTCUTS
         .iter()
         .flat_map(|(_, keys)| keys.iter())
-        .map(|(key, _)| key.width())
+        .map(|&(key, _)| key_text(key).width())
         .max()
         .unwrap_or(0)
 }
 
-/// The shortcuts as lines: a heading per group, then each key and what it does.
-fn lines(colors: &Colors) -> Vec<Line<'static>> {
+/// The shortcuts as lines, in the language set: a heading per group, then
+/// each key and what it does, wrapped to `width` columns under where the
+/// descriptions start.
+fn lines(colors: &Colors, width: usize) -> Vec<Line<'static>> {
     let key_width = key_width();
+    // Indent, the keys and a gap before each description.
+    let indent = 3 + key_width + 2;
+    let room = width.saturating_sub(indent).max(1);
     let mut lines = Vec::new();
-    for (i, (group, keys)) in SHORTCUTS.iter().enumerate() {
+    for (i, &(group, keys)) in SHORTCUTS.iter().enumerate() {
         if i > 0 {
             lines.push(Line::default());
         }
-        lines.push(Line::from(format!(" {group}")).fg(colors.accent).bold());
-        for (key, what) in keys.iter() {
-            lines.push(Line::from(vec![
-                Span::from(format!("   {key:<key_width$}  ")).fg(colors.primary),
-                Span::from(*what),
-            ]));
+        lines.push(
+            Line::from(format!(" {}", lang::t(group)))
+                .fg(colors.accent)
+                .bold(),
+        );
+        for &(key, what) in keys {
+            let key = key_text(key);
+            let pad = " ".repeat(key_width - key.width());
+            let pieces = super::messages::wrap(lang::t(what), room);
+            for (n, (piece, _)) in pieces.into_iter().enumerate() {
+                let lead = match n {
+                    0 => format!("   {key}{pad}  "),
+                    _ => " ".repeat(indent),
+                };
+                lines.push(Line::from(vec![
+                    Span::from(lead).fg(colors.primary),
+                    Span::from(piece),
+                ]));
+            }
         }
     }
     lines
 }
 
-/// Columns the widest line takes, plus one for the scrollbar, for sizing the
-/// popup.
+/// Columns the widest line takes in the language set, plus one for the
+/// scrollbar, for sizing the popup.
 pub fn width() -> usize {
     let what = SHORTCUTS
         .iter()
         .flat_map(|(_, keys)| keys.iter())
-        .map(|(_, what)| what.width())
+        .map(|&(_, what)| lang::t(what).width())
         .max()
         .unwrap_or(0);
     // Indent, the keys, a gap, then the descriptions.
     3 + key_width() + 2 + what + 1
 }
 
-/// Rows the list takes, for sizing the popup.
+/// Rows the list takes unwrapped, for sizing the popup.
 pub fn height() -> usize {
     SHORTCUTS
         .iter()
@@ -339,7 +489,8 @@ pub fn height() -> usize {
 /// Draws the list from row `scroll`, first pulling `scroll` back if it's
 /// past the end.
 pub fn draw(frame: &mut Frame, area: Rect, scroll: &mut usize, colors: &Colors) {
-    let lines = lines(colors);
+    // The scrollbar takes the last column.
+    let lines = lines(colors, usize::from(area.width).saturating_sub(1));
     let max = lines.len().saturating_sub(usize::from(area.height));
     *scroll = (*scroll).min(max);
     frame.render_widget(Paragraph::new(lines).scroll((*scroll as u16, 0)), area);
@@ -349,19 +500,71 @@ pub fn draw(frame: &mut Frame, area: Rect, scroll: &mut usize, colors: &Colors) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::Lang;
 
     #[test]
-    fn height_counts_every_line() {
-        assert_eq!(height(), lines(&Colors::default()).len());
+    fn height_counts_every_line_in_every_language() {
+        for language in Lang::ALL {
+            lang::set(language);
+            let lines = lines(&Colors::default(), usize::MAX);
+            assert_eq!(height(), lines.len(), "{language:?}");
+        }
     }
 
     #[test]
-    fn width_leaves_room_for_every_line_and_the_scrollbar() {
-        let widest = lines(&Colors::default())
+    fn width_leaves_room_for_every_line_and_the_scrollbar_in_every_language() {
+        for language in Lang::ALL {
+            lang::set(language);
+            let widest = lines(&Colors::default(), usize::MAX)
+                .iter()
+                .map(Line::width)
+                .max()
+                .unwrap();
+            assert_eq!(width(), widest + 1, "{language:?}");
+        }
+    }
+
+    #[test]
+    fn long_descriptions_wrap_under_where_descriptions_start() {
+        let text = |l: &Line| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let wide = lines(&Colors::default(), usize::MAX);
+        let narrow = lines(&Colors::default(), 60);
+        assert!(narrow.len() > wide.len(), "some wrap");
+        assert!(narrow.iter().all(|l| l.width() <= 60), "none runs past");
+        // Every letter is still there, in order, the rest of a description
+        // under its start, after the keys' column. Lines may also break
+        // after punctuation, as in `||spoiler||`.
+        let letters = |lines: &[Line]| -> String {
+            let all: String = lines.iter().map(text).collect();
+            all.chars().filter(|c| !c.is_whitespace()).collect()
+        };
+        assert_eq!(letters(&narrow), letters(&wide));
+        let indent = 3 + key_width() + 2;
+        let continued = narrow
             .iter()
-            .map(Line::width)
-            .max()
-            .unwrap();
-        assert_eq!(width(), widest + 1);
+            .map(text)
+            .find(|l| l.starts_with(&" ".repeat(indent)));
+        assert!(continued.is_some_and(|l| !l[indent..].starts_with(' ')));
+    }
+
+    #[test]
+    fn keys_written_in_words_are_translated_and_the_rest_stay() {
+        let text = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let row = |key: &str| {
+            let lines = lines(&Colors::default(), usize::MAX);
+            lines.iter().map(text).find(|l| l.contains(key)).unwrap()
+        };
+        lang::set(Lang::Ru);
+        assert!(row("Перетащить файл").contains("Прикрепить его"));
+        assert!(row("Alt-Enter / Ctrl-j").contains("Новая строка"));
+
+        lang::set(Lang::Vi);
+        assert_eq!(row("Mọi nơi"), " Mọi nơi");
+        assert!(row("Alt-Enter / Ctrl-j").contains("Xuống dòng"));
     }
 }

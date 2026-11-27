@@ -18,6 +18,7 @@ use super::truncate;
 use crate::buttons::Keyboard;
 use crate::chats::{Chats, Presence, Seen};
 use crate::images::Images;
+use crate::lang;
 use crate::messages::{
     Card, Fetched, Format, ImageFile, Msg, OpenChat, Origin, Preview, Replied, ReplyTo, SPOILER,
     ScrollAnchor, SendState, Sender, Styled,
@@ -32,9 +33,15 @@ use crate::voice::{self, Playback, Voice};
 
 /// Bubbles take at most this share of the pane width.
 const BUBBLE_WIDTH_PERCENT: usize = 75;
+/// What comes after a closed topic's name in the title.
+fn closed() -> &'static str {
+    lang::t(" · closed")
+}
 /// Columns a topic's name brings to the title besides itself: " › " and
 /// " · closed".
-const TOPIC_MARKS: usize = 12;
+fn topic_marks() -> usize {
+    " › ".width() + closed().width()
+}
 /// Largest inline photo, in terminal cells.
 const MAX_PHOTO_COLS: usize = 40;
 const MAX_PHOTO_ROWS: usize = 16;
@@ -62,7 +69,7 @@ impl Names<'_> {
             Sender::User(id) => self.users.get(&id).cloned(),
             Sender::Chat(id) => self.chats.get(id).map(|c| c.title.clone()),
         };
-        name.unwrap_or_else(|| "Unknown".into())
+        name.unwrap_or_else(|| lang::t("Unknown").into())
     }
 
     /// Who a forwarded message first came from: "Alice", or "News (Bob)"
@@ -86,7 +93,7 @@ impl Names<'_> {
     pub(super) fn author(&self, sender: Sender, outgoing: bool) -> String {
         let mut name = self.get(sender);
         if outgoing {
-            name.push_str(" (me)");
+            name.push_str(lang::t(" (me)"));
         }
         name
     }
@@ -140,6 +147,9 @@ pub(super) struct PhotoSlot {
     pub cols: u16,
     pub rows: u16,
     pub photo: Preview,
+    /// The message it's in; a video message's plays here. 0 on a link
+    /// preview's picture, which no player draws over.
+    pub id: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -156,6 +166,8 @@ pub fn draw(
     block_gaps: bool,
     playing: Option<Playback>,
     glowing: &[(i64, Duration)],
+    inline: &mut Option<crate::video::Inline>,
+    mouse: &mut crate::mouse::Map,
 ) {
     let chat = names.chats.get(open.chat_id);
     let secret = names.chats.secret(open.chat_id);
@@ -170,8 +182,8 @@ pub fn draw(
     let room = usize::from(area.width.saturating_sub(4))
         .saturating_sub(if is_secret { super::LOCK_WIDTH } else { 0 })
         .saturating_sub(badge.map_or(0, |b| b.mark().width()));
-    let topic_name = topic.map(|t| truncate(&t.name, room.saturating_sub(TOPIC_MARKS) / 2));
-    let topic_w = topic_name.as_ref().map_or(0, |n| n.width() + TOPIC_MARKS);
+    let topic_name = topic.map(|t| truncate(&t.name, room.saturating_sub(topic_marks()) / 2));
+    let topic_w = topic_name.as_ref().map_or(0, |n| n.width() + topic_marks());
     let chat_title = names.chats.title(open.chat_id).unwrap_or_default();
     title.push(
         Span::from(truncate(chat_title, room.saturating_sub(topic_w))).style(super::title_style(
@@ -192,7 +204,7 @@ pub fn draw(
         };
         title.push(Span::from(name).fg(color).bold());
         if topic.closed {
-            title.push(Span::from(" · closed").fg(colors.muted));
+            title.push(Span::from(closed()).fg(colors.muted));
         }
     }
     title.push(Span::from(" "));
@@ -207,14 +219,12 @@ pub fn draw(
     if let Some(secret) = secret.filter(|s| s.state != SecretState::Ready) {
         let (label, color) = match secret.state {
             // A secret chat's title is the other person's name.
-            SecretState::Pending => (
-                format!(
-                    "· waiting for {} to come online ",
-                    names.chats.title(open.chat_id).unwrap_or("them")
-                ),
-                colors.warning,
-            ),
-            _ => ("· ended ".into(), colors.muted),
+            SecretState::Pending => {
+                let them = names.chats.title(open.chat_id).unwrap_or(lang::t("them"));
+                let label = lang::f("· waiting for {name} to come online ", &[("name", &them)]);
+                (label, colors.warning)
+            }
+            _ => (lang::t("· ended ").into(), colors.muted),
         };
         title.push(Span::from(label).fg(color));
     } else if let Some(doing) = chat.and_then(|c| super::activity(c, names, topic)) {
@@ -237,7 +247,7 @@ pub fn draw(
         )));
     }
     if open.loading.is_some() {
-        title.push(Span::from("· loading… "));
+        title.push(Span::from(lang::t("· loading… ")));
     }
     let border = super::border(focused, colors);
     let block = super::bordered(colors)
@@ -270,9 +280,9 @@ pub fn draw(
 
     if open.messages.is_empty() {
         let text = if open.loading.is_some() {
-            "Loading…"
+            lang::t("Loading…")
         } else {
-            "No messages yet"
+            lang::t("No messages yet")
         };
         frame.render_widget(Paragraph::new(text).fg(colors.muted).centered(), inner);
         return;
@@ -287,16 +297,23 @@ pub fn draw(
     .areas(inner);
     let show_names = chat.is_none_or(|c| !c.is_channel);
     let font = images.font_size();
+    // A video message playing inline at the bigger size reserves twice the
+    // cells each way, pushing the messages around it apart. Set by z, so it
+    // holds while the file downloads and after it played out, not only while
+    // the decoder runs.
+    let medium = inline.as_ref().filter(|i| i.medium()).map(|i| i.message_id);
     let mut laid = measure(
         open,
         names,
         show_names,
         block_gaps,
         body.width as usize,
+        body.height as usize,
         font,
         images.draws_photos(),
         colors,
         playing,
+        medium,
     );
 
     let height = body.height as usize;
@@ -377,7 +394,18 @@ pub fn draw(
         };
         super::motion::glow(frame.buffer_mut(), rows, picture, elapsed, colors);
     }
-    draw_photos(frame, pane, &photos, first, images, covered, colors);
+    draw_photos(frame, pane, &photos, first, images, inline, covered, colors);
+    // Where each visible message's rows are, for the mouse.
+    for p in &placed {
+        let start = p.start.max(first);
+        let end = p.end.min(first + shown_rows);
+        if start < end {
+            let from = pane.y + (start - first) as u16;
+            mouse
+                .message_rows
+                .push((from, pane.y + (end - first) as u16, p.id));
+        }
+    }
 
     let gutters = [shift(left), shift(right)];
     // The message being answered or edited stays marked while writing.
@@ -399,37 +427,55 @@ pub fn draw(
 /// "online", "last seen 5 minutes ago", "bot"… for a chat's title, and
 /// whether they're online. `now` is a unix timestamp.
 pub(super) fn seen_label(seen: Seen, now: i64) -> (String, bool) {
+    let long_ago = || (lang::t("last seen a long time ago").into(), false);
     let presence = match seen {
-        Seen::Bot => return ("bot".into(), false),
+        Seen::Bot => return (lang::t("bot").into(), false),
         Seen::Person(presence) => presence,
     };
     let was_online = match presence {
-        Presence::Online(until) if i64::from(until) > now => return ("online".into(), true),
+        Presence::Online(until) if i64::from(until) > now => {
+            return (lang::t("online").into(), true);
+        }
         // Telegram didn't say it again, so they went offline then.
         Presence::Online(at) | Presence::Offline(at) => i64::from(at),
-        Presence::Recently => return ("last seen recently".into(), false),
-        Presence::LastWeek => return ("last seen within a week".into(), false),
-        Presence::LastMonth => return ("last seen within a month".into(), false),
-        Presence::LongAgo => return ("last seen a long time ago".into(), false),
+        Presence::Recently => return (lang::t("last seen recently").into(), false),
+        Presence::LastWeek => {
+            return (lang::t("last seen within a week").into(), false);
+        }
+        Presence::LastMonth => {
+            return (lang::t("last seen within a month").into(), false);
+        }
+        Presence::LongAgo => return long_ago(),
     };
     let ago = (now - was_online).max(0);
     let label = match ago {
-        0..60 => "last seen just now".into(),
-        60..120 => "last seen a minute ago".into(),
-        120..3600 => format!("last seen {} minutes ago", ago / 60),
+        0..60 => lang::t("last seen just now").into(),
+        60..120 => lang::t("last seen a minute ago").into(),
+        120..3600 => lang::n(
+            ago / 60,
+            "last seen {n} minute ago",
+            "last seen {n} minutes ago",
+            &[],
+        ),
         _ => {
             let (Some(then), Some(today)) = (
                 Local.timestamp_opt(was_online, 0).single(),
                 Local.timestamp_opt(now, 0).single(),
             ) else {
-                return ("last seen a long time ago".into(), false);
+                return long_ago();
             };
             let days = (today.date_naive() - then.date_naive()).num_days();
+            let time = then.format("%H:%M");
             match days {
-                0 => format!("last seen today at {}", then.format("%H:%M")),
-                1 => format!("last seen yesterday at {}", then.format("%H:%M")),
-                _ if then.year() == today.year() => format!("last seen {}", then.format("%-d %b")),
-                _ => format!("last seen {}", then.format("%-d %b %Y")),
+                0 => lang::f("last seen today at {time}", &[("time", &time)]),
+                1 => lang::f("last seen yesterday at {time}", &[("time", &time)]),
+                _ => {
+                    let date = match then.year() == today.year() {
+                        true => lang::day_month(&then),
+                        false => lang::day_month_year(&then),
+                    };
+                    lang::f("last seen {date}", &[("date", &date)])
+                }
             }
         }
     };
@@ -458,13 +504,17 @@ fn mark(frame: &mut Frame, gutters: [Rect; 2], msg: &Placed, top: usize, color: 
 }
 
 /// Paints photos over the rows reserved for them. `SlicedImage` draws just
-/// the visible rows of a photo that's partly scrolled out.
+/// the visible rows of a photo that's partly scrolled out. A video message
+/// playing inline takes its slot: kitty's placeholder cells, which the
+/// newest frame sent after the draw lands in.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_photos(
     frame: &mut Frame,
     area: Rect,
     photos: &[PhotoSlot],
     top: usize,
     images: &mut Images,
+    inline: &mut Option<crate::video::Inline>,
     covered: bool,
     colors: &Colors,
 ) {
@@ -473,7 +523,33 @@ pub(super) fn draw_photos(
         if y >= i64::from(area.height) || y + i64::from(slot.rows) <= 0 {
             continue;
         }
-        images.want(&slot.photo, slot.cols, slot.rows);
+        if let Some(player) = inline
+            .as_mut()
+            .filter(|i| i.message_id == slot.id && i.started())
+        {
+            // The whole slot, not the part on screen: the frame is fit into
+            // it, and cells scrolled away just don't show their slices.
+            player.placement = Some((slot.cols, slot.rows));
+            let (skip, shown) = visible_rows(slot.rows, y, area.height);
+            let rect = Rect {
+                x: area.x + slot.x,
+                y: (i64::from(area.y) + y.max(0)) as u16,
+                width: slot.cols.min(area.width.saturating_sub(slot.x)),
+                height: shown,
+            };
+            if rect.height > 0 {
+                if player.in_pepper() {
+                    // Pepper's box goes over these cells, not over a popup.
+                    frame.render_widget(super::Cover, rect);
+                    player.area = (!covered).then_some(rect);
+                } else {
+                    frame.render_widget(crate::video::InlineImage { skip }, rect);
+                }
+                player.seen = true;
+            }
+            continue;
+        }
+        images.want(&slot.photo, slot.cols, slot.rows, slot.id != 0);
         // Sixel and iTerm2 images are painted from one cell outside the
         // popup, and a later repaint would cover the popup's text, which
         // isn't sent again. So under a popup they wait until it closes.
@@ -482,14 +558,14 @@ pub(super) fn draw_photos(
         }
         let position = SignedPosition::from((slot.x as i16, y as i16));
         if images.draw(frame, area, position, |i| {
-            i.get(&slot.photo, slot.cols, slot.rows)
+            i.get(&slot.photo, slot.cols, slot.rows, slot.id != 0)
         }) {
             continue;
         }
         let label = if images.is_broken(&slot.photo) {
-            "Preview unavailable"
+            lang::t("Preview unavailable")
         } else {
-            "Loading…"
+            lang::t("Loading…")
         };
         // A link preview's picture is too small to say so.
         let middle = y + i64::from(slot.rows / 2);
@@ -504,6 +580,17 @@ pub(super) fn draw_photos(
             frame.render_widget(Line::from(label).fg(colors.subtle).centered(), row);
         }
     }
+}
+
+/// The part of a photo slot's `rows` visible in a pane `height` rows tall,
+/// the slot starting at `y` (negative once its top scrolled past): the first
+/// visible row, and how many rows show. The placeholder cells kitty's
+/// protocol gives an inline player's frame must cover the slot exactly — a
+/// row without one shows nothing, cutting the frame's bottom off.
+fn visible_rows(rows: u16, y: i64, height: u16) -> (u16, u16) {
+    let skip = (-y).max(0);
+    let shown = (y + i64::from(rows)).min(i64::from(height)) - y.max(0);
+    (skip as u16, shown.max(0) as u16)
 }
 
 /// Size of a photo in cells: as wide as allowed (but not past its own pixels),
@@ -521,6 +608,33 @@ fn photo_cells(photo: &Preview, max_cols: usize, font: FontSize) -> (u16, u16) {
     if rows > limit_rows as f64 {
         rows = limit_rows as f64;
         cols = rows * fh * pw / ph / fw;
+    }
+    (cols.round().max(1.0) as u16, rows.round().max(1.0) as u16)
+}
+
+/// Cells for a video message playing inline at the bigger size: twice the
+/// thumbnail's each way, but capped together, so the box stays square in
+/// pixels (a note is round; an oblong box would squash it) and fits the
+/// pane: more rows than it has would cut the bottom off.
+fn medium_cells(
+    small_cols: u16,
+    small_rows: u16,
+    max_cols: usize,
+    pane_rows: usize,
+    font: FontSize,
+) -> (u16, u16) {
+    let (fw, fh) = (f64::from(font.width.max(1)), f64::from(font.height.max(1)));
+    // The name, the time and the gap above the bubble take rows too.
+    let limit_rows = (2 * MAX_PHOTO_ROWS).min(pane_rows.saturating_sub(3)).max(2);
+    let mut cols = f64::from(small_cols) * 2.0;
+    let mut rows = f64::from(small_rows) * 2.0;
+    if cols > max_cols as f64 {
+        cols = max_cols as f64;
+        rows = cols * fw / fh;
+    }
+    if rows > limit_rows as f64 {
+        rows = limit_rows as f64;
+        cols = rows * fh / fw;
     }
     (cols.round().max(1.0) as u16, rows.round().max(1.0) as u16)
 }
@@ -578,10 +692,15 @@ fn measure<'a>(
     show_names: bool,
     gaps: bool,
     width: usize,
+    // Rows the pane has: the bigger size of an inline player is capped to
+    // fit, so its bottom is never cut off.
+    pane_rows: usize,
     font: FontSize,
     thumbnails: bool,
     colors: &Colors,
     playing: Option<Playback>,
+    // The message whose video plays inline at twice the size, if any.
+    medium: Option<i64>,
 ) -> Laid<'a> {
     // Text width inside a bubble, after one column of padding each side.
     let max_text = (width * BUBBLE_WIDTH_PERCENT / 100)
@@ -615,7 +734,7 @@ fn measure<'a>(
         let day = time.map(|t| t.date_naive());
         let separator = (day != prev_day).then(|| {
             prev_sender = None;
-            time.map_or(String::new(), |t| t.format(" %a %-d %b %Y ").to_string())
+            time.map_or(String::new(), |t| format!(" {} ", lang::full_date(&t)))
         });
         // Like a date, it breaks a block: the sender is named again.
         let unread = Some(id) == first_unread;
@@ -638,7 +757,10 @@ fn measure<'a>(
                 .forwarded
                 .as_ref()
                 .filter(|_| album.is_none_or(|a| a.first))
-                .map(|origin| format!("Forwarded from {}", names.origin(origin))),
+                .map(|origin| {
+                    let from = lang::t("Forwarded from");
+                    format!("{from} {}", names.origin(origin))
+                }),
             quote: msg
                 .reply_to
                 .as_ref()
@@ -667,10 +789,10 @@ fn measure<'a>(
         // that didn't make it, says so under itself.
         let meta = match msg.state {
             _ if msg.state == SendState::Sent && album.is_some_and(|a| !a.last) => None,
-            SendState::Sent => Some(time.map_or(String::new(), |t| {
-                let time = t.format("%H:%M");
+            SendState::Sent => Some(time.map_or(String::new(), |at| {
+                let time = at.format("%H:%M");
                 let mut meta = if edited {
-                    format!("edited {time}")
+                    format!("{} {time}", lang::t("edited"))
                 } else {
                     time.to_string()
                 };
@@ -690,12 +812,20 @@ fn measure<'a>(
                 meta
             })),
             SendState::Pending => Some(match open.upload_progress(msg) {
-                Some(done) => format!("sending {done}%"),
-                None => "sending…".into(),
+                Some(done) => format!("{} {done}%", lang::t("sending")),
+                None => lang::t("sending…").into(),
             }),
-            SendState::Failed { .. } => Some("not sent".into()),
+            SendState::Failed { .. } => Some(lang::t("not sent").into()),
         };
-        let photo = msg.preview.as_ref().map(|p| photo_cells(p, max_text, font));
+        let photo = msg.preview.as_ref().map(|p| {
+            let (cols, rows) = photo_cells(p, max_text, font);
+            // The inline player's bigger size, capped to fit the pane.
+            if medium == Some(id) && msg.video.is_some() {
+                medium_cells(cols, rows, max_text, pane_rows, font)
+            } else {
+                (cols, rows)
+            }
+        });
         let matches = caption.map_or(Vec::new(), |c| search::find(&c.text, query));
         // An album's reactions go under it, where its time is, whichever
         // photos they're on.
@@ -799,6 +929,7 @@ fn measure<'a>(
                 cols,
                 rows,
                 photo: photo.clone(),
+                id: if msg.video.is_some() { m.id } else { 0 },
             });
         }
         // A link preview's picture sits after its bar, under the text.
@@ -814,6 +945,7 @@ fn measure<'a>(
                 cols,
                 rows,
                 photo: photo.clone(),
+                id: 0,
             });
         }
         let end = bubble_start + m.service.as_ref().map_or(m.bubble.height(), Vec::len);
@@ -911,7 +1043,7 @@ fn layout(
     colors: &Colors,
 ) -> (Vec<Line<'static>>, Vec<Placed>, Vec<PhotoSlot>) {
     let mut laid = measure(
-        open, names, show_names, gaps, width, font, true, colors, None,
+        open, names, show_names, gaps, width, 1000, font, true, colors, None, None,
     );
     let placed = laid.placed.clone();
     let photos = std::mem::take(&mut laid.photos);
@@ -976,13 +1108,13 @@ struct Measured<'a> {
 /// background of its own: a sender's name over a sticker has none, and a
 /// bubble is never as wide, so neither can pass for it.
 fn unread_line(width: usize, colors: &Colors) -> Line<'static> {
-    const LABEL: &str = " Unread messages ";
-    let side = width.saturating_sub(LABEL.width());
+    let label = lang::t(" Unread messages ");
+    let side = width.saturating_sub(label.width());
     let style = Style::new().fg(colors.primary).bg(colors.selection);
     let rule = |n| Span::styled("─".repeat(n), style);
     Line::from(vec![
         rule(side / 2),
-        Span::styled(LABEL, style.bold()),
+        Span::styled(label, style.bold()),
         rule(side - side / 2),
     ])
 }
@@ -1055,8 +1187,8 @@ fn quote(open: &OpenChat, id: i64, reply: &ReplyTo, names: &Names, colors: &Colo
         },
         None => Quote {
             name: match fetched {
-                Some(Fetched::Missing) => "Deleted message".into(),
-                _ => "Loading…".into(),
+                Some(Fetched::Missing) => lang::t("Deleted message").into(),
+                _ => lang::t("Loading…").into(),
             },
             color: None,
             text: reply.quote.clone(),
@@ -1180,10 +1312,13 @@ fn pinned_bar(
     colors: &Colors,
 ) -> Line<'static> {
     let label = match count {
-        1 => format!(" {PIN} Pinned "),
-        n => format!(" {PIN} {n} pinned "),
+        1 => format!(" {PIN} {} ", lang::t("Pinned")),
+        n => format!(
+            " {PIN} {} ",
+            lang::n(n as i64, "{n} pinned", "{n} pinned", &[])
+        ),
     };
-    let (key, more) = (" gp ", "list ");
+    let (key, more) = (" gp ", lang::t("list "));
     let room = width.saturating_sub(label.width() + key.width() + more.width() + 2);
     let snippet = truncate(&newest.snippet, room);
     let pad = room.saturating_sub(snippet.width());
@@ -2002,6 +2137,7 @@ mod tests {
             hidden: None,
             saveable: true,
             voice: None,
+            video: None,
             service: None,
             mention: false,
             unplayed: false,
@@ -2077,6 +2213,8 @@ mod tests {
                     Settings::default().block_gaps,
                     playing,
                     &[],
+                    &mut None,
+                    &mut Default::default(),
                 )
             })
             .unwrap();
@@ -2317,6 +2455,18 @@ mod tests {
         // Without a timer, nothing says so.
         chats.set_auto_delete(42, 0);
         assert!(!title(&chats).contains('🔥'));
+
+        chats.set_secret(7, secret(SecretState::Pending));
+        crate::lang::set(crate::lang::Lang::Ru);
+        let pending = title(&chats);
+        assert!(
+            pending.contains("ждём, когда Chardy появится в сети"),
+            "{pending}"
+        );
+        crate::lang::set(crate::lang::Lang::Vi);
+        let pending = title(&chats);
+        assert!(pending.contains("đang chờ Chardy trực tuyến"), "{pending}");
+        crate::lang::set(crate::lang::Lang::En);
     }
 
     #[test]
@@ -2594,6 +2744,7 @@ mod tests {
             rows,
             thumbnail: false,
             avatar: false,
+            round: false,
         };
         let red = image::RgbImage::from_pixel(80, 60, image::Rgb([255, 0, 0]));
         images.insert_ready(key, red.into());
@@ -2621,6 +2772,8 @@ mod tests {
                         true,
                         None,
                         &[],
+                        &mut None,
+                        &mut Default::default(),
                     )
                 })
                 .unwrap();
@@ -2667,6 +2820,7 @@ mod tests {
             rows: rows_,
             thumbnail: false,
             avatar: false,
+            round: false,
         };
         images.insert_ready(key, red.into());
         let buf = render_buffer(&mut open, false, &mut images);
@@ -2676,6 +2830,60 @@ mod tests {
             .filter(|c| c.bg == Color::Rgb(255, 0, 0) || c.fg == Color::Rgb(255, 0, 0))
             .count();
         assert_eq!(red_cells, 40 * 15, "the whole 40x15 photo is drawn");
+    }
+
+    #[test]
+    fn a_video_message_playing_big_reserves_twice_the_cells() {
+        let mut open = OpenChat::new(42);
+        open.messages.insert(
+            1,
+            Msg {
+                preview: Some(Preview {
+                    file_id: 7,
+                    width: 240,
+                    height: 240,
+                    thumbnail: None,
+                    sticker: false,
+                }),
+                video: Some(crate::video::Note {
+                    file_id: 7,
+                    size: 1000,
+                    duration: 10,
+                    length: 240,
+                }),
+                ..msg(false, 1_790_000_000, "")
+            },
+        );
+        let users = HashMap::new();
+        let chats = Chats::default();
+        let names = Names {
+            users: &users,
+            chats: &chats,
+        };
+        let font = images().font_size();
+        let colors = Colors::default();
+        let small = measure(
+            &open, &names, true, false, 80, 1000, font, true, &colors, None, None,
+        );
+        let big = measure(
+            &open,
+            &names,
+            true,
+            false,
+            80,
+            1000,
+            font,
+            true,
+            &colors,
+            None,
+            Some(1),
+        );
+        let (small, big) = (&small.photos[0], &big.photos[0]);
+        assert_eq!(
+            (big.cols, big.rows),
+            (small.cols * 2, small.rows * 2),
+            "twice each way"
+        );
     }
 
     #[test]
@@ -2708,6 +2916,7 @@ mod tests {
             rows,
             thumbnail: false,
             avatar: false,
+            round: false,
         };
         images.insert_ready(key, red.into());
 
@@ -2939,6 +3148,125 @@ mod tests {
         );
         assert_eq!(seen(Presence::Recently), "last seen recently");
         assert_eq!(seen_label(Seen::Bot, now), ("bot".into(), false));
+    }
+
+    #[test]
+    fn in_russian_dates_last_seen_and_edits_read_in_russian() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let now = Local
+            .with_ymd_and_hms(2026, 10, 6, 15, 0, 0)
+            .unwrap()
+            .timestamp();
+        let ago = |seconds: i64| (now - seconds) as i32;
+        let seen = |presence| seen_label(Seen::Person(presence), now).0;
+        assert_eq!(
+            seen_label(Seen::Person(Presence::Online(ago(-60))), now),
+            ("в сети".into(), true)
+        );
+        assert_eq!(
+            seen(Presence::Offline(ago(2 * 60))),
+            "был(а) 2 минуты назад"
+        );
+        assert_eq!(seen(Presence::Offline(ago(5 * 60))), "был(а) 5 минут назад");
+        assert_eq!(
+            seen(Presence::Offline(ago(3 * 3600))),
+            "был(а) сегодня в 12:00"
+        );
+        assert_eq!(
+            seen(Presence::Offline(ago(10 * 86400))),
+            "был(а) 26 сентября"
+        );
+
+        let mut open = sample();
+        open.set_edited(2);
+        open.unread_line = Some(1);
+        let rows = render(&mut open, true);
+        // 21 September 2026 was a Monday; far east of Greenwich, already the 22nd.
+        let day = Local.timestamp_opt(1_790_000_000, 0).unwrap();
+        let date = match day.day() {
+            21 => " пн, 21 сентября 2026 ",
+            _ => " вт, 22 сентября 2026 ",
+        };
+        assert!(rows.iter().any(|r| r.contains(date)), "{rows:#?}");
+        let row = |needle: &str| rows.iter().find(|r| r.contains(needle)).unwrap();
+        assert!(row("hello from me").contains("изменено "), "{rows:#?}");
+        assert!(row("─ Непрочитанные сообщения ─").contains('─'));
+        assert!(row("Неизвестный").contains('│'), "a sender's name");
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_vietnamese_dates_last_seen_and_edits_read_in_vietnamese() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let now = Local
+            .with_ymd_and_hms(2026, 10, 6, 15, 0, 0)
+            .unwrap()
+            .timestamp();
+        let ago = |seconds: i64| (now - seconds) as i32;
+        let seen = |presence| seen_label(Seen::Person(presence), now).0;
+        assert_eq!(
+            seen_label(Seen::Person(Presence::Online(ago(-60))), now),
+            ("trực tuyến".into(), true)
+        );
+        assert_eq!(
+            seen(Presence::Offline(ago(5 * 60))),
+            "truy cập 5 phút trước"
+        );
+        assert_eq!(
+            seen(Presence::Offline(ago(3 * 3600))),
+            "truy cập lúc 12:00 hôm nay"
+        );
+        assert_eq!(
+            seen(Presence::Offline(ago(10 * 86400))),
+            "truy cập ngày 26 tháng 9"
+        );
+        assert_eq!(
+            seen(Presence::Offline(ago(400 * 86400))),
+            "truy cập ngày 1 tháng 9, 2025"
+        );
+
+        let mut open = sample();
+        open.set_edited(2);
+        open.unread_line = Some(1);
+        let rows = render(&mut open, true);
+        let day = Local.timestamp_opt(1_790_000_000, 0).unwrap();
+        let date = match day.day() {
+            21 => " T2, 21 tháng 9, 2026 ",
+            _ => " T3, 22 tháng 9, 2026 ",
+        };
+        assert!(rows.iter().any(|r| r.contains(date)), "{rows:#?}");
+        let row = |needle: &str| rows.iter().find(|r| r.contains(needle)).unwrap();
+        assert!(row("hello from me").contains("đã chỉnh sửa "), "{rows:#?}");
+        assert!(row("─ Tin nhắn chưa đọc ─").contains('─'));
+        assert!(row("Không rõ").contains('│'), "a sender's name");
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn the_pinned_bar_counts_its_messages_in_the_language_set() {
+        let newest = crate::pins::Pinned {
+            id: 1,
+            sender: Sender::User(1),
+            outgoing: false,
+            date: 0,
+            snippet: "see you".into(),
+        };
+        let bar = |count| -> String {
+            let line = pinned_bar(&newest, count, 60, &Colors::default());
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        assert!(bar(1).starts_with(" 📌 Pinned see you"), "{}", bar(1));
+        assert!(bar(3).starts_with(" 📌 3 pinned see you"), "{}", bar(3));
+        crate::lang::set(crate::lang::Lang::Ru);
+        assert!(bar(21).starts_with(" 📌 Закреплено: 21 see"), "{}", bar(21));
+        crate::lang::set(crate::lang::Lang::Vi);
+        assert!(bar(1).starts_with(" 📌 Tin nhắn đã ghim see"), "{}", bar(1));
+        assert!(
+            bar(3).starts_with(" 📌 3 tin nhắn đã ghim see"),
+            "{}",
+            bar(3)
+        );
+        crate::lang::set(crate::lang::Lang::En);
     }
 
     #[test]
@@ -3722,6 +4050,8 @@ mod tests {
                     true,
                     None,
                     &[],
+                    &mut None,
+                    &mut Default::default(),
                 )
             })
             .unwrap();
@@ -3766,6 +4096,8 @@ mod tests {
                     true,
                     None,
                     &[(2, Duration::ZERO)],
+                    &mut None,
+                    &mut Default::default(),
                 )
             })
             .unwrap();
@@ -3819,6 +4151,8 @@ mod tests {
                     None,
                     // The first photo came first; the caption is the last's.
                     &[(1, Duration::ZERO)],
+                    &mut None,
+                    &mut Default::default(),
                 )
             })
             .unwrap();
@@ -3880,5 +4214,19 @@ mod tests {
         let day1 = Local.timestamp_opt(1_790_000_000, 0).unwrap();
         let date = day1.format("%a %-d %b %Y").to_string();
         assert_eq!(rows.iter().filter(|r| r.contains(&date)).count(), 1);
+    }
+
+    #[test]
+    fn an_inline_players_visible_rows_cover_the_whole_slot() {
+        // All of it: nothing scrolled away, nothing past the bottom.
+        assert_eq!(visible_rows(20, 8, 40), (0, 20));
+        // The slot fills the pane from its top row.
+        assert_eq!(visible_rows(20, 0, 40), (0, 20));
+        // Five rows scrolled past the top: the rest shows.
+        assert_eq!(visible_rows(20, -5, 40), (5, 15));
+        // Only up to the pane's bottom row.
+        assert_eq!(visible_rows(20, 30, 40), (0, 10));
+        // Scrolled past the top and reaching past the bottom at once.
+        assert_eq!(visible_rows(60, -5, 40), (5, 40));
     }
 }

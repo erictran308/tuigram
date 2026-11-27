@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::lang;
 use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, ImageFormat, RgbaImage};
@@ -159,8 +160,10 @@ impl Clipboard {
 
 fn read(outbox: &Path) -> Result<Paste, String> {
     // A clipboard of its own, as this runs on another thread.
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|e| format!("Can't reach the clipboard: {e}"))?;
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| {
+        let cant = lang::t("Can't reach the clipboard");
+        format!("{cant}: {e}")
+    })?;
     if let Ok(files) = clipboard.get().file_list()
         && !files.is_empty()
     {
@@ -172,14 +175,15 @@ fn read(outbox: &Path) -> Result<Paste, String> {
             image.height as u32,
             image.bytes.into_owned(),
         )
-        .ok_or("The image on the clipboard is broken")?;
-        return save_image(image, outbox)
-            .map(Paste::Image)
-            .map_err(|e| format!("Can't save the image: {e}"));
+        .ok_or(lang::t("The image on the clipboard is broken"))?;
+        return save_image(image, outbox).map(Paste::Image).map_err(|e| {
+            let cant = lang::t("Can't save the image");
+            format!("{cant}: {e}")
+        });
     }
     match clipboard.get_text() {
         Ok(text) if !text.is_empty() => Ok(Paste::Text(text)),
-        _ => Err("Nothing to paste: the clipboard is empty".into()),
+        _ => Err(lang::t("Nothing to paste: the clipboard is empty").into()),
     }
 }
 

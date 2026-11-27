@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::lang;
 use crate::{attach, text};
 
 /// Telegram API credentials from https://my.telegram.org. Release binaries
@@ -119,6 +120,33 @@ fn prepare(dir: &Path) -> Result<PathBuf> {
     std::path::absolute(dir).with_context(|| format!("cannot find {shown}"))
 }
 
+/// A folder of tuigram's own in `parent`, named after `prefix`: made new,
+/// never one that's already there, and readable only by the user. In a
+/// shared `/tmp` or `/dev/shm`, a folder someone else made in advance could
+/// hold links that files would be written through, onto the user's own.
+pub fn new_private_dir(parent: &Path, prefix: &str) -> Result<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    for attempt in 0..100 {
+        let dir = parent.join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+                }
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!("can't make a folder in {}", parent.display())
+}
+
 /// A file the user put in the data folder (a theme, a sound), whole. Links
 /// are followed, but only to a plain file of at most `max` bytes: a link to
 /// `/dev/zero` or a pipe would otherwise hang tuigram, or fill its memory.
@@ -126,12 +154,13 @@ pub fn read_small(path: &Path, max: u64) -> std::result::Result<Vec<u8>, String>
     use std::io::Read;
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_file() {
-        return Err("not a file".into());
+        return Err(lang::t("not a file").into());
     }
     if meta.len() > max {
+        let bigger = lang::t("bigger than");
         return Err(match max >> 20 {
-            0 => format!("bigger than {} KB", max >> 10),
-            mb => format!("bigger than {mb} MB"),
+            0 => format!("{bigger} {} {}", max >> 10, lang::t("KB")),
+            mb => format!("{bigger} {mb} {}", lang::t("MB")),
         });
     }
     let mut bytes = Vec::new();
@@ -193,6 +222,22 @@ fn var(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_private_folder_is_new_and_only_the_users() {
+        let parent = std::env::temp_dir();
+        let a = new_private_dir(&parent, "tuigram-test").unwrap();
+        let b = new_private_dir(&parent, "tuigram-test").unwrap();
+        assert_ne!(a, b, "never one that's there already");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        std::fs::remove_dir(&a).unwrap();
+        std::fs::remove_dir(&b).unwrap();
+    }
 
     #[test]
     fn a_data_folder_on_another_machine_is_refused() {

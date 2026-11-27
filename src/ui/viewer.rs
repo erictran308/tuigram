@@ -10,6 +10,7 @@ use ratatui_image::sliced::SignedPosition;
 
 use super::{Cover, popup_block};
 use crate::images::Images;
+use crate::lang;
 use crate::messages::Preview;
 use crate::theme::Colors;
 use crate::viewer::{PhotoView, SIZES};
@@ -34,13 +35,13 @@ pub(super) fn draw(
     );
     let (cols, rows) = (shot.cols, shot.rows);
     // The largest photo, and the bubble's until that's downloaded.
-    images.want(&view.photo, cols, rows);
+    images.want(&view.photo, cols, rows, false);
     let stand_in = view
         .stand_in
         .clone()
         .filter(|_| !images.downloaded(&view.photo));
     if let Some(stand_in) = &stand_in {
-        images.want(stand_in, cols, rows);
+        images.want(stand_in, cols, rows, false);
     }
     let sharp = std::iter::once(&view.photo)
         .chain(&stand_in)
@@ -61,14 +62,14 @@ pub(super) fn draw(
     }
     if !ready && !failed {
         title.push(Span::from(" · "));
-        title.push(Span::from("loading…").fg(colors.accent).bold());
+        title.push(Span::from(lang::t("loading…")).fg(colors.accent).bold());
     } else if failed && !broken {
-        title.push(Span::from(" · only its thumbnail").fg(colors.subtle));
+        title.push(Span::from(lang::t(" · only its thumbnail")).fg(colors.subtle));
     }
     title.push(Span::from(" "));
     let block = popup_block(
         Line::from(title),
-        " `h/l` older/newer · `j/k` zoom in/out · `o` open in its app · `Esc` close ",
+        lang::t(" `h/l` older/newer · `j/k` zoom in/out · `o` open in its app · `Esc` close "),
         colors,
     );
     frame.render_widget(block, area);
@@ -82,15 +83,15 @@ pub(super) fn draw(
         return;
     }
     if let Some(stand_in) = &stand_in
-        && images.draw(frame, inner, at, |i| i.get(stand_in, cols, rows))
+        && images.draw(frame, inner, at, |i| i.get(stand_in, cols, rows, false))
     {
         return;
     }
     // Nothing of the size before stays while this one gets ready: the
     // words in the middle, where the eyes are, say the key was taken.
     let label = match broken {
-        true => Line::from("Can't show this photo").fg(colors.subtle),
-        false => Line::from("Loading…").fg(colors.accent).bold(),
+        true => Line::from(lang::t("Can't show this photo")).fg(colors.subtle),
+        false => Line::from(lang::t("Loading…")).fg(colors.accent).bold(),
     };
     let middle = Rect {
         y: inner.y + inner.height / 2,
@@ -224,6 +225,7 @@ mod tests {
                 id: 1,
                 label: "Photo".into(),
                 photo: true,
+                downloaded: false,
             },
             cant_copy: None,
             zoom: None,
@@ -237,6 +239,7 @@ mod tests {
             rows: shot.rows,
             thumbnail: false,
             avatar: false,
+            round: false,
         };
         images.insert_ready(key, DynamicImage::new_rgb8(20, 10));
         let ready = title(&mut view, &mut images);
@@ -269,6 +272,7 @@ mod tests {
                 id: 1,
                 label: "File: IMG_2041.PNG".into(),
                 photo: false,
+                downloaded: false,
             },
             cant_copy: None,
             zoom: None,

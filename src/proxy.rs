@@ -7,6 +7,8 @@
 use tdlib_rs::enums::ProxyType;
 use tdlib_rs::types::{Proxy, ProxyTypeHttp, ProxyTypeMtproto, ProxyTypeSocks5};
 
+use crate::lang;
+
 /// Hosts that serve Telegram's own links.
 const TELEGRAM_HOSTS: [&str; 3] = ["t.me", "telegram.me", "telegram.dog"];
 /// Longest host name DNS allows.
@@ -48,7 +50,7 @@ pub fn parse(link: &str) -> Result<Proxy, String> {
             }),
         });
     }
-    Err(NOT_A_PROXY.into())
+    Err(not_a_proxy())
 }
 
 /// The proxy a Telegram proxy link's query (after the `?`) gives.
@@ -68,7 +70,7 @@ fn telegram_proxy(kind: Kind, query: &str) -> Result<Proxy, String> {
         Kind::Mtproto => {
             let secret = get("secret")?;
             if secret.is_empty() {
-                return Err("The link has no secret".into());
+                return Err(lang::t("The link has no secret").into());
             }
             ProxyType::Mtproto(ProxyTypeMtproto {
                 secret: mtproto_secret(secret)?,
@@ -95,7 +97,10 @@ pub fn is_link(url: &str) -> bool {
 /// The proxy in words, without its password or secret, e.g.
 /// "SOCKS5 proxy 10.0.0.1:1080".
 pub fn describe(proxy: &Proxy) -> String {
-    format!("{} proxy {}", kind(proxy), address(proxy))
+    lang::f(
+        "{kind} proxy {address}",
+        &[("kind", &kind(proxy)), ("address", &address(proxy))],
+    )
 }
 
 /// What kind of proxy it is: "SOCKS5", "HTTP" or "MTProto".
@@ -160,8 +165,10 @@ pub fn masked(link: &str) -> String {
     link.to_string()
 }
 
-const NOT_A_PROXY: &str =
-    "Not a proxy link: give socks5://host:port, http://host:port or a t.me/proxy link";
+fn not_a_proxy() -> String {
+    lang::t("Not a proxy link: give socks5://host:port, http://host:port or a t.me/proxy link")
+        .into()
+}
 
 enum Kind {
     Mtproto,
@@ -208,7 +215,7 @@ fn telegram_link<'a>(link: &'a str, lower: &str) -> Option<(Kind, &'a str)> {
 fn authority(rest: &str) -> Result<(String, String, String, i32), String> {
     let rest = rest.trim_end_matches('/');
     if rest.contains(['/', '?', '#']) {
-        return Err(NOT_A_PROXY.into());
+        return Err(not_a_proxy());
     }
     let (login, place) = match rest.rsplit_once('@') {
         Some((login, place)) => (Some(login), place),
@@ -229,7 +236,7 @@ fn authority(rest: &str) -> Result<(String, String, String, i32), String> {
         Some(v6) => {
             let (server, after) = v6
                 .split_once(']')
-                .ok_or("A [ in the address isn't closed")?;
+                .ok_or(lang::t("A [ in the address isn't closed"))?;
             (server, after.strip_prefix(':').unwrap_or_default())
         }
         None => place.rsplit_once(':').unwrap_or((place, "")),
@@ -242,10 +249,10 @@ fn authority(rest: &str) -> Result<(String, String, String, i32), String> {
 fn host(text: &str) -> Result<String, String> {
     let ok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':');
     if text.is_empty() {
-        return Err("The link has no server".into());
+        return Err(lang::t("The link has no server").into());
     }
     if text.len() > MAX_HOST || !text.chars().all(ok) {
-        return Err("The server isn't a host name or an address".into());
+        return Err(lang::t("The server isn't a host name or an address").into());
     }
     Ok(text.to_string())
 }
@@ -253,8 +260,8 @@ fn host(text: &str) -> Result<String, String> {
 fn port(text: &str) -> Result<i32, String> {
     match text.parse::<u16>() {
         Ok(port) if port > 0 => Ok(port.into()),
-        _ if text.is_empty() => Err("The link has no port, as in host:1080".into()),
-        _ => Err("The port must be a number from 1 to 65535".into()),
+        _ if text.is_empty() => Err(lang::t("The link has no port, as in host:1080").into()),
+        _ => Err(lang::t("The port must be a number from 1 to 65535").into()),
     }
 }
 
@@ -262,7 +269,7 @@ fn port(text: &str) -> Result<i32, String> {
 /// not too long.
 fn secret_text(text: String) -> Result<String, String> {
     if text.len() > MAX_SECRET || text.chars().any(char::is_control) {
-        return Err("The link's user name, password or secret can't be used".into());
+        return Err(lang::t("The link's user name, password or secret can't be used").into());
     }
     Ok(text)
 }
@@ -284,11 +291,11 @@ fn mtproto_secret(text: String) -> Result<String, String> {
     let bytes = hex(&text)
         .or_else(|| URL_SAFE.decode(&text).ok())
         .or_else(|| base64::engine::general_purpose::STANDARD.decode(&text).ok())
-        .ok_or("The proxy's secret isn't hex or base64")?;
+        .ok_or(lang::t("The proxy's secret isn't hex or base64"))?;
     match (bytes.len(), bytes.first()) {
         (16, _) | (17, Some(0xdd)) => Ok(text),
         (18.., Some(0xee)) if bytes.len() <= 17 + MAX_SECRET_DOMAIN => Ok(text),
-        _ => Err("The proxy's secret isn't one Telegram's proxies use".into()),
+        _ => Err(lang::t("The proxy's secret isn't one Telegram's proxies use").into()),
     }
 }
 
@@ -317,7 +324,7 @@ fn decode(text: &str, query: bool) -> Result<String, String> {
                     .get(i + 1..i + 3)
                     .and_then(hex)
                     .and_then(|byte| byte.first().copied())
-                    .ok_or("A % in the link isn't followed by two hex digits")?;
+                    .ok_or(lang::t("A % in the link isn't followed by two hex digits"))?;
                 out.push(byte);
                 i += 3;
             }
@@ -331,7 +338,7 @@ fn decode(text: &str, query: bool) -> Result<String, String> {
             }
         }
     }
-    String::from_utf8(out).map_err(|_| "The link isn't valid text".into())
+    String::from_utf8(out).map_err(|_| lang::t("The link isn't valid text").into())
 }
 
 #[cfg(test)]
@@ -505,5 +512,31 @@ mod tests {
         );
         assert!(why("not a secret!").contains("isn't hex or base64"));
         assert_eq!(hex("+1"), None, "a sign isn't a digit");
+    }
+
+    #[test]
+    fn in_russian_a_link_that_cant_be_used_says_why_in_russian() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let why = |link| parse(link).unwrap_err();
+        assert!(why("https://example.com").starts_with("Это не ссылка на прокси"));
+        assert_eq!(
+            why("socks5://host:99999"),
+            "Порт должен быть числом от 1 до 65535"
+        );
+        let proxy = parse("socks5://10.0.0.1:1080").unwrap();
+        assert_eq!(describe(&proxy), "прокси SOCKS5 10.0.0.1:1080");
+    }
+
+    #[test]
+    fn in_vietnamese_a_link_that_cant_be_used_says_why_in_vietnamese() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let why = |link| parse(link).unwrap_err();
+        assert!(why("https://example.com").starts_with("Không phải liên kết proxy"));
+        assert_eq!(
+            why("socks5://host:99999"),
+            "Cổng phải là một số từ 1 đến 65535"
+        );
+        let proxy = parse("socks5://10.0.0.1:1080").unwrap();
+        assert_eq!(describe(&proxy), "proxy SOCKS5 10.0.0.1:1080");
     }
 }

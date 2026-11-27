@@ -17,6 +17,7 @@ use crate::buttons::Keyboard;
 use crate::chats::content_text_as_sent;
 use crate::complete::Commands;
 use crate::images::Thumbnail;
+use crate::lang;
 use crate::pins::Pinned;
 use crate::poll::Poll;
 use crate::reactions::{self, Reaction, ReactionKind};
@@ -175,6 +176,20 @@ impl Preview {
         })
     }
 
+    /// A video note's still thumbnail: the note is square, `length` pixels
+    /// across, and so is its preview.
+    fn from_video_note(note: &types::VideoNote) -> Option<Self> {
+        let thumbnail = note.thumbnail.as_ref().filter(|t| decodable(&t.format))?;
+        let side = note.length.max(1) as u32;
+        Some(Self {
+            file_id: thumbnail.file.id,
+            width: side,
+            height: side,
+            thumbnail: decode_minithumbnail(note.minithumbnail.as_ref()),
+            sticker: false,
+        })
+    }
+
     /// An image sent as a file, small: the thumbnail its sender's app made
     /// (up to 320 px), not the file, which can be tens of MB.
     fn from_document(document: &types::Document) -> Option<Self> {
@@ -298,6 +313,8 @@ pub struct Msg {
     pub saveable: bool,
     /// A voice message, which Enter plays.
     pub voice: Option<Voice>,
+    /// A video message the terminal plays itself; see [`crate::video`].
+    pub video: Option<crate::video::Note>,
     /// What happened in the chat, when it's a service message: drawn in the
     /// middle, like a date, not in a bubble.
     pub service: Option<Service>,
@@ -360,7 +377,7 @@ impl Msg {
         match &self.file {
             _ if !text.is_empty() => text,
             Some(file) => file.label.clone(),
-            None => "Message".into(),
+            None => lang::t("Message").into(),
         }
     }
 
@@ -722,6 +739,8 @@ pub struct MediaFile {
     pub label: String,
     /// A photo: copied as an image, not as a file.
     pub photo: bool,
+    /// It's on this computer already, so it opens and shows at once.
+    pub downloaded: bool,
 }
 
 /// An image sent as a file, uncompressed. Its bubble shows its picture like
@@ -752,6 +771,8 @@ struct Body {
     /// The media shown only while it's open, when it's that.
     hidden: Option<Hidden>,
     voice: Option<Voice>,
+    /// A video message the terminal plays itself; see [`crate::video`].
+    video: Option<crate::video::Note>,
 }
 
 /// The message as the bubble shows it. A photo or video shown only while
@@ -777,7 +798,12 @@ fn shown_while_open(content: &MessageContent) -> bool {
 
 /// Where media seen only while open, which tuigram can't show that way,
 /// can be.
-pub const ON_PHONE: &str = "watch it in Telegram on your phone";
+pub const ON_PHONE: &str = lang::key("watch it in Telegram on your phone");
+
+/// [`ON_PHONE`] in the language set.
+pub fn on_phone() -> &'static str {
+    lang::t(ON_PHONE)
+}
 
 /// Media that expired: a view-once photo once it was opened.
 fn expired(content: &MessageContent) -> bool {
@@ -810,13 +836,15 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
         formatted: false,
         hidden: None,
         voice: None,
+        video: None,
         image_file: None,
     };
-    let file = |id: i32, label: String| {
+    let file = |id: i32, label: String, downloaded: bool| {
         Some(MediaFile {
             id,
             label,
             photo: false,
+            downloaded,
         })
     };
     // The text or caption whose links count.
@@ -831,20 +859,23 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
     };
     match content {
         C::MessagePhoto(m) if cover && m.is_secret => {
-            body.text = labeled("[Photo · Enter to view]".into(), &m.caption);
+            let label = lang::t("[Photo · Enter to view]");
+            body.text = labeled(label.into(), &m.caption);
             source = Some(&m.caption);
         }
         // Only another app could play these, and it would keep them.
         C::MessageVideo(m) if m.is_secret => {
-            body.text = labeled(format!("[Video · {ON_PHONE}]"), &m.caption);
+            let video = lang::t("Video");
+            body.text = labeled(format!("[{video} · {}]", on_phone()), &m.caption);
             source = Some(&m.caption);
         }
         C::MessageAnimation(m) if m.is_secret => {
-            body.text = labeled(format!("[GIF · {ON_PHONE}]"), &m.caption);
+            body.text = labeled(format!("[GIF · {}]", on_phone()), &m.caption);
             source = Some(&m.caption);
         }
         C::MessageVideoNote(m) if m.is_secret => {
-            body.text = format!("[Video message · {ON_PHONE}]");
+            let note = lang::t("Video message");
+            body.text = format!("[{note} · {}]", on_phone());
         }
         C::MessageText(m) => {
             source = Some(&m.text);
@@ -864,8 +895,10 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             body.photo = Preview::largest(&m.photo).filter(|_| !m.is_secret);
             body.file = body.photo.as_ref().map(|p| MediaFile {
                 id: p.file_id,
-                label: "Photo".into(),
+                label: lang::t("Photo").into(),
                 photo: true,
+                downloaded: largest(&m.photo)
+                    .is_some_and(|s| s.photo.local.is_downloading_completed),
             });
             source = Some(&m.caption);
         }
@@ -880,22 +913,35 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
                     body.text = format!("{}\n{}", body.text, m.caption.text);
                 }
             }
-            let label = format!("Video {}", duration(m.video.duration));
-            body.file = file(m.video.video.id, label);
+            let video = lang::t("Video");
+            let label = format!("{video} {}", duration(m.video.duration));
+            body.file = file(
+                m.video.video.id,
+                label,
+                m.video.video.local.is_downloading_completed,
+            );
             source = Some(&m.caption);
         }
         C::MessageAnimation(m) => {
             body.editable = Editable::Caption {
                 above: m.show_caption_above_media,
             };
-            body.file = file(m.animation.animation.id, "GIF".into());
+            body.file = file(
+                m.animation.animation.id,
+                "GIF".into(),
+                m.animation.animation.local.is_downloading_completed,
+            );
             source = Some(&m.caption);
         }
         C::MessageDocument(m) => {
             body.editable = Editable::Caption { above: false };
             let d = &m.document;
             let name = text::clean(&d.file_name);
-            body.file = file(d.document.id, format!("File: {name}"));
+            body.file = file(
+                d.document.id,
+                format!("{}: {name}", lang::t("File")),
+                d.document.local.is_downloading_completed,
+            );
             if let Some(preview) = Preview::from_document(d).filter(|_| is_picture(d)) {
                 body.text = m.caption.text.clone();
                 body.photo = has_extension(&d.file_name, VIEWED_EXTENSIONS)
@@ -919,12 +965,20 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             } else {
                 &a.title
             };
-            body.file = file(a.audio.id, format!("Audio: {}", text::clean(name)));
+            body.file = file(
+                a.audio.id,
+                format!("{}: {}", lang::t("Audio"), text::clean(name)),
+                a.audio.local.is_downloading_completed,
+            );
             body.editable = Editable::Caption { above: false };
             source = Some(&m.caption);
         }
         C::MessageVoiceNote(m) => {
-            body.file = file(m.voice_note.voice.id, "Voice message".into());
+            body.file = file(
+                m.voice_note.voice.id,
+                lang::t("Voice message").into(),
+                m.voice_note.voice.local.is_downloading_completed,
+            );
             body.editable = Editable::Caption { above: false };
             source = Some(&m.caption);
             let voice = Voice::new(&m.voice_note, m.is_listened);
@@ -934,7 +988,17 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
                 body.voice = Some(voice);
             }
         }
-        C::MessageVideoNote(m) => body.file = file(m.video_note.video.id, "Video message".into()),
+        C::MessageVideoNote(m) => {
+            body.file = file(
+                m.video_note.video.id,
+                lang::t("Video message").into(),
+                m.video_note.video.local.is_downloading_completed,
+            );
+            body.preview = Preview::from_video_note(&m.video_note);
+            body.video = Some(crate::video::Note::new(&m.video_note));
+            // Its length before the label, as a video's bubble has it.
+            body.text = format!("▶ {} {}", duration(m.video_note.duration), body.text);
+        }
         C::MessagePoll(m) => {
             let poll = Poll::new(&m.poll);
             body.text = poll.text();
@@ -946,7 +1010,11 @@ fn body_as(content: &MessageContent, cover: bool) -> Body {
             if body.preview.is_some() {
                 body.text = String::new();
             }
-            body.file = file(m.sticker.sticker.id, "Sticker".into());
+            body.file = file(
+                m.sticker.sticker.id,
+                lang::t("Sticker").into(),
+                m.sticker.sticker.local.is_downloading_completed,
+            );
         }
         _ => {}
     }
@@ -1213,6 +1281,7 @@ impl From<Message> for Msg {
             hidden: body.hidden,
             saveable: message.can_be_saved,
             voice: body.voice,
+            video: body.video,
             image_file: body.image_file,
             service,
             mention: message.contains_unread_mention,
@@ -1433,10 +1502,10 @@ impl OpenChat {
     pub fn cant_edit(&self, id: i64) -> Option<&'static str> {
         let msg = self.messages.get(&id)?;
         match msg.state {
-            SendState::Pending => Some("Wait until it's sent"),
-            SendState::Failed { .. } => Some("This message wasn't sent"),
+            SendState::Pending => Some(lang::t("Wait until it's sent")),
+            SendState::Failed { .. } => Some(lang::t("This message wasn't sent")),
             SendState::Sent if msg.editable == Editable::No => {
-                Some("This message has no text to edit")
+                Some(lang::t("This message has no text to edit"))
             }
             SendState::Sent => None,
         }
@@ -1589,19 +1658,19 @@ impl OpenChat {
     /// Where `gd` goes from the message under the cursor: (the reply, the
     /// message it answers), or why it can't go anywhere.
     pub fn replied_jump(&self) -> Result<(i64, i64), &'static str> {
-        let from = self.cursor_id().ok_or("No message selected")?;
+        let from = self.cursor_id().ok_or(lang::t("No message selected"))?;
         let reply = self
             .messages
             .get(&from)
             .and_then(|m| m.reply_to.as_ref())
-            .ok_or("Not a reply")?;
+            .ok_or(lang::t("Not a reply"))?;
         let to = reply
             .message_id
-            .ok_or("It answers a message in another chat")?;
+            .ok_or(lang::t("It answers a message in another chat"))?;
         if !self.messages.contains_key(&to)
             && matches!(self.replied.get(&from), Some(Fetched::Missing))
         {
-            return Err("The message it answers was deleted");
+            return Err(lang::t("The message it answers was deleted"));
         }
         Ok((from, to))
     }
@@ -1927,13 +1996,14 @@ impl OpenChat {
         }
     }
 
-    /// Playing voice message `id` is to tell its sender: it's someone
-    /// else's, sent, and not played before.
+    /// Playing voice or video message `id` is to tell its sender: it's
+    /// someone else's, sent, and not played before.
     pub fn tells(&self, id: i64) -> bool {
         self.messages.get(&id).is_some_and(|msg| {
             !msg.outgoing
                 && msg.state == SendState::Sent
-                && msg.voice.as_ref().is_some_and(|v| !v.listened)
+                && (msg.voice.as_ref().is_some_and(|v| !v.listened)
+                    || (msg.video.is_some() && msg.unplayed))
         })
     }
 
@@ -2108,6 +2178,68 @@ pub(crate) mod tests {
             (10, "Video 1:05"),
             "Enter opens the video itself"
         );
+    }
+
+    #[test]
+    fn a_video_message_says_how_long_it_is_before_its_label() {
+        let note = |is_secret| {
+            MessageContent::MessageVideoNote(types::MessageVideoNote {
+                video_note: types::VideoNote {
+                    duration: 28,
+                    waveform: String::new(),
+                    length: 400,
+                    minithumbnail: None,
+                    thumbnail: None,
+                    speech_recognition_result: None,
+                    video: types::File {
+                        id: 11,
+                        ..Default::default()
+                    },
+                },
+                is_viewed: false,
+                is_secret,
+            })
+        };
+        assert_eq!(body(&note(false)).text, "▶ 0:28 [Video message]");
+        // One seen only while open isn't played here.
+        assert!(!body(&note(true)).text.contains('▶'));
+    }
+
+    #[test]
+    fn in_russian_media_are_named_in_russian() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let file = body(&video(ThumbnailFormat::Jpeg, "")).file.unwrap();
+        assert_eq!(file.label, "Видео 1:05");
+        assert_eq!(body(&video(ThumbnailFormat::Mpeg4, "")).text, "[Видео]");
+        let covered = body(&secret_photo("тебе"));
+        assert_eq!(covered.text, "[Фото · Enter — открыть]\nтебе");
+        let mut secret_video = video(ThumbnailFormat::Jpeg, "");
+        if let MessageContent::MessageVideo(v) = &mut secret_video {
+            v.is_secret = true;
+        }
+        assert_eq!(
+            body(&secret_video).text,
+            "[Видео · смотрите в Telegram на телефоне]"
+        );
+        crate::lang::set(crate::lang::Lang::En);
+    }
+
+    #[test]
+    fn in_vietnamese_media_are_named_in_vietnamese() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let file = body(&video(ThumbnailFormat::Jpeg, "")).file.unwrap();
+        assert_eq!(file.label, "Video 1:05");
+        let covered = body(&secret_photo("gửi bạn"));
+        assert_eq!(covered.text, "[Ảnh · Enter để xem]\ngửi bạn");
+        let mut secret_video = video(ThumbnailFormat::Jpeg, "");
+        if let MessageContent::MessageVideo(v) = &mut secret_video {
+            v.is_secret = true;
+        }
+        assert_eq!(
+            body(&secret_video).text,
+            "[Video · xem trong Telegram trên điện thoại]"
+        );
+        crate::lang::set(crate::lang::Lang::En);
     }
 
     #[test]
@@ -2800,6 +2932,7 @@ pub(crate) mod tests {
                     hidden: None,
                     saveable: true,
                     voice: None,
+                    video: None,
                     service: None,
                     mention: false,
                     unplayed: false,
@@ -2922,6 +3055,7 @@ pub(crate) mod tests {
             id: 3,
             label: "Photo".into(),
             photo: true,
+            downloaded: false,
         });
         assert_eq!(msg.snippet(), "Photo", "a photo without a caption");
     }
@@ -2934,6 +3068,7 @@ pub(crate) mod tests {
             id: 5,
             label: "File: map.pdf".into(),
             photo: false,
+            downloaded: false,
         });
         let mut file = types::File {
             id: 5,

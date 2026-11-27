@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{border, hint_spans, truncate};
 use crate::images::Images;
+use crate::lang;
 use crate::reactions;
 use crate::stickers::StickerPanel;
 use crate::theme::Colors;
@@ -49,16 +50,17 @@ pub fn draw(
     colors: &Colors,
 ) {
     let mut block = super::bordered(colors)
-        .title(" Stickers ")
+        .title(lang::t(" Stickers "))
         .border_style(border(true, colors));
     if let Some(shown) = panel.shown().filter(|s| !s.is_empty())
         && let Some(current) = panel.current()
     {
         // Which sticker the cursor is on, by its emoji, and how far along.
         let place = format!(
-            " {} {} of {} ",
+            " {} {} {} {} ",
             reactions::shown(&current.emoji),
             panel.selected + 1,
+            lang::t("of"),
             shown.len()
         );
         block = block.title_bottom(Line::from(place).fg(colors.muted));
@@ -69,13 +71,13 @@ pub fn draw(
     frame.render_widget(top_line(panel, top.width as usize, colors), top);
 
     let message = if panel.is_empty() && panel.query.is_none() {
-        Some("No stickers yet · `/` finds some by emoji or word")
+        Some(lang::t("No stickers yet · `/` finds some by emoji or word"))
     } else {
         match panel.shown() {
-            None if panel.search_query().is_some() => Some("Searching…"),
-            None => Some("Loading…"),
-            Some([]) if panel.search_query().is_some() => Some("No stickers found"),
-            Some([]) => Some("No stickers in this set"),
+            None if panel.search_query().is_some() => Some(lang::t("Searching…")),
+            None => Some(lang::t("Loading…")),
+            Some([]) if panel.search_query().is_some() => Some(lang::t("No stickers found")),
+            Some([]) => Some(lang::t("No stickers in this set")),
             Some(_) => None,
         }
     };
@@ -180,9 +182,11 @@ fn draw_grid(
             ..slot
         };
         if pictures && let Some(preview) = &sticker.preview {
-            images.want(preview, cols, IMAGE_ROWS);
+            images.want(preview, cols, IMAGE_ROWS, false);
             let at = SignedPosition::from((0, 0));
-            if images.draw(frame, picture, at, |i| i.get(preview, cols, IMAGE_ROWS)) {
+            if images.draw(frame, picture, at, |i| {
+                i.get(preview, cols, IMAGE_ROWS, false)
+            }) {
                 continue;
             }
         }

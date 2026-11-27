@@ -7,7 +7,8 @@ use std::ops::Range;
 use chrono::{Local, NaiveDate, TimeZone};
 use tdlib_rs::enums::SearchMessagesFilter;
 
-use crate::messages::Sender;
+use crate::lang;
+use crate::messages::{Msg, Sender};
 use crate::tg::Found;
 
 /// What a `/` search in a chat asks TDLib for: its words, and the filters
@@ -50,19 +51,22 @@ pub enum Has {
     File,
     Link,
     Voice,
+    /// A video message: the round ones.
+    Note,
     Gif,
     Audio,
 }
 
 impl Has {
     /// Every kind, by the word `has:` takes.
-    pub const ALL: [(&'static str, Has); 8] = [
+    pub const ALL: [(&'static str, Has); 9] = [
         ("photo", Has::Photo),
         ("video", Has::Video),
         ("media", Has::Media),
         ("file", Has::File),
         ("link", Has::Link),
         ("voice", Has::Voice),
+        ("note", Has::Note),
         ("gif", Has::Gif),
         ("audio", Has::Audio),
     ];
@@ -75,6 +79,7 @@ impl Has {
             Has::File => SearchMessagesFilter::Document,
             Has::Link => SearchMessagesFilter::Url,
             Has::Voice => SearchMessagesFilter::VoiceNote,
+            Has::Note => SearchMessagesFilter::VideoNote,
             Has::Gif => SearchMessagesFilter::Animation,
             Has::Audio => SearchMessagesFilter::Audio,
         }
@@ -96,18 +101,23 @@ pub fn parse(typed: &str) -> Result<Query, String> {
             words.push(token);
             continue;
         };
+        let value = &token[key.len()..];
         if seen.contains(&key) {
-            return Err(format!("Only one {key} at a time"));
+            return Err(lang::f("Only one {key} at a time", &[("key", &key)]));
         }
         seen.push(key);
-        let value = &token[key.len()..];
         match key {
+            // `from:this` is everyone in the chat the search is in: no
+            // sender filter at all.
+            "from:" if value.eq_ignore_ascii_case("this") => {}
             "from:" => query.from = Some(who(value)?),
             "has:" => {
                 let kind = Has::ALL
                     .into_iter()
                     .find(|(name, _)| value.eq_ignore_ascii_case(name))
-                    .ok_or("has: takes photo, video, media, file, link, voice, gif or audio")?;
+                    .ok_or(lang::t(
+                        "has: takes photo, video, media, file, link, voice, note, gif or audio",
+                    ))?;
                 query.has = Some(kind.1);
             }
             "before:" => query.before = Some(day_start(value)?),
@@ -116,19 +126,19 @@ pub fn parse(typed: &str) -> Result<Query, String> {
     }
     query.words = words.join(" ");
     if query.words.is_empty() && query.from.is_none() && query.has.is_none() {
-        return Err("Add words, from: or has: to search for".into());
+        return Err(lang::t("Add words, from: or has: to search for").into());
     }
     if let (Some(before), Some(after)) = (query.before, query.after)
         && after >= before
     {
-        return Err("after: has to be a day before before:".into());
+        return Err(lang::t("after: has to be a day before before:").into());
     }
     Ok(query)
 }
 
 fn who(value: &str) -> Result<Who, String> {
     match value {
-        "" | "@" => Err("from: takes me, @username or a name, like from:@alice".into()),
+        "" | "@" => Err(lang::t("from: takes me, @username or a name, like from:@alice").into()),
         _ if value.eq_ignore_ascii_case("me") => Ok(Who::Me),
         _ => Ok(match value.strip_prefix('@') {
             Some(name) => Who::Username(name.to_string()),
@@ -139,7 +149,12 @@ fn who(value: &str) -> Result<Who, String> {
 
 /// The start of a day typed like 2025-10-01, in local time, as a unix time.
 fn day_start(value: &str) -> Result<i32, String> {
-    let wrong = || format!("Dates are like 2025-10-01, not \"{value}\"");
+    let wrong = || {
+        lang::f(
+            "Dates are like 2025-10-01, not \"{value}\"",
+            &[("value", &value)],
+        )
+    };
     let day = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| wrong())?;
     let start = Local
         .from_local_datetime(&day.and_hms_opt(0, 0, 0).ok_or_else(wrong)?)
@@ -284,10 +299,139 @@ impl MessageSearch {
         match self.current {
             Some(i) => {
                 let total = (self.total.max(0) as usize).max(self.results.len());
-                format!("{} of {total}", i + 1)
+                format!("{} {} {total}", i + 1, lang::t("of"))
             }
-            None => "searching…".into(),
+            None => lang::t("searching…").into(),
         }
+    }
+}
+
+/// One match in the media browser: what a `/` search with `has:` lists.
+pub struct MediaRow {
+    pub id: i64,
+    /// What it holds: the file's name, "Photo", "Video message"…
+    pub label: String,
+    pub sender: Sender,
+    pub outgoing: bool,
+    pub date: i32,
+    /// Its file's number, for `O` to show it in the file manager: none for
+    /// what Enter wouldn't open or `y` wouldn't copy.
+    pub file_id: Option<i32>,
+    /// The file is on this computer already.
+    pub downloaded: bool,
+}
+
+impl MediaRow {
+    fn of(message: tdlib_rs::types::Message) -> Self {
+        let id = message.id;
+        Self::of_msg(id, &Msg::from(message))
+    }
+
+    fn of_msg(id: i64, msg: &Msg) -> Self {
+        let label = if msg.video.is_some() {
+            lang::t("Video message").into()
+        } else if msg.voice.is_some() {
+            lang::t("Voice message").into()
+        } else if let Some(file) = &msg.file {
+            file.label.clone()
+        } else if msg.photo.is_some() {
+            lang::t("Photo").into()
+        } else {
+            msg.snippet()
+        };
+        Self {
+            id,
+            label,
+            sender: msg.sender,
+            outgoing: msg.outgoing,
+            date: msg.date,
+            file_id: crate::app::openable_file(msg)
+                .filter(|_| crate::viewer::cant_copy(msg).is_none())
+                .map(|f| f.id),
+            downloaded: msg.file.as_ref().is_some_and(|f| f.downloaded),
+        }
+    }
+}
+
+/// The media browser: every match of a `/` search with `has:` in one
+/// list, paged from Telegram until done. Enter goes to the message.
+pub struct MediaMenu {
+    /// The search as typed, to match TDLib's answers and for the title.
+    pub query: String,
+    /// What TDLib is asked for.
+    pub ask: Query,
+    /// Matches, newest first, as far as fetched.
+    pub rows: Vec<MediaRow>,
+    pub selected: usize,
+    /// TDLib's estimate of how many match in all; -1 if unknown.
+    pub total: i32,
+    /// Where the next page of results starts.
+    pub next_from: i64,
+    /// Or this, for words found in a secret chat.
+    pub next_offset: String,
+    /// Every match has been fetched.
+    pub done: bool,
+    /// A page of results is being fetched.
+    pub loading: bool,
+    /// Why the search failed, if it did: shown in the window.
+    pub error: Option<String>,
+}
+
+impl MediaMenu {
+    pub fn new(query: String, ask: Query) -> Self {
+        Self {
+            query,
+            ask,
+            rows: Vec::new(),
+            selected: 0,
+            total: -1,
+            next_from: 0,
+            next_offset: String::new(),
+            done: false,
+            loading: false,
+            error: None,
+        }
+    }
+
+    pub fn add(&mut self, found: Found) {
+        self.total = found.total;
+        self.next_from = found.next_from;
+        self.next_offset = found.next_offset;
+        // Neither means no more pages.
+        self.done = self.next_from == 0 && self.next_offset.is_empty();
+        for message in found.messages {
+            if self.rows.iter().any(|r| r.id == message.id) {
+                continue;
+            }
+            self.rows.push(MediaRow::of(message));
+        }
+        // Newest at the top, however the pages came in.
+        self.rows
+            .sort_by(|a, b| b.date.cmp(&a.date).then(b.id.cmp(&a.id)));
+    }
+
+    /// Down (`delta` > 0) or up the list.
+    pub fn move_by(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected = self
+            .selected
+            .saturating_add_signed(delta)
+            .min(self.rows.len() - 1);
+    }
+
+    /// The first or the last row.
+    pub fn jump(&mut self, last: bool) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected = if last { self.rows.len() - 1 } else { 0 };
+    }
+
+    /// The row under the cursor.
+    pub fn current(&self) -> Option<&MediaRow> {
+        self.rows.get(self.selected)
     }
 }
 
@@ -317,6 +461,77 @@ mod tests {
         assert_eq!(found(text, "nẵng"), ["Nẵng"]);
         // 'İ' lowercases to two characters; the match still ends on a char boundary.
         assert_eq!(found("İstanbul", "i̇st"), ["İst"]);
+    }
+
+    #[test]
+    fn the_media_browser_offers_no_file_enter_or_y_would_keep_back() {
+        let (_, mut msg) = crate::messages::tests::page([1]).remove(0);
+        msg.file = Some(crate::messages::MediaFile {
+            id: 9,
+            label: "File: map.pdf".into(),
+            photo: false,
+            downloaded: true,
+        });
+        assert_eq!(MediaRow::of_msg(1, &msg).file_id, Some(9));
+        msg.saveable = false;
+        assert_eq!(MediaRow::of_msg(1, &msg).file_id, None, "can't be saved");
+        msg.saveable = true;
+        msg.destruct = Some(crate::secret::Destruct {
+            after: 10,
+            on_open: true,
+            ends: None,
+        });
+        assert_eq!(
+            MediaRow::of_msg(1, &msg).file_id,
+            None,
+            "seen only while open"
+        );
+    }
+
+    #[test]
+    fn the_media_browser_moves_by_rows() {
+        let mut menu = MediaMenu::new("has:file".into(), parse("has:file").unwrap());
+        assert!(menu.current().is_none());
+        menu.move_by(1);
+        menu.jump(true);
+
+        let row = |id| MediaRow {
+            id,
+            label: format!("file {id}"),
+            sender: Sender::User(1),
+            outgoing: false,
+            date: 0,
+            file_id: Some(id as i32),
+            downloaded: false,
+        };
+        menu.rows = vec![row(9), row(7), row(5)];
+        assert_eq!(menu.current().unwrap().id, 9);
+        menu.move_by(1);
+        assert_eq!(menu.current().unwrap().id, 7);
+        menu.move_by(10);
+        assert_eq!(menu.current().unwrap().id, 5, "no further than the last");
+        menu.move_by(-10);
+        assert_eq!(menu.current().unwrap().id, 9, "no further than the first");
+        menu.jump(true);
+        assert_eq!(menu.current().unwrap().id, 5);
+        menu.jump(false);
+        assert_eq!(menu.current().unwrap().id, 9);
+    }
+
+    #[test]
+    fn from_this_is_everyone_here() {
+        let query = parse("has:file").unwrap();
+        assert_eq!(query.has, Some(Has::File));
+        assert_eq!(query.from, None);
+
+        // Everyone in the chat the search is in: no sender filter.
+        let query = parse("has:file from:this").unwrap();
+        assert_eq!(query.has, Some(Has::File));
+        assert_eq!(query.from, None);
+
+        let query = parse("has:Video from:@Maya").unwrap();
+        assert_eq!(query.has, Some(Has::Video));
+        assert_eq!(query.from, Some(Who::Username("Maya".into())));
     }
 
     #[test]
@@ -360,6 +575,53 @@ mod tests {
     }
 
     #[test]
+    fn in_russian_a_filter_that_cant_be_read_says_why_in_russian() {
+        crate::lang::set(crate::lang::Lang::Ru);
+        let why = |typed| parse(typed).unwrap_err();
+        assert_eq!(
+            why("has:photo has:video"),
+            "has: можно указать только один раз"
+        );
+        assert_eq!(
+            why("hi before:10/01/2025"),
+            "Даты пишутся как 2025-10-01, а не «10/01/2025»"
+        );
+        let mut search = MessageSearch::new("hi".into(), parse("hi").unwrap());
+        assert_eq!(search.position(), "ищу…");
+        search.add(Found {
+            ids: vec![9, 7],
+            messages: Vec::new(),
+            total: 2,
+            next_from: 0,
+            next_offset: String::new(),
+        });
+        search.current = Some(0);
+        assert_eq!(search.position(), "1 из 2");
+    }
+
+    #[test]
+    fn in_vietnamese_a_filter_that_cant_be_read_says_why_in_vietnamese() {
+        crate::lang::set(crate::lang::Lang::Vi);
+        let why = |typed| parse(typed).unwrap_err();
+        assert_eq!(why("has:photo has:video"), "Chỉ được dùng has: một lần");
+        assert_eq!(
+            why("hi before:10/01/2025"),
+            "Ngày phải viết như 2025-10-01, không phải \"10/01/2025\""
+        );
+        let mut search = MessageSearch::new("hi".into(), parse("hi").unwrap());
+        assert_eq!(search.position(), "đang tìm…");
+        search.add(Found {
+            ids: vec![9, 7],
+            messages: Vec::new(),
+            total: 2,
+            next_from: 0,
+            next_offset: String::new(),
+        });
+        search.current = Some(0);
+        assert_eq!(search.position(), "1 / 2");
+    }
+
+    #[test]
     fn tab_finishes_the_last_word_with_a_filter_or_what_it_takes() {
         let people = ["me".to_string(), "@maya".to_string(), "@leo".to_string()];
         let tab = |typed| complete(typed, &people, "2026-10-07");
@@ -384,6 +646,7 @@ mod tests {
         assert_eq!(search.position(), "searching…");
         search.add(Found {
             ids: vec![9, 7],
+            messages: Vec::new(),
             total: 3,
             next_from: 7,
             next_offset: String::new(),
@@ -391,6 +654,7 @@ mod tests {
         assert!(!search.done);
         search.add(Found {
             ids: vec![7, 2],
+            messages: Vec::new(),
             total: 3,
             next_from: 0,
             next_offset: String::new(),
@@ -406,6 +670,7 @@ mod tests {
         let mut search = MessageSearch::new("hi".into(), parse("hi").unwrap());
         search.add(Found {
             ids: vec![9, 7],
+            messages: Vec::new(),
             total: 3,
             next_from: 0,
             next_offset: "7".into(),
@@ -414,6 +679,7 @@ mod tests {
         assert_eq!(search.next_offset, "7");
         search.add(Found {
             ids: vec![2],
+            messages: Vec::new(),
             total: 3,
             next_from: 0,
             next_offset: String::new(),

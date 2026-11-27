@@ -6,6 +6,7 @@ use ratatui::style::Style;
 use ratatui::widgets::Padding;
 
 use super::{Cover, center, popup_block, text_rows};
+use crate::lang;
 use crate::select::TextSelect;
 use crate::theme::Colors;
 
@@ -21,10 +22,11 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, select: &mut TextSelect, color
     let height = u16::try_from(rows + 2).unwrap_or(u16::MAX).min(area.height);
     let popup = center(area, width, height);
     let keys = match select.selecting() {
-        true => " `y` copy · `Esc` cancel ",
-        false => " `v` select · `Esc` close ",
+        true => lang::t(" `y` copy · `Esc` cancel "),
+        false => lang::t(" `v` select · `Esc` close "),
     };
-    let block = popup_block(" Select text ", keys, colors).padding(Padding::horizontal(1));
+    let title = lang::t(" Select text ");
+    let block = popup_block(title, keys, colors).padding(Padding::horizontal(1));
     let inner = block.inner(popup);
     frame.render_widget(Cover, popup);
     frame.render_widget(block, popup);

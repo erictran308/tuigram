@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
-use crate::text;
+use crate::{lang, text};
 
 /// The theme used when the settings name none, or one that can't be used.
 pub const DEFAULT: &str = "mocha";
@@ -143,7 +143,7 @@ impl Themes {
     pub fn colors(&self, id: &str) -> Result<Colors, String> {
         match self.list.iter().find(|theme| theme.id == id) {
             Some(theme) => theme.colors.clone(),
-            None => Err(format!("there is no theme called {:?}", text::clean(id))),
+            None => Err(no_theme(&text::clean(id))),
         }
     }
 }
@@ -184,7 +184,7 @@ impl Files {
     /// it replaces.
     fn merged(&self, id: &str, user: bool, depth: usize) -> Result<ThemeFile, String> {
         let Some(file) = self.file(id, user) else {
-            return Err(format!("there is no theme called {id:?}"));
+            return Err(no_theme(id));
         };
         let file = file?;
         let Some(parent) = &file.inherits else {
@@ -192,12 +192,16 @@ impl Files {
         };
         let user = user && parent != id;
         if self.file(parent, user).is_none() {
-            return Err(format!(
-                "{id}.toml: there is no theme called {parent:?} to inherit"
+            return Err(lang::f(
+                "{id}.toml: there is no theme called {parent} to inherit",
+                &[("id", &id), ("parent", &format!("{parent:?}"))],
             ));
         }
         if depth == MAX_INHERITS {
-            return Err(format!("{id}.toml: inherits goes round in a circle"));
+            return Err(lang::f(
+                "{id}.toml: inherits goes round in a circle",
+                &[("id", &id)],
+            ));
         }
         let mut merged = self.merged(parent, user, depth + 1)?;
         merged.palette.extend(file.palette.clone());
@@ -206,11 +210,19 @@ impl Files {
     }
 }
 
+/// Why there's no theme called `id`.
+fn no_theme(id: &str) -> String {
+    lang::f(
+        "there is no theme called {name}",
+        &[("name", &format!("{id:?}"))],
+    )
+}
+
 /// A theme file's text, read as [`crate::config::read_small`] reads: a
 /// theme is read on every start.
 fn read(path: &Path) -> Result<String, String> {
     let bytes = crate::config::read_small(path, MAX_FILE_BYTES)?;
-    String::from_utf8(bytes).map_err(|_| "it isn't UTF-8 text".into())
+    String::from_utf8(bytes).map_err(|_| lang::t("it isn't UTF-8 text").into())
 }
 
 /// Reads a theme file, or says what's wrong with it and on which line.
@@ -221,7 +233,7 @@ fn parse(text: &str) -> Result<ThemeFile, String> {
             .and_then(|span| text.get(..span.start))
             .map(|before| before.matches('\n').count() + 1);
         match line {
-            Some(line) => format!("line {line}: {}", e.message()),
+            Some(line) => format!("{} {line}: {}", lang::t("line"), e.message()),
             None => e.message().to_string(),
         }
     })
@@ -233,10 +245,17 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
     let mut palette = BTreeMap::new();
     for (name, value) in &file.palette {
         if !PALETTE.contains(&name.as_str()) {
-            return Err(format!("the palette has no color called {name:?}"));
+            return Err(lang::f(
+                "the palette has no color called {name}",
+                &[("name", &format!("{name:?}"))],
+            ));
         }
-        let color = hex(value)
-            .ok_or_else(|| format!("palette.{name} is {value:?}, not a color like \"#1e1e2e\""))?;
+        let color = hex(value).ok_or_else(|| {
+            lang::f(
+                "palette.{name} is {value}, not a color like \"#1e1e2e\"",
+                &[("name", name), ("value", &format!("{value:?}"))],
+            )
+        })?;
         palette.insert(name.as_str(), color);
     }
     let missing: Vec<&str> = PALETTE
@@ -244,7 +263,8 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
         .filter(|name| !palette.contains_key(name))
         .collect();
     if !missing.is_empty() {
-        return Err(format!("the palette needs {}", missing.join(", ")));
+        let needs = lang::t("the palette needs");
+        return Err(format!("{needs} {}", missing.join(", ")));
     }
     let p = |name: &str| palette[name];
     // What `[colors]` sets: a palette color, a "#rrggbb" one, or the
@@ -255,7 +275,10 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
             _ => palette.get(value).copied().or_else(|| hex(value)),
         });
         color.ok_or_else(|| {
-            format!("colors.{name} is {value}, not a palette color, \"#rrggbb\" or \"reset\"")
+            lang::f(
+                "colors.{name} is {value}, not a palette color, \"#rrggbb\" or \"reset\"",
+                &[("name", &name), ("value", value)],
+            )
         })
     };
     let mut set = file.colors.clone();
@@ -269,7 +292,9 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
             }
             names
         }
-        Some(_) => return Err("colors.names needs seven colors".into()),
+        Some(_) => {
+            return Err(lang::t("colors.names needs seven colors").into());
+        }
     };
     let mut role = |name: &str, default: Color| match set.remove(name) {
         Some(value) => pick(name, &value),
@@ -336,7 +361,10 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
         pills: false,
     };
     match set.keys().next() {
-        Some(name) => Err(format!("there is no color called {name:?} to set")),
+        Some(name) => Err(lang::f(
+            "there is no color called {name} to set",
+            &[("name", &format!("{name:?}"))],
+        )),
         None => Ok(colors),
     }
 }
@@ -637,6 +665,26 @@ mod tests {
         assert!(themes.colors("a").unwrap_err().contains("circle"));
         let error = Themes::built_in().colors("nope").unwrap_err();
         assert!(error.contains("\"nope\""), "{error}");
+    }
+
+    #[test]
+    fn in_russian_and_vietnamese_a_theme_says_why_in_their_words() {
+        let error = |text: &str| with_files(&[("bad", text)]).colors("bad").unwrap_err();
+        let not_a_color = "inherits = \"mocha\"\n[palette]\nbg = \"black\"";
+        crate::lang::set(crate::lang::Lang::Ru);
+        assert_eq!(
+            error(not_a_color),
+            "bad.toml: palette.bg — \"black\", а не цвет вида \"#1e1e2e\""
+        );
+        crate::lang::set(crate::lang::Lang::Vi);
+        assert_eq!(
+            error(not_a_color),
+            "bad.toml: palette.bg là \"black\", không phải màu dạng \"#1e1e2e\""
+        );
+        assert_eq!(
+            error("inherits = \"nope\""),
+            "bad.toml: không có giao diện nào tên \"nope\" để kế thừa"
+        );
     }
 
     #[test]

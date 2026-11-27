@@ -10,6 +10,7 @@ use tdlib_rs::types::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use crate::lang;
 use crate::text;
 
 /// Emoji per row in the `R` popup. TDLib is asked for the same row size, which
@@ -213,9 +214,9 @@ impl From<AvailableReactions> for Available {
         }
         let reason = r.unavailability_reason.map(|reason| match reason {
             ReactionUnavailabilityReason::AnonymousAdministrator => {
-                "You post anonymously here, so you can't react"
+                lang::t("You post anonymously here, so you can't react")
             }
-            ReactionUnavailabilityReason::Guest => "Join the chat to react",
+            ReactionUnavailabilityReason::Guest => lang::t("Join the chat to react"),
         });
         Self { emoji, reason }
     }
