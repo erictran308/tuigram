@@ -16,6 +16,7 @@ mod motion;
 mod mouse;
 mod notify;
 mod opus;
+mod pepper;
 mod picker;
 mod pins;
 mod poll;

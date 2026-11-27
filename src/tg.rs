@@ -59,7 +59,8 @@ pub enum TgEvent {
         chat_id: i64,
         topic: Option<i32>,
         query: String,
-        found: Result<Found, String>,
+        /// Boxed: a page is big, and every event is as big as the biggest.
+        found: Result<Box<Found>, String>,
     },
     /// The message that `message_id` replies to; `None` if TDLib couldn't find it.
     Replied {
@@ -911,7 +912,7 @@ impl Tg {
                 chat_id,
                 topic,
                 query,
-                found,
+                found: found.map(Box::new),
             });
         });
     }

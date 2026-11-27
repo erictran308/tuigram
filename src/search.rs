@@ -308,7 +308,8 @@ pub struct MediaRow {
     pub sender: Sender,
     pub outgoing: bool,
     pub date: i32,
-    /// Its file's number, for `O` to show it in the file manager.
+    /// Its file's number, for `O` to show it in the file manager: none for
+    /// what Enter wouldn't open or `y` wouldn't copy.
     pub file_id: Option<i32>,
     /// The file is on this computer already.
     pub downloaded: bool,
@@ -317,7 +318,10 @@ pub struct MediaRow {
 impl MediaRow {
     fn of(message: tdlib_rs::types::Message) -> Self {
         let id = message.id;
-        let msg = Msg::from(message);
+        Self::of_msg(id, &Msg::from(message))
+    }
+
+    fn of_msg(id: i64, msg: &Msg) -> Self {
         let label = if msg.video.is_some() {
             "Video message".into()
         } else if msg.voice.is_some() {
@@ -335,7 +339,9 @@ impl MediaRow {
             sender: msg.sender,
             outgoing: msg.outgoing,
             date: msg.date,
-            file_id: msg.file.as_ref().map(|f| f.id),
+            file_id: crate::app::openable_file(msg)
+                .filter(|_| crate::viewer::cant_copy(msg).is_none())
+                .map(|f| f.id),
             downloaded: msg.file.as_ref().is_some_and(|f| f.downloaded),
         }
     }
@@ -449,6 +455,31 @@ mod tests {
         assert_eq!(found(text, "nẵng"), ["Nẵng"]);
         // 'İ' lowercases to two characters; the match still ends on a char boundary.
         assert_eq!(found("İstanbul", "i̇st"), ["İst"]);
+    }
+
+    #[test]
+    fn the_media_browser_offers_no_file_enter_or_y_would_keep_back() {
+        let (_, mut msg) = crate::messages::tests::page([1]).remove(0);
+        msg.file = Some(crate::messages::MediaFile {
+            id: 9,
+            label: "File: map.pdf".into(),
+            photo: false,
+            downloaded: true,
+        });
+        assert_eq!(MediaRow::of_msg(1, &msg).file_id, Some(9));
+        msg.saveable = false;
+        assert_eq!(MediaRow::of_msg(1, &msg).file_id, None, "can't be saved");
+        msg.saveable = true;
+        msg.destruct = Some(crate::secret::Destruct {
+            after: 10,
+            on_open: true,
+            ends: None,
+        });
+        assert_eq!(
+            MediaRow::of_msg(1, &msg).file_id,
+            None,
+            "seen only while open"
+        );
     }
 
     #[test]

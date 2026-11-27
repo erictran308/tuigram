@@ -1984,13 +1984,14 @@ impl OpenChat {
         }
     }
 
-    /// Playing voice message `id` is to tell its sender: it's someone
-    /// else's, sent, and not played before.
+    /// Playing voice or video message `id` is to tell its sender: it's
+    /// someone else's, sent, and not played before.
     pub fn tells(&self, id: i64) -> bool {
         self.messages.get(&id).is_some_and(|msg| {
             !msg.outgoing
                 && msg.state == SendState::Sent
-                && msg.voice.as_ref().is_some_and(|v| !v.listened)
+                && (msg.voice.as_ref().is_some_and(|v| !v.listened)
+                    || (msg.video.is_some() && msg.unplayed))
         })
     }
 

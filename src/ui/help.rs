@@ -129,7 +129,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ),
             (
                 "from: has:",
-                "In a search: from:@alice, from:me, from:this or from:a name; has:photo (video, media, file, link, voice, gif, audio)",
+                "In a search: from:@alice, from:me, from:this or from:a name; has:photo (video, media, file, link, voice, note, gif, audio)",
             ),
             (
                 "before: after:",
@@ -426,7 +426,7 @@ const SHORTCUTS_RU: &[(&str, &[(&str, &str)])] = &[
             ),
             (
                 "from: has:",
-                "В поиске: from:@alice, from:me, from:this или from:имя; has:photo (video, media, file, link, voice, gif, audio)",
+                "В поиске: from:@alice, from:me, from:this или from:имя; has:photo (video, media, file, link, voice, note, gif, audio)",
             ),
             (
                 "before: after:",
@@ -684,6 +684,14 @@ mod tests {
                 .max()
                 .unwrap();
             assert_eq!(width(ru), widest + 1);
+        }
+    }
+
+    #[test]
+    fn the_russian_table_has_a_row_for_every_english_one() {
+        assert_eq!(SHORTCUTS.len(), SHORTCUTS_RU.len(), "sections");
+        for ((title, en), (_, ru)) in SHORTCUTS.iter().zip(SHORTCUTS_RU) {
+            assert_eq!(en.len(), ru.len(), "{title}");
         }
     }
 }

@@ -252,7 +252,7 @@ fn kitty_id_base() -> u32 {
 
 /// What kitty's protocol draws in every cell of an image, after the code
 /// that sends the image in the first cell of its first drawing.
-const PLACEHOLDER: char = '\u{10EEEE}';
+pub(crate) const PLACEHOLDER: char = '\u{10EEEE}';
 
 /// The code that sends a kitty image, taken out of `cell`, the first an
 /// image was drawn in, if it holds one: its placeholder stays.
@@ -446,8 +446,9 @@ pub struct Images {
     dropped: Dropped,
     /// See [`KITTY_BUDGET`]; smaller in tests.
     kitty_budget: usize,
-    /// The codes sending the kitty images this frame drew for the first
-    /// time: see [`Images::take_transmit`].
+    /// The codes of kitty images a frame drew before they were sent ahead
+    /// of it: see [`Images::take_transmit`]. None should be, since every
+    /// image is queued in [`Images::untransmitted`] as it's encoded.
     transmits: Vec<String>,
     /// Kitty images encoded since the terminal was sent them: kitty draws
     /// a placeholder naming an image it doesn't have yet blank, and
@@ -910,9 +911,10 @@ impl Images {
     fn pending_transmits(&mut self) -> Vec<String> {
         let mut codes = Vec::new();
         for key in std::mem::take(&mut self.untransmitted) {
-            let image = match key.avatar {
-                true => self.avatars.get(&key).map(|a| &a.image.image),
-                false => self.ready.get(&key).map(|(e, _)| &e.image),
+            let image = if key.avatar {
+                self.avatars.get(&key).map(|a| &a.image.image)
+            } else {
+                self.ready.get(&key).map(|(e, _)| &e.image)
             };
             let Some(image) = image else {
                 continue;
@@ -938,9 +940,11 @@ impl Images {
     /// kitty's protocol, its first drawing carries the image itself in the
     /// first cell it covers, where anything drawn over that cell later in
     /// the frame (a popup, the date at the top, a toast) would lose it for
-    /// good, and with it the image. So it's taken out of the cell, leaving
-    /// the placeholder, and sent after the frame
-    /// ([`send_pictures`](Self::send_pictures)).
+    /// good, and with it the image. Each is sent ahead of the frame that
+    /// first draws it ([`prime_transmits`](Self::prime_transmits)), so a
+    /// frame draws placeholders only; one that still carries its code has
+    /// it taken out of the cell, leaving the placeholder, and sent after
+    /// the frame ([`send_pictures`](Self::send_pictures)).
     pub fn draw(
         &mut self,
         frame: &mut Frame,
@@ -980,9 +984,10 @@ impl Images {
         }
     }
 
-    /// Sends the images the frame just drawn drew for the first time (see
-    /// [`draw`](Self::draw)), once it's on the terminal: its placeholders
-    /// show each as soon as it's there.
+    /// Sends the images the frame just drawn still carried the codes of
+    /// (see [`draw`](Self::draw)), once it's on the terminal. Too late for
+    /// kitty, which leaves a placeholder blank if it came before its image:
+    /// the backstop to [`prime_transmits`](Self::prime_transmits).
     pub fn send_pictures(&mut self, terminal: &mut Terminal) {
         if !self.transmits.is_empty() {
             let _ = term::send(terminal, std::mem::take(&mut self.transmits));
@@ -1440,6 +1445,16 @@ mod tests {
         SlicedImage::new(image, SignedPosition::from((0, 0))).render(buf.area, &mut buf);
         assert!(!buf[(0, 0)].symbol().starts_with('\x1b'), "no code left");
         assert!(buf[(0, 0)].symbol().contains(PLACEHOLDER));
+
+        // A chat photo for the list too.
+        let avatar = Key {
+            avatar: true,
+            ..key(9)
+        };
+        images.insert_ready(avatar, photo());
+        let codes = images.pending_transmits();
+        assert_eq!(codes.len(), 1, "{codes:?}");
+        assert!(codes[0].contains("i=2,a=T"), "{codes:?}");
 
         // One dropped before it could be sent is skipped.
         images.insert_ready(key(8), photo());

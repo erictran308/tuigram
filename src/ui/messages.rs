@@ -515,7 +515,13 @@ pub(super) fn draw_photos(
                 height: shown,
             };
             if rect.height > 0 {
-                frame.render_widget(crate::video::InlineImage { skip }, rect);
+                if player.in_pepper() {
+                    // Pepper's box goes over these cells, not over a popup.
+                    frame.render_widget(super::Cover, rect);
+                    player.area = (!covered).then_some(rect);
+                } else {
+                    frame.render_widget(crate::video::InlineImage { skip }, rect);
+                }
                 player.seen = true;
             }
             continue;

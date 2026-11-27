@@ -347,7 +347,7 @@ fn opens_once(msg: &crate::messages::Msg) -> bool {
 /// The file Enter may open from `msg`. Media seen only while open (a voice
 /// message whose timer starts once it's played) isn't handed to another
 /// app, which would keep it; a voice message tuigram plays itself is fine.
-fn openable_file(msg: &crate::messages::Msg) -> Option<&MediaFile> {
+pub(crate) fn openable_file(msg: &crate::messages::Msg) -> Option<&MediaFile> {
     msg.file
         .as_ref()
         .filter(|_| !opens_once(msg) || msg.voice.is_some())
@@ -855,6 +855,9 @@ pub struct App {
     rang_at: Option<Instant>,
     /// tuigram runs over SSH, so its sound would play on the other computer.
     pub over_ssh: bool,
+    /// Pepper's player, where video messages play through it (see
+    /// [`crate::pepper`]): never over SSH, nor in tests.
+    pub pepper: Option<PathBuf>,
     /// The colors of the theme in use.
     pub colors: Colors,
     /// Corners are drawn round (`Settings.corners`, `Auto` decided).
@@ -954,6 +957,7 @@ impl App {
         env_keys: Option<ApiKeys>,
         video_tx: UnboundedSender<VideoEvent>,
     ) -> Self {
+        let over_ssh = chime::over_ssh(|name| std::env::var(name).ok());
         let mut chats = Chats::default();
         chats.set_highlighted(&settings.highlighted_chats);
         let notify_with = settings
@@ -1008,7 +1012,10 @@ impl App {
             sound: None,
             sound_stamp: None,
             rang_at: None,
-            over_ssh: chime::over_ssh(|name| std::env::var(name).ok()),
+            over_ssh,
+            pepper: (!cfg!(test) && !over_ssh)
+                .then(crate::pepper::player)
+                .flatten(),
             settings_path,
             colors: Colors::default(),
             rounded,
@@ -1097,7 +1104,8 @@ impl App {
         mut voice_events: UnboundedReceiver<VoiceEvent>,
         mut video_events: UnboundedReceiver<VideoEvent>,
     ) -> Result<()> {
-        let mut keys = EventStream::new();
+        let mut keys =
+            EventStream::new().filter(|event| futures::future::ready(!mouse_moved(event)));
         let mut signals = quit_signals();
         // What broke the terminal, if it went away: the app then closes as
         // `q` closes it, without drawing, and returns this.
@@ -1531,7 +1539,10 @@ impl App {
                 }
                 if self.revealing.remove(&file_id) {
                     match &path {
+                        // Marked as from the internet first: from the file
+                        // manager it can be opened as Enter would.
                         Some(path) => {
+                            mark_downloaded(path);
                             reveal_in_file_manager(path);
                             self.status = Some("Shown in the file manager".into());
                         }
@@ -1564,21 +1575,18 @@ impl App {
                         }
                     }
                 }
+                // Not to an empty room either: playing a video message tells
+                // its sender, once a frame of it shows (`App::on_video`).
+                let present = self.present();
                 if let Some(view) = self.video_view.as_mut()
                     && view.waits_for(file_id)
                 {
                     match &path {
-                        Some(path) => {
-                            view.downloaded(PathBuf::from(path));
-                            // As in Telegram's apps, the sender sees it was
-                            // played once it is.
-                            self.tg.open_content(view.chat_id, view.message_id);
-                            if let Some(open) =
-                                self.open.as_mut().filter(|o| o.chat_id == view.chat_id)
-                            {
-                                open.set_opened(view.message_id);
-                            }
+                        Some(_) if !present => {
+                            self.status = Some("Video message downloaded: Enter plays it".into());
+                            self.video_view = None;
                         }
+                        Some(path) => view.downloaded(PathBuf::from(path)),
                         None => {
                             self.status = Some("Download failed".into());
                             self.video_view = None;
@@ -1589,22 +1597,16 @@ impl App {
                     && inline.waits_for(file_id)
                 {
                     match &path {
-                        Some(path) => match inline.downloaded(PathBuf::from(path)) {
-                            Ok(()) => {
-                                // As in Telegram's apps, the sender sees it
-                                // was played once it is.
-                                self.tg.open_content(inline.chat_id, inline.message_id);
-                                if let Some(open) =
-                                    self.open.as_mut().filter(|o| o.chat_id == inline.chat_id)
-                                {
-                                    open.set_opened(inline.message_id);
-                                }
-                            }
-                            Err(why) => {
+                        Some(_) if !present => {
+                            self.status = Some("Video message downloaded: Space plays it".into());
+                            self.inline_video = None;
+                        }
+                        Some(path) => {
+                            if let Err(why) = inline.downloaded(PathBuf::from(path)) {
                                 self.status = Some(format!("Can't play this video message: {why}"));
                                 self.inline_video = None;
                             }
-                        },
+                        }
                         None => {
                             self.status = Some("Download failed".into());
                             self.inline_video = None;
@@ -1816,7 +1818,12 @@ impl App {
         }
     }
 
-    fn on_found(&mut self, place: (i64, Option<i32>), query: &str, found: Result<Found, String>) {
+    fn on_found(
+        &mut self,
+        place: (i64, Option<i32>),
+        query: &str,
+        found: Result<Box<Found>, String>,
+    ) {
         // A page the media browser asked for goes to it.
         if self
             .media_menu
@@ -1841,7 +1848,7 @@ impl App {
         let wanted = search.wanted.take();
         match found {
             Ok(found) => {
-                search.add(found);
+                search.add(*found);
                 if let Some(index) = wanted {
                     self.go_to_match(index);
                 }
@@ -1858,7 +1865,7 @@ impl App {
 
     /// A page of the media browser's search: the rows are listed, and the
     /// next page is asked for until there are no more (or MEDIA_ROWS_MAX).
-    fn on_media_found(&mut self, place: (i64, Option<i32>), found: Result<Found, String>) {
+    fn on_media_found(&mut self, place: (i64, Option<i32>), found: Result<Box<Found>, String>) {
         let Some(open) = self.open.as_ref().filter(|o| o.place() == place) else {
             // The chat the search was in is gone: the list means nothing.
             self.media_menu = None;
@@ -1873,7 +1880,7 @@ impl App {
             menu.loading = false;
             match found {
                 Ok(found) => {
-                    menu.add(found);
+                    menu.add(*found);
                     if !menu.done && menu.rows.len() < MEDIA_ROWS_MAX {
                         menu.loading = true;
                         Some((
@@ -4018,6 +4025,7 @@ impl App {
         self.composer = new_composer();
         self.images.forget_files();
         self.player.stop();
+        self.inline_video = None;
         self.opening.clear();
         self.revealing.clear();
         self.copying.clear();
@@ -4429,6 +4437,7 @@ impl App {
         self.timer_menu = None;
         self.key_view = None;
         self.photo_view = None;
+        self.video_view = None;
         self.chat_info = None;
         self.text_select = None;
     }
@@ -4462,6 +4471,8 @@ impl App {
         self.pasting = false;
         // A voice message plays in its own chat, where it shows playing.
         self.player.stop();
+        // So does a video message playing in its bubble.
+        self.inline_video = None;
         if self.open.is_some() {
             self.images.clear();
         }
@@ -6102,9 +6113,15 @@ impl App {
     /// that's no longer loaded, or where the terminal can't show it, opens
     /// in its app.
     fn view_video(&mut self, message_id: i64, file: MediaFile) {
-        if !self.images.kitty() {
+        if self.pepper.is_none() && !self.images.kitty() {
             self.status =
                 Some("Video messages play in the terminal only with kitty's protocol".into());
+            self.open_target(Target::File(file));
+            return;
+        }
+        // kitty reads each frame from a file on its own computer.
+        if self.over_ssh {
+            self.status = Some("Video messages play in the terminal only on this computer".into());
             self.open_target(Target::File(file));
             return;
         }
@@ -6119,6 +6136,7 @@ impl App {
                 msg,
                 self.video_tx.clone(),
                 self.images.tmux(),
+                self.pepper.clone(),
             ),
             None => {
                 self.open_target(Target::File(file));
@@ -6143,6 +6161,7 @@ impl App {
         if open.selected.is_none() {
             open.selected = Some(message_id);
         }
+        view.tell = open.tells(message_id);
         self.tg.download(view.note.file_id);
         self.video_view = Some(view);
     }
@@ -6176,18 +6195,26 @@ impl App {
         if msg.video.is_none() {
             return;
         }
-        let Some(file) = msg.file.clone() else { return };
+        // Not what's seen only while open, which isn't handed to ffmpeg and mpv.
+        let Some(file) = openable_file(msg).cloned() else {
+            return;
+        };
+        let tell = open.tells(message_id);
         // The "large" size, and notes with no cells to play in, take the
         // whole window, as Enter does.
         if self.settings.video_note_size == VideoNoteSize::Large || msg.preview.is_none() {
             self.view_video(message_id, file);
             return;
         }
-        if !self.images.kitty() {
+        if self.pepper.is_none() && !self.images.kitty() {
             self.status = Some(
                 "This terminal can't play video messages in the chat; Enter plays one on the whole window"
                     .into(),
             );
+            return;
+        }
+        if self.over_ssh {
+            self.status = Some("Video messages play in the terminal only on this computer".into());
             return;
         }
         let Some(mut inline) = Inline::of(
@@ -6196,6 +6223,7 @@ impl App {
             msg,
             self.video_tx.clone(),
             self.images.tmux(),
+            self.pepper.clone(),
         ) else {
             return;
         };
@@ -6207,6 +6235,7 @@ impl App {
         if self.settings.video_note_size == VideoNoteSize::Medium {
             inline.toggle_zoom();
         }
+        inline.tell = tell;
         let file_id = inline.note.file_id;
         self.inline_video = None; // another message's, playing, stops
         self.tg.download(file_id);
@@ -6268,6 +6297,12 @@ impl App {
             KeyCode::Char('j' | '+' | '=') => view.zoom_in(),
             KeyCode::Char('k' | '-') => view.zoom_out(),
             KeyCode::Char(' ') => view.toggle(),
+            // What Telegram says can't be saved isn't handed to an app that
+            // can save it.
+            KeyCode::Char('o') if view.cant_copy.is_some() => {
+                self.status =
+                    Some("This video message can't be saved, so it plays only here".into());
+            }
             KeyCode::Char('o') => {
                 let file = view.file.clone();
                 self.video_view = None;
@@ -6280,15 +6315,23 @@ impl App {
 
     /// Word from the video decoder: a frame, the end (each plays once), or
     /// why it can't play — then the player closes. The tag says whose word
-    /// it is.
+    /// it is. The first frame shown while someone's there tells the sender.
     fn on_video(&mut self, event: VideoEvent) {
-        if event.tag() == crate::video::TAG_INLINE {
+        let present = self.present();
+        if event.tag == crate::video::TAG_INLINE {
             let Some(inline) = self.inline_video.as_mut() else {
                 return;
             };
-            if let Err(why) = inline.on_event(event) {
-                self.status = Some(format!("Can't play this video message: {why}"));
-                self.inline_video = None;
+            match inline.on_event(event) {
+                Err(why) => {
+                    self.status = Some(format!("Can't play this video message: {why}"));
+                    self.inline_video = None;
+                }
+                Ok(()) if present && inline.tell_now() => {
+                    let (chat_id, id) = (inline.chat_id, inline.message_id);
+                    self.played_video(chat_id, id);
+                }
+                Ok(()) => {}
             }
             return;
         }
@@ -6300,9 +6343,22 @@ impl App {
             self.video_view = None;
             return;
         }
+        let tell = (present && view.tell_now()).then_some((view.chat_id, view.message_id));
         // Played out: it plays once, then the chat is back.
         if view.finished() {
             self.video_view = None;
+        }
+        if let Some((chat_id, id)) = tell {
+            self.played_video(chat_id, id);
+        }
+    }
+
+    /// Video message `message_id` of chat `chat_id` shows playing to
+    /// someone: its sender sees it was, as in Telegram's apps.
+    fn played_video(&mut self, chat_id: i64, message_id: i64) {
+        self.tg.open_content(chat_id, message_id);
+        if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == chat_id) {
+            open.set_opened(message_id);
         }
     }
 
@@ -6312,15 +6368,16 @@ impl App {
         let Some(open) = self.open.as_ref() else {
             return;
         };
-        let file = open
-            .cursor_id()
-            .and_then(|id| open.messages.get(&id))
-            .and_then(openable_file)
-            .cloned();
-        let Some(file) = file else {
+        let msg = open.cursor_id().and_then(|id| open.messages.get(&id));
+        let Some((msg, file)) = msg.and_then(|m| Some((m, openable_file(m)?.clone()))) else {
             self.status = Some("No file in this message".into());
             return;
         };
+        // Shown, it can be copied out of the file manager.
+        if let Some(why) = crate::viewer::cant_copy(msg) {
+            self.status = Some(why.into());
+            return;
+        }
         // TDLib answers at once if the file is already downloaded.
         if self.revealing.insert(file.id) {
             self.tg.download(file.id);
@@ -6449,6 +6506,7 @@ impl App {
             || self.button_menu.is_some()
             || self.pin_menu.is_some()
             || self.pinned_menu.is_some()
+            || self.media_menu.is_some()
             || self.timer_menu.is_some()
             || self.key_view.is_some()
             || self.photo_view.is_some()
@@ -7499,6 +7557,18 @@ fn open_externally(target: &str) -> std::io::Result<()> {
     } else {
         open::that_detached(target)
     }
+}
+
+/// Mouse motion isn't anyone doing anything: it neither wakes the loop to
+/// redraw nor counts as someone being there (see [`App::present`]).
+fn mouse_moved(event: &std::io::Result<Event>) -> bool {
+    matches!(
+        event,
+        Ok(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved | MouseEventKind::Drag(_),
+            ..
+        }))
+    )
 }
 
 /// The QWERTY key a Cyrillic keycap sits on: `н` is `y`, `р` is `h`, so
@@ -10217,6 +10287,178 @@ mod tests {
             app.status.as_deref(),
             Some("Messages in secret chats can't be forwarded")
         );
+    }
+
+    /// Makes the cursor's message someone else's video message, file 50, in
+    /// a terminal speaking kitty's protocol, where they play.
+    fn video_message(app: &mut App) -> (i64, i64) {
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        app.images = Images::new(picker, unbounded_channel().0);
+        app.over_ssh = false;
+        let id = plain_message(app);
+        let open = app.open.as_mut().unwrap();
+        let msg = open.messages.get_mut(&id).unwrap();
+        msg.outgoing = false;
+        msg.links.clear();
+        msg.unplayed = true;
+        msg.preview = Some(crate::messages::Preview {
+            file_id: 51,
+            width: 240,
+            height: 240,
+            thumbnail: None,
+            sticker: false,
+        });
+        msg.file = Some(MediaFile {
+            id: 50,
+            label: "Video message".into(),
+            photo: false,
+            downloaded: false,
+        });
+        msg.video = Some(crate::video::Note {
+            file_id: 50,
+            size: 1000,
+            duration: 5,
+            length: 240,
+        });
+        (open.chat_id, id)
+    }
+
+    #[test]
+    fn space_plays_a_video_message_but_not_one_seen_only_while_open() {
+        let mut app = test_app("video-once");
+        app.focus = Focus::Messages;
+        let (_, id) = video_message(&mut app);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.inline_video.is_some(), "downloading to play");
+        app.inline_video = None;
+
+        // Its timer starts once it's opened: ffmpeg and mpv don't get it.
+        let open = app.open.as_mut().unwrap();
+        open.messages.get_mut(&id).unwrap().destruct = Some(crate::secret::Destruct {
+            after: 10,
+            on_open: true,
+            ends: None,
+        });
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.inline_video.is_none());
+        assert!(app.video_view.is_none());
+    }
+
+    #[test]
+    fn a_video_message_downloaded_while_nobody_is_there_waits_and_tells_nobody() {
+        let mut app = test_app("video-away");
+        app.focus = Focus::Messages;
+        let (_, id) = video_message(&mut app);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(
+            app.inline_video.as_ref().unwrap().tell,
+            "someone else's, unplayed"
+        );
+        app.terminal_focused = false;
+        app.on_tg(TgEvent::Downloaded {
+            file_id: 50,
+            path: Some("/nowhere/file_50.mp4".into()),
+        });
+        assert!(app.inline_video.is_none(), "not played to an empty room");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Video message downloaded: Space plays it")
+        );
+        assert!(
+            app.open.as_ref().unwrap().messages[&id].unplayed,
+            "nobody told"
+        );
+
+        // Your own tells nobody however it plays.
+        app.terminal_focused = true;
+        let open = app.open.as_mut().unwrap();
+        open.messages.get_mut(&id).unwrap().outgoing = true;
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(!app.inline_video.as_ref().unwrap().tell);
+    }
+
+    #[test]
+    fn what_telegram_says_cant_be_saved_isnt_handed_on_from_a_video_message() {
+        let mut app = test_app("video-save");
+        app.focus = Focus::Messages;
+        let (chat_id, id) = video_message(&mut app);
+        let open = app.open.as_mut().unwrap();
+        let msg = open.messages.get_mut(&id).unwrap();
+        msg.saveable = false;
+        app.video_view = VideoView::of(chat_id, id, msg, app.video_tx.clone(), false, None);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+        assert!(app.video_view.is_some(), "it stays");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("This video message can't be saved, so it plays only here")
+        );
+        assert!(app.opening.is_empty());
+
+        // Nor does O show it in the file manager.
+        app.video_view = None;
+        press(&mut app, KeyCode::Char('O'), KeyModifiers::NONE);
+        assert!(app.revealing.is_empty());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("This chat doesn't allow copying its messages")
+        );
+    }
+
+    #[test]
+    fn a_video_message_stops_on_leaving_its_chat_or_logging_out() {
+        let mut app = test_app("video-leave");
+        app.focus = Focus::Messages;
+        let (chat_id, id) = video_message(&mut app);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.inline_video.is_some());
+        let msg = &app.open.as_ref().unwrap().messages[&id];
+        app.video_view = VideoView::of(chat_id, id, msg, app.video_tx.clone(), false, None);
+        let (_, other) = two_chats(&app);
+        app.open_chat(other);
+        assert!(app.inline_video.is_none(), "its chat was left");
+        assert!(app.video_view.is_none());
+
+        let mut app = test_app("video-logout");
+        let (chat_id, id) = video_message(&mut app);
+        let msg = &app.open.as_ref().unwrap().messages[&id];
+        app.video_view = VideoView::of(chat_id, id, msg, app.video_tx.clone(), false, None);
+        app.forget_session();
+        assert!(app.video_view.is_none(), "the session ended");
+    }
+
+    #[test]
+    fn the_media_browser_holds_back_read_receipts_and_pastes_as_popups_do() {
+        let mut app = test_app("media-popup");
+        app.focus = Focus::Messages;
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "has:file".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.media_menu.is_some());
+        assert!(app.popup_open());
+        app.on_terminal_event(Event::Paste("hello".into()));
+        assert!(app.focus != Focus::Input, "no Insert mode under it");
+    }
+
+    #[test]
+    fn mouse_motion_is_nobody_doing_anything() {
+        let mouse = |kind| {
+            Ok(Event::Mouse(MouseEvent {
+                kind,
+                column: 3,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            }))
+        };
+        assert!(mouse_moved(&mouse(MouseEventKind::Moved)));
+        assert!(mouse_moved(&mouse(MouseEventKind::Drag(MouseButton::Left))));
+        assert!(!mouse_moved(&mouse(MouseEventKind::Down(
+            MouseButton::Left
+        ))));
+        assert!(!mouse_moved(&mouse(MouseEventKind::ScrollUp)));
+        assert!(!mouse_moved(&Ok(Event::FocusGained)));
     }
 
     #[test]

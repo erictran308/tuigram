@@ -1,21 +1,25 @@
-//! Video messages played in the terminal itself: ffmpeg decodes frames to
-//! raw RGBA in a tmpfs file at the video's own rate, the circle outside the
-//! round frame goes transparent, kitty's protocol puts each where the
-//! overlay's blank area is, and mpv plays the sound.
-//! Zooming restarts the decoder at the same position with a bigger frame.
-//! Everything but the few calls app.rs makes lives here.
+//! Video messages played in the terminal itself. In Pepper, Pepper's own
+//! player draws the video straight into a box of cells and plays the sound
+//! (`crate::pepper`). Elsewhere ffmpeg decodes frames to raw RGBA in a folder
+//! of the player's own, at the video's own pace, the circle outside the round
+//! frame goes transparent, kitty's protocol puts each where the overlay's
+//! blank area is, and mpv plays the sound; and where pepper-play can't play
+//! one, it plays that way too. Zooming restarts the decoder at the same
+//! position with a bigger frame. Everything but the few calls app.rs makes
+//! lives here.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Span;
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui_image::FontSize;
 use ratatui_image::picker::cap_parser::Parser;
 use tdlib_rs::types::VideoNote;
@@ -26,9 +30,13 @@ use crate::term::{self, Terminal};
 use crate::theme::Colors;
 use crate::viewer::SIZES;
 
-/// The longest file played in the terminal: video messages top out near a
-/// minute, this leaves room for long ones sent as video files.
+/// The biggest video message played in the terminal: they top out near a
+/// minute, a few MB, so this leaves room to spare.
 pub const MAX_FILE: u64 = 256 << 20;
+
+/// Frames a second the decoder puts out, whatever the video's own rate, so
+/// the frames shown tell where it is.
+const FPS: f64 = 30.0;
 
 /// A video message, as TDLib describes it.
 #[derive(Clone)]
@@ -52,23 +60,21 @@ impl Note {
     }
 }
 
-/// Word from the decoder thread, tagged with the player it serves: the
-/// fullscreen view and the inline one share the channel.
-pub enum VideoEvent {
-    /// A new frame waits in the tmpfs file.
-    Frame(u8),
-    /// The video played out.
-    Ended(u8),
-    Failed(u8, String),
+/// Word from a decoder thread: the player it serves ([`TAG_VIEW`] or
+/// [`TAG_INLINE`], which share the channel) and which run of it, since one
+/// restarted at another size can leave the last run's word on the way.
+pub struct VideoEvent {
+    pub tag: u8,
+    run: u64,
+    pub news: News,
 }
 
-impl VideoEvent {
-    /// The player the word is for: [`TAG_VIEW`] or [`TAG_INLINE`].
-    pub fn tag(&self) -> u8 {
-        match self {
-            VideoEvent::Frame(tag) | VideoEvent::Ended(tag) | VideoEvent::Failed(tag, _) => *tag,
-        }
-    }
+pub enum News {
+    /// A new frame waits in the player's frame file.
+    Frame,
+    /// The video played out.
+    Ended,
+    Failed(String),
 }
 
 /// Tag of the fullscreen player's decoder.
@@ -76,27 +82,156 @@ pub const TAG_VIEW: u8 = 0;
 /// Tag of the inline player's decoder.
 pub const TAG_INLINE: u8 = 1;
 
+/// Numbers every decoder run: see [`VideoEvent`].
+static RUNS: AtomicU64 = AtomicU64::new(0);
+
 /// The number kitty knows a video's frames by: outside the range images
 /// take, so one's deletions never touch the other's.
 const KITTY_ID: u32 = 0x7000_0000;
 
-/// Where the frame file lives: tmpfs, so kitty reads it at memory speed;
-/// the system temp dir where there is no /dev/shm (macOS, Windows).
-fn frame_dir() -> PathBuf {
+/// Where players make their folders: tmpfs, so kitty reads frames at memory
+/// speed; the system temp dir where there is no /dev/shm (macOS, Windows).
+fn frames_parent() -> PathBuf {
     let shm = PathBuf::from("/dev/shm");
-    let dir = if shm.is_dir() {
+    if shm.is_dir() {
         shm
     } else {
         std::env::temp_dir()
-    };
-    dir.join(format!("tuigram-video-{}", std::process::id()))
+    }
 }
 
-/// What plays: ffmpeg feeding frames, mpv on the sound. Both pause and
-/// resume together (SIGSTOP/SIGCONT), and die with the view.
+/// One run of a video: as kitty frames this program sends, or through
+/// Pepper's own player.
+enum Run {
+    Frames(Player),
+    #[cfg(unix)]
+    Pepper(PepperPlayer),
+}
+
+impl Run {
+    fn run(&self) -> u64 {
+        match self {
+            Run::Frames(p) => p.run,
+            #[cfg(unix)]
+            Run::Pepper(p) => p.run,
+        }
+    }
+
+    fn paused(&self) -> bool {
+        match self {
+            Run::Frames(p) => p.paused,
+            #[cfg(unix)]
+            Run::Pepper(p) => p.paused,
+        }
+    }
+
+    fn toggle(&mut self) {
+        match self {
+            Run::Frames(p) => p.toggle(),
+            #[cfg(unix)]
+            Run::Pepper(p) => p.toggle(),
+        }
+    }
+
+    /// Where it is, in seconds, for a run that started `start` in.
+    fn position(&self, start: f64) -> f64 {
+        match self {
+            Run::Frames(p) => start + p.frames.load(Relaxed) as f64 / FPS,
+            #[cfg(unix)]
+            Run::Pepper(p) => f64::from_bits(p.seconds.load(Relaxed)),
+        }
+    }
+
+    fn frames(&self) -> Option<&Player> {
+        match self {
+            Run::Frames(p) => Some(p),
+            #[cfg(unix)]
+            Run::Pepper(_) => None,
+        }
+    }
+}
+
+/// Pepper's player, pepper-play, on one video, driven over a socket pair
+/// only it and tuigram hold (its fd 3). It quits once the video played or
+/// the socket closes.
+#[cfg(unix)]
+struct PepperPlayer {
+    child: Child,
+    control: std::os::unix::net::UnixStream,
+    /// The thread reading what pepper-play says.
+    reader: Option<JoinHandle<()>>,
+    /// The box's token: see [`crate::pepper`].
+    token: String,
+    /// Seconds into the video, as pepper-play last said, as `f64` bits.
+    seconds: Arc<AtomicU64>,
+    /// Where the box was last placed; `None` while it's taken away.
+    placed: Option<Rect>,
+    run: u64,
+    paused: bool,
+}
+
+#[cfg(unix)]
+impl PepperPlayer {
+    /// Sends mpv's JSON IPC `command`.
+    fn send(&mut self, command: serde_json::Value) {
+        use std::io::Write;
+        let line = serde_json::json!({ "command": command }).to_string();
+        let _ = writeln!(self.control, "{line}");
+    }
+
+    fn toggle(&mut self) {
+        self.paused = !self.paused;
+        let pause = self.paused;
+        self.send(serde_json::json!(["set_property", "pause", pause]));
+    }
+
+    /// Puts the picture over `area`, or takes it away for `None`: only when
+    /// that changed, as each place is drawn again.
+    fn place(&mut self, terminal: &mut Terminal, area: Option<Rect>) {
+        if self.placed == area {
+            return;
+        }
+        let code = match area {
+            Some(area) => crate::pepper::place(&self.token, area),
+            None => crate::pepper::remove(&self.token),
+        };
+        let _ = term::send(terminal, [code]);
+        self.placed = area;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PepperPlayer {
+    fn drop(&mut self) {
+        // Its end of the socket closing ends pepper-play; killed too, in case
+        // it hangs, and reaped.
+        let _ = self.control.shutdown(std::net::Shutdown::Both);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        if self.placed.is_some() {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(crate::pepper::remove(&self.token).as_bytes());
+            let _ = std::io::stdout().flush();
+        }
+    }
+}
+
+/// Kitty frames: ffmpeg feeding frames into a folder of the player's own,
+/// mpv on the sound. Both pause and resume together (SIGSTOP/SIGCONT), and
+/// die with the player, the folder with them.
 struct Player {
     ffmpeg: Child,
     audio: Option<Child>,
+    /// The thread copying ffmpeg's frames into `dir`.
+    pump: Option<JoinHandle<()>>,
+    /// Made new for this run and only the user's
+    /// ([`crate::config::new_private_dir`]): someone else's frames folder in
+    /// a shared /dev/shm could read the frames or plant links to write through.
+    dir: PathBuf,
+    run: u64,
     /// Frames written to the file this run.
     frames: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -104,6 +239,11 @@ struct Player {
 }
 
 impl Player {
+    /// Where the newest frame waits for the terminal to read it.
+    fn frame_file(&self) -> PathBuf {
+        self.dir.join("frame.rgb")
+    }
+
     /// Play or pause: the decoder and the sound freeze together. Unix
     /// signals do it; Windows has nothing like them, so there pause just
     /// isn't there.
@@ -139,26 +279,33 @@ impl Drop for Player {
             let _ = audio.kill();
             let _ = audio.wait();
         }
+        // The pump ends with ffmpeg's pipe; after it nothing writes there.
+        if let Some(pump) = self.pump.take() {
+            let _ = pump.join();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// Reads frames from `pipe` (width × height × 4 bytes each, RGBA) into the
-/// tmpfs file, atomically: a half-written one never reaches the terminal.
-/// At the video's own rate, since ffmpeg runs with `-re`. The pixels
-/// outside the frame's circle go transparent: video messages are round.
+/// Reads frames from `pipe` (width × height × 4 bytes each, RGBA) into
+/// `dir`'s frame file, atomically: a half-written one never reaches the
+/// terminal. At the video's own pace, since ffmpeg runs with `-re`. The
+/// pixels outside the frame's circle go transparent: video messages are round.
+#[allow(clippy::too_many_arguments)]
 fn pump_frames(
     mut pipe: impl Read,
     width: u32,
     height: u32,
-    frames: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-    tag: u8,
-    tx: UnboundedSender<VideoEvent>,
+    dir: &Path,
+    frames: &AtomicU64,
+    stop: &AtomicBool,
+    (tag, run): (u8, u64),
+    tx: &UnboundedSender<VideoEvent>,
 ) {
+    let send = |news| tx.send(VideoEvent { tag, run, news }).is_ok();
     let size = width as usize * height as usize * 4;
-    let dir = frame_dir();
-    let tmp = dir.join(format!("frame{tag}.tmp"));
-    let out = dir.join(format!("frame{tag}.rgb"));
+    let tmp = dir.join("frame.tmp");
+    let out = dir.join("frame.rgb");
     let mut buf = vec![0u8; size];
     loop {
         if stop.load(Relaxed) {
@@ -166,25 +313,23 @@ fn pump_frames(
         }
         if let Err(e) = pipe.read_exact(&mut buf) {
             if !stop.load(Relaxed) {
-                let event = match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => VideoEvent::Ended(tag),
-                    _ => VideoEvent::Failed(tag, format!("decoding broke: {e}")),
-                };
-                let _ = tx.send(event);
+                send(match e.kind() {
+                    std::io::ErrorKind::UnexpectedEof => News::Ended,
+                    _ => News::Failed(format!("decoding broke: {e}")),
+                });
             }
             return;
         }
         mask_circle(&mut buf, width, height);
         let written = std::fs::write(&tmp, &buf).and_then(|()| std::fs::rename(&tmp, &out));
         if let Err(e) = written {
-            let _ = tx.send(VideoEvent::Failed(
-                tag,
-                format!("the frame file can't be written: {e}"),
-            ));
+            send(News::Failed(format!(
+                "the frame file can't be written: {e}"
+            )));
             return;
         }
         frames.fetch_add(1, Relaxed);
-        if tx.send(VideoEvent::Frame(tag)).is_err() {
+        if !send(News::Frame) {
             return;
         }
     }
@@ -210,10 +355,243 @@ fn mask_circle(buf: &mut [u8], width: u32, height: u32) {
     }
 }
 
+/// ffmpeg's arguments to decode `path` from `start` seconds through
+/// `filter`. The file is a sender's: it's read only as the MP4 a video
+/// message is, from the file alone, since one that's really a playlist
+/// would have older ffmpegs fetch what it lists.
+fn ffmpeg_args(path: &Path, start: &str, filter: &str) -> Vec<String> {
+    let input = format!("file:{}", path.to_string_lossy());
+    [
+        "-v",
+        "error",
+        "-nostdin",
+        "-re",
+        "-protocol_whitelist",
+        "file",
+        "-f",
+        "mov",
+        "-ss",
+        start,
+        "-i",
+        &input,
+        "-an",
+        "-vf",
+        filter,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "pipe:1",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// mpv's options for a sender's file, in mpv or pepper-play: read only as
+/// the MP4 a video message is, from the file alone (mpv takes a playlist for
+/// one by its contents and plays what it lists), with no config, scripts,
+/// yt-dlp or output on the terminal.
+const STRICT: [&str; 7] = [
+    "--no-config",
+    "--load-scripts=no",
+    "--terminal=no",
+    "--ytdl=no",
+    "--demuxer=lavf",
+    "--demuxer-lavf-format=mov",
+    "--demuxer-lavf-o=protocol_whitelist=file",
+];
+
+/// mpv's arguments to play `path`'s sound from `start` seconds.
+fn mpv_args(path: &Path, start: &str) -> Vec<String> {
+    let mut args: Vec<String> = STRICT.map(String::from).into();
+    args.extend(["--no-video".into(), format!("--start={start}")]);
+    args.extend(["--".into(), path.to_string_lossy().into_owned()]);
+    args
+}
+
+/// pepper-play's arguments to play `path` from `start` seconds, driven over
+/// the socket it gets as fd 3.
+#[cfg(unix)]
+fn pepper_args(path: &Path, start: &str) -> Vec<String> {
+    let mut args: Vec<String> = STRICT.map(String::from).into();
+    args.extend([
+        "--keep-open=no".into(),
+        "--input-ipc-client=fd://3".into(),
+        format!("--start={start}"),
+    ]);
+    args.extend(["--".into(), path.to_string_lossy().into_owned()]);
+    args
+}
+
+/// Starts playing `path` from `start` seconds: through Pepper's player
+/// `pepper` where there's one and it starts, else as kitty frames scaled
+/// into width × height pixels.
+fn spawn(
+    path: &Path,
+    start: f64,
+    (width, height): (u32, u32),
+    tag: u8,
+    tx: UnboundedSender<VideoEvent>,
+    pepper: Option<&Path>,
+) -> Result<Run> {
+    #[cfg(unix)]
+    if let Some(play) = pepper
+        && let Ok(player) = spawn_pepper(play, path, start, tag, tx.clone())
+    {
+        return Ok(Run::Pepper(player));
+    }
+    #[cfg(not(unix))]
+    let _ = pepper;
+    spawn_frames(path, start, width, height, tag, tx).map(Run::Frames)
+}
+
+/// Starts pepper-play on `path` from `start` seconds. Its words come back
+/// as decoder words ([`read_pepper`]), so the app can't tell the two apart.
+#[cfg(unix)]
+fn spawn_pepper(
+    play: &Path,
+    path: &Path,
+    start: f64,
+    tag: u8,
+    tx: UnboundedSender<VideoEvent>,
+) -> Result<PepperPlayer> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let token = crate::pepper::new_token().context("no randomness for Pepper's token")?;
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    let reading = ours.try_clone()?;
+    let fd = theirs.as_raw_fd();
+    let mut command = Command::new(play);
+    command
+        .args(pepper_args(path, &format!("{start:.3}")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: only dup2 or fcntl runs between fork and exec, both
+    // async-signal-safe. dup2 also clears close-on-exec on fd 3.
+    unsafe {
+        command.pre_exec(move || {
+            let ok = if fd == 3 {
+                libc::fcntl(3, libc::F_SETFD, 0) != -1
+            } else {
+                libc::dup2(fd, 3) != -1
+            };
+            if ok {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let child = command.spawn().context("pepper-play can't start")?;
+    drop(theirs);
+    let run = RUNS.fetch_add(1, Relaxed);
+    let seconds = Arc::new(AtomicU64::new(start.to_bits()));
+    let reader = {
+        let seconds = Arc::clone(&seconds);
+        std::thread::spawn(move || read_pepper(reading, &seconds, (tag, run), &tx))
+    };
+    let mut player = PepperPlayer {
+        child,
+        control: ours,
+        reader: Some(reader),
+        token,
+        seconds,
+        placed: None,
+        run,
+        paused: false,
+    };
+    let token = player.token.clone();
+    player.send(serde_json::json!([
+        "script-message-to",
+        "main",
+        "pepper-token",
+        token
+    ]));
+    player.send(serde_json::json!(["observe_property", 1, "time-pos"]));
+    Ok(player)
+}
+
+/// What pepper-play said, of what's heard.
+#[cfg(unix)]
+#[derive(Debug, PartialEq)]
+enum Said {
+    /// The picture started (mpv's `playback-restart`).
+    Started,
+    /// Seconds into the video.
+    At(f64),
+    Ended,
+    Failed(String),
+}
+
+/// One line of mpv's JSON IPC from pepper-play, read as [`Said`].
+#[cfg(unix)]
+fn said(line: &str) -> Option<Said> {
+    let said: serde_json::Value = serde_json::from_str(line).ok()?;
+    match said.get("event")?.as_str()? {
+        "playback-restart" => Some(Said::Started),
+        "property-change" if said.get("name")? == "time-pos" => {
+            said.get("data")?.as_f64().map(Said::At)
+        }
+        "end-file" if said.get("reason")? == "error" => {
+            let why = said.get("file_error").and_then(|e| e.as_str());
+            Some(Said::Failed(crate::text::clean(
+                why.unwrap_or("it can't be played"),
+            )))
+        }
+        "end-file" => Some(Said::Ended),
+        _ => None,
+    }
+}
+
+/// Reads what pepper-play says on `stream` until it closes, keeping where it
+/// is in `seconds` and sending the rest on as decoder words: a frame once
+/// the picture started, the end, or why it couldn't play.
+#[cfg(unix)]
+fn read_pepper(
+    stream: impl Read,
+    seconds: &AtomicU64,
+    (tag, run): (u8, u64),
+    tx: &UnboundedSender<VideoEvent>,
+) {
+    use std::io::BufRead;
+    let send = |news| tx.send(VideoEvent { tag, run, news }).is_ok();
+    let mut started = false;
+    for line in std::io::BufReader::new(stream).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        match said(&line) {
+            Some(Said::Started) if !started => {
+                started = true;
+                if !send(News::Frame) {
+                    return;
+                }
+            }
+            Some(Said::At(at)) => seconds.store(at.to_bits(), Relaxed),
+            Some(Said::Ended) => {
+                send(News::Ended);
+                return;
+            }
+            Some(Said::Failed(why)) => {
+                send(News::Failed(why));
+                return;
+            }
+            _ => {}
+        }
+    }
+    // The socket closed with no end said: pepper-play quit, or was stopped.
+    send(if started {
+        News::Ended
+    } else {
+        News::Failed("pepper-play stopped".into())
+    });
+}
+
 /// Starts decoding `path` from `start` seconds, scaled into width × height
 /// pixels, with the sound in mpv. No audio rather than no video when mpv
 /// is missing.
-fn spawn(
+fn spawn_frames(
     path: &Path,
     start: f64,
     width: u32,
@@ -221,95 +599,56 @@ fn spawn(
     tag: u8,
     tx: UnboundedSender<VideoEvent>,
 ) -> Result<Player> {
-    std::fs::create_dir_all(frame_dir())?;
-    let frames = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
+    let dir = crate::config::new_private_dir(&frames_parent(), "tuigram-video")?;
     // Fit into the box, padded to it: the frame's size never changes, so
     // the reader can count bytes.
     let filter = format!(
-        "scale={width}:{height}:force_original_aspect_ratio=decrease,\
+        "fps={FPS},scale={width}:{height}:force_original_aspect_ratio=decrease,\
          pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
     );
-    let mut ffmpeg = Command::new("ffmpeg")
-        .args([
-            "-v",
-            "error",
-            "-nostdin",
-            "-re",
-            "-ss",
-            &format!("{start:.3}"),
-            "-i",
-            &path.to_string_lossy(),
-            "-an",
-            "-vf",
-            &filter,
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgba",
-            "pipe:1",
-        ])
+    let start = format!("{start:.3}");
+    let ffmpeg = Command::new("ffmpeg")
+        .args(ffmpeg_args(path, &start, &filter))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .context("ffmpeg isn't installed")?;
-    let pipe = ffmpeg.stdout.take().context("ffmpeg's frames are piped")?;
-    let audio = Command::new("mpv")
-        .args([
-            "--no-video",
-            "--really-quiet",
-            &format!("--start={start:.3}"),
-            &path.to_string_lossy(),
-        ])
+        .spawn();
+    let ffmpeg = match ffmpeg {
+        Ok(ffmpeg) => ffmpeg,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e).context("ffmpeg isn't installed");
+        }
+    };
+    // From here on, dropping the player cleans up after it.
+    let mut player = Player {
+        ffmpeg,
+        audio: None,
+        pump: None,
+        dir,
+        run: RUNS.fetch_add(1, Relaxed),
+        frames: Arc::new(AtomicU64::new(0)),
+        stop: Arc::new(AtomicBool::new(false)),
+        paused: false,
+    };
+    let pipe = player
+        .ffmpeg
+        .stdout
+        .take()
+        .context("ffmpeg's frames are piped")?;
+    player.audio = Command::new("mpv")
+        .args(mpv_args(path, &start))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .ok();
-    let (frames2, stop2) = (Arc::clone(&frames), Arc::clone(&stop));
-    std::thread::spawn(move || pump_frames(pipe, width, height, frames2, stop2, tag, tx));
-    Ok(Player {
-        ffmpeg,
-        audio,
-        frames,
-        stop,
-        paused: false,
-    })
-}
-
-/// The video's shape and frame rate, read once the file is here: the rate
-/// tells where it is by frames shown, the shape sizes the overlay.
-fn probe(path: &Path) -> (f64, f64) {
-    let parsed = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height,r_frame_rate",
-            "-of",
-            "csv=p=0",
-            &path.to_string_lossy(),
-        ])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            let mut parts = s.trim().split(',');
-            let w: f64 = parts.next()?.parse().ok()?;
-            let h: f64 = parts.next()?.parse().ok()?;
-            let rate = parts.next()?;
-            let mut rate = rate.split('/');
-            let num: f64 = rate.next()?.parse().ok()?;
-            let den: f64 = rate.next().map_or(Ok(1.0), str::parse).ok()?;
-            Some((w / h.max(1.0), num / den.max(0.001)))
-        });
-    match parsed {
-        Some((aspect, fps)) if (1.0..=240.0).contains(&fps) && aspect > 0.0 => (aspect, fps),
-        _ => (1.0, 30.0),
-    }
+    let (frames, stop) = (Arc::clone(&player.frames), Arc::clone(&player.stop));
+    let (dir, run) = (player.dir.clone(), player.run);
+    player.pump = Some(std::thread::spawn(move || {
+        pump_frames(pipe, width, height, &dir, &frames, &stop, (tag, run), &tx);
+    }));
+    Ok(player)
 }
 
 /// A video message playing in the terminal, over everything but the status
@@ -321,12 +660,17 @@ pub struct VideoView {
     /// What `o` opens in another app.
     pub file: MediaFile,
     pub note: Note,
+    /// Why `o` doesn't hand the file to another app: Telegram says it
+    /// can't be saved.
+    pub cant_copy: Option<&'static str>,
+    /// Playing it is to tell its sender, once a frame of it shows: see
+    /// [`VideoView::tell_now`].
+    pub tell: bool,
     /// The downloaded file, once TDLib brings it.
     path: Option<PathBuf>,
-    /// Width over height, and frames a second.
-    aspect: f64,
-    fps: f64,
-    player: Option<Player>,
+    player: Option<Run>,
+    /// Pepper's player, while it's the one to try: see [`crate::pepper`].
+    pepper: Option<PathBuf>,
     tx: UnboundedSender<VideoEvent>,
     /// Seconds into the video the current run started at.
     start: f64,
@@ -340,6 +684,8 @@ pub struct VideoView {
     pixels: Option<(u32, u32)>,
     /// A frame waits to be sent to the terminal.
     pending: bool,
+    /// A frame of it came from the decoder.
+    framed: bool,
     /// It played out: video messages play once, then the app closes the view.
     done: bool,
     /// Why it can't play, once: the app shows it and closes the view.
@@ -357,6 +703,7 @@ impl VideoView {
         msg: &Msg,
         tx: UnboundedSender<VideoEvent>,
         tmux: bool,
+        pepper: Option<PathBuf>,
     ) -> Option<Self> {
         let note = msg.video.clone()?;
         let file = msg.file.clone().filter(|f| f.id == note.file_id)?;
@@ -365,16 +712,18 @@ impl VideoView {
             message_id,
             file,
             note,
+            cant_copy: crate::viewer::cant_copy(msg),
+            tell: false,
             path: None,
-            aspect: 1.0,
-            fps: 30.0,
             player: None,
+            pepper,
             tx,
             start: 0.0,
             zoom: None,
             rect: None,
             pixels: None,
             pending: false,
+            framed: false,
             done: false,
             error: None,
             tmux,
@@ -388,23 +737,31 @@ impl VideoView {
 
     /// The file is downloaded: played from the next frame drawn.
     pub fn downloaded(&mut self, path: PathBuf) {
-        let (aspect, fps) = probe(&path);
-        self.aspect = aspect;
-        self.fps = fps;
         self.path = Some(path);
     }
 
-    /// Where it is, in seconds, by frames shown this run.
+    /// True once, when a frame of it has come and playing it is to tell
+    /// its sender: the app tells them then, as Telegram's apps do.
+    pub fn tell_now(&mut self) -> bool {
+        let now = self.tell && self.framed;
+        if now {
+            self.tell = false;
+        }
+        now
+    }
+
+    /// Where it is, in seconds.
     fn position(&self) -> f64 {
-        let shown = self.player.as_ref().map_or(0, |p| p.frames.load(Relaxed));
-        self.start + shown as f64 / self.fps
+        self.player
+            .as_ref()
+            .map_or(self.start, |p| p.position(self.start))
     }
 
     /// Playing; paused; waiting for the file.
     pub fn status(&self) -> &'static str {
         match &self.player {
             None => "loading…",
-            Some(p) if p.paused => "paused",
+            Some(p) if p.paused() => "paused",
             Some(_) => "playing",
         }
     }
@@ -453,19 +810,32 @@ impl VideoView {
 
     /// Word from the decoder: a frame to send, the end (it plays once, then
     /// the app closes the view), or why it can't play — `Err` closes the
-    /// view too.
+    /// view too. A run stopped for another, at a new size, is no longer heard.
     pub fn on_event(&mut self, event: VideoEvent) -> Result<(), String> {
-        match event {
-            VideoEvent::Frame(_) => {
+        if self.player.as_ref().is_none_or(|p| p.run() != event.run) {
+            return Ok(());
+        }
+        match event.news {
+            News::Frame => {
                 self.pending = true;
+                self.framed = true;
                 Ok(())
             }
-            VideoEvent::Ended(_) => {
+            News::Ended => {
                 self.player = None;
                 self.done = true;
                 Ok(())
             }
-            VideoEvent::Failed(_, why) => Err(why),
+            // pepper-play couldn't play it at all: kitty frames play it
+            // instead, from the next frame drawn.
+            News::Failed(_)
+                if !self.framed && self.player.as_ref().is_some_and(|p| p.frames().is_none()) =>
+            {
+                self.pepper = None;
+                self.player = None;
+                Ok(())
+            }
+            News::Failed(why) => Err(why),
         }
     }
 
@@ -474,9 +844,9 @@ impl VideoView {
         self.done
     }
 
-    /// The picture's cells within `inner`, centered, keeping the video's
-    /// shape at the zoom picked. Font cells are about twice as tall as
-    /// wide: the pixel box accounts for it.
+    /// The picture's cells within `inner`, centered and square, as video
+    /// messages are, at the zoom picked. Font cells are about twice as tall
+    /// as wide: the pixel box accounts for it.
     fn layout(&self, inner: Rect, font: FontSize) -> (Rect, (u32, u32)) {
         let share = self.share();
         let (fw, fh) = (
@@ -485,11 +855,10 @@ impl VideoView {
         );
         let mut cols = f64::from(inner.width) * share;
         let mut rows = f64::from(inner.height) * share;
-        let wide = cols * fw / (rows * fh);
-        if wide > self.aspect {
-            cols = rows * fh / fw * self.aspect;
+        if cols * fw > rows * fh {
+            cols = rows * fh / fw;
         } else {
-            rows = cols * fw / fh / self.aspect;
+            rows = cols * fw / fh;
         }
         let cols = cols.max(1.0) as u16;
         let rows = rows.max(1.0) as u16;
@@ -524,28 +893,33 @@ impl VideoView {
         if let Some(i) = self.zoom {
             title.push_str(&format!(" · {:.0}%", SIZES[i] * 100.0));
         }
-        frame.render_widget(Clear, area);
+        frame.render_widget(crate::ui::Cover, area);
         frame.render_widget(Paragraph::new(Span::from(title)).block(block), area);
-        frame.render_widget(Clear, at);
+        frame.render_widget(crate::ui::Cover, at);
 
+        // Pepper scales the picture to its box itself: only kitty frames are
+        // made again at a new size.
         let needs_restart = self.path.is_some()
             && !self.done
-            && (self.player.is_none() || self.pixels != Some(pixels));
+            && self
+                .player
+                .as_ref()
+                .is_none_or(|p| p.frames().is_some() && self.pixels != Some(pixels));
         if needs_restart && self.error.is_none() {
             let position = if self.player.is_some() {
                 self.position()
             } else {
                 self.start
             };
-            let was_paused = self.player.as_ref().is_some_and(|p| p.paused);
+            let was_paused = self.player.as_ref().is_some_and(Run::paused);
             self.player = None;
             match spawn(
                 &self.path.clone().unwrap(),
                 position,
-                pixels.0,
-                pixels.1,
+                pixels,
                 TAG_VIEW,
                 self.tx.clone(),
+                self.pepper.as_deref(),
             ) {
                 Ok(mut player) => {
                     if was_paused {
@@ -561,20 +935,26 @@ impl VideoView {
     }
 
     /// Sends the newest frame to the terminal, if one waits and the picture
-    /// has a place. Called after each frame ratatui draws, so the picture
-    /// lands over the board's blank cells.
+    /// has a place; in Pepper, places the box where the picture goes. Called
+    /// after each frame ratatui draws, so the picture lands over the board's
+    /// blank cells.
     pub fn send_frame(&mut self, terminal: &mut Terminal) {
-        if !self.pending || self.player.is_none() {
+        #[cfg(unix)]
+        if let Some(Run::Pepper(player)) = &mut self.player {
+            player.place(terminal, self.rect);
             return;
         }
+        let Some(player) = self.player.as_ref().and_then(Run::frames) else {
+            return;
+        };
         let (Some(at), Some((w, h))) = (self.rect, self.pixels) else {
             return;
         };
+        if !self.pending {
+            return;
+        }
         self.pending = false;
-        let file = frame_dir().join(format!("frame{TAG_VIEW}.rgb"));
-        use base64::Engine;
-        let path =
-            base64::engine::general_purpose::STANDARD.encode(file.as_os_str().as_encoded_bytes());
+        let path = kitty_path(&player.frame_file());
         let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
         let codes = [
             // The picture goes at its cell, whatever ratatui left under the
@@ -589,8 +969,14 @@ impl VideoView {
     }
 }
 
+/// A frame file's path as kitty's protocol takes it, in base64.
+fn kitty_path(file: &Path) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(file.as_os_str().as_encoded_bytes())
+}
+
 /// The video's frames go away with the view: kitty's image is deleted, the
-/// decoder and the sound die with the player, the tmpfs file is removed.
+/// decoder and the sound die with the player, its folder with them.
 impl Drop for VideoView {
     fn drop(&mut self) {
         let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
@@ -598,7 +984,6 @@ impl Drop for VideoView {
         use std::io::Write;
         let _ = std::io::stdout().write_all(code.as_bytes());
         let _ = std::io::stdout().flush();
-        let _ = std::fs::remove_dir_all(frame_dir());
     }
 }
 
@@ -617,15 +1002,21 @@ pub struct Inline {
     /// The message it's in.
     pub message_id: i64,
     pub note: Note,
+    /// Playing it is to tell its sender, once a frame of it shows: see
+    /// [`Inline::tell_now`].
+    pub tell: bool,
     /// The downloaded file, once TDLib brings it.
     path: Option<PathBuf>,
-    fps: f64,
     /// The square the decoder scales to, in pixels: the note's own size.
     side: u32,
-    player: Option<Player>,
+    player: Option<Run>,
+    /// Pepper's player, while it's the one to try: see [`crate::pepper`].
+    pepper: Option<PathBuf>,
     tx: UnboundedSender<VideoEvent>,
     /// A frame waits to be sent to the terminal.
     pending: bool,
+    /// A frame of it came from the decoder.
+    framed: bool,
     /// z blew it up to twice the thumbnail's cells each way.
     medium: bool,
     /// The bubble's picture cells were drawn this frame; ui sets it, the
@@ -636,6 +1027,9 @@ pub struct Inline {
     /// big (`c`/`r` on the transmit), or it guesses a size from the cells
     /// it has seen — a guess a partial redraw breaks, cutting the picture.
     pub placement: Option<(u16, u16)>,
+    /// In Pepper, the cells the ui left blank for the picture this frame:
+    /// `None` while a popup is over them, which Pepper's box would cover.
+    pub area: Option<Rect>,
     tmux: bool,
 }
 
@@ -648,6 +1042,7 @@ impl Inline {
         msg: &Msg,
         tx: UnboundedSender<VideoEvent>,
         tmux: bool,
+        pepper: Option<PathBuf>,
     ) -> Option<Self> {
         let note = msg.video.clone()?;
         msg.preview.as_ref()?;
@@ -656,14 +1051,17 @@ impl Inline {
             message_id,
             side: note.length,
             note,
+            tell: false,
             path: None,
-            fps: 30.0,
             player: None,
+            pepper,
             tx,
             pending: false,
+            framed: false,
             medium: false,
             seen: false,
             placement: None,
+            area: None,
             tmux,
         })
     }
@@ -681,21 +1079,31 @@ impl Inline {
     /// The file is downloaded: played from the first frame, square as the
     /// note is.
     pub fn downloaded(&mut self, path: PathBuf) -> Result<(), String> {
-        let (_, fps) = probe(&path);
-        self.fps = fps;
-        self.player = Some(
-            spawn(
-                &path,
-                0.0,
-                self.side,
-                self.side,
-                TAG_INLINE,
-                self.tx.clone(),
-            )
-            .map_err(|e| format!("{e:#}"))?,
-        );
         self.path = Some(path);
+        self.start_over()
+    }
+
+    /// Plays it from the start.
+    fn start_over(&mut self) -> Result<(), String> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let side = (self.side, self.side);
+        let pepper = self.pepper.as_deref();
+        let run = spawn(path, 0.0, side, TAG_INLINE, self.tx.clone(), pepper);
+        self.player = Some(run.map_err(|e| format!("{e:#}"))?);
+        self.framed = false;
         Ok(())
+    }
+
+    /// True once, when a frame of it has come and playing it is to tell
+    /// its sender: the app tells them then, as Telegram's apps do.
+    pub fn tell_now(&mut self) -> bool {
+        let now = self.tell && self.framed;
+        if now {
+            self.tell = false;
+        }
+        now
     }
 
     /// The decoder is up: the bubble can show frames instead of the still.
@@ -703,10 +1111,15 @@ impl Inline {
         self.player.is_some()
     }
 
-    /// Where it is, in seconds, by frames shown: where [`VideoView`] takes
-    /// over on Enter.
+    /// The picture plays through Pepper's player, in a box over the cells
+    /// the ui leaves blank, not in kitty's placeholder cells.
+    pub fn in_pepper(&self) -> bool {
+        self.player.as_ref().is_some_and(|p| p.frames().is_none())
+    }
+
+    /// Where it is, in seconds: where [`VideoView`] takes over on Enter.
     pub fn position(&self) -> f64 {
-        self.player.as_ref().map_or(0, |p| p.frames.load(Relaxed)) as f64 / self.fps
+        self.player.as_ref().map_or(0.0, |p| p.position(0.0))
     }
 
     /// Play or pause; after it played out, play it again from the start.
@@ -714,10 +1127,7 @@ impl Inline {
         match &mut self.player {
             Some(player) => player.toggle(),
             None => {
-                if let Some(path) = &self.path {
-                    self.player =
-                        spawn(path, 0.0, self.side, self.side, TAG_INLINE, self.tx.clone()).ok();
-                }
+                let _ = self.start_over();
             }
         }
     }
@@ -743,38 +1153,55 @@ impl Inline {
     }
 
     /// Word from the decoder: a frame to send, or the end — it plays once,
-    /// then the bubble shows the still again until Space starts it over.
+    /// then the bubble shows the still again until Space starts it over. A
+    /// run stopped for another is no longer heard.
     pub fn on_event(&mut self, event: VideoEvent) -> Result<(), String> {
-        match event {
-            VideoEvent::Frame(_) => {
+        if self.player.as_ref().is_none_or(|p| p.run() != event.run) {
+            return Ok(());
+        }
+        match event.news {
+            News::Frame => {
                 self.pending = true;
+                self.framed = true;
                 Ok(())
             }
-            VideoEvent::Ended(_) => {
+            News::Ended => {
                 self.player = None;
                 Ok(())
             }
-            VideoEvent::Failed(_, why) => Err(why),
+            // pepper-play couldn't play it at all: kitty frames play it
+            // instead.
+            News::Failed(_) if !self.framed && self.in_pepper() => {
+                self.pepper = None;
+                self.start_over()
+            }
+            News::Failed(why) => Err(why),
         }
     }
 
     /// Sends the newest frame to the terminal as a virtual placement sized
     /// to the slot's cells (`c`/`r`): kitty fits the frame into it, keeping
     /// the aspect. The bubble's placeholder cells (see [`InlineImage`]) say
-    /// where it shows, so it follows the text as it scrolls. Called after
-    /// each frame ratatui draws.
+    /// where it shows, so it follows the text as it scrolls. In Pepper, places
+    /// the box over [`Inline::area`] instead. Called after each frame ratatui
+    /// draws.
     pub fn send_frame(&mut self, terminal: &mut Terminal) {
-        if !self.pending || self.player.is_none() {
+        #[cfg(unix)]
+        if let Some(Run::Pepper(player)) = &mut self.player {
+            player.place(terminal, self.area);
             return;
         }
+        let Some(player) = self.player.as_ref().and_then(Run::frames) else {
+            return;
+        };
         let Some((c, r)) = self.placement else {
             return;
         };
+        if !self.pending {
+            return;
+        }
         self.pending = false;
-        let file = frame_dir().join(format!("frame{TAG_INLINE}.rgb"));
-        use base64::Engine;
-        let path =
-            base64::engine::general_purpose::STANDARD.encode(file.as_os_str().as_encoded_bytes());
+        let path = kitty_path(&player.frame_file());
         let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
         let (s, v) = (self.side, self.side);
         let code = format!(
@@ -827,7 +1254,7 @@ impl ratatui::widgets::Widget for InlineImage {
                     continue;
                 };
                 symbol.clear();
-                symbol.push(PLACEHOLDER);
+                symbol.push(crate::images::PLACEHOLDER);
                 if x == 0 {
                     symbol.push(diacritic(row));
                     symbol.push(diacritic(0));
@@ -840,9 +1267,6 @@ impl ratatui::widgets::Widget for InlineImage {
         }
     }
 }
-
-/// The character kitty reserves for image placeholders.
-const PLACEHOLDER: char = '\u{10EEEE}';
 
 /// Row/column diacritics for kitty's unicode placeholders.
 /// From https://sw.kovidgoyal.net/kitty/_downloads/1792bad15b12979994cd6ecc54c967a6/rowcolumn-diacritics.txt
@@ -1171,5 +1595,129 @@ mod tests {
         // The edge is a shade, not a step.
         let edge = (1..15).map(|x| alpha(x, 1)).find(|&a| a > 0 && a < 255);
         assert!(edge.is_some(), "a half-covered pixel on the edge");
+    }
+
+    #[test]
+    fn a_senders_file_is_read_only_as_a_local_mp4() {
+        let path = Path::new("/files/video_notes/file_3.mp4");
+        let args = ffmpeg_args(path, "0.000", "fps=30");
+        let input = args.iter().position(|a| a == "-i").unwrap();
+        let before = &args[..input];
+        assert!(
+            before
+                .windows(2)
+                .any(|w| w == ["-protocol_whitelist", "file"]),
+            "{args:?}"
+        );
+        assert!(before.windows(2).any(|w| w == ["-f", "mov"]), "{args:?}");
+        assert_eq!(args[input + 1], "file:/files/video_notes/file_3.mp4");
+
+        let mut players = vec![mpv_args(path, "0.000")];
+        #[cfg(unix)]
+        players.push(pepper_args(path, "0.000"));
+        for args in players {
+            for wanted in [
+                "--no-config",
+                "--load-scripts=no",
+                "--ytdl=no",
+                "--demuxer=lavf",
+                "--demuxer-lavf-format=mov",
+                "--demuxer-lavf-o=protocol_whitelist=file",
+            ] {
+                assert!(args.iter().any(|a| a == wanted), "{wanted}: {args:?}");
+            }
+            assert_eq!(
+                args[args.len() - 2..],
+                ["--", "/files/video_notes/file_3.mp4"]
+            );
+        }
+    }
+
+    #[test]
+    fn frames_go_into_the_players_own_folder_tagged_with_its_run() {
+        let dir = crate::config::new_private_dir(&std::env::temp_dir(), "tuigram-test").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Two frames of 2 × 2 pixels, then the end.
+        let pipe = [255u8; 2 * 2 * 4 * 2];
+        let stop = AtomicBool::new(false);
+        pump_frames(
+            &pipe[..],
+            2,
+            2,
+            &dir,
+            &AtomicU64::new(0),
+            &stop,
+            (TAG_INLINE, 7),
+            &tx,
+        );
+        let events: Vec<VideoEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().all(|e| e.tag == TAG_INLINE && e.run == 7));
+        let news: Vec<&News> = events.iter().map(|e| &e.news).collect();
+        assert!(matches!(news[..], [News::Frame, News::Frame, News::Ended]));
+        assert_eq!(std::fs::read(dir.join("frame.rgb")).unwrap().len(), 16);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_pepper_play_says_is_read_as_decoder_words() {
+        // As pepper-play 0.4.0 said it, playing a clip.
+        let lines = [
+            r#"{"data": null, "request_id": 0, "error": "success"}"#,
+            r#"{"event": "start-file", "playlist_entry_id": 1}"#,
+            r#"{"event": "property-change", "id": 1, "name": "time-pos", "data": null}"#,
+            r#"{"event": "file-loaded"}"#,
+            r#"{"event": "property-change", "id": 1, "name": "time-pos", "data": 0.5}"#,
+            r#"{"event": "playback-restart"}"#,
+            r#"{"event": "property-change", "id": 1, "name": "time-pos", "data": 1.92}"#,
+            r#"{"event": "playback-restart"}"#,
+            r#"{"event": "end-file", "reason": "eof", "playlist_entry_id": 1}"#,
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let seconds = AtomicU64::new(0);
+        read_pepper(lines.join("\n").as_bytes(), &seconds, (TAG_VIEW, 3), &tx);
+        let events: Vec<VideoEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().all(|e| e.tag == TAG_VIEW && e.run == 3));
+        let news: Vec<&News> = events.iter().map(|e| &e.news).collect();
+        assert!(matches!(news[..], [News::Frame, News::Ended]), "one start");
+        assert_eq!(f64::from_bits(seconds.load(Relaxed)), 1.92);
+
+        let failed = r#"{"event": "end-file", "reason": "error", "file_error": "loading failed"}"#;
+        assert_eq!(said(failed), Some(Said::Failed("loading failed".into())));
+        // It quit before the picture started: it couldn't play it.
+        read_pepper(&b""[..], &seconds, (TAG_VIEW, 4), &tx);
+        assert!(matches!(rx.try_recv().unwrap().news, News::Failed(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_video_message_pepper_play_cant_play_plays_as_kitty_frames() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_, mut msg) = crate::messages::tests::page([1]).remove(0);
+        msg.file = Some(MediaFile {
+            id: 5,
+            label: "Video message".into(),
+            photo: false,
+            downloaded: true,
+        });
+        msg.video = Some(Note {
+            file_id: 5,
+            size: 10,
+            duration: 1,
+            length: 240,
+        });
+        // A pepper-play that quits at once, as one without libmpv does.
+        let quits = PathBuf::from("/bin/sh");
+        let mut view = VideoView::of(1, 1, &msg, tx.clone(), false, Some(quits)).unwrap();
+        let path = Path::new("/nowhere/file_5.mp4");
+        let run = spawn(path, 0.0, (8, 8), TAG_VIEW, tx, view.pepper.as_deref()).unwrap();
+        assert!(run.frames().is_none(), "Pepper's player first");
+        view.player = Some(run);
+        let event = rx.blocking_recv().unwrap();
+        assert!(view.on_event(event).is_ok(), "not an error to show");
+        assert!(
+            view.player.is_none() && view.pepper.is_none(),
+            "kitty frames next"
+        );
     }
 }

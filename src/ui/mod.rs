@@ -174,7 +174,7 @@ fn hint_spans(hints: &str, text: Style, colors: &Colors) -> Vec<Span<'static>> {
 /// emoji in a name, a chat's 🔒). ratatui takes a cell after such a
 /// character to be its second half, and never draws there, so the
 /// character would show over the popup's border.
-struct Cover;
+pub(crate) struct Cover;
 
 impl Widget for Cover {
     fn render(self, area: Rect, buf: &mut Buffer) {
