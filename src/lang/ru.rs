@@ -710,8 +710,8 @@ pub(super) fn text(en: &str) -> Option<&'static str> {
         "Back to the chat or reply you left / forward again" => {
             "Назад к чату или ответу, откуда ушли / снова вперёд"
         }
-        "Resize the panes: h / l, = as at first, Enter keeps, Esc cancels" => {
-            "Ширина панелей: h / l, = как было, Enter сохранить, Esc отмена"
+        "Resize the panes: h / l, = as at first, saved at once; Esc or Enter is done" => {
+            "Ширина панелей: h / l, = как было, сохраняется сразу; Esc или Enter — готово"
         }
         "Quit (press again to stop waiting)" => "Выход (ещё раз — не ждать)",
         "Quit, except while writing" => "Выход, кроме режима набора текста",
@@ -1201,11 +1201,11 @@ pub(super) fn text(en: &str) -> Option<&'static str> {
         " INSERT " => " НАБОР ",
         " STICKERS " => " СТИКЕРЫ ",
         " RESIZE " => " ШИРИНА ",
-        "  `h` narrower · `l` wider · `=` as at first · `Enter` keep · `Esc` cancel" => {
-            "  `h` уже · `l` шире · `=` как было · `Enter` оставить · `Esc` отмена"
+        "  `h` narrower · `l` wider · `=` as at first · saved at once · `Esc` done" => {
+            "  `h` уже · `l` шире · `=` как было · сохраняется сразу · `Esc` готово"
         }
-        "  `h` wider · `l` narrower · `=` as at first · `Enter` keep · `Esc` cancel" => {
-            "  `h` шире · `l` уже · `=` как было · `Enter` оставить · `Esc` отмена"
+        "  `h` wider · `l` narrower · `=` as at first · saved at once · `Esc` done" => {
+            "  `h` шире · `l` уже · `=` как было · сохраняется сразу · `Esc` готово"
         }
         "  `y` edit · `n` or `Esc` cancel" => "  `y` изменить · `n` или `Esc` отмена",
         "  `y` join · `n` or `Esc` cancel" => "  `y` вступить · `n` или `Esc` отмена",

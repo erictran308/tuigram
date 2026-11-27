@@ -1449,10 +1449,21 @@ fn draw_settings(
             vec![Span::from(label).fg(colors.muted)]
         }
     };
+    let shortcuts_tab = tab(lang::t(" Shortcuts "), menu.tab == HelpTab::Shortcuts);
+    let settings_tab = tab(lang::t(" Settings "), menu.tab == HelpTab::Settings);
+    // Where each label lands on the top border, after the corner and a space.
+    let width_of = |spans: &[Span]| spans.iter().map(|s| s.width() as u16).sum::<u16>();
+    let shortcuts_from = popup.x + 2;
+    let shortcuts_to = shortcuts_from + width_of(&shortcuts_tab);
+    let settings_to = shortcuts_to + 1 + width_of(&settings_tab);
+    let tab_columns = [
+        (shortcuts_from, shortcuts_to),
+        (shortcuts_to + 1, settings_to),
+    ];
     let mut tabs = vec![Span::from(" ")];
-    tabs.extend(tab(lang::t(" Shortcuts "), menu.tab == HelpTab::Shortcuts));
+    tabs.extend(shortcuts_tab);
     tabs.push(Span::from(" "));
-    tabs.extend(tab(lang::t(" Settings "), menu.tab == HelpTab::Settings));
+    tabs.extend(settings_tab);
     tabs.push(Span::from(" "));
     let tabs = Line::from(tabs);
     let keys = match menu.tab {
@@ -1468,10 +1479,16 @@ fn draw_settings(
     frame.render_widget(block, popup);
     if menu.tab == HelpTab::Shortcuts {
         help::draw(frame, inner, &mut menu.scroll, colors);
+        menu.drawn = crate::mouse::Popup {
+            area: popup,
+            tabs: tab_columns,
+            list: inner,
+            rows: Vec::new(),
+        };
         return;
     }
 
-    let row = |i: usize, mark: &'static str, label: Span<'static>| {
+    let row = |i: usize, mark: String, label: Span<'static>| {
         let selected = i == menu.selected;
         let bar = if selected {
             Span::from("▌").fg(colors.accent)
@@ -1489,15 +1506,35 @@ fn draw_settings(
     let check = |on: bool| if on { " [✓] " } else { " [ ] " };
     let first_theme = SettingsMenu::themes(sounds);
     let last_row = first_theme + themes.list.len() - 1;
+    // Rows wrap rather than run past the popup's edge, each under its own
+    // label: the bar and the scrollbar take a column each.
+    let room = usize::from(inner.width).saturating_sub(2);
     // The line the cursor is on, and the last one to show with it.
     let mut lines = Vec::new();
     let (mut cursor, mut cursor_end) = (0, 0);
-    let mut add = |lines: &mut Vec<Line<'static>>, i: usize, mark, label: &str| {
-        if i == menu.selected {
-            cursor = lines.len();
-            cursor_end = cursor;
+    // The lines each setting's row takes, for the mouse.
+    let mut owners: Vec<(std::ops::Range<usize>, usize)> = Vec::new();
+    let mut add = |lines: &mut Vec<Line<'static>>, i: usize, mark: &'static str, label: &str| {
+        let start = lines.len();
+        let width = room.saturating_sub(mark.width()).max(1);
+        for (n, (piece, _)) in messages::wrap(label, width).into_iter().enumerate() {
+            let lead = match n {
+                0 => mark.to_string(),
+                _ => " ".repeat(mark.width()),
+            };
+            lines.push(row(i, lead, Span::from(piece)));
         }
-        lines.push(row(i, mark, Span::from(label.to_string())));
+        if i == menu.selected {
+            (cursor, cursor_end) = (start, lines.len() - 1);
+        }
+        owners.push((start..lines.len(), i));
+        start..lines.len()
+    };
+    // A muted line of its own, wrapped the same way.
+    let note = |lines: &mut Vec<Line<'static>>, text: &str| {
+        for (piece, _) in messages::wrap(text.trim_start(), room.max(1)) {
+            lines.push(Line::from(format!(" {piece}")).fg(colors.muted));
+        }
     };
     // Each language by its own name, so it's found whichever is set.
     let dot = |on: bool| if on { " ● " } else { " ○ " };
@@ -1597,8 +1634,10 @@ fn draw_settings(
     lines.push(Line::default());
     lines.push(heading(lang::t(" Sound for new messages")));
     if over_ssh {
-        let why = lang::t(" Not played over SSH: it would play on the other computer");
-        lines.push(Line::from(why).fg(colors.muted));
+        note(
+            &mut lines,
+            lang::t(" Not played over SSH: it would play on the other computer"),
+        );
     }
     add(
         &mut lines,
@@ -1620,9 +1659,11 @@ fn draw_settings(
     }
     if let Some(dir) = &sounds.dir {
         lines.push(Line::default());
-        lines
-            .push(Line::from(lang::t(" Your own sounds, WAV or Ogg Opus, go in")).fg(colors.muted));
-        lines.push(Line::from(format!(" {}", short_path(dir))).fg(colors.muted));
+        note(
+            &mut lines,
+            lang::t(" Your own sounds, WAV or Ogg Opus, go in"),
+        );
+        note(&mut lines, &short_path(dir));
     }
     let sounds_end = lines.len() - 1;
     lines.push(Line::default());
@@ -1634,19 +1675,20 @@ fn draw_settings(
         } else {
             " ○ "
         };
-        add(&mut lines, first_theme + i, mark, &theme.label);
+        let drawn = add(&mut lines, first_theme + i, mark, &theme.label);
         // One that can't be used is dimmed; picking it says why.
-        if theme.colors.is_err()
-            && let Some(line) = lines.last_mut()
-            && let Some(label) = line.spans.last_mut()
-        {
-            label.style = label.style.fg(colors.muted);
+        if theme.colors.is_err() {
+            for line in &mut lines[drawn] {
+                if let Some(label) = line.spans.last_mut() {
+                    label.style = label.style.fg(colors.muted);
+                }
+            }
         }
     }
     if let Some(dir) = &themes.dir {
         lines.push(Line::default());
-        lines.push(Line::from(lang::t(" Your own themes go in")).fg(colors.muted));
-        lines.push(Line::from(format!(" {}", short_path(dir))).fg(colors.muted));
+        note(&mut lines, lang::t(" Your own themes go in"));
+        note(&mut lines, &short_path(dir));
     }
     // On the last sound or theme, the lines after it show too.
     if menu.selected == first_theme - 1 {
@@ -1668,6 +1710,21 @@ fn draw_settings(
     *scroll = (*scroll).min(max);
     frame.render_widget(Paragraph::new(lines).scroll((*scroll as u16, 0)), inner);
     scrollbar(frame, inner, max, *scroll, colors);
+    let first = *scroll;
+    let rows = (first..first + rows)
+        .map(|line| {
+            owners
+                .iter()
+                .find(|(lines, _)| lines.contains(&line))
+                .map(|&(_, i)| i)
+        })
+        .collect();
+    menu.drawn = crate::mouse::Popup {
+        area: popup,
+        tabs: tab_columns,
+        list: inner,
+        rows,
+    };
 }
 
 /// A scrollbar down the right of `area`, for a list scrolled `position` rows
@@ -2838,10 +2895,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
                 .bg(colors.accent),
             match app.settings.chat_list_side {
                 Side::Left => lang::t(
-                    "  `h` narrower · `l` wider · `=` as at first · `Enter` keep · `Esc` cancel",
+                    "  `h` narrower · `l` wider · `=` as at first · saved at once · `Esc` done",
                 ),
                 Side::Right => lang::t(
-                    "  `h` wider · `l` narrower · `=` as at first · `Enter` keep · `Esc` cancel",
+                    "  `h` wider · `l` narrower · `=` as at first · saved at once · `Esc` done",
                 ),
             },
         ),
@@ -3130,11 +3187,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         spans.extend(hint_spans(hints.trim_start(), muted, colors));
     }
     match app.resizing {
-        Some(Resizing::List(_)) => {
+        Some(Resizing::List) => {
             let width = format!("  {} {}%", lang::t("chat list"), app.settings.list_width());
             spans.push(Span::from(width).fg(colors.fg));
         }
-        Some(Resizing::Topics(_)) => {
+        Some(Resizing::Topics) => {
             let n = app.settings.topics_pane_width();
             let width = lang::n(n.into(), "  topics {n} column", "  topics {n} columns", &[]);
             spans.push(Span::from(width).fg(colors.fg));
@@ -3341,8 +3398,8 @@ mod tests {
             selected: 3,
             ..SettingsMenu::new(HelpTab::Shortcuts, &Settings::default())
         };
-        // Too short for the whole list.
-        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        // Too short for the whole list, and wide enough that none wraps.
+        let mut terminal = Terminal::new(TestBackend::new(300, 20)).unwrap();
         let mut draw = |menu: &mut SettingsMenu| {
             terminal
                 .draw(|f| {

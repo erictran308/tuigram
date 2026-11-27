@@ -38,7 +38,9 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ),
             (
                 "Ctrl-r",
-                lang::key("Resize the panes: h / l, = as at first, Enter keeps, Esc cancels"),
+                lang::key(
+                    "Resize the panes: h / l, = as at first, saved at once; Esc or Enter is done",
+                ),
             ),
             ("q", lang::key("Quit (press again to stop waiting)")),
             ("Ctrl-c", lang::key("Quit, except while writing")),
@@ -426,9 +428,13 @@ fn key_width() -> usize {
 }
 
 /// The shortcuts as lines, in the language set: a heading per group, then
-/// each key and what it does.
-fn lines(colors: &Colors) -> Vec<Line<'static>> {
+/// each key and what it does, wrapped to `width` columns under where the
+/// descriptions start.
+fn lines(colors: &Colors, width: usize) -> Vec<Line<'static>> {
     let key_width = key_width();
+    // Indent, the keys and a gap before each description.
+    let indent = 3 + key_width + 2;
+    let room = width.saturating_sub(indent).max(1);
     let mut lines = Vec::new();
     for (i, &(group, keys)) in SHORTCUTS.iter().enumerate() {
         if i > 0 {
@@ -442,10 +448,17 @@ fn lines(colors: &Colors) -> Vec<Line<'static>> {
         for &(key, what) in keys {
             let key = key_text(key);
             let pad = " ".repeat(key_width - key.width());
-            lines.push(Line::from(vec![
-                Span::from(format!("   {key}{pad}  ")).fg(colors.primary),
-                Span::from(lang::t(what)),
-            ]));
+            let pieces = super::messages::wrap(lang::t(what), room);
+            for (n, (piece, _)) in pieces.into_iter().enumerate() {
+                let lead = match n {
+                    0 => format!("   {key}{pad}  "),
+                    _ => " ".repeat(indent),
+                };
+                lines.push(Line::from(vec![
+                    Span::from(lead).fg(colors.primary),
+                    Span::from(piece),
+                ]));
+            }
         }
     }
     lines
@@ -464,7 +477,7 @@ pub fn width() -> usize {
     3 + key_width() + 2 + what + 1
 }
 
-/// Rows the list takes, for sizing the popup.
+/// Rows the list takes unwrapped, for sizing the popup.
 pub fn height() -> usize {
     SHORTCUTS
         .iter()
@@ -476,7 +489,8 @@ pub fn height() -> usize {
 /// Draws the list from row `scroll`, first pulling `scroll` back if it's
 /// past the end.
 pub fn draw(frame: &mut Frame, area: Rect, scroll: &mut usize, colors: &Colors) {
-    let lines = lines(colors);
+    // The scrollbar takes the last column.
+    let lines = lines(colors, usize::from(area.width).saturating_sub(1));
     let max = lines.len().saturating_sub(usize::from(area.height));
     *scroll = (*scroll).min(max);
     frame.render_widget(Paragraph::new(lines).scroll((*scroll as u16, 0)), area);
@@ -492,7 +506,8 @@ mod tests {
     fn height_counts_every_line_in_every_language() {
         for language in Lang::ALL {
             lang::set(language);
-            assert_eq!(height(), lines(&Colors::default()).len(), "{language:?}");
+            let lines = lines(&Colors::default(), usize::MAX);
+            assert_eq!(height(), lines.len(), "{language:?}");
         }
     }
 
@@ -500,13 +515,36 @@ mod tests {
     fn width_leaves_room_for_every_line_and_the_scrollbar_in_every_language() {
         for language in Lang::ALL {
             lang::set(language);
-            let widest = lines(&Colors::default())
+            let widest = lines(&Colors::default(), usize::MAX)
                 .iter()
                 .map(Line::width)
                 .max()
                 .unwrap();
             assert_eq!(width(), widest + 1, "{language:?}");
         }
+    }
+
+    #[test]
+    fn long_descriptions_wrap_under_where_descriptions_start() {
+        let text = |l: &Line| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let wide = lines(&Colors::default(), usize::MAX);
+        let narrow = lines(&Colors::default(), 60);
+        assert!(narrow.len() > wide.len(), "some wrap");
+        assert!(narrow.iter().all(|l| l.width() <= 60), "none runs past");
+        // Every letter is still there, in order, the rest of a description
+        // under its start, after the keys' column. Lines may also break
+        // after punctuation, as in `||spoiler||`.
+        let letters = |lines: &[Line]| -> String {
+            let all: String = lines.iter().map(text).collect();
+            all.chars().filter(|c| !c.is_whitespace()).collect()
+        };
+        assert_eq!(letters(&narrow), letters(&wide));
+        let indent = 3 + key_width() + 2;
+        let continued = narrow
+            .iter()
+            .map(text)
+            .find(|l| l.starts_with(&" ".repeat(indent)));
+        assert!(continued.is_some_and(|l| !l[indent..].starts_with(' ')));
     }
 
     #[test]
@@ -518,7 +556,7 @@ mod tests {
                 .collect::<String>()
         };
         let row = |key: &str| {
-            let lines = lines(&Colors::default());
+            let lines = lines(&Colors::default(), usize::MAX);
             lines.iter().map(text).find(|l| l.contains(key)).unwrap()
         };
         lang::set(Lang::Ru);

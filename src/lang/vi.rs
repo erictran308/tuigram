@@ -658,8 +658,8 @@ pub(super) fn text(en: &str) -> Option<&'static str> {
         "Back to the chat or reply you left / forward again" => {
             "Quay lại cuộc trò chuyện hoặc tin trả lời vừa rời / tiến tới lại"
         }
-        "Resize the panes: h / l, = as at first, Enter keeps, Esc cancels" => {
-            "Đổi cỡ các khung: h / l, = như ban đầu, Enter để giữ, Esc để hủy"
+        "Resize the panes: h / l, = as at first, saved at once; Esc or Enter is done" => {
+            "Đổi cỡ các khung: h / l, = như ban đầu, lưu ngay; Esc hoặc Enter để xong"
         }
         "Quit (press again to stop waiting)" => "Thoát (nhấn lần nữa để khỏi chờ)",
         "Quit, except while writing" => "Thoát, trừ khi đang soạn tin",
@@ -1152,11 +1152,11 @@ pub(super) fn text(en: &str) -> Option<&'static str> {
         " INSERT " => " NHẬP ",
         " STICKERS " => " NHÃN DÁN ",
         " RESIZE " => " ĐỔI CỠ ",
-        "  `h` narrower · `l` wider · `=` as at first · `Enter` keep · `Esc` cancel" => {
-            "  `h` hẹp hơn · `l` rộng hơn · `=` như ban đầu · `Enter` giữ · `Esc` hủy"
+        "  `h` narrower · `l` wider · `=` as at first · saved at once · `Esc` done" => {
+            "  `h` hẹp hơn · `l` rộng hơn · `=` như ban đầu · lưu ngay · `Esc` xong"
         }
-        "  `h` wider · `l` narrower · `=` as at first · `Enter` keep · `Esc` cancel" => {
-            "  `h` rộng hơn · `l` hẹp hơn · `=` như ban đầu · `Enter` giữ · `Esc` hủy"
+        "  `h` wider · `l` narrower · `=` as at first · saved at once · `Esc` done" => {
+            "  `h` rộng hơn · `l` hẹp hơn · `=` như ban đầu · lưu ngay · `Esc` xong"
         }
         "  `y` edit · `n` or `Esc` cancel" => "  `y` chỉnh sửa · `n` hoặc `Esc` hủy",
         "  `y` join · `n` or `Esc` cancel" => "  `y` tham gia · `n` hoặc `Esc` hủy",

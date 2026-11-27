@@ -1,7 +1,8 @@
 //! What the mouse points at: the panes' cells as they were last drawn, and
 //! which chat, topic or message each of their rows is. The ui fills the map
 //! while drawing a frame; a click or a wheel turn then reads it. Everything
-//! the app.rs mouse handler needs to know about the screen lives here.
+//! the app.rs mouse handler needs to know about the screen lives here, the
+//! `?` popup's tabs and rows too ([`Popup`]).
 
 use ratatui::layout::Rect;
 
@@ -88,4 +89,46 @@ pub enum Pane {
     Chats,
     Topics,
     Messages,
+}
+
+/// The `?` popup as drawn last frame: where its tabs and its rows are.
+#[derive(Clone, Debug, Default)]
+pub struct Popup {
+    /// The popup, borders included: the wheel turns over all of it.
+    pub area: Rect,
+    /// The columns each tab's label takes on the top border, in the order
+    /// drawn: the shortcuts, then the settings.
+    pub tabs: [(u16, u16); 2],
+    /// Where the rows are drawn, and which setting each row of it shows
+    /// from its top: `None` for headings, notes and gaps.
+    pub list: Rect,
+    pub rows: Vec<Option<usize>>,
+}
+
+impl Popup {
+    /// (x, y) is over the popup.
+    pub fn contains(&self, x: u16, y: u16) -> bool {
+        self.area.contains((x, y).into())
+    }
+
+    /// The tab whose label is at (x, y): 0 the shortcuts, 1 the settings.
+    pub fn tab_at(&self, x: u16, y: u16) -> Option<usize> {
+        if y != self.area.y {
+            return None;
+        }
+        self.tabs
+            .iter()
+            .position(|&(from, to)| (from..to).contains(&x))
+    }
+
+    /// The setting whose row is at (x, y).
+    pub fn setting_at(&self, x: u16, y: u16) -> Option<usize> {
+        if !self.list.contains((x, y).into()) {
+            return None;
+        }
+        self.rows
+            .get(usize::from(y - self.list.y))
+            .copied()
+            .flatten()
+    }
 }

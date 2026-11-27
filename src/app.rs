@@ -499,6 +499,8 @@ pub struct SettingsMenu {
     /// How notifications went out when the popup opened, so turning them
     /// off and on again keeps the way, e.g. "bell".
     pub saved_notifications: Notifications,
+    /// Where its tabs and rows were drawn last frame, for the mouse.
+    pub drawn: crate::mouse::Popup,
 }
 
 impl SettingsMenu {
@@ -546,6 +548,7 @@ impl SettingsMenu {
             selected: 0,
             settings_scroll: 0,
             saved_notifications: settings.notifications,
+            drawn: crate::mouse::Popup::default(),
         }
     }
 }
@@ -756,14 +759,13 @@ impl Command {
     }
 }
 
-/// Ctrl-r's resize mode: the pane whose edge `h` and `l` move, with its
-/// width before, which Esc puts back.
+/// Ctrl-r's resize mode: the pane whose edge `h` and `l` move.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resizing {
     /// The chat list, in percent of the window.
-    List(u16),
+    List,
     /// A forum's topics pane, in columns.
-    Topics(u16),
+    Topics,
 }
 
 /// Where keys go. `Input` is Insert mode; the others are Normal mode.
@@ -2609,8 +2611,13 @@ impl App {
     /// The mouse: the wheel scrolls the pane under it, a click focuses it —
     /// a chat or topic opens, a message becomes the cursor (and opens on a
     /// second click, as in Telegram's apps), the composer takes the keys.
-    /// Popups and viewers keep their keys: clicks then do nothing.
+    /// Popups and viewers keep their keys: clicks then do nothing, but in
+    /// the `?` popup, which takes them ([`App::on_settings_mouse`]).
     fn on_mouse(&mut self, mouse: MouseEvent) {
+        if matches!(self.screen, Screen::Main) && self.settings_on_top() {
+            self.on_settings_mouse(mouse);
+            return;
+        }
         if !matches!(self.screen, Screen::Main)
             || self.over_panes()
             || self.photo_view.is_some()
@@ -2624,6 +2631,58 @@ impl App {
             MouseEventKind::ScrollUp => self.mouse_scroll(x, y, -1),
             MouseEventKind::Down(MouseButton::Left) => self.mouse_click(x, y),
             _ => {}
+        }
+    }
+
+    /// The `?` popup has the keys: nothing `on_key` hands them to first is up.
+    fn settings_on_top(&self) -> bool {
+        self.settings_menu.is_some()
+            && self.confirm.is_none()
+            && self.notice.is_none()
+            && self.key_view.is_none()
+            && self.photo_view.is_none()
+            && self.video_view.is_none()
+    }
+
+    /// The mouse in the `?` popup: the wheel over it moves as `j` and `k`
+    /// do, a click on a tab switches to it, and one on a setting puts the
+    /// cursor there. Only a click on the setting already under the cursor
+    /// changes it, as Enter does, so a stray click changes nothing.
+    fn on_settings_mouse(&mut self, mouse: MouseEvent) {
+        let Some(menu) = self.settings_menu.as_ref() else {
+            return;
+        };
+        let (x, y) = (mouse.column, mouse.row);
+        let drawn = &menu.drawn;
+        let wheel = |code| drawn.contains(x, y).then_some(code);
+        let code = match mouse.kind {
+            MouseEventKind::ScrollDown => wheel(KeyCode::Char('j')),
+            MouseEventKind::ScrollUp => wheel(KeyCode::Char('k')),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let tab = drawn.tab_at(x, y);
+                let on_settings = menu.tab == HelpTab::Settings;
+                let row = drawn.setting_at(x, y).filter(|_| on_settings);
+                let selected = menu.selected;
+                match (tab, row) {
+                    (Some(tab), _) => {
+                        if let Some(menu) = self.settings_menu.as_mut() {
+                            menu.tab = [HelpTab::Shortcuts, HelpTab::Settings][tab];
+                        }
+                    }
+                    (None, Some(row)) if row == selected => self.change_setting(),
+                    (None, Some(row)) => {
+                        if let Some(menu) = self.settings_menu.as_mut() {
+                            menu.selected = row;
+                        }
+                    }
+                    (None, None) => {}
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(code) = code {
+            self.on_settings_key(KeyEvent::new(code, KeyModifiers::NONE), false);
         }
     }
 
@@ -2721,10 +2780,10 @@ impl App {
             // Before `r`, which replies.
             // In a forum's topics, the topics pane; else the chat list.
             (Focus::Topics, KeyCode::Char('r')) if ctrl && self.forum.is_some() => {
-                self.resizing = Some(Resizing::Topics(self.settings.topics_width));
+                self.resizing = Some(Resizing::Topics);
             }
             (_, KeyCode::Char('r')) if ctrl => {
-                self.resizing = Some(Resizing::List(self.settings.chat_list_width));
+                self.resizing = Some(Resizing::List);
             }
             (_, KeyCode::Char('g')) => self.pending_g = true,
             // From the chats or a forum's topics: opens the one under the
@@ -5705,10 +5764,10 @@ impl App {
     }
 
     /// Resize mode takes the keys: `h` and `l` move the line between the
-    /// chat list and the chat as you press them, `=` puts it back where it
-    /// starts out, Enter keeps it and Esc puts back where it was.
+    /// panes as you press them and `=` puts it back where it starts out, each
+    /// saved at once; Enter, Esc or Ctrl-r leave.
     fn on_resize_key(&mut self, key: KeyEvent, ctrl: bool) {
-        let Some(before) = self.resizing else {
+        let Some(pane) = self.resizing else {
             return;
         };
         // `h` and `l` move the line between the panes that way: the chat
@@ -5717,43 +5776,29 @@ impl App {
             Side::Left => -1,
             Side::Right => 1,
         };
+        let widths = |s: &Settings| (s.chat_list_width, s.topics_width);
+        let before = widths(&self.settings);
         let settings = &mut self.settings;
-        match (before, key.code) {
-            (Resizing::List(_), KeyCode::Char('h') | KeyCode::Left) => settings.resize_list(left),
-            (Resizing::List(_), KeyCode::Char('l') | KeyCode::Right) => settings.resize_list(-left),
-            (Resizing::Topics(_), KeyCode::Char('h') | KeyCode::Left) => {
-                settings.resize_topics(left)
-            }
-            (Resizing::Topics(_), KeyCode::Char('l') | KeyCode::Right) => {
+        match (pane, key.code) {
+            (Resizing::List, KeyCode::Char('h') | KeyCode::Left) => settings.resize_list(left),
+            (Resizing::List, KeyCode::Char('l') | KeyCode::Right) => settings.resize_list(-left),
+            (Resizing::Topics, KeyCode::Char('h') | KeyCode::Left) => settings.resize_topics(left),
+            (Resizing::Topics, KeyCode::Char('l') | KeyCode::Right) => {
                 settings.resize_topics(-left)
             }
-            (Resizing::List(_), KeyCode::Char('=')) => {
+            (Resizing::List, KeyCode::Char('=')) => {
                 settings.chat_list_width = settings::DEFAULT_LIST_WIDTH;
             }
-            (Resizing::Topics(_), KeyCode::Char('=')) => {
+            (Resizing::Topics, KeyCode::Char('=')) => {
                 settings.topics_width = settings::DEFAULT_TOPICS_WIDTH;
             }
-            (_, KeyCode::Esc) => {
-                match before {
-                    Resizing::List(width) => settings.chat_list_width = width,
-                    Resizing::Topics(width) => settings.topics_width = width,
-                }
-                self.resizing = None;
-            }
-            (_, KeyCode::Enter) => self.end_resize(),
-            (_, KeyCode::Char('r')) if ctrl => self.end_resize(),
+            (_, KeyCode::Enter | KeyCode::Esc) => self.resizing = None,
+            (_, KeyCode::Char('r')) if ctrl => self.resizing = None,
             _ => {}
         }
-    }
-
-    /// Leaves resize mode with the panes as they are, saved for next time.
-    fn end_resize(&mut self) {
-        let changed = match self.resizing.take() {
-            Some(Resizing::List(width)) => width != self.settings.chat_list_width,
-            Some(Resizing::Topics(width)) => width != self.settings.topics_width,
-            None => false,
-        };
-        if changed && let Err(e) = self.settings.save(&self.settings_path) {
+        if widths(&self.settings) != before
+            && let Err(e) = self.settings.save(&self.settings_path)
+        {
             self.status = Some(format!("{}{e:#}", lang::t("Couldn't save settings: ")));
         }
     }
@@ -8245,6 +8290,125 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The screen at `width` columns, one char per cell, so a column is an
+    /// index into its row.
+    fn grid(app: &mut App, width: u16) -> Vec<Vec<char>> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The cell `text` starts at, on the first of `rows` that has it.
+    fn cell_of(grid: &[Vec<char>], rows: std::ops::Range<u16>, text: &str) -> (u16, u16) {
+        let want: Vec<char> = text.chars().collect();
+        rows.clone()
+            .find_map(|y| {
+                let row = &grid[usize::from(y)];
+                let x = row.windows(want.len()).position(|w| w == want.as_slice())?;
+                Some((x as u16, y))
+            })
+            .unwrap_or_else(|| panic!("{text} isn't on rows {rows:?}"))
+    }
+
+    fn mouse_at(kind: MouseEventKind, (x, y): (u16, u16)) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn the_settings_popup_takes_the_mouse() {
+        let dir = std::env::temp_dir().join(format!("tuigram-mouse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        let click = |at| mouse_at(MouseEventKind::Down(MouseButton::Left), at);
+        let menu = |app: &App| {
+            let menu = app.settings_menu.as_ref().unwrap();
+            (menu.tab, menu.selected)
+        };
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        let screen = grid(&mut app, 120);
+        let top = app.settings_menu.as_ref().unwrap().drawn.area.y;
+        let settings_tab = cell_of(&screen, top..top + 1, "Settings");
+        app.on_mouse(click(settings_tab));
+        assert_eq!(menu(&app).0, HelpTab::Settings, "its tab");
+
+        // A click puts the cursor on a setting; only one on the setting
+        // under the cursor changes it.
+        let gaps = app.settings.chat_gaps;
+        let screen = grid(&mut app, 120);
+        let row = cell_of(&screen, 0..20, "A gap between chats");
+        app.on_mouse(click(row));
+        assert_eq!(menu(&app).1, SettingsMenu::CHAT_GAPS);
+        assert_eq!(app.settings.chat_gaps, gaps, "not yet");
+        grid(&mut app, 120);
+        app.on_mouse(click(row));
+        assert_eq!(app.settings.chat_gaps, !gaps);
+        let saved = Settings::load(&settings::path(&dir)).unwrap();
+        assert_eq!(saved.chat_gaps, !gaps, "saved at once");
+
+        // The wheel over it moves as j and k do; elsewhere it does nothing.
+        app.on_mouse(mouse_at(MouseEventKind::ScrollDown, row));
+        assert_eq!(menu(&app).1, SettingsMenu::LIST_RIGHT);
+        app.on_mouse(mouse_at(MouseEventKind::ScrollUp, (0, 0)));
+        assert_eq!(menu(&app).1, SettingsMenu::LIST_RIGHT);
+
+        // Nothing while a popup over it has the keys.
+        app.confirm = Some(Confirm::new("Log out?", Vec::new(), Confirmed::Logout));
+        app.on_mouse(mouse_at(MouseEventKind::ScrollDown, row));
+        app.on_mouse(click(settings_tab));
+        assert_eq!(menu(&app).1, SettingsMenu::LIST_RIGHT);
+        app.confirm = None;
+
+        let screen = grid(&mut app, 120);
+        let shortcuts_tab = cell_of(&screen, top..top + 1, "Shortcuts");
+        app.on_mouse(click(shortcuts_tab));
+        assert_eq!(menu(&app).0, HelpTab::Shortcuts);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_long_setting_wraps_and_a_click_on_any_of_its_rows_picks_it() {
+        let dir = std::env::temp_dir().join(format!("tuigram-wrap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let tg = Tg::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(tg, images, &dir);
+        lang::set(lang::Lang::Vi);
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        // Right under the secret chats' row, which then shows too.
+        app.settings_menu.as_mut().unwrap().selected = SettingsMenu::SOUND_FOCUSED;
+        let screen = grid(&mut app, 80);
+        // Its whole sentence, to its last word, inside the popup.
+        let first = cell_of(&screen, 0..20, "Nhận các cuộc");
+        let last = cell_of(&screen, 0..20, "thoại");
+        assert!(last.1 > first.1, "on rows of its own");
+        let popup = app.settings_menu.as_ref().unwrap().drawn.area;
+        assert!(last.0 + 5 < popup.right(), "inside the popup");
+        app.on_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), last));
+        let selected = app.settings_menu.as_ref().unwrap().selected;
+        assert_eq!(selected, SettingsMenu::SECRET_CHATS);
+        assert!(
+            !app.settings.accept_secret_chats,
+            "a first click only picks it"
+        );
+        lang::set(lang::Lang::En);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_language_picked_in_the_settings_speaks_at_once_and_is_saved() {
         let dir = std::env::temp_dir().join(format!("tuigram-language-{}", std::process::id()));
@@ -8463,7 +8627,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_r_resizes_the_panes_and_enter_keeps_it_for_next_time() {
+    fn ctrl_r_resizes_the_panes_and_each_press_is_kept_for_next_time() {
         let dir = std::env::temp_dir().join(format!("tuigram-resize-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
@@ -8491,17 +8655,24 @@ mod tests {
             status.contains(" RESIZE ") && status.contains("chat list 45%"),
             "{status}"
         );
+        let saved = || {
+            Settings::load(&settings::path(&dir))
+                .unwrap()
+                .chat_list_width
+        };
+        assert_eq!(saved(), 45, "saved as it's pressed, no Enter needed");
 
         press(&mut app, KeyCode::Enter, none);
         assert!(app.resizing.is_none());
-        let saved = Settings::load(&settings::path(&dir)).unwrap();
-        assert_eq!(saved.chat_list_width, 45);
 
         press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('h'), none);
         assert_eq!(edge(&screen(&mut app)), 39);
+        assert_eq!(saved(), 40);
         press(&mut app, KeyCode::Esc, none);
-        assert_eq!(edge(&screen(&mut app)), 44, "Esc puts it back");
+        assert!(app.resizing.is_none());
+        assert_eq!(edge(&screen(&mut app)), 39, "Esc leaves it as it is");
+        assert_eq!(saved(), 40);
         assert!(app.focus == Focus::Messages, "and stays in the chat");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -8858,28 +9029,33 @@ mod tests {
         let list = app.settings.chat_list_width;
 
         press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
-        assert_eq!(app.resizing, Some(Resizing::Topics(30)));
+        assert_eq!(app.resizing, Some(Resizing::Topics));
         press(&mut app, KeyCode::Char('l'), none);
         press(&mut app, KeyCode::Char('l'), none);
         let rows = screen_of(&mut app, 140);
         assert_eq!(edge(&rows), start + 4, "two columns a press");
         assert!(rows.last().unwrap().contains("topics 34 columns"));
         assert_eq!(app.settings.chat_list_width, list, "the chat list stays");
+        let saved = |app: &App| Settings::load(&app.settings_path).unwrap().topics_width;
+        assert_eq!(saved(&app), 34, "kept for next time as it's pressed");
         press(&mut app, KeyCode::Esc, none);
-        assert_eq!(edge(&screen_of(&mut app, 140)), start, "Esc puts it back");
+        assert_eq!(
+            edge(&screen_of(&mut app, 140)),
+            start + 4,
+            "Esc leaves it as it is"
+        );
 
         press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('h'), none);
         press(&mut app, KeyCode::Enter, none);
         assert!(app.resizing.is_none());
-        assert_eq!(app.settings.topics_width, 28);
-        let saved = Settings::load(&app.settings_path).unwrap();
-        assert_eq!(saved.topics_width, 28, "kept for next time");
+        assert_eq!(app.settings.topics_width, 32);
+        assert_eq!(saved(&app), 32);
 
         // Elsewhere, Ctrl-r still resizes the chat list.
         app.focus = Focus::Messages;
         press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
-        assert!(matches!(app.resizing, Some(Resizing::List(_))));
+        assert!(matches!(app.resizing, Some(Resizing::List)));
     }
 
     #[test]
@@ -11288,7 +11464,7 @@ mod tests {
     #[test]
     fn logging_out_leaves_no_popup_or_resize_mode_behind() {
         let mut app = test_app("forget-popups");
-        app.resizing = Some(Resizing::List(30));
+        app.resizing = Some(Resizing::List);
         app.confirm = Some(Confirm::new("Log out?", Vec::new(), Confirmed::Logout));
         app.react_menu = Some(ReactMenu::new(1, "hi".into()));
         app.forget_session();
